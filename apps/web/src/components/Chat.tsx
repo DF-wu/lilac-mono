@@ -1,3 +1,5 @@
+import { rewindDraft } from "../rewind-draft";
+import type { OptimisticTurn } from "../optimistic-turns";
 import { useEventCallback } from "../use-event-callback";
 import { useStore } from "zustand";
 import { draftAttachment, releaseDraftAttachments, type DraftThread } from "../draft-thread";
@@ -24,15 +26,21 @@ import {
   type ReactNode,
 } from "react";
 import { X, RotateCcw } from "lucide-react";
-import type { NativeInput, DisplayPart, NativeThread } from "@stanley2058/lilac-client-protocol";
+import type {
+  NativeInput,
+  DisplayPart,
+  NativeThread,
+  ReadyTurnSlot,
+} from "@stanley2058/lilac-client-protocol";
 import type { ChatCommon, ComposerSubmission } from "../types";
 import { resolveAttachmentIds } from "../uploads";
 import { inputDeliveryOptions } from "../input-mode";
 import { deliverPendingInput, type PendingInput } from "../pending-input";
+import { pendingMessageParts } from "../pending-message";
 export type { PendingInput } from "../pending-input";
 import { Button } from "./ui/button";
 import { Composer } from "./Composer";
-import { Timeline, useLatestReadableTurn } from "./Timeline";
+import { Timeline, ThinkingIndicator, useLatestReadableTurn } from "./Timeline";
 import { attempt, ErrorNotice, IconButton, Modal, VirtualList } from "./ui";
 
 import { UploadProgressContext } from "../upload-context";
@@ -152,7 +160,16 @@ export function Chat(props: ChatProps) {
   const historySnapshot = useCallback(() => !!store.checkpoint, [store]);
   const historyLoaded = useSyncExternalStore(subscribeHistory, historySnapshot, historySnapshot);
   const readableTurnId = useLatestReadableTurn(store);
-  const active = !!thread?.activeRunId;
+  const sendingEntry = localThread?.sending
+    ? localThread.creation?.entry
+    : pendingEntries.find((entry) => entry.state === "preparing" || entry.state === "accepted");
+  const activeTurnSnapshot = useCallback(() => {
+    const slot = store.at(store.size - 1);
+    return slot?.kind === "ready" && (slot.state === "pending" || slot.state === "running");
+  }, [store]);
+  const activeTurn = useSyncExternalStore(subscribeHistory, activeTurnSnapshot, activeTurnSnapshot);
+  const serverActive = !!thread?.activeRunId || activeTurn;
+  const active = serverActive || !!sendingEntry;
   const previousActive = useRef(active);
   const canEdit = useRef(editable);
   canEdit.current = editable;
@@ -196,11 +213,9 @@ export function Chat(props: ChatProps) {
     ...queueOptions(client, threadId),
     enabled: online && !local && editable,
   });
-  const queue = editable ? (queueQuery.data?.items ?? []) : [];
-
-  useEffect(() => {
-    if (!editable) setRewindTarget(undefined);
-  }, [editable]);
+  const queue = editable
+    ? (queueQuery.data?.items ?? []).filter((entry) => entry.mode !== "prompt")
+    : [];
   const subscribe = useCallback(
     (listener: () => void) => pool.subscribe(threadId, listener),
     [pool, threadId],
@@ -208,6 +223,60 @@ export function Chat(props: ChatProps) {
   const snapshot = useCallback(() => pool.get(threadId), [pool, threadId]);
   const uploads = useSyncExternalStore(subscribe, snapshot, snapshot);
   const uploadProgress = useMemo(() => ({ pool, threadId }), [pool, threadId]);
+  const pendingAttachments = useMemo(
+    () =>
+      sendingEntry?.submission.attachments.map(
+        (attachment) => uploads.find((upload) => upload.key === attachment.key) ?? attachment,
+      ) ?? [],
+    [sendingEntry, uploads],
+  );
+  const messageResourceUrl = useCallback(
+    (id: string) =>
+      pendingAttachments.find((attachment) => (attachment.resourceId ?? attachment.key) === id)
+        ?.preview ?? resourceUrl(id),
+    [pendingAttachments, resourceUrl],
+  );
+  const pendingTurn = useMemo<ReadyTurnSlot | undefined>(() => {
+    if (!sendingEntry || (!sendingEntry.optimisticSlotIds && serverActive)) return;
+    return {
+      kind: "ready",
+      slotId: `sending:${sendingEntry.commandId}`,
+      turnId: `sending:${sendingEntry.commandId}`,
+      position: store.size,
+      state: "pending",
+      messages: [
+        {
+          id: sendingEntry.commandId,
+          role: "user",
+          metadata: { authorId: scope.principalId },
+          parts: pendingMessageParts(sendingEntry.submission, pendingAttachments),
+        },
+      ],
+    };
+  }, [sendingEntry, pendingAttachments, serverActive, scope.principalId, store]);
+  const optimisticTurn = useMemo<OptimisticTurn | undefined>(() => {
+    if (!pendingTurn || !sendingEntry) return;
+    return {
+      slot: pendingTurn,
+      precedingSlotIds: sendingEntry.optimisticSlotIds ?? store.slotIds,
+      confirmedSlotId: sendingEntry.receipt?.turnId,
+    };
+  }, [pendingTurn, sendingEntry, store]);
+  const resolveOptimistic = useEventCallback(() => {
+    if (!sendingEntry?.receipt) return;
+    for (const attachment of sendingEntry.submission.attachments)
+      pool.release(threadId, attachment.key);
+    commitPending((entries) =>
+      entries.filter((entry) => entry.commandId !== sendingEntry.commandId),
+    );
+  });
+  const visiblePendingEntries = pendingEntries.filter(
+    (entry) => entry.commandId !== sendingEntry?.commandId || !pendingTurn,
+  );
+
+  useEffect(() => {
+    if (!editable) setRewindTarget(undefined);
+  }, [editable]);
   const recoveryUpload = useCallback(
     (resourceId: string, file: File, onProgress: (fraction: number) => void) =>
       upload(resourceId, file, onProgress, pool.signal),
@@ -314,7 +383,7 @@ export function Chat(props: ChatProps) {
           )
         : entry.text,
       ...inputDeliveryOptions(
-        active,
+        serverActive,
         entry.submission.mode,
         entry.submission.modelId,
         !!entry.submission.command,
@@ -325,15 +394,20 @@ export function Chat(props: ChatProps) {
     };
   }
   async function deliver(entry: PendingInput, retryFailed = false) {
+    let awaitingProjection = false;
     const outcome = await deliverPendingInput(
       entry,
       () => prepareInput(entry, retryFailed),
       (input) => client.submit(input),
-      (patch) => setPending(entry.commandId, patch),
+      (patch) => {
+        awaitingProjection = patch?.state === "accepted";
+        setPending(entry.commandId, patch);
+      },
       currentId.current !== threadId || canEdit.current,
     );
     if (outcome?.kind !== "accepted") return;
-    for (const attachment of entry.submission.attachments) pool.release(threadId, attachment.key);
+    if (!awaitingProjection)
+      for (const attachment of entry.submission.attachments) pool.release(threadId, attachment.key);
     void refreshQueue();
   }
   function submit(submission: ComposerSubmission) {
@@ -345,6 +419,7 @@ export function Chat(props: ChatProps) {
       commandId: crypto.randomUUID(),
       text: submission.text,
       submission,
+      optimisticSlotIds: serverActive ? undefined : [...store.slotIds],
       state: "preparing",
     };
     commitPending((entries) => [...entries, entry]);
@@ -381,24 +456,55 @@ export function Chat(props: ChatProps) {
     )
       return;
     setRewinding(true);
-    const reply = await attempt(
-      () =>
-        rpc.threads.rewind({
-          threadId: threadId,
-          commandId: crypto.randomUUID(),
-          historyGeneration: checkpoint.historyGeneration,
-          expectedRevision: checkpoint.projectionRevision,
-          turnId: rewindTarget,
-        }),
-      setError,
-    );
+    let target = store.get(rewindTarget);
+    while (target?.kind === "ready" && target.partsCursor) {
+      const cursor = target.partsCursor;
+      await client.loadTurnPage(threadId, rewindTarget);
+      target = store.get(rewindTarget);
+      if (target?.kind !== "ready" || target.partsCursor === cursor) {
+        setError("Could not load the complete message. Try rewinding again.");
+        setRewinding(false);
+        return;
+      }
+    }
+    const message =
+      target?.kind === "ready"
+        ? target.messages.find(
+            (item) => item.role === "user" && item.metadata?.inputMode !== "steer",
+          )
+        : undefined;
+    if (!message) {
+      setError("The message is no longer available.");
+      setRewinding(false);
+      return;
+    }
+    const restored = await rewindDraft({
+      parts: message.parts,
+      threadId,
+      resourceUrl,
+      pool,
+      onError: setError,
+      rewind: async () => {
+        if (!canEdit.current || currentId.current !== threadId) return;
+        return attempt(
+          () =>
+            rpc.threads.rewind({
+              threadId,
+              commandId: crypto.randomUUID(),
+              historyGeneration: checkpoint.historyGeneration,
+              expectedRevision: checkpoint.projectionRevision,
+              turnId: rewindTarget,
+            }),
+          setError,
+        );
+      },
+    });
     setRewinding(false);
-    if (!reply || (currentId.current === threadId && !canEdit.current)) return;
+    if (!restored) return;
     const current = getDraft();
     commitDraft({
-      text: reply.text,
+      ...restored,
       skillIds: [],
-      attachments: [],
       savedText: current.text || current.savedText,
     });
     setRewindTarget(undefined);
@@ -510,11 +616,11 @@ export function Chat(props: ChatProps) {
           if (local) props.onLocalChange(threadId, (current) => ({ ...current, error: undefined }));
         }}
       />
-      {localThread?.creation ? (
+      {localThread?.creation && !pendingTurn ? (
         <div className="pending-input flex flex-wrap gap-2 p-2 mb-2 rounded-sm bg-surface text-sm">
           <span>{localThread.creation.entry.text}</span>
           <small>
-            {localThread.sending ? "Creating conversation…" : "Conversation could not be created."}
+            {localThread.sending ? <ThinkingIndicator /> : "Conversation could not be created."}
           </small>
           {!localThread.sending ? (
             <Button
@@ -525,10 +631,10 @@ export function Chat(props: ChatProps) {
           ) : null}
         </div>
       ) : null}
-      {pendingEntries.length ? (
+      {visiblePendingEntries.length ? (
         <VirtualList
           className="pending-inputs max-h-48 h-24"
-          items={pendingEntries}
+          items={visiblePendingEntries}
           itemKey={(entry) => entry.commandId}
           label="Pending messages"
           estimate={88}
@@ -538,8 +644,8 @@ export function Chat(props: ChatProps) {
               key={entry.commandId}
             >
               <span>{entry.text}</span>
-              <small>{entry.error ?? "Sending…"}</small>
-              {editable && entry.state !== "preparing" ? (
+              {entry.error ? <small>{entry.error}</small> : <ThinkingIndicator />}
+              {editable && entry.state !== "preparing" && entry.state !== "accepted" ? (
                 <Button
                   type="button"
                   onClick={() =>
@@ -637,7 +743,7 @@ export function Chat(props: ChatProps) {
           onRetryAttachment={composerRetryAttachment}
           active={active}
           canCancel={active || queue.length > 0}
-          disabled={!editable || !draftLoaded}
+          disabled={!editable || !draftLoaded || !!rewinding}
           submitting={!!localThread?.creation}
           modelId={localThread?.modelId ?? thread?.modelId}
           onModelChange={composerModelChange}
@@ -683,6 +789,8 @@ export function Chat(props: ChatProps) {
       <div className="chat-workspace min-h-0 flex flex-col flex-1" data-thread-id={threadId}>
         <UploadProgressContext.Provider value={uploadProgress}>
           <Timeline
+            optimisticTurn={optimisticTurn}
+            onOptimisticResolved={resolveOptimistic}
             emptyContent={renderEmptyConversation()}
             header={props.header}
             footer={composer}
@@ -690,7 +798,7 @@ export function Chat(props: ChatProps) {
             client={client}
             threadId={threadId}
             canEdit={editable && draftLoaded}
-            resourceUrl={resourceUrl}
+            resourceUrl={messageResourceUrl}
             upload={recoveryUpload}
             onRewind={setRewindTarget}
             rewindDisabled={active}
@@ -705,8 +813,8 @@ export function Chat(props: ChatProps) {
           onClose={() => setRewindTarget(undefined)}
         >
           <p>
-            The selected turn and everything after it will leave the conversation. Its text returns
-            to your composer. File changes and other tool effects remain.
+            The selected turn and everything after it will leave the conversation. Its text and
+            attachments return to your composer. File changes and other tool effects remain.
           </p>
           {active ? <p>Wait for the agent to finish before rewinding.</p> : null}
           <div className="dialog-actions flex justify-end gap-2 mt-6">

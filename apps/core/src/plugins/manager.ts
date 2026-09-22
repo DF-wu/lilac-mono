@@ -33,12 +33,11 @@ import { createBuiltinCoreToolPlugins } from "./builtin";
 import {
   buildUnifiedToolCatalogResult,
   catalogCandidateExecutable,
-  createPortableToolSearchResult,
+  createPortableToolSearch,
   formatCatalogNamespaceSummary,
   type CatalogNamespaceSummary,
   type CatalogToolCandidate,
   type CatalogToolEntry,
-  type PortableToolSearchInvalid,
   type UnifiedToolCatalogInvalid,
 } from "../mcp/catalog";
 import {
@@ -151,7 +150,7 @@ export class Level1ToolsetInvariantViolation extends TaggedError(
 }> {}
 
 export class Level1ToolsetAssemblyFailed extends TaggedError("Level1ToolsetAssemblyFailed")<{
-  readonly cause: UnifiedToolCatalogInvalid | PortableToolSearchInvalid;
+  readonly cause: UnifiedToolCatalogInvalid;
   readonly message: string;
 }> {}
 
@@ -597,24 +596,11 @@ export function createCoreToolPluginManager(params: {
     }
     if (catalog.entries.length > 0) {
       directToolNames.add("find_tools");
-      const search: ResultType<unknown, PortableToolSearchInvalid> = createPortableToolSearchResult(
-        {
-          catalog: catalog.entries,
-          namespaceSummaries: mcpNamespaceSummaries,
-          onSelectCatalogIds: buildParams.onSelectCatalogIds,
-          requestContext: buildParams.requestContext,
-        },
-      );
-      const searchError = resultErrorOrNull(search);
-      if (searchError) {
-        return Result.err(
-          new Level1ToolsetAssemblyFailed({
-            cause: searchError,
-            message: searchError.message,
-          }),
-        );
-      }
-      const searchTool = selectResultValue(search);
+      const searchTool = createPortableToolSearch({
+        catalog: catalog.entries,
+        namespaceSummaries: mcpNamespaceSummaries,
+        onSelectCatalogIds: buildParams.onSelectCatalogIds,
+      });
       assignOpaqueTool(tools, "find_tools", searchTool);
     }
 

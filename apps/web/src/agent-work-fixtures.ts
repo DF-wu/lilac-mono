@@ -73,7 +73,7 @@ const thought = activity(
 const weather = activity(
   "demo_weather",
   "tool",
-  "Checked Saturday's weather",
+  'weather.lookup {"city":"Kyoto","day":"Saturday"}',
   "complete",
   'weather.lookup({ city: "Kyoto", day: "Saturday" })\n\n18°C, light cloud, 10% chance of rain.',
   850,
@@ -81,7 +81,7 @@ const weather = activity(
 const hours = activity(
   "demo_hours",
   "tool",
-  "Checked museum opening hours",
+  'web.search {"query":"Kyoto museum Saturday hours"}',
   "complete",
   'web.search({ query: "Kyoto museum Saturday hours" })\n\nOpen 10:00–18:00. Last admission 17:30.',
   1200,
@@ -116,17 +116,17 @@ const multiple = [
 const answer =
   "I'd choose the **riverside walk**, with the museum as a rainy-day backup.\n\n1. Start at Sanjo Station around 10:00.\n2. Walk north along the river, then stop for coffee.\n3. Keep the afternoon free, or visit the museum before its 17:30 last admission.\n\nBring a light jacket. No reservations are needed for the walk.";
 const final = message("demo_final", [{ type: "text", text: answer }], "final");
-const streamFrames = Array.from(
-  { length: Math.ceil(answer.length / 16) },
-  (_value: undefined, index) =>
-    turn([
-      work,
-      {
-        ...final,
-        metadata: { ...final.metadata, incomplete: true },
-        parts: [{ type: "text", text: answer.slice(0, (index + 1) * 16) }],
-      },
-    ]),
+const paragraphs = answer.split("\n\n");
+const streamFrames = paragraphs.map((_paragraph, index) =>
+  turn([
+    work,
+    commentary,
+    {
+      ...final,
+      metadata: { ...final.metadata, incomplete: true },
+      parts: [{ type: "text", text: paragraphs.slice(0, index + 1).join("\n\n") }],
+    },
+  ]),
 );
 
 const introduction = message("demo_introduction", [
@@ -275,9 +275,9 @@ const parentRouteDone = message("demo_parent_work", [
 
 export const agentWorkStages: AgentWorkStage[] = [
   {
-    id: "queued",
-    label: "Queued",
-    description: "The prompt is waiting to be admitted.",
+    id: "sent",
+    label: "Message sent",
+    description: "The agent shows Thinking immediately after sending.",
     frames: [
       {
         ...turn([], "pending"),
@@ -322,7 +322,7 @@ export const agentWorkStages: AgentWorkStage[] = [
           activity(
             "demo_weather",
             "tool",
-            "Checking the weather…",
+            'weather.lookup {"city":"Kyoto","day":"Saturday"}',
             "running",
             'weather.lookup({ city: "Kyoto", day: "Saturday" })',
           ),
@@ -341,14 +341,14 @@ export const agentWorkStages: AgentWorkStage[] = [
           activity(
             "demo_weather",
             "tool",
-            "Checking the weather…",
+            'weather.lookup {"city":"Kyoto","day":"Saturday"}',
             "running",
             "Waiting for the forecast.",
           ),
           activity(
             "demo_hours",
             "tool",
-            "Checking opening hours…",
+            'web.search {"query":"Kyoto museum Saturday hours"}',
             "running",
             "Waiting for the museum's schedule.",
           ),
@@ -441,7 +441,7 @@ export const agentWorkStages: AgentWorkStage[] = [
     id: "streaming",
     label: "Streaming response",
     description:
-      "Play to watch the final answer arrive in chunks. Pause to inspect a partial answer.",
+      "Play to watch the final answer arrive in paragraphs. Pause to inspect a partial answer.",
     frames: streamFrames,
   },
   {
@@ -464,7 +464,7 @@ export const agentWorkStages: AgentWorkStage[] = [
           activity(
             "demo_full_call",
             "tool",
-            "Checking opening hours…",
+            'web.search {"query":"Kyoto museum Saturday hours"}',
             "running",
             "Waiting for the museum schedule.",
           ),
@@ -608,6 +608,38 @@ export const agentWorkStages: AgentWorkStage[] = [
   },
 ];
 
+const flowStages = [
+  "sent",
+  "thinking",
+  "tool-call",
+  "parallel-tools",
+  "tool-results",
+  "streaming",
+  "complete",
+];
+export const conversationFrames = flowStages
+  .flatMap((id) => agentWorkStages.find((stage) => stage.id === id)!.frames)
+  .map((frame) => ({
+    ...frame,
+    messages: frame.messages.map((message) => ({
+      ...message,
+      parts: message.parts.map((part) => {
+        if (part.type !== "data-activity") return part;
+        const { detail: _detail, durationMs: _duration, ...data } = part.data;
+        return {
+          ...part,
+          data: { ...data, ...(data.kind === "tool" ? { detail: data.label } : {}) },
+        };
+      }),
+    })),
+  }));
+agentWorkStages.unshift({
+  id: "conversation",
+  label: "Send to completion",
+  description: "Send a message to watch the same timeline and composer used in a thread.",
+  frames: conversationFrames,
+});
+
 export function demoSubagents(slot: ReadyTurnSlot): SubagentSummary[] {
   return slot.messages.flatMap((message) =>
     message.parts.flatMap((part) => {
@@ -620,7 +652,7 @@ export function demoSubagents(slot: ReadyTurnSlot): SubagentSummary[] {
       if (!profile) return [];
       const titles = {
         explore: "Checking riverside conditions…",
-        general: "Checking opening hours…",
+        general: 'web.search {"query":"Kyoto museum Saturday hours"}',
       };
       return [
         {

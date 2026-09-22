@@ -1,19 +1,20 @@
+import type { OptimisticTurn } from "../optimistic-turns";
 import { WorkspacePanels, WorkspaceSidePanel } from "./WorkspacePanels";
-import { useMemo } from "react";
+import { useMemo, useLayoutEffect } from "react";
 import { useStore } from "zustand";
 import { demoSubagents, demoSubagentTranscript } from "../agent-work-fixtures";
 import { createPanelStore, defaultRightPanel } from "../panel-store";
 import { SubagentContext } from "./subagent-context";
 import { SubagentPanelView, RightPanelToggle } from "./SubagentPanel";
-import { MessageArrivals } from "../message-arrivals";
-import { MessageArrivalsContext } from "./message-arrivals";
 import { useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Pause, Play, RotateCcw } from "lucide-react";
 import { agentWorkStages } from "../agent-work-fixtures";
 import { MessageIdentityContext } from "./message-identity";
-import { MessageServicesContext, type MessageServices } from "./message-services";
-import { Turn } from "./Timeline";
-import type { ReadyTurnSlot } from "@stanley2058/lilac-client-protocol";
+import { type MessageServices } from "./message-services";
+import { Timeline } from "./Timeline";
+import { NativeThreadStore } from "@stanley2058/lilac-client";
+import { StreamingModeSelect, type StreamingMode } from "./StreamingSettings";
+import { Composer } from "./Composer";
 import { Button } from "./ui/button";
 import { IconButton } from "./ui";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
@@ -29,14 +30,62 @@ const identities = {
 
 export function AgentWorkDemo() {
   const [panel] = useState(createPanelStore);
+  const [streaming, setStreaming] = useState<StreamingMode>("paragraph");
   const panelLayout = useStore(panel, (state) => state.threads.get("demo") ?? defaultRightPanel);
   const panelOpen = panelLayout.open;
   const panelSelection = useStore(panel, (state) => state.selection);
-  const [playhead, setPlayhead] = useState({ stage: 1, frame: 0, playing: false });
+  const [playhead, setPlayhead] = useState({ stage: 0, frame: 0, playing: false });
+  const [store] = useState(() => new NativeThreadStore());
+  const revision = useRef(0);
+  const client = useMemo(
+    () => ({ thread: () => store, hydrate: async () => {}, loadTurnPage: async () => {} }),
+    [store],
+  );
+  const [text, setText] = useState("Compare a riverside walk with a museum visit for Saturday.");
+  const [run, setRun] = useState(0);
+  const [sent, setSent] = useState(false);
+  const [optimistic, setOptimistic] = useState<OptimisticTurn>();
+  const [promptText, setPromptText] = useState("");
   const [feedback, setFeedback] = useState("");
   const container = useRef<HTMLDivElement>(null);
   const stage = agentWorkStages[playhead.stage]!;
-  const slot = stage.frames[playhead.frame]!;
+  const frames = useMemo(
+    () =>
+      streaming === "paragraph"
+        ? stage.frames
+        : stage.frames.filter(
+            (frame) =>
+              !frame.messages.some(
+                (message) => message.metadata?.phase === "final" && message.metadata.incomplete,
+              ),
+          ),
+    [stage, streaming],
+  );
+  const slot = frames[Math.min(playhead.frame, frames.length - 1)] ?? stage.frames.at(-1)!;
+  useLayoutEffect(() => {
+    const messages = slot.messages.map((message) => ({
+      ...message,
+      id: stage.id === "conversation" ? `${message.id}_${run}` : message.id,
+      parts:
+        message.role === "user" && promptText && stage.id === "conversation"
+          ? [{ type: "text" as const, text: promptText }]
+          : message.parts.map((part) =>
+              "id" in part && stage.id === "conversation"
+                ? { ...part, id: `${part.id}_${run}` }
+                : part,
+            ),
+    }));
+    store.replay({
+      kind: "window",
+      checkpoint: {
+        protocolVersion: 1,
+        historyGeneration: 0,
+        projectionRevision: ++revision.current,
+        cursor: `demo_${revision.current}`,
+      },
+      slots: stage.id === "conversation" && !sent ? [] : [{ ...slot, messages }],
+    });
+  }, [store, slot, stage.id, sent, promptText, run]);
   const agents = useMemo(() => demoSubagents(slot), [slot]);
   const selectedAgent = agents.find((agent) => agent.id === panelSelection?.agentId);
   const agentContext = useMemo(
@@ -51,17 +100,17 @@ export function AgentWorkDemo() {
     const timer = window.setTimeout(
       () => {
         setPlayhead((current) => {
-          if (current.frame + 1 < stage.frames.length)
-            return { ...current, frame: current.frame + 1 };
+          if (current.frame + 1 < frames.length) return { ...current, frame: current.frame + 1 };
+          if (stage.id === "conversation") return { ...current, playing: false };
           if (current.stage + 1 < agentWorkStages.length)
             return { ...current, stage: current.stage + 1, frame: 0 };
           return { ...current, playing: false };
         });
       },
-      stage.frames.length > 1 ? 140 : 2200,
+      frames.length > 1 ? 1400 : 2200,
     );
     return () => window.clearTimeout(timer);
-  }, [playhead, stage]);
+  }, [playhead, stage, frames]);
   useEffect(() => {
     const element = container.current;
     if (!element) return;
@@ -82,10 +131,14 @@ export function AgentWorkDemo() {
   }, []);
   function select(index: number) {
     setPlayhead({ stage: index, frame: 0, playing: false });
+    setSent(false);
+    setOptimistic(undefined);
     setFeedback("");
   }
   function togglePlayback() {
+    setOptimistic(undefined);
     setFeedback("");
+    setSent(true);
     setPlayhead((current) => {
       if (current.playing) return { ...current, playing: false };
       if (current.stage === agentWorkStages.length - 1)
@@ -125,6 +178,14 @@ export function AgentWorkDemo() {
           </SelectContent>
         </Select>
         <div className="ds-row flex items-center flex-wrap gap-2">
+          <StreamingModeSelect
+            value={streaming}
+            disabled={playhead.playing}
+            onChange={(mode) => {
+              setStreaming(mode);
+              select(0);
+            }}
+          />
           <IconButton
             label="Previous stage"
             disabled={playhead.stage === 0}
@@ -156,28 +217,85 @@ export function AgentWorkDemo() {
       </div>
       <SubagentContext value={agentContext}>
         <div
-          className={`ds-agent-workspace h-144 max-h-[70dvh] overflow-hidden relative [border:1px_solid_var(--ui-border)] rounded-lg ${panelOpen ? "" : "right-panel-hidden"}`}
+          className={`ds-agent-workspace h-144 max-h-[70dvh] overflow-clip relative [border:1px_solid_var(--ui-border)] rounded-lg ${panelOpen ? "" : "right-panel-hidden"}`}
         >
           <RightPanelToggle open={panelOpen} onToggle={() => panel.getState().toggle("demo")} />
           <WorkspacePanels rightOpen={panelOpen} rightWidth={panelLayout.width}>
-            <div className="chat-panel">
-              <div
-                className="ds-agent-preview [&_.turn]:p-0 h-144 max-h-[70dvh] overflow-auto p-4 [border:1px_solid_var(--ui-border)] rounded-lg bg-background pt-[calc(2rem_+_calc(var(--ui-space-unit)*3))]"
-                aria-label="Agent work preview"
-                tabIndex={0}
-              >
-                <MessageIdentityContext value={identities}>
-                  <MessageServicesContext value={services}>
-                    <DemoTurn
-                      key={stage.id}
-                      slot={slot}
-                      onRewind={() =>
-                        setFeedback("Rewind selected. This demo does not change any conversation.")
-                      }
-                    />
-                  </MessageServicesContext>
-                </MessageIdentityContext>
-              </div>
+            <div className="chat-panel flex flex-col">
+              <MessageIdentityContext value={identities}>
+                <Timeline
+                  optimisticTurn={optimistic}
+                  onOptimisticResolved={() => setOptimistic(undefined)}
+                  client={client}
+                  threadId="demo"
+                  {...services}
+                  onRewind={() => select(0)}
+                  emptyMessage="Send a message to start the demo."
+                  footer={
+                    <div className="p-4">
+                      {optimistic && !optimistic.confirmedSlotId ? (
+                        <Button
+                          variant="secondary"
+                          onClick={() => {
+                            setOptimistic({ ...optimistic, confirmedSlotId: slot.slotId });
+                            setSent(true);
+                            setPlayhead({ stage: 0, frame: 0, playing: true });
+                          }}
+                        >
+                          Confirm send
+                        </Button>
+                      ) : null}
+                      <Composer
+                        text={text}
+                        onText={setText}
+                        skillIds={[]}
+                        onSkills={() => {}}
+                        onCommand={() => {}}
+                        attachments={[]}
+                        onAttach={() => {}}
+                        onRemoveAttachment={() => {}}
+                        onRetryAttachment={() => {}}
+                        active={
+                          (stage.id !== "conversation" || sent) &&
+                          (slot.state === "pending" || slot.state === "running")
+                        }
+                        canCancel={
+                          playhead.playing && (slot.state === "pending" || slot.state === "running")
+                        }
+                        disabled={!!optimistic}
+                        windowDrop={false}
+                        onModelChange={() => {}}
+                        onCancel={() => setPlayhead((current) => ({ ...current, playing: false }))}
+                        onSubmit={(submission) => {
+                          setRun((value) => value + 1);
+                          setPromptText(submission.text);
+                          setText("");
+                          setOptimistic({
+                            precedingSlotIds: [],
+                            slot: {
+                              kind: "ready",
+                              slotId: `sending:demo:${run + 1}`,
+                              turnId: `sending:demo:${run + 1}`,
+                              position: 0,
+                              state: "pending",
+                              messages: [
+                                {
+                                  id: `demo-command:${run + 1}`,
+                                  role: "user",
+                                  metadata: { authorId: "demo_user" },
+                                  parts: [{ type: "text", text: submission.text }],
+                                },
+                              ],
+                            },
+                          });
+                          setSent(false);
+                          setPlayhead({ stage: 0, frame: 0, playing: false });
+                        }}
+                      />
+                    </div>
+                  }
+                />
+              </MessageIdentityContext>
             </div>
             <WorkspaceSidePanel
               side="right"
@@ -201,18 +319,5 @@ export function AgentWorkDemo() {
         {feedback}
       </p>
     </div>
-  );
-}
-
-function DemoTurn({ slot, onRewind }: { slot: ReadyTurnSlot; onRewind: () => void }) {
-  const [arrivals] = useState(() => {
-    const arrivals = new MessageArrivals();
-    arrivals.activate([]);
-    return arrivals;
-  });
-  return (
-    <MessageArrivalsContext value={arrivals}>
-      <Turn slot={slot} onRewind={onRewind} onLoadMore={() => {}} />
-    </MessageArrivalsContext>
   );
 }

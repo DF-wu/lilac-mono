@@ -1,3 +1,4 @@
+import { ConversationBadge } from "./components/ConversationReference";
 import lilacLogo from "./assets/logo.svg";
 import { LinkPreviewAnchor } from "./components/LinkWithFavicon";
 import { SidebarEmptyState } from "./components/SidebarEmptyState";
@@ -237,7 +238,7 @@ const messageFixtures: DisplayMessage[] = [
     parts: [
       {
         type: "text",
-        text: "Start with the riverside walk, then stop at **Chapter House** for coffee. The bookstore next door stays open until six.\n\nLeave the afternoon free. You won't need reservations.",
+        text: "Start with the riverside walk, then stop at **Chapter House** for coffee. The bookstore next door stays open until six.\n\nLeave the afternoon free. You won't need reservations.\n\nSave `weekend.md` and check [the itinerary](/tmp/weekend.md) or [meeting-room](/?ref=discord:meeting-room&message=demo).",
       },
     ],
   },
@@ -754,6 +755,13 @@ function FileTabsDemo() {
     store
       .getState()
       .openFile("demo", { type: "path", path: "/workspace/example.ts", name: "example.ts" });
+    store
+      .getState()
+      .openThread(
+        "demo",
+        { surface: "native", sessionId: "example-thread" },
+        "Example conversation",
+      );
     return store;
   });
   const tabs = useStore(store, (state) => state.tabs.get("demo") ?? defaultPanelTabs);
@@ -765,8 +773,9 @@ function FileTabsDemo() {
         onFocus={(id) => actions.focusTab("demo", id)}
         onClose={(id) => actions.closeTab("demo", id)}
         onAgents={() => actions.openAgents("demo")}
-        renderTab={(tab) =>
-          tab.type === "agents" ? (
+        renderTab={(tab) => {
+          if (tab.type === "thread") return <ConversationBadge target={tab.target} />;
+          return tab.type === "agents" ? (
             <div className="file-status grid place-content-center flex-1 p-4 text-sm text-muted-foreground">
               No subagents yet
             </div>
@@ -790,8 +799,8 @@ function FileTabsDemo() {
                 truncated: false,
               }}
             />
-          )
-        }
+          );
+        }}
       />
     </div>
   );
@@ -883,6 +892,16 @@ function Attachments() {
           />
         </Specimen>
         <Specimen title="Right panel tabs">
+          <div className="flex flex-wrap gap-2 mb-3">
+            <ConversationBadge target={{ surface: "native", sessionId: "example-thread" }} />
+            <ConversationBadge
+              target={{
+                surface: "discord",
+                sessionId: "123456789012345678",
+                messageId: "987654321098765432",
+              }}
+            />
+          </div>
           <FileTabsDemo />
         </Specimen>
         <Specimen title="File source · lines 123–125">
@@ -944,13 +963,21 @@ function Controls() {
     <Section id="controls" title="Controls">
       <Specimen title="Buttons">
         <div className="ds-row flex items-center flex-wrap gap-2">
-          {(["default", "secondary", "outline", "ghost", "destructive", "link"] as const).map(
-            (variant) => (
-              <Button key={variant} variant={variant}>
-                {variant}
-              </Button>
-            ),
-          )}
+          {(
+            [
+              "default",
+              "secondary",
+              "reference",
+              "outline",
+              "ghost",
+              "destructive",
+              "link",
+            ] as const
+          ).map((variant) => (
+            <Button key={variant} variant={variant}>
+              {variant}
+            </Button>
+          ))}
           <Button disabled>Disabled</Button>
           <IconButton label="New conversation">
             <Plus />

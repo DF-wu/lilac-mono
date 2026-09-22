@@ -1,3 +1,4 @@
+import type { NativeReferences } from "./references";
 import { resolveLinkPreview } from "./link-preview";
 import type { NativeLiveFileService } from "./resources-live";
 import type { NativeSubagents } from "./subagents";
@@ -32,13 +33,17 @@ import type { NativeSearchStore } from "./store-search";
 import type { NativeSurfaceStore } from "./store-surface";
 
 export type NativeRpcServiceOptions = {
+  references?: Pick<NativeReferences, "resolve" | "read">;
   files?: Pick<NativeLiveFileService, "resolve">;
   subagents?: Pick<NativeSubagents, "list" | "read">;
   store: NativeStore;
   auth: NativeAuthenticator;
   installationId: string;
   catalogs: Pick<NativeCatalogService, "get" | "subscribe">;
-  config: Pick<NativeConfigService, "read" | "save" | "reloadMcp">;
+  config: Pick<
+    NativeConfigService,
+    "read" | "save" | "reloadMcp" | "readStreaming" | "setStreaming"
+  >;
   execution: Pick<NativeExecution, "kick" | "cancel" | "rewind" | "deleteThread">;
   resources: Pick<NativeResourceService, "reserve">;
   search: Pick<NativeSearchStore, "searchMessages">;
@@ -802,6 +807,12 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
       },
     },
     config: {
+      readStreaming(principal) {
+        return config.readStreaming(principal.userId);
+      },
+      setStreaming(principal, input) {
+        return config.setStreaming(principal.userId, input);
+      },
       read(principal, input) {
         return config.read(principal.userId, input.kind);
       },
@@ -818,6 +829,14 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
           })),
         }));
       },
+    },
+    references: {
+      resolve: (principal, target) =>
+        options.references?.resolve(principal.userId, target) ??
+        Result.err(nativeFailure("not-found", "References unavailable")),
+      read: (principal, input) =>
+        options.references?.read(principal.userId, input) ??
+        Result.err(nativeFailure("not-found", "References unavailable")),
     },
     search: {
       query(principal, input) {

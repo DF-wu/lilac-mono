@@ -209,3 +209,23 @@ abandoned output. External tool effects still have the existing at-least-once re
 See [MIGRATIONS.md](../MIGRATIONS.md) before downgrading. Older builds do not understand native refs,
 resource origins or native recovery checkpoint fields. Drain work and keep a consistent backup before
 switching binaries.
+
+
+## Conversation links
+
+Use **Copy link** in a native conversation card's context menu, or right-click a native or Discord
+message's copy button. A normal click still copies the message content. Paste a copied link into the
+composer to insert an inline reference with the conversation's icon and title. Missing titles fall
+back to the session ID. Title autocomplete is not included.
+
+Click a reference to open a read-only tab in the right panel. Message links highlight the source
+message and allow paging toward older and newer messages in its conversation. Session links open
+at the latest messages. The context menu offers **Open in main view**, **Copy link**, and **Open in
+Discord** where available. A response split across Discord messages links to its first source
+message. Rows without a source message offer **Copy conversation link** instead.
+
+Native previews update while open. Discord previews use retained agent history, not a live channel
+fetch. Missing messages keep an external-open fallback. Existing membership and owner-only external
+history rules apply to links. The agent receives session coordinates for session links, and the
+conversation thread ID plus source message coordinates for message links when locally resolvable.
+Referenced message content is not automatically inserted into the prompt.

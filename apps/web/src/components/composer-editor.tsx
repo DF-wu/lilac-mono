@@ -1,3 +1,5 @@
+import { parseReferenceHref, referenceHref } from "@stanley2058/lilac-client-protocol";
+import { ConversationBadge } from "./ConversationReference";
 import { FileIcon } from "./FileIcon";
 import { FileActions } from "./FileActions";
 import { useOptionalWorkspace } from "../workspace-context";
@@ -76,6 +78,7 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { IconButton } from "./ui";
+import { referenceChipStyles } from "./ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import type { Attachment } from "../types";
 
@@ -157,7 +160,7 @@ function AttachmentElement(props: PlateElementProps) {
             render={
               <span
                 data-ui="composer-attachment-chip"
-                className="composer-attachment-chip relative inline-flex items-center gap-1 max-w-full px-1 rounded-sm bg-muted text-foreground text-sm align-middle whitespace-nowrap [line-height:1.5]"
+                className={`composer-attachment-chip relative inline-flex items-center gap-1 max-w-full px-2 rounded-sm whitespace-nowrap ${referenceChipStyles}`}
                 contentEditable={false}
                 data-state={attachment?.state ?? "missing"}
               />
@@ -212,6 +215,22 @@ export function attachmentSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
+
+const referenceType = "composer_reference";
+function ReferenceElement(props: PlateElementProps) {
+  const href = projectComposerNode(props.element).url ?? "";
+  const target = parseReferenceHref(href);
+  return (
+    <PlateElement {...props} as="span">
+      <span contentEditable={false}>{target ? <ConversationBadge target={target} /> : href}</span>
+      {props.children}
+    </PlateElement>
+  );
+}
+const ReferencePlugin = createPlatePlugin({
+  key: referenceType,
+  node: { isElement: true, isInline: true, isVoid: true, component: ReferenceElement },
+});
 
 const AttachmentPlugin = createPlatePlugin({
   key: attachmentType,
@@ -284,6 +303,7 @@ const BlockList: RenderNodeWrapper = (props: ListElementProps) => {
 
 export const composerPlugins = [
   AttachmentPlugin,
+  ReferencePlugin,
   ParagraphPlugin.withComponent(Paragraph),
   BoldPlugin.configure({
     inputRules: [BoldRules.markdown({ variant: "*" }), BoldRules.markdown({ variant: "_" })],
@@ -365,6 +385,10 @@ function deserializeComposer(editor: PlateEditor, text: string) {
     }
   }
   return mapComposerValue(value, (node) => {
+    const target =
+      node.type === KEYS.a ? parseReferenceHref(projectComposerNode(node).url ?? "") : undefined;
+    if (target)
+      return { type: referenceType, url: referenceHref(target), children: [{ text: "" }] };
     if (node.type !== KEYS.a || !projectComposerNode(node).url?.startsWith("attachment:"))
       return node;
     return {
@@ -403,6 +427,19 @@ function trimEmptyInlineText(nodes: Descendant[]): Descendant[] {
 
 function serializeComposer(editor: PlateEditor, references: boolean): string {
   const value = mapComposerValue(editor.children, (node) => {
+    if (node.type === referenceType) {
+      const target = parseReferenceHref(projectComposerNode(node).url ?? "");
+      if (target)
+        return {
+          type: KEYS.a,
+          url: referenceHref(target),
+          children: [
+            {
+              text: `#${target.surface}:${target.sessionId}${target.messageId ? `/${target.messageId}` : ""}`,
+            },
+          ],
+        };
+    }
     if (node.type !== attachmentType) return node;
     const metadata = projectComposerNode(node);
     const text = metadata.name;
@@ -520,9 +557,11 @@ export function remapComposerAttachments(text: string, keys: ReadonlyMap<string,
 }
 
 export function composerPlainText(editor: PlateEditor): string {
-  return mapComposerValue(editor.children, (node) =>
-    node.type === attachmentType ? { text: projectComposerNode(node).name } : node,
-  )
+  return mapComposerValue(editor.children, (node) => {
+    if (node.type === attachmentType) return { text: projectComposerNode(node).name };
+    if (node.type === referenceType) return { text: projectComposerNode(node).url ?? "" };
+    return node;
+  })
     .map((node) => NodeApi.string(node))
     .join("\n\n");
 }
@@ -668,8 +707,12 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
           aria-controls={props.expanded ? "composer-completions" : undefined}
           aria-activedescendant={props.activeDescendant}
           placeholder={props.placeholder}
-          onKeyDown={(event) => {
+          onKeyDownCapture={(event) => {
             props.onKeyDown(event);
+            // Completion must consume Tab before Plate's indentation handlers run.
+            if (event.defaultPrevented) event.stopPropagation();
+          }}
+          onKeyDown={(event) => {
             if (event.defaultPrevented || event.nativeEvent.isComposing) return;
             if (event.key === "Enter" && event.shiftKey) {
               event.preventDefault();
@@ -678,6 +721,18 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
           }}
           onPaste={(event) => {
             props.onPaste(event);
+            if (!event.defaultPrevented) {
+              const target = parseReferenceHref(
+                event.clipboardData.getData("text/plain").trim(),
+                location.origin,
+              );
+              if (target) {
+                event.preventDefault();
+                captureComposerPaste(editor).insert(
+                  `[#${target.surface}:${target.sessionId}](${referenceHref(target)})`,
+                );
+              }
+            }
             // Plate requires a handled result to skip its HTML deserializer.
             return event.defaultPrevented;
           }}

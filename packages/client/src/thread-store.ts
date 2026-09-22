@@ -1,4 +1,5 @@
 import type {
+  DisplayMessage,
   Hydration,
   LiveUpdate,
   ReadyTurnSlot,
@@ -442,52 +443,51 @@ function applyReadyChange(
     if (index < 0) return undefined;
     return { ...slot, messages: slot.messages.toSpliced(index, 0, change.message) };
   }
-  if (change.kind === "message-meta") {
-    const index = slot.messages.findIndex((message) => message.id === change.messageId);
-    const message = slot.messages[index];
-    if (!message) return undefined;
-    return {
-      ...slot,
-      messages: slot.messages.with(index, {
-        ...message,
-        metadata: { ...message.metadata, ...change.metadata },
-      }),
-    };
-  }
   if (change.kind === "remove-message") {
     const index = slot.messages.findIndex((message) => message.id === change.messageId);
     if (index < 0) return undefined;
     return { ...slot, messages: slot.messages.toSpliced(index, 1) };
   }
-  if (change.kind === "truncate-parts") {
-    const index = slot.messages.findIndex((message) => message.id === change.messageId);
-    const message = slot.messages[index];
-    if (!message || change.length > message.parts.length) return undefined;
-    return {
-      ...slot,
-      messages: slot.messages.with(index, {
-        ...message,
-        parts: message.parts.slice(0, change.length),
-      }),
-    };
-  }
-  if (change.kind !== "append-text" && change.kind !== "set-part") return undefined;
+  if (
+    change.kind !== "message-meta" &&
+    change.kind !== "truncate-parts" &&
+    change.kind !== "append-text" &&
+    change.kind !== "set-part"
+  )
+    return undefined;
   const index = slot.messages.findIndex((message) => message.id === change.messageId);
   const message = slot.messages[index];
   if (!message) return undefined;
-  if (change.kind === "set-part") {
-    if (change.partIndex > message.parts.length) return undefined;
-    const parts = [...message.parts];
-    parts[change.partIndex] = change.part;
-    return { ...slot, messages: slot.messages.with(index, { ...message, parts }) };
+  const next = updateDisplayMessage(message, change);
+  return next ? { ...slot, messages: slot.messages.with(index, next) } : undefined;
+}
+
+export function updateDisplayMessage(
+  message: DisplayMessage,
+  change: Extract<
+    LiveUpdate["changes"][number],
+    { kind: "message-meta" | "truncate-parts" | "append-text" | "set-part" }
+  >,
+): DisplayMessage | undefined {
+  switch (change.kind) {
+    case "message-meta":
+      return { ...message, metadata: { ...message.metadata, ...change.metadata } };
+    case "truncate-parts":
+      if (change.length > message.parts.length) return undefined;
+      return { ...message, parts: message.parts.slice(0, change.length) };
+    case "set-part": {
+      if (change.partIndex > message.parts.length) return undefined;
+      const parts = [...message.parts];
+      parts[change.partIndex] = change.part;
+      return { ...message, parts };
+    }
+    case "append-text": {
+      const part = message.parts[change.partIndex];
+      if (!part || part.type !== "text") return undefined;
+      return {
+        ...message,
+        parts: message.parts.with(change.partIndex, { ...part, text: part.text + change.text }),
+      };
+    }
   }
-  const part = message.parts[change.partIndex];
-  if (!part || part.type !== "text") return undefined;
-  return {
-    ...slot,
-    messages: slot.messages.with(index, {
-      ...message,
-      parts: message.parts.with(change.partIndex, { ...part, text: part.text + change.text }),
-    }),
-  };
 }

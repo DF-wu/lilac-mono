@@ -12,7 +12,10 @@ export function useUploadProgress(resourceId: string) {
     [context],
   );
   const snapshot = useCallback(
-    () => context?.pool.get(context.threadId).find((item) => item.resourceId === resourceId),
+    () =>
+      context?.pool
+        .get(context.threadId)
+        .find((item) => (item.resourceId ?? item.key) === resourceId),
     [context, resourceId],
   );
   const attachment = useSyncExternalStore(subscribe, snapshot, snapshot);

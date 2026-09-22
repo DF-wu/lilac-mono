@@ -2,7 +2,6 @@ import { tool } from "ai";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 import type { ClaudeCodeToolCatalogMetadataMap } from "@stanley2058/lilac-claude-code-bridge";
-import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
 
 import {
   assignCatalogToolNames,
@@ -49,10 +48,6 @@ export type CatalogNamespaceSummary = {
 
 export class UnifiedToolCatalogInvalid extends TaggedError("UnifiedToolCatalogInvalid")<{
   readonly reason: "duplicate-identity" | "name-collision" | "name-missing";
-  readonly message: string;
-}> {}
-
-export class PortableToolSearchInvalid extends TaggedError("PortableToolSearchInvalid")<{
   readonly message: string;
 }> {}
 
@@ -363,40 +358,11 @@ function exactToolMatches(
   return { matches, missing };
 }
 
-function portableRequestClient(value: string): AdapterPlatform | null {
-  switch (value) {
-    case "discord":
-    case "github":
-    case "slack":
-    case "telegram":
-    case "unknown":
-    case "web":
-    case "whatsapp":
-      return value;
-    default:
-      return null;
-  }
-}
-
-export function createPortableToolSearchResult(params: {
+export function createPortableToolSearch(params: {
   catalog: readonly CatalogToolEntry[];
   namespaceSummaries?: readonly CatalogNamespaceSummary[];
   onSelectCatalogIds?: (catalogIds: readonly string[]) => void;
-  requestContext?: {
-    readonly requestClient: string;
-    readonly sessionId: string;
-  };
 }) {
-  const requestClient = params.requestContext
-    ? portableRequestClient(params.requestContext.requestClient)
-    : null;
-  if (params.requestContext && !requestClient) {
-    return Result.err(
-      new PortableToolSearchInvalid({
-        message: "Unsupported portable tool search request client",
-      }),
-    );
-  }
   const namespaceCatalog = [...(params.namespaceSummaries ?? [])]
     .sort(
       (left, right) =>
@@ -411,38 +377,36 @@ export function createPortableToolSearchResult(params: {
       : [`Available MCP namespaces:\n${namespaceCatalog.join("\n")}`]),
   ].join("\n\n");
 
-  return Result.ok(
-    tool({
-      description: searchDescription,
-      inputSchema: toolSearchInputSchema,
-      execute: ({ query, max_results }) => {
-        const parsedQuery = parseToolSearchQuery(query);
-        const exact =
-          parsedQuery.type === "select"
-            ? exactToolMatches(params.catalog, parsedQuery.names)
-            : undefined;
-        const allMatches =
-          parsedQuery.type === "select"
-            ? (exact?.matches ?? [])
-            : rankedToolMatches(params.catalog, parsedQuery);
-        const matches = allMatches.slice(0, max_results ?? 5);
+  return tool({
+    description: searchDescription,
+    inputSchema: toolSearchInputSchema,
+    execute: ({ query, max_results }) => {
+      const parsedQuery = parseToolSearchQuery(query);
+      const exact =
+        parsedQuery.type === "select"
+          ? exactToolMatches(params.catalog, parsedQuery.names)
+          : undefined;
+      const allMatches =
+        parsedQuery.type === "select"
+          ? (exact?.matches ?? [])
+          : rankedToolMatches(params.catalog, parsedQuery);
+      const matches = allMatches.slice(0, max_results ?? 5);
 
-        params.onSelectCatalogIds?.(matches.map((entry) => entry.stableId));
+      params.onSelectCatalogIds?.(matches.map((entry) => entry.stableId));
 
-        return {
-          query,
-          queryType: parsedQuery.type,
-          matches: matches.map((entry) => ({
-            name: entry.modelName,
-            stableId: entry.stableId,
-            source: entry.source,
-            sourceId: entry.sourceId,
-            rawName: entry.rawName,
-            ...(entry.title === undefined ? {} : { title: entry.title }),
-          })),
-          ...(exact?.missing.length ? { missing: exact.missing } : {}),
-        };
-      },
-    }),
-  );
+      return {
+        query,
+        queryType: parsedQuery.type,
+        matches: matches.map((entry) => ({
+          name: entry.modelName,
+          stableId: entry.stableId,
+          source: entry.source,
+          sourceId: entry.sourceId,
+          rawName: entry.rawName,
+          ...(entry.title === undefined ? {} : { title: entry.title }),
+        })),
+        ...(exact?.missing.length ? { missing: exact.missing } : {}),
+      };
+    },
+  });
 }

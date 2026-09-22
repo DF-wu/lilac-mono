@@ -184,6 +184,62 @@ describe("formatToolArgsForDisplay", () => {
     ).toBe(" legacy.txt");
   });
 
+  it("preserves non-Bash arguments in bounded native activity details", () => {
+    const args = { pattern: "apps/core/src/surface/native/**/*.ts", cwd: "/workspace/lilac" };
+    expect(
+      formatToolArgsForDisplayWithSpecs(
+        "glob",
+        args,
+        BUILTIN_TOOL_SPECS,
+        undefined,
+        undefined,
+        8192,
+      ),
+    ).toBe(` ${JSON.stringify(args)}`);
+    expect(
+      formatToolArgsForDisplayWithSpecs(
+        "plugin_without_formatter",
+        args,
+        undefined,
+        undefined,
+        undefined,
+        8192,
+      ),
+    ).toBe(` ${JSON.stringify(args)}`);
+    expect(
+      formatToolArgsForDisplayWithSpecs(
+        "read",
+        { filePath: "a".repeat(9000) },
+        undefined,
+        undefined,
+        undefined,
+        8192,
+      ).length,
+    ).toBe(8193);
+  });
+
+  it("omits unserializable native arguments and preserves serialization Panic", () => {
+    expect(
+      formatToolArgsForDisplayWithSpecs(
+        "custom",
+        { value: 1n },
+        undefined,
+        undefined,
+        undefined,
+        8192,
+      ),
+    ).toBe("");
+    const panic = new Panic({ message: "serialization invariant" });
+    const args = {
+      toJSON() {
+        throw panic;
+      },
+    };
+    expect(() =>
+      formatToolArgsForDisplayWithSpecs("custom", args, undefined, undefined, undefined, 8192),
+    ).toThrow(panic);
+  });
+
   it("prefers plugin metadata formatter when provided", () => {
     const specs = new Map<string, Level1ToolSpec<unknown>>([
       [

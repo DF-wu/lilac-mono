@@ -24,6 +24,7 @@ export function createNativeExecution(options: {
   transcriptStore: TranscriptStore;
   runner: () => NativeRunnerControl | undefined;
   customCommands?: CustomCommandManager;
+  expandReferences?: (userId: string, text: string) => ResultType<string, Error>;
   validateSkill?: (skillId: string, starterId: string) => boolean;
   getOldMessageSelectionMaxAgeMs?: () => number | undefined;
   now?: () => number;
@@ -169,7 +170,10 @@ export function createNativeExecution(options: {
         message_id: input.messageId,
         message_time: new Date(input.createdAt).toISOString(),
       });
-      const body = skillText ? `${skillText}\n\n${input.text}` : input.text;
+      const expanded = options.expandReferences
+        ? yield* options.expandReferences(thread.starterId, input.text)
+        : input.text;
+      const body = skillText ? `${skillText}\n\n${expanded}` : expanded;
       const text = `${header}\n${escapeSurfaceMetadataTags(body)}`;
       const parts: Extract<StoredMessageV1, { role: "user" }>["content"] = [{ type: "text", text }];
       for (const attachmentId of input.attachmentIds) {

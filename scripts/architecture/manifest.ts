@@ -3810,6 +3810,14 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : [],
     boundaryDecoders: [
+      ...(root === "packages/client-protocol"
+        ? [
+            {
+              identity: { module: "src/references.ts", exportName: "parseReferenceHref" },
+              category: "wire" as const,
+            },
+          ]
+        : []),
       ...(root === "apps/web"
         ? [
             {
@@ -3963,6 +3971,13 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               identity: { module: "src/surface/native/gateway.ts", exportName },
               category: "wire" as const,
             })),
+            {
+              identity: {
+                module: "src/surface/native/config-service.ts",
+                exportName: "streamingDocument.gen.<callback@1>",
+              },
+              category: "persistence" as const,
+            },
             {
               identity: {
                 module: "src/surface/native/adapter.ts",
@@ -4911,6 +4926,9 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "NativeConfigService.save",
               "NativeConfigService.saveSerialized",
               "NativeConfigService.reloadMcp",
+              "NativeConfigService.readStreaming",
+              "NativeConfigService.setStreaming",
+              "streamingDocument",
               "validateDocument",
               "writeAtomic",
             ].map((exportName) => ({

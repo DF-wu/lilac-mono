@@ -449,10 +449,13 @@
     height: var(--ui-icon-size);
     flex-shrink: 0;
   }
-  .markdown code {
+  .markdown code,
+  .composer-editor code {
+    vertical-align: middle;
     font-family: var(--ui-font-mono);
     font-size: 0.9em;
-    background: var(--ui-surface-hover);
+    background: var(--ui-background);
+    color: var(--ui-foreground);
     border-radius: var(--ui-radius-sm);
     padding: calc(var(--ui-space-unit) * 1);
   }
@@ -463,7 +466,9 @@
     background: var(--ui-surface);
     overflow: auto;
   }
-  .markdown pre code {
+  .markdown pre code,
+  .composer-editor pre code {
+    vertical-align: baseline;
     padding: 0;
     background: transparent;
   }

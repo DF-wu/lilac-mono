@@ -7527,7 +7527,12 @@ export async function startBusAgentRunner(params: {
             }
 
             if (event.type === "tool_execution_start") {
-              publishNativeToolActivity(event.toolCallId, "start", event.toolName);
+              if (nativeOutput && event.toolName !== "batch")
+                publishNativeToolActivity(
+                  event.toolCallId,
+                  "start",
+                  `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event, 8192)}`,
+                );
               const startedAt = Date.now();
               toolStartMs.set(event.toolCallId, startedAt);
               currentTurnToolCallIds.add(event.toolCallId);
@@ -7573,7 +7578,13 @@ export async function startBusAgentRunner(params: {
                   ok = toolFailure.ok;
                   break;
               }
-              publishNativeToolActivity(event.toolCallId, "end", event.toolName, ok);
+              if (nativeOutput && event.toolName !== "batch")
+                publishNativeToolActivity(
+                  event.toolCallId,
+                  "end",
+                  `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event, 8192)}`,
+                  ok,
+                );
               const interruptedForShutdown = shutdownAbortRequestIds.has(headers.request_id);
               const toolFailureError = toolFailure.error ?? "tool failed";
 

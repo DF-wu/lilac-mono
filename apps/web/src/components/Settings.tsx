@@ -3,6 +3,7 @@ import { useWorkspace } from "../workspace-context";
 import { useStore } from "zustand";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { configOptions, userOptions, useNativeOnline } from "../queries";
+import { StreamingSettings } from "./StreamingSettings";
 import { SidebarPreferences } from "./SidebarPreferences";
 import { AccountProfile } from "./AccountProfile";
 import { AgentIdentity } from "./AgentIdentity";
@@ -109,6 +110,8 @@ export function Settings({
     setSaving((current) => ({ ...current, [request.kind]: false }));
     if (!saved) return;
     void queries.invalidateQueries({ queryKey: ["config", request.kind] });
+    if (request.kind === "core")
+      void queries.invalidateQueries({ queryKey: ["config", "streaming"] });
     setEditors((current) => completeConfigSave(current, request, saved));
   }
   async function reload() {
@@ -196,6 +199,18 @@ export function Settings({
             <TabsContent value="options" className="settings-section">
               <h2>Thread</h2>
               <SidebarPreferences />
+              {viewer.role === "owner" ? (
+                <StreamingSettings
+                  disabled={!!saving.core}
+                  onSaved={() =>
+                    setEditors((current) => {
+                      const core = current.core;
+                      if (!core || core.text !== core.document.text) return current;
+                      return { ...current, core: undefined };
+                    })
+                  }
+                />
+              ) : null}
               <h2>Access</h2>
               <dl className="settings-account grid gap-4 mb-6">
                 <div>

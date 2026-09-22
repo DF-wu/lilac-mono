@@ -233,3 +233,21 @@ test("rewind stays between time and copy and is disabled for an active agent", (
     expect(/\sdisabled(?:=|\s|>)/.test(rewind!)).toBe(rewindDisabled);
   }
 });
+
+test("a sent prompt immediately shows thinking and suppresses the queue marker", () => {
+  const html = renderStage("sent");
+  expect(html).toContain("activity-summary");
+  expect(html).toContain("animate-spin");
+  expect(html).toContain("working-text");
+  expect(html).toContain('aria-expanded="false"');
+  expect(html).toContain("Thinking…");
+  expect(html).not.toContain(">queued<");
+  expect(html.match(/aria-label="About Lilac"/gu)).toHaveLength(1);
+});
+
+test("work duration uses the prompt timestamp for older turns without a start timestamp", () => {
+  const complete = agentWorkStages.find((stage) => stage.id === "complete")!.frames[0]!;
+  expect(renderStage("complete", { ...complete, startedAt: undefined })).toContain(
+    "Worked for 12s",
+  );
+});

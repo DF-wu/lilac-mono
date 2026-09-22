@@ -1,3 +1,4 @@
+import { CopyReferenceItem } from "./ConversationReference";
 import { memo, useState } from "react";
 import { useLocation } from "@tanstack/react-router";
 import { useStore } from "zustand";
@@ -153,8 +154,11 @@ export const SidebarThread = memo(function SidebarThread({
           />
         )}
       </ContextMenuTrigger>
-      {editable || settleAction ? (
+      {thread || editable || settleAction ? (
         <ContextMenuContent>
+          {thread ? (
+            <CopyReferenceItem label="Copy link" target={{ surface: "native", sessionId: id }} />
+          ) : null}
           {settleAction ? (
             <ContextMenuItem disabled={settleDisabled} onClick={settle}>
               {section === "settled" ? <Undo2 /> : <CircleCheck />}

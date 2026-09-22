@@ -109,10 +109,10 @@
 
 .markdown .file-link {
   display: inline-flex;
-  vertical-align: baseline;
+  vertical-align: middle;
   align-items: center;
   gap: calc(var(--ui-space-unit) * 1);
-  padding: 0 calc(var(--ui-space-unit) * 1);
+  padding: calc(var(--ui-space-unit) * 1);
   max-width: 100%;
   height: auto;
   font-family: var(--ui-font-mono);

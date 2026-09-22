@@ -1,3 +1,5 @@
+import { ThreadReferenceView } from "./ThreadReferenceView";
+import { ConversationIcon } from "./ConversationReference";
 import { FileIcon } from "./FileIcon";
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { defaultPanelTabs, defaultRightPanel, type PanelTabs, type PanelTab } from "../panel-store";
@@ -153,13 +155,15 @@ export function RightPanel({ threadId, foreground }: { threadId: string; foregro
       onFocus={(id) => actions.focusTab(threadId, id)}
       onClose={(id) => actions.closeTab(threadId, id)}
       onAgents={() => actions.openAgents(threadId)}
-      renderTab={(tab, active) =>
-        tab.type === "agents" ? (
-          <NativeSubagentPanel threadId={threadId} foreground={foreground && active} embedded />
-        ) : (
-          <FilePanelContent target={tab.target} tabId={tab.id} active={visible && active} />
-        )
-      }
+      renderTab={(tab, active) => {
+        if (tab.type === "agents")
+          return (
+            <NativeSubagentPanel threadId={threadId} foreground={foreground && active} embedded />
+          );
+        if (tab.type === "thread")
+          return <ThreadReferenceView target={tab.target} active={visible && active} panel />;
+        return <FilePanelContent target={tab.target} tabId={tab.id} active={visible && active} />;
+      }}
     />
   );
 }
@@ -180,6 +184,10 @@ export function RightPanelTabs({
   visible?: boolean;
 }) {
   const list = useRef<HTMLDivElement>(null);
+  function tabName(tab: PanelTab) {
+    if (tab.type === "agents") return "Agents";
+    return tab.type === "thread" ? tab.title : tab.target.name;
+  }
   useLayoutEffect(() => {
     const viewport = list.current;
     const active = viewport?.querySelector<HTMLElement>('[role="tab"][data-active]');
@@ -210,19 +218,19 @@ export function RightPanelTabs({
             {tabs.items.map((tab) => (
               <div className="file-panel-tab relative flex flex-none max-w-48" key={tab.id}>
                 <TabsTrigger value={tab.id}>
-                  {tab.type === "agents" ? (
-                    <Bot />
-                  ) : (
+                  {tab.type === "agents" ? <Bot /> : null}
+                  {tab.type === "thread" ? <ConversationIcon surface={tab.target.surface} /> : null}
+                  {tab.type === "file" ? (
                     <FileIcon
                       name={tab.target.name}
                       mediaType={tab.target.type === "resource" ? tab.target.mediaType : undefined}
                     />
-                  )}
-                  <span>{tab.type === "agents" ? "Agents" : tab.target.name}</span>
+                  ) : null}
+                  <span>{tabName(tab)}</span>
                 </TabsTrigger>
                 <IconButton
                   className="file-tab-close"
-                  label={`Close ${tab.type === "agents" ? "Agents" : tab.target.name}`}
+                  label={`Close ${tabName(tab)}`}
                   onClick={() => onClose(tab.id)}
                 >
                   <X />

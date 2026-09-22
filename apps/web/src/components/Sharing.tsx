@@ -125,7 +125,7 @@ export function Sharing({ thread }: { thread: NativeThread }) {
                 !online ||
                 mutating ||
                 entry.user.id === thread.starterId ||
-                entry.user.role === "owner"
+                entry.user.role !== "participant"
               }
               onValueChange={(value) =>
                 change.mutate({ userId: entry.user.id, role: value === "edit" ? "edit" : "read" })
@@ -147,7 +147,7 @@ export function Sharing({ thread }: { thread: NativeThread }) {
                 !online ||
                 mutating ||
                 entry.user.id === thread.starterId ||
-                entry.user.role === "owner"
+                entry.user.role !== "participant"
               }
               onClick={() => change.mutate({ userId: entry.user.id })}
             >

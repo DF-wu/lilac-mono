@@ -4,7 +4,7 @@ import { z } from "zod";
 
 import {
   buildUnifiedToolCatalogResult,
-  createPortableToolSearchResult,
+  createPortableToolSearch,
   formatCatalogNamespaceSummary,
   type CatalogToolCandidate,
 } from "../../src/mcp/catalog";
@@ -18,12 +18,6 @@ function buildUnifiedToolCatalog(params: Parameters<typeof buildUnifiedToolCatal
   const catalog = buildUnifiedToolCatalogResult(params);
   if (catalog.status === "error") throw catalog.error;
   return catalog.value;
-}
-
-function createPortableToolSearch(params: Parameters<typeof createPortableToolSearchResult>[0]) {
-  const search = createPortableToolSearchResult(params);
-  if (search.status === "error") throw search.error;
-  return search.value;
 }
 
 function executable(description = "fixture description") {
@@ -206,7 +200,6 @@ describe("unified deferred tool catalog", () => {
       createPortableToolSearch({
         catalog: catalog.entries,
         onSelectCatalogIds: (catalogIds) => selections.push(catalogIds),
-        requestContext: { requestClient: "discord", sessionId: "session-1" },
       }),
     );
 
@@ -219,18 +212,6 @@ describe("unified deferred tool catalog", () => {
       matches: [{ stableId: expect.any(String) }, { stableId: expect.any(String) }],
     });
   });
-
-  it.each(["discord", "github", "slack", "telegram", "unknown", "web", "whatsapp"] as const)(
-    "keeps the broad portable MCP request-client reader for %s",
-    (requestClient) => {
-      const created = createPortableToolSearchResult({
-        catalog: [],
-        requestContext: { requestClient, sessionId: "session-1" },
-      });
-
-      expect(created.status).toBe("ok");
-    },
-  );
 
   it("ranks name matches above metadata-only matches and supports fuzzy keywords", async () => {
     const catalog = buildUnifiedToolCatalog({
@@ -277,7 +258,6 @@ describe("unified deferred tool catalog", () => {
       createPortableToolSearch({
         catalog: catalog.entries,
         onSelectCatalogIds: (catalogIds) => selections.push([...catalogIds]),
-        requestContext: { requestClient: "discord", sessionId: "session-1" },
       }),
     );
 
@@ -345,21 +325,6 @@ describe("unified deferred tool catalog", () => {
     );
     expect((defaultResult as { matches: unknown[] }).matches).toHaveLength(5);
     expect((expandedResult as { matches: unknown[] }).matches).toHaveLength(8);
-  });
-
-  it("rejects an unrecognized request client", () => {
-    const catalog = buildUnifiedToolCatalog({
-      candidates: [candidate({ source: "mcp", sourceId: "one", rawName: "search-one" })],
-    });
-
-    const search = createPortableToolSearchResult({
-      catalog: catalog.entries,
-      requestContext: { requestClient: "desktop", sessionId: "session-1" },
-    });
-    expect(search.status).toBe("error");
-    if (search.status === "error") {
-      expect(search.error._tag).toBe("PortableToolSearchInvalid");
-    }
   });
 
   it("retains and can explicitly return all 5,000 catalog entries", async () => {

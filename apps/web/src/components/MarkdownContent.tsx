@@ -1,3 +1,5 @@
+import { parseReferenceHref } from "@stanley2058/lilac-client-protocol";
+import { ConversationBadge } from "./ConversationReference";
 import { FileLink, MarkdownImage } from "./FileActions";
 import { parseFilePath } from "../file-target";
 import { githubAlerts, MarkdownBlockquote } from "./markdown-alerts";
@@ -71,6 +73,10 @@ function TaskCheckbox({ checked }: ComponentProps<"input">) {
 
 function MessageLink({ children, href }: ComponentProps<"a">) {
   const resources = useContext(MessageResourcesContext);
+  const reference = href
+    ? parseReferenceHref(href, typeof location === "undefined" ? undefined : location.origin)
+    : undefined;
+  if (reference) return <ConversationBadge target={reference} />;
   const resource = href === undefined ? undefined : resources.get(href);
   if (resource && href)
     return (

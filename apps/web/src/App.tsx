@@ -1,3 +1,5 @@
+import { parseReferenceHref } from "@stanley2058/lilac-client-protocol";
+import { ThreadReferenceView } from "./components/ThreadReferenceView";
 import { SidebarEmptyState } from "./components/SidebarEmptyState";
 import type { WorkspaceSearch } from "./router";
 import { readTheme, setThemeMode } from "./theme/theme";
@@ -154,6 +156,11 @@ function Workspace(props: AppProps) {
       shouldThrow: false,
       select: (match) => match.search,
     }) ?? {};
+  const reference = search.ref
+    ? parseReferenceHref(
+        `/?${new URLSearchParams({ ref: search.ref, ...(search.message ? { message: search.message } : {}) })}`,
+      )
+    : undefined;
   const settings = search.settings;
   const archived = search.view === "archived";
   const external = search.view === "others" && viewer.role === "owner";
@@ -508,6 +515,7 @@ function Workspace(props: AppProps) {
     const files = moveAttachments(creation.entry.submission.attachments);
     const entry: PendingInput = {
       ...creation.entry,
+      optimisticSlotIds: [],
       submission: {
         ...creation.entry.submission,
         attachmentText: creation.entry.submission.attachmentText
@@ -591,6 +599,10 @@ function Workspace(props: AppProps) {
     const outcome = await client.submit(prepared);
     if (pool.signal.aborted) return;
     if (outcome.kind === "accepted") {
+      if (outcome.receipt.turnId) {
+        patch({ state: "accepted", receipt: outcome.receipt });
+        return;
+      }
       for (const file of files) pool.release(created.id, file.key);
       patch(null);
       return;
@@ -732,7 +744,7 @@ function Workspace(props: AppProps) {
     changeView({ view: external ? undefined : "others", otherThread: undefined });
   });
   const selectExternal = useEventCallback((id: string) => {
-    changeView({ view: "others", otherThread: id });
+    changeView({ view: "others", otherThread: id, ref: undefined, message: undefined });
   });
   const openSettings = useEventCallback(() => changeView({ settings: "account" }));
   const openDesign = useEventCallback(
@@ -827,7 +839,7 @@ function Workspace(props: AppProps) {
         <NativeSubagentProvider
           threadId={selectedId ?? ""}
           running={selected?.displayStatus === "working"}
-          foreground={active && !external}
+          foreground={active && !external && !reference}
         >
           <Tooltip.Provider delay={350}>
             <main
@@ -996,12 +1008,13 @@ function Workspace(props: AppProps) {
                 </WorkspaceSidePanel>
                 <div id="chat" className="chat-panel">
                   <div className="main-panel h-full relative min-w-0 min-h-0 flex flex-col">
-                    {external && owner ? (
+                    {reference ? <ThreadReferenceView target={reference} active={active} /> : null}
+                    {!reference && external && owner ? (
                       <Suspense fallback={<ExternalSkeleton conversation />}>
                         <External threadId={externalId} />
                       </Suspense>
                     ) : null}
-                    {!external && selectedId && routeDraftExists
+                    {!reference && !external && selectedId && routeDraftExists
                       ? (() => {
                           const thread = selected ?? selectedMetadata.data;
                           return (
@@ -1093,7 +1106,7 @@ function Workspace(props: AppProps) {
                           );
                         })()
                       : null}
-                    {!external && !selectedId ? (
+                    {!reference && !external && !selectedId ? (
                       <div className="welcome">
                         <Button onClick={createThread}>
                           <Plus />
@@ -1111,7 +1124,7 @@ function Workspace(props: AppProps) {
                   onWidthChange={(width) => panels.getState().resize(selectedId, width)}
                   label="Right panel width"
                 >
-                  <RightPanel threadId={selectedId ?? ""} foreground={active && !external} />
+                  <RightPanel threadId={selectedId ?? ""} foreground={active} />
                 </WorkspaceSidePanel>
               </WorkspacePanels>
               {settings ? (

@@ -1,5 +1,5 @@
 import type { CommandOutcome } from "@stanley2058/lilac-client";
-import type { NativeInput } from "@stanley2058/lilac-client-protocol";
+import type { NativeInput, NativeInputReceipt } from "@stanley2058/lilac-client-protocol";
 import type { ComposerSubmission } from "./types";
 
 export type PendingInput = {
@@ -8,7 +8,9 @@ export type PendingInput = {
   submission: ComposerSubmission;
   input?: NativeInput;
   error?: string;
-  state: "preparing" | "uncertain" | "rejected";
+  optimisticSlotIds?: readonly string[];
+  receipt?: NativeInputReceipt;
+  state: "preparing" | "uncertain" | "rejected" | "accepted";
 };
 
 export async function deliverPendingInput(
@@ -33,7 +35,11 @@ export async function deliverPendingInput(
   const outcome = await submit(input);
   switch (outcome.kind) {
     case "accepted":
-      update(null);
+      update(
+        entry.optimisticSlotIds && input.mode === "prompt" && outcome.receipt.turnId
+          ? { state: "accepted", receipt: outcome.receipt }
+          : null,
+      );
       return outcome;
     case "uncertain":
       update({ state: "uncertain", error: "Send not confirmed. Retry safely when connected." });

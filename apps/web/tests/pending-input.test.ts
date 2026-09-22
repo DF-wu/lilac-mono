@@ -165,3 +165,24 @@ test("losing permission does not turn an uncertain send into a new payload", asy
   expect(f.preparations()).toBe(1);
   expect(f.removed()).toBe(true);
 });
+
+test("accepted optimistic prompts remain until their server turn is rendered", async () => {
+  const f = fixture();
+  f.entry().optimisticSlotIds = [];
+  f.outcomes.push({ ...accepted, receipt: { ...accepted.receipt, turnId: "turn" } });
+  await f.send();
+  expect(f.removed()).toBe(false);
+  expect(f.entry()).toMatchObject({
+    state: "accepted",
+    receipt: { messageId: "message", turnId: "turn" },
+  });
+});
+
+test("a retry delivered as steering does not retain an optimistic turn", async () => {
+  const f = fixture();
+  f.entry().optimisticSlotIds = [];
+  f.state.active = true;
+  f.outcomes.push({ ...accepted, receipt: { ...accepted.receipt, turnId: "active-turn" } });
+  await f.send();
+  expect(f.removed()).toBe(true);
+});

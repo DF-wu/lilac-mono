@@ -32,8 +32,7 @@
   border-inline-start: calc(var(--ui-space-unit) * 1) solid var(--ui-muted-foreground);
   color: var(--ui-muted-foreground);
 }
-.composer-editor pre,
-.composer-editor code {
+.composer-editor pre {
   background: var(--ui-muted);
   border-radius: var(--ui-radius-sm);
 }
@@ -75,8 +74,8 @@
 
 .composer-attachment-chip > img,
 .composer-attachment-chip > svg {
-  width: calc(var(--ui-space-unit) * 4);
-  height: calc(var(--ui-space-unit) * 4);
+  width: 1em;
+  height: 1em;
   flex-shrink: 0;
   object-fit: cover;
   border-radius: var(--ui-radius-sm);
@@ -88,8 +87,10 @@
   flex-shrink: 0;
 }
 .composer-attachment-chip .icon-button {
-  width: calc(var(--ui-space-unit) * 6);
-  height: calc(var(--ui-space-unit) * 6);
+  width: 1lh;
+  height: 1lh;
+  font-size: inherit;
+  line-height: inherit;
   flex-shrink: 0;
 }
 .composer-attachment-chip .icon-button svg {

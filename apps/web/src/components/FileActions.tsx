@@ -126,7 +126,7 @@ function ResolvedFileLink({ target }: { target: FileTarget }) {
         <TooltipTrigger
           render={
             <Button
-              variant="secondary"
+              variant="reference"
               className="file-link"
               onPointerEnter={() => setHovered(true)}
               onFocus={() => setHovered(true)}
