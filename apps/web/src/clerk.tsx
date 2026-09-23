@@ -1,3 +1,4 @@
+import { ConnectionLoading } from "./components/ui/connection-loading";
 import { createClerkSessionRefresh, resumeClerkSession } from "./clerk-session-refresh";
 import { Button } from "./components/ui/button";
 import { ClerkProvider, SignIn, UserProfile, useAuth, useClerk, useUser } from "@clerk/react";
@@ -56,8 +57,8 @@ function SignInView({ onSignedIn }: { onSignedIn: () => Promise<void> }) {
     setBusy(false);
     result.match({ ok: () => {}, err: (failure) => setError(failure.message) });
   }
-  if (!isLoaded) return null;
-  if (isSignedIn && resuming) return <p role="status">Connecting…</p>;
+  if (!isLoaded) return <ConnectionLoading />;
+  if (isSignedIn && resuming) return <ConnectionLoading />;
   if (isSignedIn)
     return (
       <div className="login-form grid gap-4">

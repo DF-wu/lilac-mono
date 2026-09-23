@@ -696,9 +696,12 @@
 :root[data-animation] :where([class*="transition"], [class*="duration"], .work-summary svg) {
   transition-duration: var(--ui-motion-duration) !important;
 }
-:root[data-animation] .animate-spin,
-:root[data-animation] .thread-card[data-state="working"] .thread-state-icon svg {
+:root[data-animation] .animate-spin {
   animation-duration: var(--ui-motion-spin-duration) !important;
+}
+:root[data-animation] [data-slot="loading-spinner"],
+:root[data-animation] [data-slot="loading-spinner"] * {
+  animation-duration: var(--ld-duration) !important;
 }
 :root[data-animation] [data-slot="skeleton"] {
   animation-duration: var(--ui-motion-pulse-duration) !important;

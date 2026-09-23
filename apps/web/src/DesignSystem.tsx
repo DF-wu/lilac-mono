@@ -1,3 +1,6 @@
+import { SPINNERS } from "loading-dev";
+import { LoadingSpinner } from "./components/ui/loading-spinner";
+import { ConnectionLoading } from "./components/ui/connection-loading";
 import { ReconnectionDemo } from "./components/ReconnectionDemo";
 import { ConversationBadge } from "./components/ConversationReference";
 import lilacLogo from "./assets/logo.svg";
@@ -22,7 +25,6 @@ import {
   ChevronRight,
   Copy,
   FileText,
-  LoaderCircle,
   Pencil,
   Plus,
   Trash2,
@@ -78,7 +80,7 @@ import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "./componen
 import { TooltipProvider } from "./components/ui/tooltip";
 import { Markdown } from "./components/Markdown";
 import ComposerEditor from "./components/composer-editor";
-import { Message } from "./components/Timeline";
+import { Message, ThinkingIndicator } from "./components/Timeline";
 import { ThreadQueueDemo } from "./components/ThreadQueueDemo";
 import { DeploymentSettingsForm } from "./components/DeploymentSettings";
 import { AgentWorkDemo } from "./components/AgentWorkDemo";
@@ -800,14 +802,10 @@ function Messages() {
           </div>
         </Specimen>
       </div>
+      <ThinkingSpinnerDemo />
       <Specimen title="Markers">
         <div className="ds-stack">
-          <Marker>
-            <MarkerIcon>
-              <LoaderCircle />
-            </MarkerIcon>
-            <MarkerContent>Thinking…</MarkerContent>
-          </Marker>
+          <ThinkingIndicator />
           <Marker variant="separator">
             <MarkerContent>Conversation compacted</MarkerContent>
           </Marker>
@@ -1089,6 +1087,36 @@ function Attachments() {
     </Section>
   );
 }
+const spinnerOptions = Object.entries(SPINNERS).map(([value, component]) => ({
+  value,
+  label: value.replaceAll("-", " ").replace(/^./, (letter) => letter.toUpperCase()),
+  component,
+}));
+
+function ThinkingSpinnerDemo() {
+  const [selected, setSelected] = useState<string | null>("morph");
+  const spinner = spinnerOptions.find((option) => option.value === selected)?.component;
+  return (
+    <Specimen title="Thinking spinner">
+      <div className="flex flex-col items-start gap-4" data-ui="thinking-spinner-demo">
+        <Select value={selected} onValueChange={setSelected} items={spinnerOptions}>
+          <SelectTrigger aria-label="Thinking spinner">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {spinnerOptions.map((option) => (
+              <SelectItem key={option.value} value={option.value}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <ThinkingIndicator spinner={<LoadingSpinner spinner={spinner} />} />
+      </div>
+    </Specimen>
+  );
+}
+
 function Controls() {
   const [discordId, setDiscordId] = useState("");
   const [savedDiscordId, setSavedDiscordId] = useState("");
@@ -1163,6 +1191,12 @@ function Controls() {
             onChange={setDiscordId}
             onSave={() => setSavedDiscordId(discordId.trim())}
           />
+        </Specimen>
+        <Specimen title="Reconnecting">
+          <div className="login-shell flex flex-col gap-6 py-12">
+            <h1>Lilac</h1>
+            <ConnectionLoading />
+          </div>
         </Specimen>
         <Specimen title="Sign-in styles">
           <div className={clerkAppearance.signIn.elements.cardBox}>

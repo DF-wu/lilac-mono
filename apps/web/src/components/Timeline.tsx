@@ -1,3 +1,4 @@
+import { LoadingSpinner } from "./ui/loading-spinner";
 import { AddReaction, MessageReactions } from "./MessageReactions";
 import { OptimisticTurns, type OptimisticTurn } from "../optimistic-turns";
 import { CopyReferenceItem, useConversation } from "./ConversationReference";
@@ -37,7 +38,6 @@ import {
   Brain,
   Wrench,
   Workflow,
-  LoaderCircle,
 } from "lucide-react";
 import type { NativeClient, NativeThreadStore } from "@stanley2058/lilac-client";
 import type {
@@ -374,12 +374,10 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   );
 });
 
-export function ThinkingIndicator() {
+export function ThinkingIndicator({ spinner }: { spinner?: ReactNode } = {}) {
   return (
     <Marker className="px-2 py-1" role="status" data-ui="thinking">
-      <MarkerIcon>
-        <LoaderCircle className="animate-spin" />
-      </MarkerIcon>
+      <MarkerIcon>{spinner ?? <LoadingSpinner />}</MarkerIcon>
       <MarkerContent>
         <span className="working-text">Thinking...</span>
       </MarkerContent>
@@ -1196,7 +1194,7 @@ export function activitySummary(
 }
 
 function ActivityIcon({ part }: { part: ActivityPart }) {
-  if (part.data.state === "running") return <LoaderCircle className="animate-spin" />;
+  if (part.data.state === "running") return <LoadingSpinner />;
   if (part.data.kind === "thinking") return <Brain />;
   if (part.data.kind === "workflow") return <Workflow />;
   return <Wrench />;

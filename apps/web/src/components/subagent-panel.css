@@ -62,9 +62,6 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-:root[data-animation] .subagent-status .animate-spin {
-  animation-duration: var(--ui-motion-spin-duration) !important;
-}
 
 .right-panel-toggle {
   position: absolute;

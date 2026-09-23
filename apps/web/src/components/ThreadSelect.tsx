@@ -1,7 +1,8 @@
+import { LoadingSpinner } from "./ui/loading-spinner";
 import { useWorkspace } from "../workspace-context";
 import { useQuery } from "@tanstack/react-query";
 import { participantOptions, useNativeOnline } from "../queries";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type ComponentType, type ReactNode } from "react";
 import {
   SquarePen,
   Clock3,
@@ -11,10 +12,8 @@ import {
   Users,
   CircleCheck,
   Pin,
-  LoaderCircle,
   CircleAlert,
   MessageCircleQuestion,
-  type LucideIcon,
 } from "lucide-react";
 import type { NativeThread, NativeUser } from "@stanley2058/lilac-client-protocol";
 import { relativeThreadTime } from "../thread-metadata";
@@ -27,10 +26,10 @@ export type ThreadDisplayState = "idle" | "completed" | "working" | "error" | "i
 const states = {
   idle: { label: "Idle", icon: MessageSquare },
   completed: { label: "Completed, unread", icon: CircleCheck },
-  working: { label: "Working", icon: LoaderCircle },
+  working: { label: "Working", icon: LoadingSpinner },
   error: { label: "Run failed", icon: CircleAlert },
   input: { label: "Needs your input", icon: MessageCircleQuestion },
-} satisfies Record<ThreadDisplayState, { label: string; icon: LucideIcon }>;
+} satisfies Record<ThreadDisplayState, { label: string; icon: ComponentType }>;
 
 export function ThreadCard({
   title,

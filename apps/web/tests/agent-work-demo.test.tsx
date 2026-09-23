@@ -238,7 +238,7 @@ test("reaction sits between time and rewind, and rewind is disabled for an activ
 test("a sent prompt immediately shows thinking and suppresses the queue marker", () => {
   const html = renderStage("sent");
   expect(html).toContain("activity-summary");
-  expect(html).toContain("animate-spin");
+  expect(html).toContain('data-slot="loading-spinner"');
   expect(html).toContain("working-text");
   expect(html).toContain('aria-expanded="false"');
   expect(html).toContain("Thinking…");

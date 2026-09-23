@@ -1,3 +1,4 @@
+import { ConnectionLoading } from "./components/ui/connection-loading";
 import { watchSystemTheme } from "./theme/theme";
 import { SurfaceVisibilityContext } from "./components/ui/surface-visibility";
 import { Outlet, RouterProvider, useMatch } from "@tanstack/react-router";
@@ -101,9 +102,8 @@ function Root() {
   if (state.kind === "starting")
     return (
       <div className="login-shell w-[min(100%_-_calc(var(--ui-space-unit)*8),_24rem)] min-h-dvh mx-auto flex flex-col justify-center gap-6 py-12">
-        <span className="brand inline-flex gap-1 items-baseline text-2xl [letter-spacing:-0.07em] font-[650]">
-          Lilac
-        </span>
+        <h1>Lilac</h1>
+        <ConnectionLoading />
       </div>
     );
   if (state.kind === "offline")
@@ -133,7 +133,7 @@ function Root() {
         auth?.provider === "clerk" &&
         auth.publishableKey ? (
           <AccountLoadBoundary onReload={reload} message="Unable to load sign-in.">
-            <Suspense fallback={<p>Loading sign-in…</p>}>
+            <Suspense fallback={<ConnectionLoading />}>
               <ClerkLogin publishableKey={auth.publishableKey} onSignedIn={start} />
             </Suspense>
           </AccountLoadBoundary>

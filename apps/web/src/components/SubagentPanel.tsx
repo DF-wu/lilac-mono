@@ -1,3 +1,4 @@
+import { LoadingSpinner } from "./ui/loading-spinner";
 import { defaultRightPanel } from "../panel-store";
 import { useContext, useMemo, useEffect, type ReactNode } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -7,7 +8,6 @@ import {
   Bot,
   CircleAlert,
   CircleCheck,
-  LoaderCircle,
   PanelRightClose,
   PanelRightOpen,
 } from "lucide-react";
@@ -314,7 +314,7 @@ export function SubagentPanelView({
 }
 
 function AgentStatus({ agent }: { agent: SubagentSummary }) {
-  if (agent.state === "running") return <LoaderCircle className="animate-spin" />;
+  if (agent.state === "running") return <LoadingSpinner />;
   if (agent.state === "complete") return <CircleCheck />;
   return <CircleAlert />;
 }
