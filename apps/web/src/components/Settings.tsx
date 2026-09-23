@@ -1,3 +1,4 @@
+import { KeybindingsSettings } from "./KeybindingsSettings";
 import { NotificationSettings } from "./NotificationSettings";
 import type { SettingsTab } from "../router";
 import { useWorkspace } from "../workspace-context";
@@ -53,7 +54,7 @@ export function Settings({
 }) {
   const [open, setOpen] = useState(true);
   const narrow = useSyncExternalStore(subscribeToSettingsWidth, isNarrowSettings);
-  const { client, preferences, notifications, accountProfile } = useWorkspace();
+  const { client, preferences, keybindings, notifications, accountProfile } = useWorkspace();
   const animation = useStore(preferences, (state) => state.animation);
   const [editors, setEditors] = useState<ConfigEditors>({});
   const [error, setError] = useState<string>();
@@ -138,6 +139,7 @@ export function Settings({
             if (
               value === "account" ||
               value === "options" ||
+              value === "keybindings" ||
               value === "notifications" ||
               value === "theme" ||
               value === "deployment" ||
@@ -166,6 +168,7 @@ export function Settings({
               <TabsTrigger value="account">Account</TabsTrigger>
               <TabsTrigger value="theme">Appearance</TabsTrigger>
               <TabsTrigger value="options">Options</TabsTrigger>
+              <TabsTrigger value="keybindings">Keybindings</TabsTrigger>
               <TabsTrigger value="notifications">Notifications</TabsTrigger>
             </div>
             {viewer.role === "owner" ? (
@@ -201,6 +204,9 @@ export function Settings({
             </TabsContent>
             <TabsContent value="notifications" className="settings-section">
               <NotificationSettings preferences={notifications} />
+            </TabsContent>
+            <TabsContent value="keybindings" className="settings-section">
+              <KeybindingsSettings store={keybindings} />
             </TabsContent>
             <TabsContent value="options" className="settings-section">
               <h2>Thread</h2>

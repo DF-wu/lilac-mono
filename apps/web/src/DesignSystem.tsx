@@ -1,3 +1,6 @@
+import { KeybindingsSettings } from "./components/KeybindingsSettings";
+import { createKeybindings } from "./keybindings";
+import { CopyReferenceButton } from "./components/ConversationReference";
 import { Switch } from "./components/ui/switch";
 import { NotificationSettings } from "./components/NotificationSettings";
 import { createNotificationPreferences } from "./notifications";
@@ -100,6 +103,7 @@ const sections = [
   ["messages", "Messages"],
   ["agent-work", "Agent work"],
   ["notifications", "Notifications"],
+  ["keybindings", "Keybindings"],
   ["deployment", "Deployment settings"],
   ["composer", "Composer"],
   ["reconnection", "Reconnection"],
@@ -1333,6 +1337,9 @@ function Overlays() {
         <IconButton label="Copy message">
           <Copy />
         </IconButton>
+        <CopyReferenceButton
+          target={{ surface: "native", sessionId: "demo", messageId: "message" }}
+        />
       </div>
       <ContextMenu>
         <ContextMenuTrigger
@@ -1561,6 +1568,9 @@ export default function DesignSystem() {
               >
                 <AgentWorkDemo />
               </Section>
+              <Section id="keybindings" title="Keybindings">
+                <KeybindingsDemo />
+              </Section>
               <Section id="notifications" title="Notifications">
                 <NotificationSettingsDemo />
               </Section>
@@ -1635,6 +1645,11 @@ export default function DesignSystem() {
       </TooltipProvider>
     </QueryClientProvider>
   );
+}
+
+function KeybindingsDemo() {
+  const [store] = useState(() => createKeybindings());
+  return <KeybindingsSettings store={store} />;
 }
 
 function NotificationSettingsDemo() {

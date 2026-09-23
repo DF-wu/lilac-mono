@@ -1,14 +1,17 @@
+import type { ShortcutAction } from "../keybindings";
 import { useRef, type ReactNode } from "react";
 import { IconButton } from "./ui";
 
 export function PanelToggleButton({
   label,
   open,
+  shortcut,
   onToggle,
   children,
 }: {
   label: string;
   open: boolean;
+  shortcut?: ShortcutAction;
   onToggle: () => void;
   children: ReactNode;
 }) {
@@ -16,6 +19,7 @@ export function PanelToggleButton({
   return (
     <IconButton
       label={label}
+      shortcut={shortcut}
       className="touch-manipulation"
       aria-expanded={open}
       onPointerDown={(event) => {

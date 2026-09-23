@@ -140,6 +140,7 @@ export const SidebarThread = memo(function SidebarThread({
           />
         ) : (
           <ThreadCard
+            shortcutId={id}
             title={title}
             starterName={viewer.displayName}
             draft="new"

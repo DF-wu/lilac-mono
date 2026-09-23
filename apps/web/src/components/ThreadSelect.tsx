@@ -1,3 +1,4 @@
+import { useThreadShortcut } from "../shortcuts";
 import { LoadingSpinner } from "./ui/loading-spinner";
 import { useWorkspace } from "../workspace-context";
 import { useQuery } from "@tanstack/react-query";
@@ -33,6 +34,7 @@ const states = {
 
 export function ThreadCard({
   title,
+  shortcutId,
   starterName,
   starterAvatarUrl,
   updatedAt,
@@ -45,6 +47,7 @@ export function ThreadCard({
   onSelect,
 }: {
   title: string;
+  shortcutId?: string;
   starterName: string;
   starterAvatarUrl?: string;
   updatedAt?: number;
@@ -56,6 +59,7 @@ export function ThreadCard({
   actions?: ReactNode;
   onSelect: () => void;
 }) {
+  const shortcut = useThreadShortcut(shortcutId);
   const StatusIcon = states[state].icon;
   return (
     <div
@@ -67,6 +71,8 @@ export function ThreadCard({
         variant="ghost"
         className="thread-card-select absolute inset-0 w-full h-full rounded-[inherit]"
         onClick={onSelect}
+        title={shortcut.label ? `Open thread (${shortcut.label})` : undefined}
+        aria-keyshortcuts={shortcut.aria}
         aria-label={`${title || "Untitled"}, ${states[state].label}${draft && !selected ? ", Draft" : ""}`}
       />
       <span className="thread-card-copy relative pointer-events-none flex min-w-0 flex-col gap-0 pt-[calc(var(--ui-space-unit)*1.5)] px-3 pb-3">
@@ -116,6 +122,14 @@ export function ThreadCard({
           {title || "Untitled"}
         </span>
       </span>
+      {shortcut.held && shortcut.label ? (
+        <kbd
+          data-ui="thread-shortcut"
+          className="absolute bottom-2 right-2 pointer-events-none rounded-sm bg-popover px-2 py-1 text-xs text-popover-foreground shadow-sm"
+        >
+          {shortcut.label}
+        </kbd>
+      ) : null}
     </div>
   );
 }
@@ -157,6 +171,7 @@ export function ThreadSelect({
   pinned?: boolean;
   draft?: "new" | "reply";
 }) {
+  const shortcut = useThreadShortcut(thread.id);
   const { client } = useWorkspace();
   const [open, setOpen] = useState(false);
   const online = useNativeOnline(client);
@@ -174,6 +189,7 @@ export function ThreadSelect({
     <Tooltip onOpenChange={setOpen}>
       <TooltipTrigger render={<div className="thread-card-trigger block min-w-0 w-full" />}>
         <ThreadCard
+          shortcutId={thread.id}
           title={thread.title}
           starterName={starter}
           starterAvatarUrl={
@@ -196,6 +212,7 @@ export function ThreadSelect({
       >
         <div className="thread-details flex flex-col gap-2 text-sm wrap-anywhere">
           <strong>{thread.title || "Untitled"}</strong>
+          {shortcut.label ? <kbd>{shortcut.label}</kbd> : null}
           <span>
             <UserRound />
             Started by {starter}

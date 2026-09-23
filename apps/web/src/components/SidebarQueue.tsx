@@ -1,3 +1,4 @@
+import { useThreadTargets } from "../shortcuts";
 import { SidebarEmptyState } from "./SidebarEmptyState";
 import { useEventCallback } from "../use-event-callback";
 import { memo, useEffect, useState } from "react";
@@ -136,6 +137,12 @@ export const SidebarQueue = memo(function SidebarQueue({
     remember(id);
     onSelect(id);
   });
+  useThreadTargets(
+    [...visible.pinned, ...visible.active, ...(settledOpen ? visible.settled : [])].map(
+      (entry) => entry.id,
+    ),
+    select,
+  );
   const rename = useEventCallback((id: string, title: string) => {
     remember(id);
     onRename(id, title);

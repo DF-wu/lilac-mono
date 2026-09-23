@@ -1,8 +1,7 @@
 import { LoadingSpinner } from "./ui/loading-spinner";
 import { AddReaction, MessageReactions } from "./MessageReactions";
 import { OptimisticTurns, type OptimisticTurn } from "../optimistic-turns";
-import { CopyReferenceItem, useConversation } from "./ConversationReference";
-import { ContextMenu, ContextMenuContent, ContextMenuTrigger } from "./ui/context-menu";
+import { CopyReferenceButton, useConversation } from "./ConversationReference";
 import { useSubagents, subagentProfileName } from "./subagent-context";
 import type { SubagentSummary } from "@stanley2058/lilac-client-protocol";
 import { copyMessage, messageClipboard } from "../message-clipboard";
@@ -1083,19 +1082,12 @@ const MessageBody = memo(function MessageBody(
         {copiedAt ? <CopyCheck /> : <Copy />}
       </IconButton>
     ) : null;
-  const copy =
-    !props.optimistic && copyReference && copyButton ? (
-      <ContextMenu>
-        <ContextMenuTrigger render={<span className="inline-flex" />}>
-          {copyButton}
-        </ContextMenuTrigger>
-        <ContextMenuContent>
-          <CopyReferenceItem target={copyReference} />
-        </ContextMenuContent>
-      </ContextMenu>
-    ) : (
-      copyButton
-    );
+  const copy = copyButton ? (
+    <>
+      {copyButton}
+      <CopyReferenceButton target={copyReference} disabled={!!props.optimistic} />
+    </>
+  ) : null;
   return (
     <LiveMessageContext value={props.live ?? false}>
       <ChatMessage

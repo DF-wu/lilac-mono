@@ -1,3 +1,5 @@
+import { useShortcut } from "../shortcuts";
+import type { ShortcutAction } from "../keybindings";
 import {
   useCallback,
   useEffect,
@@ -20,14 +22,17 @@ import { Result } from "better-result";
 export function IconButton({
   label,
   tooltip = label,
+  shortcut,
   children,
   variant = "ghost",
   ...props
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
   label: string;
   tooltip?: string;
+  shortcut?: ShortcutAction;
   variant?: ComponentProps<typeof Button>["variant"];
 }) {
+  const keys = useShortcut(shortcut);
   return (
     <Tooltip>
       <TooltipTrigger
@@ -39,12 +44,16 @@ export function IconButton({
             {...props}
             className={`icon-button rounded-sm ${variant === "ghost" ? "text-muted-foreground" : ""} ${props.className ?? ""}`}
             aria-label={label}
+            aria-keyshortcuts={keys.aria ?? props["aria-keyshortcuts"]}
           />
         }
       >
         {children}
       </TooltipTrigger>
-      <TooltipContent>{tooltip}</TooltipContent>
+      <TooltipContent>
+        {tooltip}
+        {keys.label ? ` (${keys.label})` : ""}
+      </TooltipContent>
     </Tooltip>
   );
 }

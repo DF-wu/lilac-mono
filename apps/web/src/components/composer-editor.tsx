@@ -1,3 +1,5 @@
+import { shortcutOverlayOpen } from "../shortcuts";
+import { formatBinding, ariaBinding } from "../keybindings";
 import { parseReferenceHref, referenceHref } from "@stanley2058/lilac-client-protocol";
 import { ConversationBadge } from "./ConversationReference";
 import { FileIcon } from "./FileIcon";
@@ -624,6 +626,7 @@ export type ComposerEditorProps = {
   text: string;
   documentKey?: string;
   loadingDraft?: boolean;
+  autoFocus?: boolean;
   attachments?: readonly Attachment[];
   onRemoveAttachment?: (key: string) => void;
   onRetryAttachment?: (key: string) => void;
@@ -699,6 +702,24 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
     }),
     [editor, attachments],
   );
+  const focusedDocument = useRef<string>(undefined);
+  useEffect(() => {
+    if (
+      !props.documentKey ||
+      props.loadingDraft ||
+      props.disabled ||
+      focusedDocument.current === props.documentKey
+    )
+      return;
+    focusedDocument.current = props.documentKey;
+    if (!props.autoFocus || window.matchMedia("(pointer: coarse)").matches || shortcutOverlayOpen())
+      return;
+    const focused = document.activeElement;
+    if (focused instanceof Element && focused.closest('input, textarea, [contenteditable="true"]'))
+      return;
+    editor.tf.select(editor.api.end([]));
+    editor.tf.focus();
+  }, [editor, props.documentKey, props.loadingDraft, props.disabled, props.autoFocus]);
   function change() {
     if (props.loadingDraft) return;
     const references = attachmentKeys(editor);
@@ -726,6 +747,7 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
         <ComposerFormatting editor={editor} disabled={props.disabled} />
         <PlateContent
           className="composer-editor"
+          data-ui="composer-input"
           style={{
             minHeight: "calc(1lh + calc(var(--ui-space-unit) * 3) * 2)",
             overflowWrap: "anywhere",
@@ -801,10 +823,22 @@ const ComposerFormatting = memo(function ComposerFormatting({
       aria-label="Text formatting"
       onMouseDown={(event) => event.preventDefault()}
     >
-      <IconButton label="Bold" disabled={disabled} onClick={() => mark(KEYS.bold)}>
+      <IconButton
+        tooltip={`Bold (${formatBinding({ code: "KeyB", mod: true, alt: false, shift: false })})`}
+        aria-keyshortcuts={ariaBinding({ code: "KeyB", mod: true, alt: false, shift: false })}
+        label="Bold"
+        disabled={disabled}
+        onClick={() => mark(KEYS.bold)}
+      >
         <Bold />
       </IconButton>
-      <IconButton label="Italic" disabled={disabled} onClick={() => mark(KEYS.italic)}>
+      <IconButton
+        tooltip={`Italic (${formatBinding({ code: "KeyI", mod: true, alt: false, shift: false })})`}
+        aria-keyshortcuts={ariaBinding({ code: "KeyI", mod: true, alt: false, shift: false })}
+        label="Italic"
+        disabled={disabled}
+        onClick={() => mark(KEYS.italic)}
+      >
         <Italic />
       </IconButton>
       <IconButton

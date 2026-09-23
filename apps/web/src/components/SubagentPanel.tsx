@@ -323,6 +323,7 @@ export function RightPanelToggle({ open, onToggle }: { open: boolean; onToggle: 
   return (
     <div className="right-panel-toggle">
       <PanelToggleButton
+        shortcut="rightPanel"
         label={open ? "Hide right panel" : "Show right panel"}
         open={open}
         onToggle={onToggle}

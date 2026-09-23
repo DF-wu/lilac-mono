@@ -1,3 +1,11 @@
+import {
+  useAppShortcuts,
+  useThreadShortcut,
+  useShortcut,
+  ThreadShortcutTargets,
+  focusMainComposer,
+  blurForThreadNavigation,
+} from "./shortcuts";
 import { watchNotifications, holdNotificationLock, notificationScope } from "./notifications";
 import { useConnectionNotice } from "./use-connection-notice";
 import { parseReferenceHref } from "@stanley2058/lilac-client-protocol";
@@ -474,6 +482,8 @@ function Workspace(props: AppProps) {
       void attempt(() => props.draftCache!.saveDraft(props.scope, id, empty), setError);
   });
   const select = useEventCallback(function select(id: string) {
+    blurForThreadNavigation();
+    if (id === selectedRef.current) focusMainComposer();
     const search = { view: archived ? ("archived" as const) : undefined };
     if (id.startsWith("draft:")) {
       void navigate({ to: "/", state: { draftThreadId: id }, search });
@@ -483,6 +493,7 @@ function Workspace(props: AppProps) {
   });
 
   const createThread = useEventCallback(function createThread() {
+    blurForThreadNavigation();
     const draft = newDraftThread();
     const changed = new Map(draftStore.getState().localDrafts);
     for (const [id, existing] of changed) if (!hasDraftContent(existing)) changed.delete(id);
@@ -782,6 +793,24 @@ function Workspace(props: AppProps) {
       }),
   );
   const logout = useEventCallback(() => void attempt(props.onLogout, setError));
+  const newThreadKeys = useShortcut("newThread");
+  const settingsKeys = useShortcut("settings");
+  useAppShortcuts({
+    enabled: active,
+    blocked: !!settings,
+    newThread: createThread,
+    settings: openSettings,
+    sidebar: () => {
+      const focused = document.activeElement?.closest("#sidebar");
+      panels.getState().toggleSidebar();
+      if (focused) focusMainComposer();
+    },
+    rightPanel: () => {
+      const focused = document.activeElement?.closest("#right-panel");
+      panels.getState().toggle(selectedId);
+      if (focused) focusMainComposer();
+    },
+  });
   const sidebarToolbar = useMemo(
     () => (
       <div className="sidebar-search-row flex items-center gap-1 min-w-0 mb-2">
@@ -808,7 +837,12 @@ function Workspace(props: AppProps) {
               <Globe />
             </IconButton>
           ) : null}
-          <IconButton label="New conversation" tooltip="New" onClick={createThread}>
+          <IconButton
+            label="New conversation"
+            tooltip="New thread"
+            shortcut="newThread"
+            onClick={createThread}
+          >
             <MessageCirclePlus />
           </IconButton>
         </nav>
@@ -828,14 +862,15 @@ function Workspace(props: AppProps) {
         <ContextMenu>
           <ContextMenuTrigger
             render={
-              <IconButton label="Settings" onClick={openSettings}>
+              <IconButton label="Settings" shortcut="settings" onClick={openSettings}>
                 <SettingsIcon />
               </IconButton>
             }
           />
           <ContextMenuContent side="top" align="end">
             <ContextMenuItem onClick={openSettings}>
-              <SettingsIcon /> Settings
+              <SettingsIcon /> Settings{" "}
+              <span className="ml-auto text-xs text-muted-foreground">{settingsKeys.label}</span>
             </ContextMenuItem>
             <ContextMenuItem onClick={openDesign}>
               <Palette /> Design
@@ -847,7 +882,7 @@ function Workspace(props: AppProps) {
         </ContextMenu>
       </footer>
     ),
-    [viewer, props.sessionControl, openSettings, openDesign, logout],
+    [viewer, props.sessionControl, openSettings, openDesign, logout, settingsKeys.label],
   );
   return (
     <MessageIdentityContext.Provider value={identities}>
@@ -865,6 +900,7 @@ function Workspace(props: AppProps) {
               <div className="sidebar-toggle fixed top-0 left-3 h-8 flex items-center z-40 [&_.icon-button]:size-[var(--ui-control-compact)]">
                 <PanelToggleButton
                   label={sidebar ? "Hide sidebar" : "Show sidebar"}
+                  shortcut="sidebar"
                   open={sidebar}
                   onToggle={panels.getState().toggleSidebar}
                 >
@@ -905,6 +941,22 @@ function Workspace(props: AppProps) {
                       </span>
                     </header>
                     {sidebarToolbar}
+                    {archived && !results && !external ? (
+                      <ThreadShortcutTargets
+                        ids={sidebarThreads.map((thread) => thread.id)}
+                        select={select}
+                      />
+                    ) : null}
+                    {results ? (
+                      <ThreadShortcutTargets
+                        ids={results.items.map((hit) => hit.threadId)}
+                        select={(id) => {
+                          const hit = results.items.find((hit) => hit.threadId === id);
+                          if (hit?.surface === "native") select(id);
+                          else selectExternal(id);
+                        }}
+                      />
+                    ) : null}
                     {external && owner && !results ? (
                       <ExternalSidebar selectedId={externalId} onSelect={selectExternal} />
                     ) : null}
@@ -918,20 +970,17 @@ function Workspace(props: AppProps) {
                             className="thread-list flex-1"
                             estimate={92}
                             render={(hit) => (
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                className="search-result flex w-full gap-1 p-3 text-left rounded-sm h-auto flex-col items-start whitespace-normal"
-                                onClick={() => {
+                              <SearchThreadButton
+                                id={hit.threadId}
+                                title={hit.title}
+                                excerpt={hit.excerpt}
+                                onSelect={() => {
                                   if (hit.surface === "native") select(hit.threadId);
                                   else {
                                     selectExternal(hit.threadId);
                                   }
                                 }}
-                              >
-                                <strong>{hit.title}</strong>
-                                <span>{hit.excerpt}</span>
-                              </Button>
+                              />
                             )}
                           />
                           {results.items.length === 0 && !searching ? (
@@ -1038,6 +1087,7 @@ function Workspace(props: AppProps) {
                               threadId={selectedId}
                               thread={thread}
                               foreground={active}
+                              autoFocus={active && !settings && !search.ref && !search.message}
                               catalog={catalog}
                               onError={setError}
                               readTurns={readTurns.current}
@@ -1124,7 +1174,15 @@ function Workspace(props: AppProps) {
                       : null}
                     {!reference && !external && !selectedId ? (
                       <div className="welcome">
-                        <Button onClick={createThread}>
+                        <Button
+                          title={
+                            newThreadKeys.label
+                              ? `New thread (${newThreadKeys.label})`
+                              : "New thread"
+                          }
+                          aria-keyshortcuts={newThreadKeys.aria}
+                          onClick={createThread}
+                        >
                           <Plus />
                           New conversation
                         </Button>
@@ -1223,3 +1281,35 @@ function Workspace(props: AppProps) {
   );
 }
 export default App;
+
+function SearchThreadButton({
+  id,
+  title,
+  excerpt,
+  onSelect,
+}: {
+  id: string;
+  title: string;
+  excerpt: string;
+  onSelect: () => void;
+}) {
+  const shortcut = useThreadShortcut(id);
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      className="search-result relative flex w-full gap-1 p-3 text-left rounded-sm h-auto flex-col items-start whitespace-normal"
+      title={shortcut.label ? `Open thread (${shortcut.label})` : undefined}
+      aria-keyshortcuts={shortcut.aria}
+      onClick={onSelect}
+    >
+      <strong>{title}</strong>
+      <span>{excerpt}</span>
+      {shortcut.held && shortcut.label ? (
+        <kbd className="absolute bottom-2 right-2 rounded-sm bg-popover px-2 py-1 text-xs text-popover-foreground shadow-sm">
+          {shortcut.label}
+        </kbd>
+      ) : null}
+    </Button>
+  );
+}

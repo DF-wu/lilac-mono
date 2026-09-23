@@ -38,6 +38,7 @@ export type ComposerProps = Partial<Pick<ChatCommon, "client" | "scope" | "catal
   text: string;
   documentKey?: string;
   loadingDraft?: boolean;
+  autoFocus?: boolean;
   skillIds: string[];
   onSkills: (ids: string[]) => void;
   commandId?: string;
@@ -484,6 +485,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           <ComposerEditor
             documentKey={props.documentKey}
             loadingDraft={props.loadingDraft}
+            autoFocus={props.autoFocus}
             ref={input}
             text={text}
             attachments={attachments}
@@ -562,6 +564,8 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           ) : null}
           <IconButton
             label={active && custom ? "Queue command as follow-up" : "Send message"}
+            tooltip={`${active && custom ? "Queue command as follow-up" : "Send message"} (Enter)`}
+            aria-keyshortcuts="Enter"
             variant="default"
             className="rounded-full"
             disabled={

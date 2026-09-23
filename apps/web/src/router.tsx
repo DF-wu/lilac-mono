@@ -19,6 +19,7 @@ const workspaceSearchSchema = z.object({
     .enum([
       "account",
       "options",
+      "keybindings",
       "notifications",
       "theme",
       "deployment",

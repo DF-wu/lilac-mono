@@ -1,5 +1,13 @@
 # MIGRATIONS.md
 
+## Native web keybindings
+
+Keyboard shortcuts are stored only in the browser under `lilac-keybindings-v1`, scoped to the
+installation and principal. The version 1 payload contains physical key codes and modifiers for
+each action; null disables an action. Missing, invalid, duplicate, or unsupported payloads use
+default bindings without rewriting storage. No Core configuration or server-data migration is needed.
+
+
 ## Native reaction names
 
 Reaction responses add optional `userNames` (at most five display names) and `overflowCount`.

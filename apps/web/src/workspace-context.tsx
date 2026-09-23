@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { AppProps } from "./types";
 import { UploadPool } from "./uploads";
 import { createDraftStore } from "./draft-store";
+import { createKeybindings } from "./keybindings";
 import { createPreferences } from "./preferences";
 import { releaseDraftAttachments } from "./draft-thread";
 
@@ -13,6 +14,7 @@ type WorkspaceServices = Pick<
   AppProps,
   "client" | "scope" | "upload" | "resourceUrl" | "draftCache" | "accountProfile"
 > & {
+  keybindings: ReturnType<typeof createKeybindings>;
   panels: ReturnType<typeof createPanelStore>;
   pool: UploadPool;
   drafts: ReturnType<typeof createDraftStore>;
@@ -30,6 +32,10 @@ export function useWorkspace() {
 export function WorkspaceProvider({ children, ...props }: AppProps & { children: ReactNode }) {
   const { client, scope, upload, resourceUrl, draftCache, accountProfile } = props;
   useEffect(() => watchConnectionLifecycle(client), [client]);
+  const keybindings = useMemo(
+    () => createKeybindings(scope),
+    [scope.installationId, scope.principalId],
+  );
   const panels = useMemo(() => createPanelStore(scope), [scope.installationId, scope.principalId]);
   const pool = useMemo(() => new UploadPool(client, upload), [client, upload]);
   const drafts = useMemo(() => createDraftStore(), [client]);
@@ -65,6 +71,7 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
       notifications,
       preferences,
       panels,
+      keybindings,
     }),
     [
       client,
@@ -78,6 +85,7 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
       notifications,
       preferences,
       panels,
+      keybindings,
     ],
   );
   const queries = useMemo(

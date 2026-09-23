@@ -68,6 +68,7 @@ export type ChatProps = Pick<ChatCommon, "catalog" | "onError"> & {
   pending: PendingInput[];
   onPending: (id: string, update: (pending: PendingInput[]) => PendingInput[]) => void;
   foreground: boolean;
+  autoFocus?: boolean;
 };
 
 export function Chat(props: ChatProps) {
@@ -741,6 +742,7 @@ export function Chat(props: ChatProps) {
       <div hidden={!editable}>
         <Composer
           documentKey={threadId}
+          autoFocus={props.autoFocus}
           loadingDraft={!draftLoaded}
           windowDrop={props.foreground}
           catalog={props.catalog}
