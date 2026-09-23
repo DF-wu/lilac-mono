@@ -165,6 +165,9 @@
   max-height: 24rem;
   overflow: hidden;
 }
+.message-card-preview[data-streaming="true"] {
+  overflow: clip;
+}
 .message-card-preview[data-collapsed="true"][data-overflow="true"] {
   mask-image: linear-gradient(to bottom, black calc(100% - 3rem), transparent);
 }

@@ -53,6 +53,7 @@ import { MessageResourcesContext } from "./message-resources";
 import { Bubble, BubbleContent } from "./ui/bubble";
 import "./message-presentation.css";
 import { Markdown } from "./Markdown";
+import { readMotionDuration } from "../theme/motion";
 import { Button } from "./ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
 import { Message as ChatMessage, MessageContent, MessageAvatar } from "./ui/message";
@@ -824,6 +825,7 @@ function MessageCard({
   content,
   self,
   collapsible,
+  streaming,
   arrivalId,
   reactions,
 }: {
@@ -832,12 +834,18 @@ function MessageCard({
   content: MessageCardGroup;
   self: boolean;
   collapsible: boolean;
+  streaming: boolean;
 }) {
   const arrivalRef = useMessageArrival(
     arrivalId,
     content.texts.some(Boolean) || content.attachments.length > 0,
   );
   const contentRef = useRef<HTMLDivElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
+  const heightAnimation = useRef<Animation | null>(null);
+  const previousStream = useRef<{ text: string; height: number; blocks: number } | null>(null);
+  const live = useContext(LiveMessageContext);
+  const streamText = streaming && content.texts.length === 1 ? content.texts[0] : undefined;
   const previewId = useId();
   const [expanded, setExpanded] = useState(false);
   const [long, setLong] = useState(false);
@@ -858,6 +866,43 @@ function MessageCard({
   useLayoutEffect(() => {
     if (contentRef.current) timeline?.measureTurn(contentRef.current);
   }, [expanded, long, timeline]);
+  useLayoutEffect(() => {
+    const preview = previewRef.current;
+    const markdown = contentRef.current?.querySelector(".markdown");
+    if (!preview || !markdown || streamText === undefined) {
+      previousStream.current = null;
+      heightAnimation.current?.cancel();
+      return;
+    }
+    const previous = previousStream.current;
+    const height = preview.scrollHeight;
+    previousStream.current = { text: streamText, height, blocks: markdown.children.length };
+    if (
+      !live ||
+      !previous ||
+      streamText.length <= previous.text.length ||
+      !streamText.startsWith(previous.text)
+    ) {
+      heightAnimation.current?.cancel();
+      return;
+    }
+    const duration = readMotionDuration() * 2;
+    if (!duration) return;
+    const from =
+      heightAnimation.current?.playState === "running"
+        ? preview.getBoundingClientRect().height
+        : previous.height;
+    heightAnimation.current?.cancel();
+    if (height > from) {
+      heightAnimation.current = preview.animate(
+        [{ height: `${from}px` }, { height: `${height}px` }],
+        { duration, easing: "ease-out" },
+      );
+    }
+    for (const block of Array.from(markdown.children).slice(previous.blocks)) {
+      block.animate([{ opacity: 0 }, { opacity: 1 }], { duration, easing: "ease-out" });
+    }
+  }, [live, streamText]);
   const collapsed = collapsible && !expanded;
   const images = content.attachments.filter((part) => part.data.mediaType.startsWith("image/"));
   const files = content.attachments.filter((part) => !part.data.mediaType.startsWith("image/"));
@@ -865,11 +910,13 @@ function MessageCard({
     <Bubble ref={arrivalRef} variant={self ? "tinted" : "muted"} className="message-bubble">
       <BubbleContent>
         <div
+          ref={previewRef}
           id={previewId}
           data-ui="message-card-preview"
           className="message-card-preview min-w-0"
           data-collapsed={collapsed}
           data-overflow={long}
+          data-streaming={streaming}
           onFocusCapture={() => {
             if (collapsed) setExpanded(true);
           }}
@@ -1070,6 +1117,7 @@ const MessageBody = memo(function MessageBody(
                     content={group}
                     self={self}
                     collapsible={message.role === "user"}
+                    streaming={message.role === "assistant" && !!props.live}
                     reactions={
                       index === lastContent ? (
                         <MessageReactions messageId={message.id} items={reactions} />

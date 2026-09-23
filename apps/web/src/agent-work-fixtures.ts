@@ -113,8 +113,14 @@ const multiple = [
     ),
   ]),
 ];
-const answer =
-  "I'd choose the **riverside walk**, with the museum as a rainy-day backup.\n\n1. Start at Sanjo Station around 10:00.\n2. Walk north along the river, then stop for coffee.\n3. Keep the afternoon free, or visit the museum before its 17:30 last admission.\n\nBring a light jacket. No reservations are needed for the walk.";
+const answer = [
+  "I'd choose the **riverside walk** for Saturday and keep the museum as a backup. The forecast is mild at 18°C, with light cloud and only a small chance of rain. That makes the river the more flexible choice, especially if you want time to stop along the way.",
+  "Start at Sanjo Station around 10:00 and walk north beside the water. The full route takes about two hours, but you can turn back whenever you like. There are several bridges, so shortening the walk does not require retracing the whole route.",
+  "Plan a coffee stop after the first stretch. A café with indoor seating gives you somewhere to rest if the wind picks up, and it keeps the morning relaxed. Leave a little room in the schedule for photos or a detour through the nearby streets.",
+  "If the weather changes, switch to the museum. It is open from 10:00 to 18:00, with last admission at 17:30, so you can make that call after breakfast. Allow about 90 minutes for the visit and another 15 minutes for the bus ride from the riverside area.",
+  "For the afternoon, keep the plan open. You could return to the river for a shorter stroll, browse nearby shops, or stay longer at the museum if an exhibition catches your eye. The two options are close enough that you do not need to commit to both in advance.",
+  "Bring a light jacket and comfortable shoes. No reservation is needed for the walk; check the museum's ticket page before leaving if you decide to go indoors.",
+].join("\n\n");
 const final = message("demo_final", [{ type: "text", text: answer }], "final");
 const paragraphs = answer.split("\n\n");
 const streamFrames = paragraphs.map((_paragraph, index) =>
@@ -123,8 +129,14 @@ const streamFrames = paragraphs.map((_paragraph, index) =>
     commentary,
     {
       ...final,
-      metadata: { ...final.metadata, incomplete: true },
-      parts: [{ type: "text", text: paragraphs.slice(0, index + 1).join("\n\n") }],
+      parts: [
+        {
+          type: "text",
+          text:
+            paragraphs.slice(0, index + 1).join("\n\n") +
+            (index < paragraphs.length - 1 ? "\n\n" : ""),
+        },
+      ],
     },
   ]),
 );
@@ -439,9 +451,9 @@ export const agentWorkStages: AgentWorkStage[] = [
   },
   {
     id: "streaming",
-    label: "Streaming response",
+    label: "Paragraph streaming",
     description:
-      "Play to watch the final answer arrive in paragraphs. Pause to inspect a partial answer.",
+      "Play to watch a longer answer arrive one paragraph at a time. Pause to inspect a partial answer.",
     frames: streamFrames,
   },
   {

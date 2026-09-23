@@ -35,7 +35,8 @@ test("streaming frames preserve message identity and grow into the completed ans
     expect(message.id).toBe(final.id);
     expect(text.startsWith(previous)).toBe(true);
     expect(fullText.startsWith(text)).toBe(true);
-    expect(message.metadata?.incomplete).toBe(true);
+    expect(message.metadata?.incomplete).not.toBe(true);
+    if (slot !== streaming.frames.at(-1)) expect(text.endsWith("\n\n")).toBe(true);
     previous = text;
   }
   expect(previous).toBe(fullText);
