@@ -808,3 +808,22 @@ workflow and transcript stores; there is no stored-data migration. Update client
 Transcript responses contain bounded pages of display text and activity labels. They omit system
 prompts, raw reasoning, tool arguments, and provider state. Older runs without retained transcripts
 show an unavailable state. Panel visibility and pixel width are local to the current workspace session.
+
+## Shared cross-surface conversation memory
+
+Conversation memory now indexes Discord and native threads in the shared conversation-thread tables
+in the Discord search database. The first open without the `conversation_index_v2` marker drops and
+recreates only those derived thread, summary, facet, FTS, and embedding tables. Retained Discord
+messages, native records, conversation IDs, grants, resources, and canonical transcripts are unchanged.
+Native runtime startup drops the obsolete `native_thread_summaries` table. No old summaries are copied.
+The materializer rebuilds Discord groups, and native entries are projected from current retained turns.
+The existing summarization worker regenerates quiet eligible threads and their embeddings. Recall is
+incomplete until that refresh finishes; manual `conversation.thread.runSummarization` can trigger it.
+
+Every conversation-memory result now includes `surface`, and native thread references are
+`native:<threadId>`. Deploy Core and its tools together. Both agent origins can search and read all
+retained native conversations, independent of native ownership and grants; Discord allowlists still
+apply. Native UI read and write permissions remain unchanged. Derived native state is discarded when
+its retained message content or history generation changes, including edits, rewinds, and deletion.
+Model selection, titles, archiving, and grant changes preserve existing summaries. Downgrading requires
+rebuilding the derived index for the older runtime; do not reuse cross-surface derived rows with an older binary.

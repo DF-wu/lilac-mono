@@ -202,9 +202,18 @@ Recent agent writes include projected responses and tool-sent messages. Startup 
 for historical responses whose native input records identify the owning request. It cannot infer the
 owner of older standalone tool messages that have no request link.
 
-Native conversation search ranks lexical matches and applies `minScore`. `hybrid` requests use lexical
-fallback and report `mode: lexical` with `vectorAvailable: false`. Explicit `semantic` requests return
-an unsupported-mode error. Structured questions remain unavailable.
+`conversation.thread.search` and automatic recall use the same summary and embedding index for
+Discord and native conversations. Both origins search all retained native threads and allowlisted
+Discord conversations. Native ownership and sharing grants do not restrict these agent memory reads;
+they still control native UI access and conversation modification. Deleted, rewound, pending-mutation,
+and ephemeral native content is excluded. Explicit `participantId` filters remain available; automatic
+participant filtering applies only within Discord when the request originates there.
+
+Search supports lexical, semantic, and hybrid retrieval with shared ranking and `minScore` behavior.
+Use `surface: native` or `surface: discord` to restrict a search. Compact results, metadata, reads, and
+automatic recall include `surface`. Native conversation-memory IDs use `native:<threadId>` and can be
+passed directly to `conversation.thread.read`. Summarization maintenance uses the shared runner and
+supports native IDs, dry runs, force, clear, and embedding refresh. Structured questions remain unavailable.
 
 ## Persistence and rollback
 

@@ -113,8 +113,9 @@ conversation:
       expansionMinConfidence: 0.57
       # Search mode for auto-injected metadata: hybrid, semantic, or lexical.
       mode: hybrid
-      # Only inject threads containing at least one user visible in the composed
-      # request/reply-chain context.
+      # Restricts Discord-origin recall of Discord threads to participants visible
+      # in the composed request/reply-chain context.
+      # Native candidates and native-origin cross-surface recall remain global.
       filterCurrentParticipants: false
 
 surface:
