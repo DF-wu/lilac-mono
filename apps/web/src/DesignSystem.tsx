@@ -1162,12 +1162,9 @@ function Controls() {
           </label>
           <div className="ds-field flex flex-col gap-2 text-sm">
             <span>Search</span>
-            <SidebarSearch
-              onSearch={(query) => setSearch(query.trim())}
-              onClear={() => setSearch("")}
-            />
+            <SidebarSearch onSearch={setSearch} />
             <span className="ds-muted" role="status">
-              {search ? `Submitted search: ${search}` : ""}
+              {search ? `Search: ${search}` : ""}
             </span>
           </div>
           <label className="ds-field flex flex-col gap-2 text-sm">

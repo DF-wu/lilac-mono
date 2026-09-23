@@ -717,12 +717,6 @@ function Workspace(props: AppProps) {
   const archiveSidebarThread = useEventCallback(
     (id: string, archived: boolean) => void update(id, { archived }),
   );
-  const searchSidebar = useEventCallback((query: string) => {
-    const next = query.trim();
-    if (next && next === searchQuery) void searchResults.refetch();
-    setSearchQuery(next);
-  });
-  const clearSidebarSearch = useCallback(() => setSearchQuery(""), []);
   const toggleArchived = useEventCallback(() => {
     changeView({ view: archived ? undefined : "archived", otherThread: undefined });
   });
@@ -746,7 +740,7 @@ function Workspace(props: AppProps) {
   const sidebarToolbar = useMemo(
     () => (
       <div className="sidebar-search-row flex items-center gap-1 min-w-0 mb-2">
-        <SidebarSearch onSearch={searchSidebar} onClear={clearSidebarSearch} />
+        <SidebarSearch onSearch={setSearchQuery} />
         <nav
           className="sidebar-tabs flex items-center py-2 px-0"
           aria-label="Conversation filters and actions"
@@ -775,16 +769,7 @@ function Workspace(props: AppProps) {
         </nav>
       </div>
     ),
-    [
-      archived,
-      external,
-      owner,
-      searchSidebar,
-      clearSidebarSearch,
-      toggleArchived,
-      toggleExternal,
-      createThread,
-    ],
+    [archived, external, owner, toggleArchived, toggleExternal, createThread],
   );
   const sidebarFooter = useMemo(
     () => (
