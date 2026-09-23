@@ -479,13 +479,17 @@
   }
   .markdown table {
     border-collapse: collapse;
-    width: 100%;
+    width: max-content;
+    min-width: 100%;
     font-size: var(--ui-text-sm);
   }
   .markdown th,
   .markdown td {
+    max-width: var(--ui-table-cell-max-width);
     padding: calc(var(--ui-space-unit) * 2) calc(var(--ui-space-unit) * 3);
     text-align: left;
+    vertical-align: top;
+    overflow-wrap: anywhere;
   }
   .markdown th {
     background: var(--ui-surface-hover);
@@ -628,9 +632,6 @@
 .markdown[data-wrap="true"] pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-}
-.markdown[data-wrap="true"] table {
-  table-layout: fixed;
 }
 
 .virtual-list.scroll-fade {

@@ -18,6 +18,7 @@
   --ui-line-normal: 1.6;
   --ui-sidebar-width: 18rem;
   --ui-chat-width: calc(54rem + calc(var(--ui-space-unit) * 4) * 2);
+  --ui-table-cell-max-width: 36ch;
   --ui-icon-size: 1.125rem;
   --ui-control-size: 2.25rem;
   --ui-radius-xl: 0.75rem;

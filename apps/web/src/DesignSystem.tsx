@@ -324,6 +324,13 @@ const messageFixtures: DisplayMessage[] = [
 const richText =
   '### A small plan\n\nUse **bold**, *italic*, ~~strikethrough~~, and `inline code`. Links include a favicon: [GitHub](https://github.com).\n\n> Leave enough room to change your mind.\n\n- [x] Pick a place\n- [ ] Check the weather\n\n| Time | Plan |\n| --- | --- |\n| Morning | Coffee and a walk |\n| Afternoon | Bookstore |\n\n```typescript\nconst weekend = { pace: "slow", reservations: false };\nconsole.log("There is time to stop and explore", weekend);\n```\n\n```bash\nbun run dev:web\n```\n\nCurrency stays prose: your $10 suggestion makes sense over $7.\n\nInline math: $a^2 + b^2 = c^2$.\n\n$$\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n$$\n\n```mermaid\nflowchart LR\n  Coffee --> Walk --> Bookstore\n```';
 
+const tableExample = [
+  "| Restaurant | Location | Budget per person | Why consider it |",
+  "| --- | --- | ---: | --- |",
+  "| **時時香 SHANN Rice Bar** | Main building **9F** | **NT$600–850** | **Good for a mixed group.** Taiwanese, Sichuan and Cantonese sharing dishes let everyone order a varied spread. Some dishes are spicy, but the whole meal does not need to be. |",
+  "| Garden Kitchen | Station **2F** | NT$400–600 | Set meals, vegetarian options, and plenty of room for six people. |",
+].join("\n");
+
 const alertExamples = [
   "> [!NOTE]\n> Keep useful context close to the conversation.",
   "> [!TIP]\n> Use **Shift + Enter** to add a new line.",
@@ -1551,6 +1558,12 @@ export default function DesignSystem() {
                     </LinkPreviewAnchor>
                   </div>
                   <Markdown text={richText} />
+                  <Specimen title="Table with long descriptions">
+                    <Markdown text={tableExample} />
+                  </Specimen>
+                  <Specimen title="Table in a wrapped preview">
+                    <Markdown text={tableExample} wrap />
+                  </Specimen>
                   <Specimen title="GitHub alerts">
                     <Markdown text={alertExamples} />
                   </Specimen>
