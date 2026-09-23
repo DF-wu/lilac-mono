@@ -1,7 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import {
+  BlobAdapterFailure,
+  BlobDeleteFailed,
+  createMemoryBlobStore,
+  type BlobStore,
+} from "@stanley2058/lilac-blob-storage";
+import { corePreparedRequestEnvelopeSchema } from "../bridge/request-delivery/core-integration";
 import { Result, type Result as ResultType } from "better-result";
 import {
+  EventPublishContractInvalid,
+  EventPublishTransportFailed,
   lilacEventTypes,
   storedMessagesV1Schema,
   type CmdRequestMessageData,
@@ -26,7 +35,7 @@ function value<T, E>(result: ResultType<T, E>): T {
   });
 }
 
-function fixture() {
+function fixture(blobStore?: BlobStore) {
   let now = 1_000;
   let maxAgeMs: number | undefined;
   const store = new NativeStore(new Database(":memory:"), () => now);
@@ -54,11 +63,13 @@ function fixture() {
   const published: { data: CmdRequestMessageData; headers: Record<string, string> }[] = [];
   let cancellations = 0;
   let cancellationFailure: Error | undefined;
+  let publicationFailure: EventPublishContractInvalid | EventPublishTransportFailed | undefined;
   const bus: Pick<LilacBus, "publish"> = {
     publish: async (type, data, options) => {
       if (type === lilacEventTypes.CmdRequestMessage) {
         published.push({ data: data as CmdRequestMessageData, headers: options?.headers ?? {} });
       }
+      if (publicationFailure) return Result.err(publicationFailure);
       return Result.ok({
         id: String(published.length),
         cursor: String(published.length),
@@ -69,6 +80,7 @@ function fixture() {
   const execution = createNativeExecution({
     store,
     transcriptStore: transcripts,
+    blobStore,
     bus,
     now: () => now,
     getOldMessageSelectionMaxAgeMs: () => maxAgeMs,
@@ -133,6 +145,9 @@ function fixture() {
     setMaxAge: (value: number | undefined) => {
       maxAgeMs = value;
     },
+    failPublication: (error: EventPublishContractInvalid | EventPublishTransportFailed) => {
+      publicationFailure = error;
+    },
     failCancellation: (error?: Error) => {
       cancellationFailure = error;
     },
@@ -144,6 +159,112 @@ function fixture() {
 }
 
 describe("native execution admission", () => {
+  test.each(["published", "invalid", "transport", "cleanup"] as const)(
+    "prepares retained blob history and preserves ownership: %s",
+    async (outcome) => {
+      const blobs = value(await createMemoryBlobStore());
+      const f = fixture(blobs);
+      const deletion = spyOn(blobs, "delete");
+      try {
+        f.submit("first");
+        value(await f.execution.kick(f.thread.id));
+        const first = f.request();
+        const upload = value(
+          await blobs.startUpload({
+            source: new TextEncoder().encode("retained file"),
+            retention: { kind: "durable" },
+          }),
+        );
+        const ref = value(await blobs.resolve(upload.handle, { timeoutMs: 1_000 }));
+        const file = { type: "blob" as const, blob: ref, mediaType: "text/plain" };
+        const canonical: StoredMessageV1[] = [
+          { role: "user", content: [file] },
+          { role: "assistant", content: [file] },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: "call",
+                toolName: "inspect",
+                output: { type: "content", value: [file] },
+              },
+            ],
+          },
+        ];
+        value(
+          f.transcripts.saveRequestTranscript({
+            requestId: first.requestId,
+            sessionId: first.sessionId,
+            requestClient: "native",
+            messages: canonical,
+          }),
+        );
+        value(await f.execution.runnerLifecycle.settled(first, "completed"));
+        f.submit("follow-up");
+        const failure =
+          outcome === "transport"
+            ? new EventPublishTransportFailed({
+                cause: new Error("offline"),
+                eventType: lilacEventTypes.CmdRequestMessage,
+                topic: "cmd.request",
+                message: "publication uncertain",
+              })
+            : new EventPublishContractInvalid({
+                eventType: lilacEventTypes.CmdRequestMessage,
+                message: "invalid envelope",
+              });
+        if (outcome !== "published") f.failPublication(failure);
+        if (outcome === "cleanup")
+          deletion.mockResolvedValue(
+            Result.err(
+              new BlobDeleteFailed({
+                objectId: ref.objectId,
+                failure: new BlobAdapterFailure({
+                  adapter: "memory",
+                  kind: "io",
+                  operation: "delete",
+                  message: "delete failed",
+                }),
+                message: "delete failed",
+              }),
+            ),
+          );
+        const result = await f.execution.kick(f.thread.id);
+        if (outcome === "published") value(result);
+        else if (outcome === "cleanup") {
+          const error = result.match({ ok: () => undefined, err: (error) => error });
+          expect(error).toBeInstanceOf(AggregateError);
+          if (!(error instanceof AggregateError)) throw new Error("Expected aggregate error");
+          expect(error.errors[0]).toBe(failure);
+          expect(error.errors[1].name).toBe("DiscordRequestBlobCleanupFailed");
+        } else expect(result.match({ ok: () => undefined, err: (error) => error })).toBe(failure);
+        expect(deletion).toHaveBeenCalledTimes(
+          outcome === "invalid" || outcome === "cleanup" ? 3 : 0,
+        );
+        const publication = f.published.at(-1)!;
+        expect(corePreparedRequestEnvelopeSchema.safeParse(publication).success).toBe(true);
+        const part = publication.data.messages[0]!.content[0];
+        if (typeof part === "string" || part?.type !== "blob") throw new Error("Expected blob");
+        if (outcome === "invalid") {
+          expect((await blobs.resolve(part.blob, { timeoutMs: 1_000 })).isErr()).toBe(true);
+        } else {
+          const copied = value(await blobs.resolve(part.blob, { timeoutMs: 1_000 }));
+          expect(copied.sha256).toBe(ref.sha256);
+          expect(copied.objectId).not.toBe(ref.objectId);
+        }
+        expect(value(await blobs.resolve(upload.handle, { timeoutMs: 1_000 }))).toEqual(ref);
+        expect(
+          value(f.transcripts.getRequestTranscript({ requestId: first.requestId }))?.messages,
+        ).toEqual(canonical);
+      } finally {
+        deletion.mockRestore();
+        f.close();
+        value(await blobs.close({ deadlineAtMs: Date.now() + 1_000 }));
+      }
+    },
+  );
+
   test("attributes multiple speakers and steering, escapes body tags, and retains canonical attribution", async () => {
     const f = fixture();
     try {

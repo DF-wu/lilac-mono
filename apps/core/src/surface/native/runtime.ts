@@ -173,6 +173,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     store,
     bus: options.bus,
     transcriptStore: options.transcript,
+    blobStore: options.blobs,
     runner: options.runner,
     customCommands: options.customCommands,
     validateSkill: (id) => skills.some((skill) => skill.name === id),
