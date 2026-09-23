@@ -242,7 +242,7 @@ export type ConversationThreadToolService = {
   planAutoInjectSearch(
     input: Parameters<ConversationThreadService["planAutoInjectSearch"]>[0],
   ): Promise<ConversationThreadAutoInjectQueryPlan>;
-  getAutoInjectRankingCorpusDocuments?(): readonly string[];
+  getAutoInjectRankingCorpusDocuments?(): readonly string[] | Promise<readonly string[]>;
 };
 
 export type ConversationThreadSearchResult = {
@@ -259,6 +259,7 @@ export type ConversationThreadSearchResult = {
     queryAboutnessError?: string;
   };
   results: Array<{
+    surface: "discord" | "native";
     threadId: string;
     title: string;
     brief: string;
@@ -335,6 +336,7 @@ type ConversationThreadSearchHitWithAttribution = ConversationThreadSearchHit & 
 
 export type ConversationThreadReadOutput = {
   thread: {
+    surface: "discord" | "native";
     threadId: string;
     title?: string;
     brief?: string;
@@ -452,17 +454,19 @@ export type ConversationThreadSummarizer = (input: {
   omittedMessages?: number;
 }) => Promise<ConversationThreadSummaryInput>;
 
+export type ConversationThreadSummaryAttachment = DiscordAttachmentMeta & { data?: Uint8Array };
+
 export type ConversationThreadSummaryMessage = Omit<ConversationThreadMessage, "attachments"> & {
-  attachments: DiscordAttachmentMeta[];
+  attachments: ConversationThreadSummaryAttachment[];
 };
 
 export type ConversationThreadAttachmentHydrator = (input: {
-  refs: readonly { channelId: string; messageId: string }[];
+  refs: readonly { surface?: "discord" | "native"; channelId: string; messageId: string }[];
 }) => Promise<
   ResultType<
     Array<{
-      ref: { channelId: string; messageId: string };
-      attachments: DiscordAttachmentMeta[];
+      ref: { surface?: "discord" | "native"; channelId: string; messageId: string };
+      attachments: ConversationThreadSummaryAttachment[];
     }>,
     ConversationThreadOperationFailed
   >
@@ -837,6 +841,24 @@ export async function buildThreadSummaryModelMessages(input: {
     const message = input.messages[index]!;
     content.push({ type: "text", text: formatMessageForSummary(message) });
     for (const attachment of message.attachments) {
+      if (message.surface === "native" && !attachment.data) {
+        content.push({
+          type: "text",
+          text: attachmentMetadataText({
+            filename: attachment.filename,
+            mediaType: attachment.mimeType,
+            size: attachment.size,
+            surface: "native",
+            reason: "content unavailable or exceeds attachment limits",
+          }),
+        });
+        continue;
+      }
+      if (attachment.data)
+        attachmentState.cache.set(attachment.url, {
+          bytes: attachment.data,
+          mimeType: attachment.mimeType,
+        });
       const mediaType = attachment.mimeType?.split(";", 1)[0]?.trim().toLowerCase();
       let modality: "image" | "pdf" | null = null;
       if (mediaType?.startsWith("image/")) modality = "image";
@@ -863,6 +885,8 @@ export async function buildThreadSummaryModelMessages(input: {
 }
 
 function attachmentMetadataText(input: {
+  surface?: "discord" | "native";
+  reason?: string;
   filename?: string;
   mediaType?: string;
   size?: number;
@@ -872,7 +896,7 @@ function attachmentMetadataText(input: {
     input.mediaType ? `mime="${input.mediaType.replace(/[\n\r"\\]/gu, "_")}"` : null,
     input.size !== undefined ? `size=${input.size}` : null,
   ].filter((field): field is string => field !== null);
-  return `[discord_attachment ${fields.join(" ")}]\n(attachment omitted: utility model does not support this media type)`;
+  return `[${input.surface ?? "discord"}_attachment ${fields.join(" ")}]\n(attachment omitted: ${input.reason ?? "utility model does not support this media type"})`;
 }
 
 function supportsUtilityModelAttachment(
@@ -1419,6 +1443,8 @@ function shouldAllowDiscordThread(
 }
 
 function buildSearchFilters(input: {
+  surface?: "discord" | "native";
+  participantSurface?: "discord" | "native";
   sessionId?: string;
   participantId?: string;
   participantIdsAny?: readonly string[];
@@ -1426,6 +1452,8 @@ function buildSearchFilters(input: {
   afterTs?: number;
 }): ConversationThreadSearchFilters {
   return {
+    surface: input.surface ?? (input.sessionId?.startsWith("native:") ? "native" : undefined),
+    participantSurface: input.participantSurface,
     sessionId: input.sessionId?.trim() || undefined,
     participantId: input.participantId?.trim() || undefined,
     participantIdsAny: input.participantIdsAny,
@@ -1852,6 +1880,8 @@ export class ConversationThreadService {
   ) {}
 
   async search(input: {
+    surface?: "discord" | "native";
+    participantSurface?: "discord" | "native";
     query: string | readonly string[];
     limit?: number;
     sessionId?: string;
@@ -1910,7 +1940,13 @@ export class ConversationThreadService {
           mode,
           candidateCount: recalled.length,
         });
-    const hits = this.applyAboutnessCoverage(recalled, queryAboutness)
+    this.params.store.refreshNativeThreads();
+    const currentHits = recalled.filter(
+      (hit) =>
+        hit.kind !== "native_thread" ||
+        this.params.store.getThread(hit.threadId)?.summary_input_hash === hit.sourceRevision,
+    );
+    const hits = this.applyAboutnessCoverage(currentHits, queryAboutness)
       .filter((hit) => hit.score >= minScore)
       .slice(0, limit);
     const result = {
@@ -1969,8 +2005,9 @@ export class ConversationThreadService {
     return planned.map(normalizeAutoInjectQueryPlan);
   }
 
-  getAutoInjectRankingCorpusDocuments(): readonly string[] {
-    return this.params.store.listAutoInjectRankingDocuments();
+  async getAutoInjectRankingCorpusDocuments(): Promise<readonly string[]> {
+    const cfg = await this.params.getConfig();
+    return this.params.store.listAutoInjectRankingDocuments(buildSearchAllowlist(cfg));
   }
 
   async read(input: {
@@ -1981,6 +2018,7 @@ export class ConversationThreadService {
     const cfg = await this.params.getConfig();
     const offset = Math.max(0, Math.floor(input.offset ?? 0));
     const limit = Math.min(200, Math.max(1, Math.floor(input.limit ?? DEFAULT_READ_LIMIT)));
+    this.params.store.refreshNativeThreads();
     const result = this.params.store.readThread(input.threadId, offset, limit);
     return result.andThen((value) => {
       if (!value) {
@@ -1992,6 +2030,7 @@ export class ConversationThreadService {
         );
       }
       if (
+        value.thread.kind !== "native_thread" &&
         !shouldAllowDiscordThread(cfg, {
           channelId: value.thread.channel_id,
           parentChannelId: value.thread.parent_channel_id,
@@ -2028,11 +2067,14 @@ export class ConversationThreadService {
           userId: message.userId,
           userName: message.userName,
           time: formatTime(message.ts),
-          content: stripUserThreadContinueDirective({
-            message,
-            cfg,
-            botMentionNames,
-          }),
+          content:
+            value.thread.kind === "native_thread"
+              ? message.text
+              : stripUserThreadContinueDirective({
+                  message,
+                  cfg,
+                  botMentionNames,
+                }),
         })),
       });
     });
@@ -2042,6 +2084,7 @@ export class ConversationThreadService {
     threadIds: readonly string[];
   }): Promise<ResultType<ConversationThreadMetadataOutput, ConversationThreadMetadataError>> {
     const cfg = await this.params.getConfig();
+    this.params.store.refreshNativeThreads();
     const threadIds = normalizeMetadataThreadIds(input);
     if (threadIds.length === 0) {
       return Result.err(
@@ -2062,6 +2105,7 @@ export class ConversationThreadService {
       }
 
       if (
+        thread.kind !== "native_thread" &&
         !shouldAllowDiscordThread(cfg, {
           channelId: thread.channel_id,
           parentChannelId: thread.parent_channel_id,
@@ -2095,6 +2139,7 @@ export class ConversationThreadService {
   async runSummarization(
     input: ConversationThreadRunSummarizationInput = {},
   ): Promise<ConversationThreadRunSummarizationResult> {
+    this.params.store.refreshNativeThreads();
     const jobId = input.jobId;
     const cfg = await this.params.getConfig();
     const refreshed = { channels: 0, threads: 0, messages: 0 };
@@ -2327,10 +2372,10 @@ export class ConversationThreadService {
                 const hydrationError = hydrated.match({ ok: () => null, err: (error) => error });
                 if (hydrationError) return Result.err(hydrationError);
                 const hydratedMessages = hydrated.match({ ok: (value) => value, err: () => [] });
-                const summaryMessages = this.normalizeMessagesForSummarization(
-                  hydratedMessages,
-                  cfg,
-                );
+                const summaryMessages =
+                  thread.kind === "native_thread"
+                    ? hydratedMessages
+                    : this.normalizeMessagesForSummarization(hydratedMessages, cfg);
                 this.logger.debug("thread summary generation started", {
                   jobId,
                   threadId: thread.thread_id,
@@ -2588,7 +2633,11 @@ export class ConversationThreadService {
   ): Promise<ResultType<ConversationThreadSummaryMessage[], ConversationThreadOperationFailed>> {
     const refs = messages
       .filter((message) => message.attachments.length > 0)
-      .map((message) => ({ channelId: message.channelId, messageId: message.messageId }));
+      .map((message) => ({
+        ...(message.surface === "native" ? { surface: "native" as const } : {}),
+        channelId: message.channelId,
+        messageId: message.messageId,
+      }));
     if (refs.length === 0) {
       return Result.ok(messages.map((message) => ({ ...message, attachments: [] })));
     }
@@ -2603,7 +2652,10 @@ export class ConversationThreadService {
     const hydrated = await this.params.attachmentHydrator({ refs });
     return hydrated.andThen((items) => {
       const byRef = new Map(
-        items.map((item) => [`${item.ref.channelId}\u001f${item.ref.messageId}`, item]),
+        items.map((item) => [
+          `${item.ref.surface ?? "discord"}\u001f${item.ref.channelId}\u001f${item.ref.messageId}`,
+          item,
+        ]),
       );
       const output: ConversationThreadSummaryMessage[] = [];
       for (const message of messages) {
@@ -2611,7 +2663,9 @@ export class ConversationThreadService {
           output.push({ ...message, attachments: [] });
           continue;
         }
-        const item = byRef.get(`${message.channelId}\u001f${message.messageId}`);
+        const item = byRef.get(
+          `${message.surface ?? "discord"}\u001f${message.channelId}\u001f${message.messageId}`,
+        );
         if (!item) {
           return Result.err(
             conversationThreadOperationFailed(
@@ -2836,6 +2890,7 @@ export class ConversationThreadService {
     const candidates = new Map<string, ConversationThreadSearchHit>();
     const add = (hit: ConversationThreadSearchHit) => {
       if (
+        hit.kind !== "native_thread" &&
         !shouldAllowDiscordThread(input.cfg, {
           channelId: hit.channelId,
           parentChannelId: hit.parentChannelId,
@@ -3041,6 +3096,7 @@ export class ConversationThreadService {
   private formatSearchHit(hit: ConversationThreadSearchHitWithAttribution, verbose: boolean) {
     return {
       threadId: hit.threadId,
+      surface: hit.kind === "native_thread" ? ("native" as const) : ("discord" as const),
       title: hit.title,
       brief: hit.brief,
       ...(verbose
@@ -3061,7 +3117,7 @@ export class ConversationThreadService {
             ...(hit.queryAttribution ? { queryAttribution: hit.queryAttribution } : {}),
             ...(hit.aboutnessCoverage ? { aboutnessCoverage: hit.aboutnessCoverage } : {}),
             session: {
-              platform: "discord" as const,
+              platform: hit.kind === "native_thread" ? ("native" as const) : ("discord" as const),
               channelId: hit.channelId,
               guildId: hit.guildId,
               parentChannelId: hit.parentChannelId,
@@ -3086,6 +3142,7 @@ export class ConversationThreadService {
   }): ConversationThreadReadOutput["thread"] {
     return {
       threadId: input.thread.thread_id,
+      surface: input.thread.kind === "native_thread" ? "native" : "discord",
       ...(input.summary
         ? {
             title: input.summary.title,
@@ -3098,7 +3155,7 @@ export class ConversationThreadService {
           }
         : {}),
       session: {
-        platform: "discord",
+        platform: input.thread.kind === "native_thread" ? "native" : "discord",
         channelId: input.thread.channel_id,
         guildId: input.thread.guild_id ?? undefined,
         parentChannelId: input.thread.parent_channel_id ?? undefined,

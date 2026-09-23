@@ -1,3 +1,9 @@
+import {
+  installNativeConversationSource,
+  readNativeConversationThreads,
+  readNativeConversationMessages,
+  readNativeConversationAttachments,
+} from "../surface/native/conversation-source";
 import { SUMMARY_QUIET_MS } from "./thread-summary-policy";
 import { CONVERSATION_FACET_WEIGHTS as FACET_WEIGHTS } from "./thread-search-weights";
 import { Database } from "bun:sqlite";
@@ -57,7 +63,7 @@ function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
 export const CONVERSATION_THREAD_SUMMARY_VERSION = 5;
 export const CONVERSATION_THREAD_EMBEDDING_VERSION = 1;
 
-export type ConversationThreadKind = "discord_thread" | "inferred_channel_thread";
+export type ConversationThreadKind = "discord_thread" | "inferred_channel_thread" | "native_thread";
 
 export type ConversationThreadRepairKind = "content" | "topology";
 
@@ -117,6 +123,7 @@ export type ConversationThreadSummarizationEligibility = {
 export type ConversationThreadSummaryRow = PersistedConversationThreadSummaryRow;
 
 export type ConversationThreadMessage = {
+  surface?: "discord" | "native";
   channelId: string;
   messageId: string;
   ordinal: number;
@@ -163,6 +170,7 @@ export type ConversationThreadSearchHit = {
   guildId?: string;
   parentChannelId?: string;
   kind: ConversationThreadKind;
+  sourceRevision?: string;
   title: string;
   brief: string;
   topics: string[];
@@ -183,6 +191,8 @@ export type ConversationThreadSearchHit = {
 };
 
 export type ConversationThreadSearchFilters = {
+  surface?: "discord" | "native";
+  participantSurface?: "discord" | "native";
   sessionId?: string;
   participantId?: string;
   participantIdsAny?: readonly string[];
@@ -239,6 +249,7 @@ const SEMANTIC_SIMILARITY_FLOOR = 0.15;
 
 export type ConversationThreadStoreOptions = {
   surfaceDbPath?: string;
+  nativeDbPath?: string;
   mainAgentUserNames?: readonly string[];
   onPersistenceDiagnostic?: (diagnostic: ConversationThreadPersistenceDiagnostic) => void;
 };
@@ -368,7 +379,12 @@ function computeSummaryHash(summary: ConversationThreadSummary): string {
 }
 
 function computeFacetHash(facets: readonly ConversationThreadFacetInput[]): string {
-  return stableHash(facets.map((facet) => [facet.facet, facet.text].join("\u001f")).join("\u001e"));
+  return stableHash(
+    [...facets]
+      .sort((a, b) => a.facet.localeCompare(b.facet))
+      .map((facet) => [facet.facet, facet.text].join("\u001f"))
+      .join("\u001e"),
+  );
 }
 
 function facetWeightSql(alias: string): string {
@@ -638,6 +654,7 @@ export class ConversationThreadStore {
   private readonly searchDbPath: string;
   private readonly surfaceDbPath?: string;
   private readonly mainAgentUserNames: ReadonlySet<string>;
+  private hasNativeSource = false;
   private readonly onPersistenceDiagnostic: (
     diagnostic: ConversationThreadPersistenceDiagnostic,
   ) => void;
@@ -663,6 +680,65 @@ export class ConversationThreadStore {
     this.hasSurfaceDb = this.attachSurfaceDb();
     this.loadVectorExtension();
     this.migrate();
+    installNativeConversationSource(this.db, options.nativeDbPath);
+    this.hasNativeSource = options.nativeDbPath !== undefined;
+    this.installMessageSource();
+  }
+
+  attachNativeSource(databasePath: string): void {
+    installNativeConversationSource(this.db, databasePath);
+    this.hasNativeSource = true;
+  }
+
+  private installMessageSource(): void {
+    this.db.run(`CREATE TEMP VIEW conversation_source_messages AS
+      SELECT 'discord' AS surface, channel_id,message_id,user_id,user_name,text,ts,deleted
+      FROM discord_search_messages
+      UNION ALL SELECT 'native',channel_id,message_id,user_id,user_name,text,ts,0
+      FROM native_conversation_messages`);
+  }
+
+  refreshNativeThreads(): void {
+    if (!this.hasNativeSource) return;
+    this.db.transaction(() => this.materializeNativeThreads())();
+  }
+
+  private materializeNativeThreads(): void {
+    const threads = selectResultValue(readNativeConversationThreads(this.db));
+    const activeIds = new Set(threads.map((thread) => `native:${thread.id}`));
+    for (const row of this.db
+      .query<{ thread_id: string }, []>(
+        "SELECT thread_id FROM conversation_threads WHERE kind='native_thread'",
+      )
+      .all()) {
+      if (!activeIds.has(row.thread_id)) this.deleteThread(row.thread_id);
+    }
+    for (const thread of threads) {
+      const threadId = `native:${thread.id}`;
+      const existing = this.getThread(threadId);
+      const hash = `native:${stableHash(thread.revision)}`;
+      const sourceMessages = selectResultValue(readNativeConversationMessages(this.db, thread.id));
+      if (existing?.summary_input_hash === hash) continue;
+      const messages: IndexedMessageRow[] = sourceMessages.map((message) => ({
+        ...message,
+        guild_id: null,
+        parent_channel_id: null,
+        session_type: "thread",
+        edited_ts: null,
+        updated_ts: thread.updated_at,
+        attachments_hash: null,
+        is_chat: 1,
+        reply_to_channel_id: null,
+        reply_to_message_id: null,
+      }));
+      // Rebuild changed native entries so removed text cannot survive in a previous summary.
+      this.deleteThread(threadId);
+      this.upsertThread({ threadId, kind: "native_thread", parentChannelId: null, messages });
+      this.db.run(
+        "UPDATE conversation_threads SET summary_input_hash=?,updated_at=?,end_ts=? WHERE thread_id=?",
+        [hash, thread.updated_at, thread.updated_at, threadId],
+      );
+    }
   }
 
   close(): void {
@@ -783,6 +859,25 @@ export class ConversationThreadStore {
   }
 
   private migrate(): void {
+    const reset = this.db.transaction(() => {
+      const current = this.db
+        .query("SELECT name FROM sqlite_master WHERE name='conversation_index_v2'")
+        .get();
+      if (current) return;
+      for (const table of [
+        "conversation_thread_facets_fts",
+        "conversation_thread_embeddings",
+        "conversation_thread_facets",
+        "conversation_thread_summaries",
+        "conversation_thread_messages",
+        "conversation_threads",
+      ])
+        this.db.run(`DROP TABLE IF EXISTS ${table}`);
+      this.db.run("CREATE TABLE conversation_index_v2 (version INTEGER NOT NULL)");
+      this.db.run("INSERT INTO conversation_index_v2 VALUES (2)");
+    });
+    reset();
+
     this.db.run(`
       CREATE TABLE IF NOT EXISTS conversation_threads (
         thread_id TEXT PRIMARY KEY,
@@ -1304,6 +1399,7 @@ export class ConversationThreadStore {
   }
 
   getThread(threadId: string): ConversationThreadRow | null {
+    if (threadId.startsWith("native:") && !this.hasNativeSource) return null;
     return this.db
       .query<ConversationThreadRow, [string]>(
         "SELECT * FROM conversation_threads WHERE thread_id = ?",
@@ -1339,8 +1435,8 @@ export class ConversationThreadStore {
       .query<{ threadId: string; ordinal: number; authorId: string }, [string, string]>(`
       SELECT tm.thread_id AS threadId, tm.ordinal, m.user_id AS authorId
       FROM conversation_thread_messages tm
-      JOIN discord_search_messages m ON m.channel_id = tm.channel_id AND m.message_id = tm.message_id
-      WHERE tm.channel_id = ? AND tm.message_id = ? AND m.deleted = 0
+      JOIN conversation_source_messages m ON m.channel_id = tm.channel_id AND m.message_id = tm.message_id AND m.surface = CASE WHEN tm.thread_id LIKE 'native:%' THEN 'native' ELSE 'discord' END
+      WHERE tm.channel_id = ? AND tm.message_id = ? AND m.deleted = 0 AND m.surface = 'discord'
       ORDER BY tm.thread_id LIMIT 1
     `)
       .get(channelId, messageId);
@@ -1354,7 +1450,7 @@ export class ConversationThreadStore {
       .query<{ messageId: string; ordinal: number; authorId: string }, [string, number]>(`
       SELECT tm.message_id AS messageId, tm.ordinal, m.user_id AS authorId
       FROM conversation_thread_messages tm
-      JOIN discord_search_messages m ON m.channel_id = tm.channel_id AND m.message_id = tm.message_id
+      JOIN conversation_source_messages m ON m.channel_id = tm.channel_id AND m.message_id = tm.message_id AND m.surface = CASE WHEN tm.thread_id LIKE 'native:%' THEN 'native' ELSE 'discord' END
       WHERE tm.thread_id = ? AND tm.ordinal < ? AND m.deleted = 0
       ORDER BY tm.ordinal DESC LIMIT 200
     `)
@@ -1376,9 +1472,9 @@ export class ConversationThreadStore {
           m.text,
           m.ts
         FROM conversation_thread_messages tm
-        JOIN discord_search_messages m
+        JOIN conversation_source_messages m
           ON m.channel_id = tm.channel_id
-         AND m.message_id = tm.message_id
+         AND m.message_id = tm.message_id AND m.surface = CASE WHEN tm.thread_id LIKE 'native:%' THEN 'native' ELSE 'discord' END
         WHERE tm.thread_id = ?
           AND m.deleted = 0
         ORDER BY tm.ordinal ASC
@@ -1396,6 +1492,7 @@ export class ConversationThreadStore {
     }>;
 
     return rows.map((row) => ({
+      surface: threadId.startsWith("native:") ? "native" : "discord",
       channelId: row.channel_id,
       messageId: row.message_id,
       ordinal: row.ordinal,
@@ -1403,7 +1500,11 @@ export class ConversationThreadStore {
       userName: row.user_name ?? undefined,
       text: row.text,
       ts: row.ts,
-      attachments: this.listMessageAttachments(row.channel_id, row.message_id),
+      attachments: threadId.startsWith("native:")
+        ? selectResultValue(
+            readNativeConversationAttachments(this.db, row.channel_id, row.message_id),
+          )
+        : this.listMessageAttachments(row.channel_id, row.message_id),
     }));
   }
 
@@ -1443,9 +1544,9 @@ export class ConversationThreadStore {
         `
         SELECT COUNT(1) AS c
         FROM conversation_thread_messages tm
-        JOIN discord_search_messages m
+        JOIN conversation_source_messages m
           ON m.channel_id = tm.channel_id
-         AND m.message_id = tm.message_id
+         AND m.message_id = tm.message_id AND m.surface = CASE WHEN tm.thread_id LIKE 'native:%' THEN 'native' ELSE 'discord' END
         WHERE tm.thread_id = ?
           AND m.deleted = 0
         `,
@@ -1560,6 +1661,7 @@ export class ConversationThreadStore {
     embeddingModelId?: string;
     force?: boolean;
   }): ConversationThreadSummarizationEligibility[] {
+    this.refreshNativeThreads();
     const now = input?.now ?? Date.now();
     const quietMs = input?.quietMs ?? SUMMARY_QUIET_MS;
     const embeddingModelId =
@@ -1580,6 +1682,7 @@ export class ConversationThreadStore {
     const clauses = [
       "(CASE WHEN t.last_summarized_at IS NULL THEN t.end_ts ELSE t.updated_at END) <= ?",
       "t.message_count > 1",
+      "(t.kind!='native_thread' OR EXISTS(SELECT 1 FROM native_conversation_threads n WHERE n.id=t.channel_id AND n.active=0))",
     ];
     if (input?.force !== true) {
       clauses.push("(t.maintenance_retry_after IS NULL OR t.maintenance_retry_after <= ?)");
@@ -1757,6 +1860,7 @@ export class ConversationThreadStore {
     ConversationThreadSummaryWriteResult | null,
     ConversationThreadSqliteDriverFailure
   > {
+    this.refreshNativeThreads();
     const normalized = normalizeSummary(summary);
     const now = Date.now();
     const topicsJson = JSON.stringify(normalized.topics);
@@ -1904,17 +2008,19 @@ export class ConversationThreadStore {
     }));
   }
 
-  listAutoInjectRankingDocuments(): string[] {
+  listAutoInjectRankingDocuments(allowlist?: ConversationThreadSearchAllowlist): string[] {
+    this.refreshNativeThreads();
+    const filter = buildSearchFilterClause(undefined, allowlist);
     const rows = this.db
       .query(
         `
-        SELECT text
-        FROM conversation_thread_facets
-        WHERE facet = 'combined'
-        ORDER BY thread_id ASC
+        SELECT f.text
+        FROM conversation_thread_facets f JOIN conversation_threads t ON t.thread_id=f.thread_id
+        WHERE f.facet = 'combined' AND ${filter.sql}
+        ORDER BY f.thread_id ASC
         `,
       )
-      .all() as Array<{ text: string }>;
+      .all(...filter.values) as Array<{ text: string }>;
     return rows.map((row) => row.text);
   }
 
@@ -1933,6 +2039,12 @@ export class ConversationThreadStore {
       embedding: Float32Array;
     }>;
   }): void {
+    this.refreshNativeThreads();
+    if (
+      input.threadId.startsWith("native:") &&
+      this.computeEmbeddingInputHash(input.threadId) !== input.embeddingInputHash
+    )
+      return;
     const now = Date.now();
     const tx = this.db.transaction(() => {
       this.db.run("DELETE FROM conversation_thread_embeddings WHERE thread_id = ?", [
@@ -1970,6 +2082,7 @@ export class ConversationThreadStore {
     filters?: ConversationThreadSearchFilters;
     allowlist?: ConversationThreadSearchAllowlist;
   }): ResultType<ConversationThreadSearchHit[], PersistedDataError> {
+    this.refreshNativeThreads();
     const ftsQuery = normalizeFtsQuery(input.query);
     if (!ftsQuery) return Result.ok([]);
 
@@ -2029,6 +2142,7 @@ export class ConversationThreadStore {
         guildId: row.guild_id ?? undefined,
         parentChannelId: row.parent_channel_id ?? undefined,
         kind: row.kind,
+        sourceRevision: row.summary_input_hash ?? undefined,
         title: summary.title,
         brief: summary.brief,
         topics: summary.topics,
@@ -2059,6 +2173,7 @@ export class ConversationThreadStore {
     filters?: ConversationThreadSearchFilters;
     allowlist?: ConversationThreadSearchAllowlist;
   }): ResultType<ConversationThreadSearchHit[], PersistedDataError> {
+    this.refreshNativeThreads();
     if (!this.vectorLoaded) return Result.ok([]);
 
     const limit = Math.min(SEARCH_LIMIT_MAX, Math.max(1, Math.floor(input.limit ?? 5)));
@@ -2127,6 +2242,7 @@ export class ConversationThreadStore {
         guildId: row.guild_id ?? undefined,
         parentChannelId: row.parent_channel_id ?? undefined,
         kind: row.kind,
+        sourceRevision: row.summary_input_hash ?? undefined,
         title: summary.title,
         brief: summary.brief,
         topics: summary.topics,
@@ -2157,7 +2273,9 @@ function buildSearchFilterClause(
   sql: string;
   values: Array<string | number>;
 } {
-  const clauses: string[] = [];
+  const clauses: string[] = [
+    "(t.kind!='native_thread' OR EXISTS(SELECT 1 FROM native_conversation_threads n WHERE n.id=t.channel_id))",
+  ];
   const values: Array<string | number> = [];
 
   const channelIds = allowlist?.channelIds.filter((id) => id.trim().length > 0) ?? [];
@@ -2176,12 +2294,17 @@ function buildSearchFilterClause(
       values.push(...guildIds);
     }
 
-    clauses.push(allowClauses.length > 0 ? `(${allowClauses.join(" OR ")})` : "0 = 1");
+    clauses.push(`(t.kind='native_thread' OR (${allowClauses.join(" OR ") || "0=1"}))`);
   }
 
+  if (filters?.surface) {
+    clauses.push(
+      filters.surface === "native" ? "t.kind='native_thread'" : "t.kind!='native_thread'",
+    );
+  }
   if (filters?.sessionId) {
     clauses.push("t.channel_id = ?");
-    values.push(filters.sessionId);
+    values.push(filters.sessionId.replace(/^(native|discord):/u, ""));
   }
 
   if (filters?.participantId) {
@@ -2189,9 +2312,9 @@ function buildSearchFilterClause(
       EXISTS (
         SELECT 1
         FROM conversation_thread_messages tm
-        JOIN discord_search_messages m
+        JOIN conversation_source_messages m
           ON m.channel_id = tm.channel_id
-         AND m.message_id = tm.message_id
+         AND m.message_id = tm.message_id AND m.surface = CASE WHEN tm.thread_id LIKE 'native:%' THEN 'native' ELSE 'discord' END
         WHERE tm.thread_id = t.thread_id
           AND m.deleted = 0
           AND m.user_id = ?
@@ -2206,18 +2329,21 @@ function buildSearchFilterClause(
     ),
   ];
   if (participantIdsAny.length > 0) {
+    let crossSurface = "";
+    if (filters?.participantSurface === "native") crossSurface = "1=1 OR ";
+    if (filters?.participantSurface === "discord") crossSurface = "t.kind='native_thread' OR ";
     const placeholders = participantIdsAny.map(() => "?").join(", ");
     clauses.push(`
-      EXISTS (
+      (${crossSurface}EXISTS (
         SELECT 1
         FROM conversation_thread_messages tm
-        JOIN discord_search_messages m
+        JOIN conversation_source_messages m
           ON m.channel_id = tm.channel_id
-         AND m.message_id = tm.message_id
+         AND m.message_id = tm.message_id AND m.surface = CASE WHEN tm.thread_id LIKE 'native:%' THEN 'native' ELSE 'discord' END
         WHERE tm.thread_id = t.thread_id
           AND m.deleted = 0
           AND m.user_id IN (${placeholders})
-      )
+      ))
     `);
     values.push(...participantIdsAny);
   }

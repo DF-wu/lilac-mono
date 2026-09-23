@@ -1564,6 +1564,7 @@ describe("conversation thread store", () => {
     };
     expect(Object.keys(compactSearch.results[0] ?? {}).sort()).toEqual([
       "brief",
+      "surface",
       "threadId",
       "title",
     ]);

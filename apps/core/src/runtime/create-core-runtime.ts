@@ -1,5 +1,4 @@
 import { nativeFailure } from "../surface/native/errors";
-import { withNativeThreadSummaries } from "./native-summarization";
 import { openNativeInstallation, type NativeInstallation } from "../surface/native/installation";
 import {
   createNativeRuntime,
@@ -3287,11 +3286,49 @@ export async function createCoreRuntime(
             > extends ResultType<infer Value, ConversationThreadOperationFailed>
               ? Value
               : never = [];
+            const hydrateNativeAt = async (
+              index: number,
+              ref: Parameters<ConversationThreadAttachmentHydrator>[0]["refs"][number],
+            ): Promise<ResultType<typeof hydrated, ConversationThreadOperationFailed>> => {
+              if (!nativeRuntime)
+                return Result.err(
+                  new ConversationThreadOperationFailed({
+                    operation: "summarize-thread",
+                    message: "Native conversation storage is unavailable",
+                  }),
+                );
+              const remainingBytes =
+                50 * 1024 * 1024 -
+                hydrated.reduce(
+                  (total, item) =>
+                    total +
+                    item.attachments.reduce(
+                      (sum, attachment) => sum + (attachment.data?.byteLength ?? 0),
+                      0,
+                    ),
+                  0,
+                );
+              const result = await nativeRuntime.hydrateConversationAttachments(
+                ref,
+                remainingBytes,
+              );
+              const decision = result.match<
+                | { kind: "value"; value: (typeof hydrated)[number] }
+                | { kind: "error"; error: ConversationThreadOperationFailed }
+              >({
+                ok: (value) => ({ kind: "value" as const, value }),
+                err: (error) => ({ kind: "error" as const, error }),
+              });
+              if (decision.kind === "error") return Result.err(decision.error);
+              hydrated.push(decision.value);
+              return hydrateAt(index + 1);
+            };
             const hydrateAt = async (
               index: number,
             ): Promise<ResultType<typeof hydrated, ConversationThreadOperationFailed>> => {
               const ref = input.refs[index];
               if (!ref) return Result.ok(hydrated);
+              if (ref.surface === "native") return hydrateNativeAt(index, ref);
               const read = await surfaceAdapter.readMsg({
                 platform: "discord",
                 ...ref,
@@ -3326,6 +3363,11 @@ export async function createCoreRuntime(
             };
             return await hydrateAt(0);
           };
+          const nativeConversationDbPath = nativeInstallation
+            ? path.join(env.dataDir, "native-surface.db")
+            : undefined;
+          if (nativeConversationDbPath)
+            activeConversationThreadStore.attachNativeSource(nativeConversationDbPath);
           const threadService = new ConversationThreadService({
             store: activeConversationThreadStore,
             getConfig: () => getCoreConfig(),
@@ -3365,6 +3407,8 @@ export async function createCoreRuntime(
               threadService.runSummarization(input),
             );
           stopConversationThreadSummarizationWorker = startConversationThreadSummarizationWorker({
+            nativeDbPath: nativeConversationDbPath,
+            attachmentHydrator: hydrateThreadAttachments,
             searchDbPath: discordSearchDbPath,
             surfaceDbPath: discordSurfaceDbPath,
             adapter: surfaceAdapter,
@@ -3435,11 +3479,6 @@ export async function createCoreRuntime(
               return await continueFlushed();
             },
           };
-          if (nativeRuntime)
-            conversationThreadSummarizationRunner = withNativeThreadSummaries(
-              conversationThreadSummarizationRunner,
-              nativeRuntime.refreshSummaries,
-            );
           stopDiscordSearchIndexer = await startDiscordSearchIndexer({
             eventSource: discordEventSource,
             search: discordSearchService,

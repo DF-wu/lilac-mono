@@ -8776,6 +8776,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
           },
           results: [
             {
+              surface: "discord" as const,
               threadId: "related-thread",
               title: "Relevant native continuation context",
               brief: "A deterministic auto-injected result.",
@@ -10066,6 +10067,7 @@ describe("buildAutoInjectedThreadSearchMessages", () => {
       toolCallId: "auto-thread-1",
       entries: [
         {
+          surface: "discord" as const,
           threadId: "thread-1",
           title: "Short thread title",
           brief: "Short thread brief",
@@ -10098,6 +10100,7 @@ describe("buildAutoInjectedThreadSearchMessages", () => {
       value: {
         entries: [
           {
+            surface: "discord" as const,
             threadId: "thread-1",
             title: "Short thread title",
             brief: "Short thread brief",
@@ -10144,7 +10147,7 @@ describe("buildAutoInjectedThreadSearchMessages", () => {
     );
     const injected = buildAutoInjectedThreadSearchMessages({
       toolCallId: "auto-thread-deterministic",
-      entries: [{ threadId: "thread-1", title: "Relevant thread" }],
+      entries: [{ surface: "discord" as const, threadId: "thread-1", title: "Relevant thread" }],
     });
     const storedInjected = transcriptResultValue(projectStoredMessagesV1(injected));
 
@@ -10187,7 +10190,7 @@ describe("buildAutoInjectedThreadSearchMessages", () => {
     const canonicalMessages = [{ role: "user", content: "current" }] satisfies ModelMessage[];
     const injectedMessages = buildAutoInjectedThreadSearchMessages({
       toolCallId: "auto-thread-invalid",
-      entries: [{ threadId: "thread-1", title: "Relevant thread" }],
+      entries: [{ surface: "discord" as const, threadId: "thread-1", title: "Relevant thread" }],
     });
     const complete = buildCoreLineageManifestV2([
       {
@@ -10460,6 +10463,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
           },
           results: [
             {
+              surface: "discord" as const,
               threadId: "thread-1",
               title: "Below display",
               brief: belowDisplayBrief,
@@ -10473,6 +10477,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
               },
             },
             {
+              surface: "discord" as const,
               threadId: "thread-2",
               title: "Near threshold",
               brief: nearThresholdBrief,
@@ -10486,6 +10491,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
               },
             },
             {
+              surface: "discord" as const,
               threadId: "thread-3",
               title: "Over threshold",
               brief: overThresholdBrief,
@@ -10525,16 +10531,19 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       value: {
         entries: [
           {
+            surface: "discord" as const,
             threadId: "thread-1",
             title: "Below display",
             brief: belowDisplayBrief,
           },
           {
+            surface: "discord" as const,
             threadId: "thread-2",
             title: "Near threshold",
             brief: nearThresholdBrief,
           },
           {
+            surface: "discord" as const,
             threadId: "thread-3",
             title: "Over threshold",
             brief: `${overThresholdBrief.slice(0, AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH)} ...(${overThresholdBrief.length - AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH} remaining)`,
@@ -10607,7 +10616,14 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
               count: 1,
               vectorAvailable: false,
             },
-            results: [{ threadId: "thread-1", title: "Should not appear", brief: "" }],
+            results: [
+              {
+                surface: "discord" as const,
+                threadId: "thread-1",
+                title: "Should not appear",
+                brief: "",
+              },
+            ],
           };
         },
         metadata: async () => {
@@ -10714,6 +10730,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             },
             results: [
               {
+                surface: "discord" as const,
                 threadId: "thread-1",
                 title: "OAuth callback login loop",
                 brief: "",
@@ -10755,6 +10772,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       value: {
         entries: [
           {
+            surface: "discord" as const,
             threadId: "thread-1",
             title: "OAuth callback login loop",
             timeRange: formatExpectedLocalThreadTimeRange(startTime, endTime),
@@ -10815,6 +10833,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
           const resultsByQuery: Record<
             string,
             Array<{
+              surface: "discord" | "native";
               threadId: string;
               title: string;
               brief: string;
@@ -10823,12 +10842,14 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
           > = {
             "auth cookies": [
               {
+                surface: "discord" as const,
                 threadId: "shared",
                 title: "Shared top",
                 brief: "",
                 score: 0.99,
               },
               {
+                surface: "discord" as const,
                 threadId: "auth-second",
                 title: "Auth second",
                 brief: "",
@@ -10837,12 +10858,14 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             ],
             "workplace context": [
               {
+                surface: "discord" as const,
                 threadId: "shared",
                 title: "Shared top",
                 brief: "",
                 score: 0.98,
               },
               {
+                surface: "discord" as const,
                 threadId: "work-second",
                 title: "Work second",
                 brief: "",
@@ -10851,6 +10874,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             ],
             "project architecture": [
               {
+                surface: "discord" as const,
                 threadId: "project-top",
                 title: "Project top",
                 brief: "",
@@ -10894,7 +10918,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(result.output).toEqual({
       type: "json",
       value: {
-        entries: [{ threadId: "project-top", title: "Project top" }],
+        entries: [{ surface: "discord" as const, threadId: "project-top", title: "Project top" }],
       },
     });
   });
@@ -10955,6 +10979,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             },
             results: [
               {
+                surface: "discord" as const,
                 threadId: query,
                 title,
                 brief: "",
@@ -10987,8 +11012,16 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       type: "json",
       value: {
         entries: [
-          { threadId: "third category", title: "third category result" },
-          { threadId: "first category", title: "first category result" },
+          {
+            surface: "discord" as const,
+            threadId: "third category",
+            title: "third category result",
+          },
+          {
+            surface: "discord" as const,
+            threadId: "first category",
+            title: "first category result",
+          },
         ],
       },
     });
@@ -11041,10 +11074,29 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
           const requestedLimit = input.limit ?? 5;
           requestedLimits.push(requestedLimit);
           const results = [
-            { threadId: "generic-1", title: "General project notes", brief: "", score: 1 },
-            { threadId: "generic-2", title: "General status update", brief: "", score: 0.9 },
-            { threadId: "generic-3", title: "General coordination", brief: "", score: 0.8 },
             {
+              surface: "discord" as const,
+              threadId: "generic-1",
+              title: "General project notes",
+              brief: "",
+              score: 1,
+            },
+            {
+              surface: "discord" as const,
+              threadId: "generic-2",
+              title: "General status update",
+              brief: "",
+              score: 0.9,
+            },
+            {
+              surface: "discord" as const,
+              threadId: "generic-3",
+              title: "General coordination",
+              brief: "",
+              score: 0.8,
+            },
+            {
+              surface: "discord" as const,
               threadId: "buried-target",
               title: "Buried target incident",
               brief: "",
@@ -11101,7 +11153,13 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(result.output).toEqual({
       type: "json",
       value: {
-        entries: [{ threadId: "buried-target", title: "Buried target incident" }],
+        entries: [
+          {
+            surface: "discord" as const,
+            threadId: "buried-target",
+            title: "Buried target incident",
+          },
+        ],
       },
     });
   });
@@ -11164,6 +11222,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             },
             results: [
               {
+                surface: "discord" as const,
                 threadId: "working-thread",
                 title: "Working thread",
                 brief: "",
@@ -11199,7 +11258,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(result.output).toEqual({
       type: "json",
       value: {
-        entries: [{ threadId: "working-thread", title: "Working thread" }],
+        entries: [
+          { surface: "discord" as const, threadId: "working-thread", title: "Working thread" },
+        ],
       },
     });
   });
@@ -11241,7 +11302,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       raw: {},
       previousMessages: buildAutoInjectedThreadSearchMessages({
         toolCallId: "conversation_thread_previous",
-        entries: [{ threadId: "thread-1", title: "Previously injected" }],
+        entries: [
+          { surface: "discord" as const, threadId: "thread-1", title: "Previously injected" },
+        ],
       }),
       userMessages: [{ role: "user", content: "A sufficiently meaningful message" }],
       conversationThreads: {
@@ -11256,7 +11319,14 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             count: 1,
             vectorAvailable: false,
           },
-          results: [{ threadId: "thread-1", title: "Previously injected", brief: "" }],
+          results: [
+            {
+              surface: "discord" as const,
+              threadId: "thread-1",
+              title: "Previously injected",
+              brief: "",
+            },
+          ],
         }),
         metadata: async () => {
           throw new Error("not used");
@@ -11342,6 +11412,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
           },
           results: [
             {
+              surface: "discord" as const,
               threadId: "thread-1",
               title: "Cookie callback thread",
               brief: "",
@@ -11403,7 +11474,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       raw: {},
       previousMessages: buildAutoInjectedThreadSearchMessages({
         toolCallId: "conversation_thread_previous",
-        entries: [{ threadId: "thread-1", title: "Previously injected" }],
+        entries: [
+          { surface: "discord" as const, threadId: "thread-1", title: "Previously injected" },
+        ],
       }),
       userMessages: [
         {
@@ -11433,6 +11506,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             },
             results: [
               {
+                surface: "discord" as const,
                 threadId: "thread-2",
                 title: "Cookie callback thread",
                 brief: "",
@@ -11495,7 +11569,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       raw: {},
       previousMessages: buildAutoInjectedThreadSearchMessages({
         toolCallId: "conversation_thread_previous",
-        entries: [{ threadId: "thread-1", title: "Previously injected" }],
+        entries: [
+          { surface: "discord" as const, threadId: "thread-1", title: "Previously injected" },
+        ],
       }),
       userMessages: [
         {
@@ -11523,6 +11599,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
           },
           results: [
             {
+              surface: "discord" as const,
               threadId: "thread-2",
               title: "Edge middleware host header",
               brief: "",
@@ -11547,7 +11624,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(messages).toHaveLength(2);
   });
 
-  it("skips injection when participant filtering is enabled without visible participants", async () => {
+  it("searches across surfaces when no comparable participant IDs are available", async () => {
     const cfg = parseCoreConfigV2ToUniversal({
       surface: {
         discord: {
@@ -11599,7 +11676,14 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
               count: 1,
               vectorAvailable: false,
             },
-            results: [{ threadId: "thread-1", title: "Should not appear", brief: "" }],
+            results: [
+              {
+                surface: "discord" as const,
+                threadId: "thread-1",
+                title: "Related thread",
+                brief: "",
+              },
+            ],
           };
         },
         metadata: async () => {
@@ -11616,9 +11700,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       onError: () => {},
     });
 
-    expect(messages).toEqual([]);
-    expect(plannerCalls).toBe(0);
-    expect(searchCalls).toBe(0);
+    expect(messages).toHaveLength(2);
+    expect(plannerCalls).toBe(1);
+    expect(searchCalls).toBe(1);
   });
 
   it("continues injecting metadata when optional status publishing fails", async () => {
@@ -11676,7 +11760,14 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             count: 1,
             vectorAvailable: false,
           },
-          results: [{ threadId: "thread-1", title: "Related title", brief: "" }],
+          results: [
+            {
+              surface: "discord" as const,
+              threadId: "thread-1",
+              title: "Related title",
+              brief: "",
+            },
+          ],
         }),
         metadata: async () => {
           throw new Error("not used");
@@ -11708,7 +11799,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       limit: 3,
       searches: [["meaningful message"]],
       participantFilterUserCount: 0,
-      entries: [{ threadId: "thread-1", title: "Related title" }],
+      entries: [{ surface: "discord" as const, threadId: "thread-1", title: "Related title" }],
     });
     expect(errors).toEqual([
       "auto-injected thread search status publish failed; continuing",

@@ -88,7 +88,7 @@ test("reference titles and model expansion respect the executing principal", asy
   expect((await f.references.resolve("reader", target)).isErr()).toBe(true);
   expect((await f.references.read("reader", { target })).isErr()).toBe(true);
   const expanded = f.references.expand("owner", text).unwrap();
-  expect(expanded).toContain(`"conversationThreadId":"${f.thread.id}"`);
+  expect(expanded).toContain(`"conversationThreadId":"native:${f.thread.id}"`);
   expect(expanded).toContain('"messageId":"message"');
   expect(expanded).not.toContain("Secret");
   const denied = f.references.expand("reader", text).unwrap();

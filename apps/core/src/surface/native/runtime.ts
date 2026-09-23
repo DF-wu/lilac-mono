@@ -1,5 +1,5 @@
 import { NativeReferences } from "./references";
-import type { NativeStoreError } from "./store";
+import { nativeStoreTransaction, type NativeStoreError } from "./store";
 import { serverToolFailure } from "@stanley2058/lilac-plugin-runtime";
 import type { NativeAttachmentOutput } from "../../tool-server/tools/attachment";
 import type { NativeOutputPublisher } from "./output";
@@ -22,10 +22,7 @@ import {
 import { discoverSkills, type DiscoveredSkill } from "@stanley2058/lilac-utils/skills";
 import { toDurableResolvedModelPlan, type CoreConfig } from "@stanley2058/lilac-utils";
 import type { CustomCommandManager } from "../../custom-commands/manager";
-import type {
-  ConversationThreadRunSummarizationInput,
-  ConversationThreadToolService,
-} from "../../conversation/thread-service";
+import type { ConversationThreadToolService } from "../../conversation/thread-service";
 import type { McpRegistryApi } from "../../mcp/registry-types";
 import type { CoreResourceService } from "../../resource";
 import type { SqliteTranscriptStore } from "../../transcript/transcript-store";
@@ -58,9 +55,8 @@ import {
   type ExternalHistory,
   type ExternalOutputs,
 } from "./search-external";
-import { NativeSummaryRefresher, emptyNativeSummaryResult } from "./search-summary";
+import { hydrateNativeConversationAttachments } from "./conversation-attachments";
 import { NativeSearchStore } from "./store-search";
-import { NativeSummaryStore } from "./store-search-summary";
 import { NativeSurfaceStore } from "./store-surface";
 
 export function nativeRuntimeFailureToHost(error: Error): never {
@@ -268,28 +264,19 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     reportFatalError: options.reportFatalError,
   });
   const searchStore = new NativeSearchStore({ db: database, store });
-  const summaries = new NativeSummaryStore({ db: database, store });
-  const summaryInitialization = summaries.initialize();
-  const summaryError = summaryInitialization.match({ ok: () => null, err: (error) => error });
-  if (summaryError) return Result.err(summaryError);
+  const retiredSummaries = nativeStoreTransaction(database, () => {
+    database.run("DROP TABLE IF EXISTS native_thread_summaries");
+    return Result.ok(undefined);
+  });
+  const retirementError = retiredSummaries.match({ ok: () => null, err: (error) => error });
+  if (retirementError) return Result.err(retirementError);
   const search = new NativeSearchService({
     store,
     searchStore,
-    summaries,
-    get planner() {
-      return options.conversationThreads();
-    },
-    get externalThreads() {
+    get conversationThreads() {
       return options.conversationThreads();
     },
   });
-  const summaryRefresher = new NativeSummaryRefresher({
-    store,
-    search: searchStore,
-    summaries,
-    getConfig: options.getConfig,
-  });
-  const summaryAbort = new AbortController();
   const config = new NativeConfigService({
     dataDir: options.dataDir,
     ownerId: options.getConfig().surface.native.auth.ownerId,
@@ -669,7 +656,6 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   }
 
   async function stopIngress() {
-    summaryAbort.abort();
     await titles.stop();
     stopAgentIdentity();
     unsubscribe?.();
@@ -714,20 +700,10 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       }
       yield* resources.reconcileReferences();
       yield* surface.pruneDeleted();
-      yield* summaries.pruneDeleted();
       yield* store.pruneReplay();
 
       return Result.ok(undefined);
     });
-  }
-  async function refreshSummaries(input: ConversationThreadRunSummarizationInput = {}) {
-    if (
-      summaryAbort.signal.aborted ||
-      (input.trigger === "periodic" &&
-        !options.getConfig().conversation.thread.summarization.enabled)
-    )
-      return Result.ok(emptyNativeSummaryResult(input.dryRun));
-    return summaryRefresher.refresh({ ...input, abortSignal: summaryAbort.signal });
   }
   function scopedResources(request: NativeRunnerRequest) {
     return resources.scopedAccess(parseNativeRequestEnvelope(request)?.starterUserId ?? "");
@@ -747,6 +723,10 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     createOutput,
     scopedResources,
     scopedThreads,
+    hydrateConversationAttachments: (
+      ref: Parameters<typeof hydrateNativeConversationAttachments>[1],
+      remainingBytes: number,
+    ) => hydrateNativeConversationAttachments({ store, surface, resources }, ref, remainingBytes),
     startOutput,
     startIngress,
     stopIngress,
@@ -754,7 +734,6 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     recover,
     recoverOperator,
     maintain,
-    refreshSummaries,
     updateCatalog,
   });
 }
