@@ -1,3 +1,4 @@
+import { createNotificationPreferences } from "./notifications";
 import { watchConnectionLifecycle } from "./connection-lifecycle";
 import { createPanelStore } from "./panel-store";
 import { createContext, useContext, useEffect, useMemo, type ReactNode } from "react";
@@ -15,6 +16,7 @@ type WorkspaceServices = Pick<
   panels: ReturnType<typeof createPanelStore>;
   pool: UploadPool;
   drafts: ReturnType<typeof createDraftStore>;
+  notifications: ReturnType<typeof createNotificationPreferences>;
   preferences: ReturnType<typeof createPreferences>;
 };
 const WorkspaceContext = createContext<WorkspaceServices | undefined>(undefined);
@@ -33,6 +35,10 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
   const drafts = useMemo(() => createDraftStore(), [client]);
   const preferences = useMemo(
     () => createPreferences(scope),
+    [scope.installationId, scope.principalId],
+  );
+  const notifications = useMemo(
+    () => createNotificationPreferences(scope),
     [scope.installationId, scope.principalId],
   );
   useEffect(() => {
@@ -56,6 +62,7 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
       accountProfile,
       pool,
       drafts,
+      notifications,
       preferences,
       panels,
     }),
@@ -68,6 +75,7 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
       accountProfile,
       pool,
       drafts,
+      notifications,
       preferences,
       panels,
     ],

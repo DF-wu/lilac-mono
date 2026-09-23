@@ -1,3 +1,4 @@
+import { watchNotifications, holdNotificationLock, notificationScope } from "./notifications";
 import { useConnectionNotice } from "./use-connection-notice";
 import { parseReferenceHref } from "@stanley2058/lilac-client-protocol";
 import { ThreadReferenceView } from "./components/ThreadReferenceView";
@@ -105,7 +106,7 @@ function Workspace(props: AppProps) {
   });
   const routePathname = useLocation({ select: (location) => location.pathname });
   const routeDraftId = useLocation({ select: (location) => location.state.draftThreadId });
-  const { pool, drafts: draftStore, panels } = useWorkspace();
+  const { pool, drafts: draftStore, panels, notifications } = useWorkspace();
   const draftIds = useStore(draftStore, (state) => state.ids);
   const setLocalDrafts = draftStore.getState().setLocalDrafts;
   const { client, initial } = props;
@@ -162,6 +163,50 @@ function Workspace(props: AppProps) {
       )
     : undefined;
   const settings = search.settings;
+  const viewedNotificationThread = search.view === "others" ? search.otherThread : routeThreadId;
+  const openNotificationThread = useEventCallback((threadId: string) => {
+    void navigate({ to: "/threads/$threadId", params: { threadId }, search: {} });
+  });
+  useEffect(
+    () =>
+      watchNotifications({
+        client,
+        initial: initial.threads.items,
+        scope: props.scope,
+        preferences: notifications,
+        openThread: openNotificationThread,
+      }),
+    [client, notifications],
+  );
+  useEffect(() => {
+    let release: (() => void) | undefined;
+    const update = () => {
+      release?.();
+      release = undefined;
+      if (
+        active &&
+        !settings &&
+        viewedNotificationThread &&
+        document.visibilityState === "visible" &&
+        document.hasFocus() &&
+        navigator.locks
+      )
+        release = holdNotificationLock(
+          `${notificationScope(props.scope)}:view:${viewedNotificationThread}`,
+        );
+    };
+    update();
+    window.addEventListener("focus", update);
+    window.addEventListener("blur", update);
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      release?.();
+      window.removeEventListener("focus", update);
+      window.removeEventListener("blur", update);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [active, settings, viewedNotificationThread, notifications]);
+
   const archived = search.view === "archived";
   const external = search.view === "others" && viewer.role === "owner";
   const externalId = search.otherThread;

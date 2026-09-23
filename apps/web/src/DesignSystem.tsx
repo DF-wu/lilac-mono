@@ -1,3 +1,6 @@
+import { Switch } from "./components/ui/switch";
+import { NotificationSettings } from "./components/NotificationSettings";
+import { createNotificationPreferences } from "./notifications";
 import { SPINNERS } from "loading-dev";
 import { LoadingSpinner } from "./components/ui/loading-spinner";
 import { ConnectionLoading } from "./components/ui/connection-loading";
@@ -96,6 +99,7 @@ const sections = [
   ["threads", "Threads"],
   ["messages", "Messages"],
   ["agent-work", "Agent work"],
+  ["notifications", "Notifications"],
   ["deployment", "Deployment settings"],
   ["composer", "Composer"],
   ["reconnection", "Reconnection"],
@@ -1124,6 +1128,25 @@ function Controls() {
   const [model, setModel] = useState<string | null>("balanced");
   return (
     <Section id="controls" title="Controls">
+      <Specimen title="Switches">
+        <div className="flex flex-wrap items-center gap-6">
+          <label className="flex items-center gap-2">
+            <Switch /> Off
+          </label>
+          <label className="flex items-center gap-2">
+            <Switch defaultChecked /> On
+          </label>
+          <label className="flex items-center gap-2">
+            <Switch size="sm" defaultChecked /> Small
+          </label>
+          <label className="flex items-center gap-2">
+            <Switch disabled /> Disabled off
+          </label>
+          <label className="flex items-center gap-2">
+            <Switch disabled defaultChecked /> Disabled on
+          </label>
+        </div>
+      </Specimen>
       <Specimen title="Buttons">
         <div className="ds-row flex items-center flex-wrap gap-2">
           {(
@@ -1538,6 +1561,9 @@ export default function DesignSystem() {
               >
                 <AgentWorkDemo />
               </Section>
+              <Section id="notifications" title="Notifications">
+                <NotificationSettingsDemo />
+              </Section>
               <Section id="deployment" title="Deployment settings">
                 <DeploymentSettingsForm
                   value={{
@@ -1608,5 +1634,16 @@ export default function DesignSystem() {
         </div>
       </TooltipProvider>
     </QueryClientProvider>
+  );
+}
+
+function NotificationSettingsDemo() {
+  const [preferences] = useState(() =>
+    createNotificationPreferences({ installationId: "design-system", principalId: "preview" }),
+  );
+  return (
+    <div className="max-w-xl">
+      <NotificationSettings preferences={preferences} />
+    </div>
   );
 }

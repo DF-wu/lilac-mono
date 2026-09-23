@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type {
   NativeDeploymentSettings,
@@ -9,6 +9,7 @@ import { useNativeOnline } from "../queries";
 import { ErrorNotice } from "./ui";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
+import { Switch } from "./ui/switch";
 import { StreamingModeSelect } from "./StreamingSettings";
 
 type DeploymentDocument = NativeRpcOutputs["config"]["readDeployment"];
@@ -34,6 +35,7 @@ export function DeploymentSettingsForm({
   const [retentionAge, setRetentionAge] = useState(
     value.storageRetentionMaxAgeMs?.toString() ?? "",
   );
+  const triggerRunId = useId();
   const [triggerRun, setTriggerRun] = useState(value.crossThreadSend.triggerRun);
   return (
     <form
@@ -114,20 +116,16 @@ export function DeploymentSettingsForm({
           </span>
         </label>
         <div className="flex items-center justify-between gap-6">
-          <span>Start a run for cross-thread messages</span>
-          <Button
-            type="button"
-            variant="outline"
-            role="switch"
-            aria-checked={triggerRun}
-            aria-label="Start a run for cross-thread messages"
-            onClick={() => {
+          <label htmlFor={triggerRunId}>Start a run for cross-thread messages</label>
+          <Switch
+            id={triggerRunId}
+            checked={triggerRun}
+            disabled={disabled || pending}
+            onCheckedChange={(checked) => {
               onEdit?.();
-              setTriggerRun((value) => !value);
+              setTriggerRun(checked);
             }}
-          >
-            {triggerRun ? "On" : "Off"}
-          </Button>
+          />
         </div>
         <Button type="submit" className="justify-self-start">
           {pending ? "Saving…" : "Save"}
