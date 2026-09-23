@@ -1,4 +1,6 @@
 import {
+  BlobObjectAbsent,
+  BlobObjectExpired,
   materializeBlobRead,
   type BlobHandleV1,
   type BlobRefV1,
@@ -76,7 +78,9 @@ async function copyStoredBlob(input: {
   blobStore?: BlobStore;
   part: StoredFilePartV1;
   handles: BlobHandleV1[];
-}): Promise<ResultType<BusFilePartV2, DiscordStoredBlobPreparationFailed>> {
+}): Promise<
+  ResultType<BusFilePartV2 | { type: "text"; text: string }, DiscordStoredBlobPreparationFailed>
+> {
   if (!input.blobStore) {
     return Result.err(
       preparationFailure(input.part.blob, "open", "Discord request blob storage is unavailable"),
@@ -88,9 +92,20 @@ async function copyStoredBlob(input: {
       blobStore
         .open(input.part.blob)
         .then((opened) =>
-          opened.mapError((error) => preparationFailure(input.part.blob, "open", error.message)),
+          opened
+            .tryRecover((error) =>
+              BlobObjectAbsent.is(error) || BlobObjectExpired.is(error)
+                ? Result.ok(null)
+                : Result.err(error),
+            )
+            .mapError((error) => preparationFailure(input.part.blob, "open", error.message)),
         ),
     );
+    if (read === null)
+      return Result.ok({
+        type: "text" as const,
+        text: `[Previously retained file is unavailable: ${input.part.filename ?? input.part.mediaType}.]`,
+      });
     const bytes = yield* Result.await(
       materializeBlobRead(read).then((materialized) =>
         materialized.mapError((error) =>

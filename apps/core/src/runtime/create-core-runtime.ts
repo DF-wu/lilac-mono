@@ -2117,6 +2117,10 @@ export async function createCoreRuntime(
           dbPath: path.join(env.dataDir, "request-delivery.db"),
           blobStore: blobStoreCreation.store,
           logger: requestDeliveryLogger,
+          inputBlobRetained: (objectId) =>
+            transcriptStore
+              ? transcriptStore.readCoreOwnedBlob(objectId).map((blob) => blob !== null)
+              : Result.err(new Error("Transcript ownership is unavailable during input cleanup")),
           activity: {
             requestStarted: (id) => adapter.presence.requestStarted(id),
             requestSettled: (id) => adapter.presence.requestSettled(id),

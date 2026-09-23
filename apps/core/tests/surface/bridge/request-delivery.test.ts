@@ -39,6 +39,8 @@ import {
   type RequestDeliveryPublisher,
 } from "../../../src/surface/bridge/request-delivery";
 
+import { SqliteTranscriptStore } from "../../../src/transcript/transcript-store";
+
 function value<T, E extends Error>(result: ResultType<T, E>): T {
   return result.match({
     ok: (resultValue) => resultValue,
@@ -105,6 +107,7 @@ function coordinator(input: {
   store: ReturnType<typeof createStore>;
   blobStore: Pick<BlobStore, "resolve" | "open" | "delete">;
   now?: () => number;
+  inputBlobRetained?: (objectId: string) => ResultType<boolean, Error>;
   activity?: { requestStarted(id: string): void; requestSettled(id: string): void };
   logger?: {
     debug(message: string, context: Readonly<Record<string, string | number | boolean>>): void;
@@ -116,6 +119,7 @@ function coordinator(input: {
     blobStore: input.blobStore,
     admission: createCoreRequestDeliveryAdmission(input.blobStore),
     activity: input.activity,
+    inputBlobRetained: input.inputBlobRetained,
     ...(input.now ? { now: input.now } : {}),
     ...(input.logger ? { logger: input.logger } : {}),
   });
@@ -142,6 +146,77 @@ function publicationClaimMethods() {
 }
 
 describe("durable request delivery", () => {
+  test("hands retained input blobs to transcript ownership when the request ends", async () => {
+    const store = createStore();
+    const transcripts = new SqliteTranscriptStore(":memory:");
+    const blobs = await memoryBlobStore();
+    try {
+      const upload = value(
+        await blobs.startUpload({
+          source: new TextEncoder().encode("retained image"),
+          retention: { kind: "durable" },
+        }),
+      );
+      const ref = value(await blobs.resolve(upload.handle, { timeoutMs: 1_000 }));
+      const id = crypto.randomUUID();
+      value(
+        store.prepare({
+          requestDeliveryId: id,
+          requestId: "retained",
+          envelope: envelope({
+            requestDeliveryId: id,
+            requestId: "retained",
+            handle: upload.handle,
+          }),
+          inputHandles: [upload.handle],
+          createdAt: 1,
+        }),
+      );
+      let ownershipAvailable = false;
+      const delivery = coordinator({
+        store,
+        blobStore: blobs,
+        inputBlobRetained: (id) =>
+          ownershipAvailable
+            ? transcripts.readCoreOwnedBlob(id).map((blob) => blob !== null)
+            : Result.err(new Error("Ownership lookup unavailable")),
+      });
+      const accepted = value(await delivery.handleDelivery(id));
+      if (accepted.disposition !== "accepted") throw new Error("Expected admission");
+      value(
+        transcripts.saveRequestTranscript({
+          requestId: "retained",
+          sessionId: "session-1",
+          requestClient: "discord",
+          messages: accepted.record.work.data.messages,
+        }),
+      );
+      value(await delivery.terminalize({ requestDeliveryId: id, outcome: { kind: "completed" } }));
+      expect(value(store.load(id)).state).toBe("terminal");
+      expect(value(await blobs.resolve(upload.handle, { timeoutMs: 1_000 }))).toEqual(ref);
+      expect(value(await delivery.maintain()).failures).toHaveLength(1);
+      ownershipAvailable = true;
+      expect(value(await delivery.maintain()).failures).toEqual([]);
+      expect(
+        value(
+          await transcripts.maintainCoreOwnedBlobs({
+            blobStore: blobs,
+            limit: 10,
+            now: Date.now() + 600_000,
+          }),
+        ).deleted,
+      ).toBe(0);
+      const read = value(await blobs.open(ref));
+      expect(new TextDecoder().decode(value(await materializeBlobRead(read)))).toBe(
+        "retained image",
+      );
+    } finally {
+      transcripts.close();
+      store.close();
+      await blobs.close({ deadlineAtMs: Date.now() + 1_000 });
+    }
+  });
+
   test("tracks delivery activity before admission, across recovery, and through terminal outcomes", async () => {
     const store = createStore();
     const blobs = await memoryBlobStore();

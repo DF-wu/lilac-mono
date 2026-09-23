@@ -159,7 +159,7 @@ function fixture(blobStore?: BlobStore) {
 }
 
 describe("native execution admission", () => {
-  test.each(["published", "invalid", "transport", "cleanup"] as const)(
+  test.each(["published", "invalid", "transport", "cleanup", "missing", "expired"] as const)(
     "prepares retained blob history and preserves ownership: %s",
     async (outcome) => {
       const blobs = value(await createMemoryBlobStore());
@@ -176,7 +176,11 @@ describe("native execution admission", () => {
           }),
         );
         const ref = value(await blobs.resolve(upload.handle, { timeoutMs: 1_000 }));
-        const file = { type: "blob" as const, blob: ref, mediaType: "text/plain" };
+        const file = {
+          type: "blob" as const,
+          blob: outcome === "expired" ? { ...ref, expiresAt: 0 } : ref,
+          mediaType: "text/plain",
+        };
         const canonical: StoredMessageV1[] = [
           { role: "user", content: [file] },
           { role: "assistant", content: [file] },
@@ -201,6 +205,8 @@ describe("native execution admission", () => {
           }),
         );
         value(await f.execution.runnerLifecycle.settled(first, "completed"));
+        if (outcome === "missing") value(await blobs.delete(ref));
+        deletion.mockClear();
         f.submit("follow-up");
         const failure =
           outcome === "transport"
@@ -214,7 +220,8 @@ describe("native execution admission", () => {
                 eventType: lilacEventTypes.CmdRequestMessage,
                 message: "invalid envelope",
               });
-        if (outcome !== "published") f.failPublication(failure);
+        if (outcome !== "published" && outcome !== "missing" && outcome !== "expired")
+          f.failPublication(failure);
         if (outcome === "cleanup")
           deletion.mockResolvedValue(
             Result.err(
@@ -231,7 +238,8 @@ describe("native execution admission", () => {
             ),
           );
         const result = await f.execution.kick(f.thread.id);
-        if (outcome === "published") value(result);
+        if (outcome === "published" || outcome === "missing" || outcome === "expired")
+          value(result);
         else if (outcome === "cleanup") {
           const error = result.match({ ok: () => undefined, err: (error) => error });
           expect(error).toBeInstanceOf(AggregateError);
@@ -244,6 +252,28 @@ describe("native execution admission", () => {
         );
         const publication = f.published.at(-1)!;
         expect(corePreparedRequestEnvelopeSchema.safeParse(publication).success).toBe(true);
+        if (outcome === "missing" || outcome === "expired") {
+          const placeholder = {
+            type: "text" as const,
+            text: "[Previously retained file is unavailable: text/plain.]",
+          };
+          expect(publication.data.messages.slice(0, 3)).toEqual([
+            { role: "user", content: [placeholder] },
+            { role: "assistant", content: [placeholder] },
+            {
+              role: "tool",
+              content: [
+                {
+                  type: "tool-result",
+                  toolCallId: "call",
+                  toolName: "inspect",
+                  output: { type: "content", value: [placeholder] },
+                },
+              ],
+            },
+          ]);
+          return;
+        }
         const part = publication.data.messages[0]!.content[0];
         if (typeof part === "string" || part?.type !== "blob") throw new Error("Expected blob");
         if (outcome === "invalid") {

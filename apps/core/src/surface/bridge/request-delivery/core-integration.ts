@@ -415,6 +415,7 @@ export function createCoreRequestDelivery(input: {
   readonly now?: () => number;
   readonly logger?: RequestDeliveryLogger;
   readonly activity?: RequestDeliveryActivity;
+  readonly inputBlobRetained?: (objectId: string) => ResultType<boolean, Error>;
 }) {
   const store = new SqliteRequestDeliveryStore({
     dbPath: input.dbPath,
@@ -425,6 +426,7 @@ export function createCoreRequestDelivery(input: {
     blobStore: input.blobStore,
     admission: createCoreRequestDeliveryAdmission(input.blobStore),
     activity: input.activity,
+    inputBlobRetained: input.inputBlobRetained,
     ...(input.now ? { now: input.now } : {}),
     ...(input.logger ? { logger: input.logger } : {}),
   });
