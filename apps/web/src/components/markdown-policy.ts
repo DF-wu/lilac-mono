@@ -5,6 +5,8 @@ export function markdownUrl(url: string): string {
   )
     return "";
   if (clean.startsWith("//") || clean.includes("\\")) return "";
+  const resource = /^resource:\/\/(r1_[0-9a-f]{32})$/u.exec(clean);
+  if (resource) return `/api/resources/${resource[1]}`;
   if (/^(?:https?:|mailto:)/iu.test(clean)) return clean;
   if (/^[a-z][a-z\d+.-]*:/iu.test(clean)) return "";
   return clean;

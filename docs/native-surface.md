@@ -95,6 +95,10 @@ thread references it. Text previews return at most 64 KiB, with a truncation ind
 files and an error for binary data. Local and SSH filepath previews read only that prefix of the
 latest file and show an error when it is gone.
 
+Markdown links and images accept retained `resource://r1_<128-bit-id>` references. They use the
+authenticated resource endpoint and preserve the original resource's access rules. Transient
+`resource://t1_` references and explicit SSH URIs are not supported in Markdown.
+
 Settings > Deployment controls response streaming for the instance. Paragraph publishes text at
 blank-line boundaries. Full publishes the
 buffered text at model-step completion or tool handoff. Clients never receive token-by-token text.

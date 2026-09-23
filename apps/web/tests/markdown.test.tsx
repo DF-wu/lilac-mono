@@ -166,6 +166,36 @@ describe("markdown", () => {
     expect(html).toContain("const value");
     expect(html).toContain("&lt;script&gt;");
   });
+  test("retained resource links and images use the authenticated resource endpoint", () => {
+    const id = `r1_${"ab".repeat(16)}`;
+    const uri = `resource://${id}`;
+    expect(markdownUrl(uri)).toBe(`/api/resources/${id}`);
+    const html = renderToStaticMarkup(
+      <MarkdownContent text={`[report.txt](${uri})\n\n![Chart](${uri})`} />,
+    );
+    expect(html).toContain(`href="/api/resources/${id}"`);
+    expect(html).toContain(`src="/api/resources/${id}"`);
+    expect(html).toContain('aria-label="Preview Chart"');
+    expect(html).not.toContain("resource://");
+  });
+  test("resource URLs reject transient IDs and noncanonical forms", () => {
+    const id = `r1_${"ab".repeat(16)}`;
+    for (const uri of [
+      `resource://t1_${"ab".repeat(16)}`,
+      `resource://${id}/file`,
+      `resource://${id}?download=1`,
+      `resource://${id}#fragment`,
+      `resource://user@${id}`,
+      `resource://${id}:443`,
+      `resource://${id.toUpperCase()}`,
+      `RESOURCE://${id}`,
+      `resource://${id.slice(0, -1)}`,
+      `resource://${id}a`,
+      `resource://${id.replace("ab", "%61b")}`,
+      "ssh://host/path.png",
+    ])
+      expect(markdownUrl(uri)).toBe("");
+  });
   test("link protocols reject executable and ambiguous URLs", () => {
     for (const url of [
       "javascript:alert(1)",
