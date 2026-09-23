@@ -41,7 +41,8 @@ export type { PendingInput } from "../pending-input";
 import { Button } from "./ui/button";
 import { Composer } from "./Composer";
 import { Timeline, ThinkingIndicator, useLatestReadableTurn } from "./Timeline";
-import { attempt, ErrorNotice, IconButton, Modal, VirtualList } from "./ui";
+import { attempt, IconButton, Modal, VirtualList } from "./ui";
+import { toast } from "./ui/toast";
 
 import { UploadProgressContext } from "../upload-context";
 const queueLabels = { prompt: "Prompt", steer: "Steering", followup: "Follow-up" };
@@ -205,7 +206,9 @@ export function Chat(props: ChatProps) {
   useEffect(
     () =>
       client.subscribe((event) => {
-        if (event.kind === "error" && !store.checkpoint) setHistoryError(event.error.message);
+        if (event.kind === "connection" && event.state === "online") setHistoryError(undefined);
+        if (event.kind === "error" && event.error.kind !== "network" && !store.checkpoint)
+          setHistoryError(event.error.message);
       }),
     [client, store],
   );
@@ -290,8 +293,8 @@ export function Chat(props: ChatProps) {
   );
   const refreshQueue = useCallback(() => refreshQueueQuery(queries, threadId), [queries, threadId]);
   useEffect(() => {
-    if (queueQuery.error) setError(queueQuery.error.message);
-  }, [queueQuery.error]);
+    if (queueQuery.error && client.connectionState === "online") setError(queueQuery.error.message);
+  }, [client, queueQuery.error]);
   useEffect(
     () =>
       client.subscribe((event) => {
@@ -606,16 +609,26 @@ export function Chat(props: ChatProps) {
   });
   const composerCancel = useEventCallback(() => void cancel());
   const composerSubmit = useEventCallback(submit);
+  const composerError = localThread?.error ?? error ?? draftQuery.error?.message ?? historyError;
+  const dismissComposerError = useEventCallback((id: string, message: string) => {
+    if (id !== threadId || message !== composerError) return;
+    setError(undefined);
+    setHistoryError(undefined);
+    if (local) props.onLocalChange(threadId, (current) => ({ ...current, error: undefined }));
+  });
+  useEffect(() => {
+    if (!composerError) return;
+    const id = `composer-error:${threadId}`;
+    toast.add({
+      id,
+      title: composerError,
+      type: "error",
+      onClose: () => dismissComposerError(threadId, composerError),
+    });
+    return () => toast.close(id);
+  }, [composerError, threadId, dismissComposerError]);
   const composer = (
     <div className="chat-bottom w-full max-w-[var(--ui-chat-width)] my-0 mx-auto pt-2 px-6 pb-6 max-workspace:px-3 max-workspace:pb-3">
-      <ErrorNotice
-        message={localThread?.error ?? error ?? draftQuery.error?.message ?? historyError}
-        onDismiss={() => {
-          setError(undefined);
-          setHistoryError(undefined);
-          if (local) props.onLocalChange(threadId, (current) => ({ ...current, error: undefined }));
-        }}
-      />
       {localThread?.creation && !pendingTurn ? (
         <div className="pending-input flex flex-wrap gap-2 p-2 mb-2 rounded-sm bg-surface text-sm">
           <span>{localThread.creation.entry.text}</span>
@@ -745,6 +758,7 @@ export function Chat(props: ChatProps) {
           canCancel={active || queue.length > 0}
           disabled={!editable || !draftLoaded || !!rewinding}
           submitting={!!localThread?.creation}
+          offline={!online}
           modelId={localThread?.modelId ?? thread?.modelId}
           onModelChange={composerModelChange}
           onSubmit={composerSubmit}

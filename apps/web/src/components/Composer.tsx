@@ -52,6 +52,7 @@ export type ComposerProps = Partial<Pick<ChatCommon, "client" | "scope" | "catal
   disabled: boolean;
   windowDrop?: boolean;
   submitting?: boolean;
+  offline?: boolean;
   modelId?: string;
   onModelChange: (modelId: string) => void;
   onSubmit: (value: ComposerSubmission) => void;
@@ -148,7 +149,13 @@ export const Composer = memo(function Composer(props: ComposerProps) {
   }
 
   function submit() {
-    if (disabled || !editorReady || props.submitting || (!text.trim() && attachments.length === 0))
+    if (
+      disabled ||
+      props.offline ||
+      !editorReady ||
+      props.submitting ||
+      (!text.trim() && attachments.length === 0)
+    )
       return;
     if (input.current?.hasMissingAttachments()) {
       setError("Reattach or remove the missing files before sending.");
@@ -558,7 +565,11 @@ export const Composer = memo(function Composer(props: ComposerProps) {
             variant="default"
             className="rounded-full"
             disabled={
-              disabled || !editorReady || props.submitting || (!text.trim() && !attachments.length)
+              disabled ||
+              props.offline ||
+              !editorReady ||
+              props.submitting ||
+              (!text.trim() && !attachments.length)
             }
             onClick={submit}
           >

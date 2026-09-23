@@ -1,3 +1,4 @@
+import { ReconnectionDemo } from "./components/ReconnectionDemo";
 import { ConversationBadge } from "./components/ConversationReference";
 import lilacLogo from "./assets/logo.svg";
 import { LinkPreviewAnchor } from "./components/LinkWithFavicon";
@@ -95,6 +96,7 @@ const sections = [
   ["agent-work", "Agent work"],
   ["deployment", "Deployment settings"],
   ["composer", "Composer"],
+  ["reconnection", "Reconnection"],
   ["attachments", "Attachments"],
   ["content", "Rich content"],
   ["controls", "Controls"],
@@ -1314,13 +1316,15 @@ function Overlays() {
             variant="secondary"
             onClick={() =>
               toast.add({
-                title: "You're offline",
-                description: "Cached conversations are still available.",
-                type: "warning",
+                id: "connection-demo",
+                title: "Reconnecting…",
+                type: "info",
+                timeout: 0,
+                actionProps: { children: "Retry", onClick: () => toast.close("connection-demo") },
               })
             }
           >
-            Offline
+            Reconnecting
           </Button>
           <Button
             variant="secondary"
@@ -1504,6 +1508,13 @@ export default function DesignSystem() {
                 />
               </Section>
               <ComposerSpecimen />
+              <Section
+                id="reconnection"
+                title="Reconnection"
+                description="Try the real composer and connection notice with a simulated outage."
+              >
+                <ReconnectionDemo />
+              </Section>
               <Attachments />
               <Section id="content" title="Rich content">
                 <div className="ds-content min-w-0">

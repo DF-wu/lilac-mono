@@ -1,3 +1,4 @@
+import { createClerkSessionRefresh } from "./clerk-session-refresh";
 import { Button } from "./components/ui/button";
 import { ClerkProvider, SignIn, UserProfile, useAuth, useClerk, useUser } from "@clerk/react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -100,7 +101,6 @@ function SessionStatus({
   useEffect(() => {
     if (!isLoaded) return;
     const controller = new AbortController();
-    let refreshing = false;
     async function endSession() {
       const result = await Result.tryPromise({
         try: onLogout,
@@ -113,29 +113,13 @@ function SessionStatus({
       void endSession();
       return () => controller.abort();
     }
-    async function refresh() {
-      if (refreshing || controller.signal.aborted) return;
-      refreshing = true;
-      const refreshed = await Result.tryPromise({
-        try: async () => {
-          const token = await getToken({ skipCache: true });
-          if (controller.signal.aborted) return "canceled" as const;
-          if (!token) return "signed-out" as const;
-          if (!client.rpc) return "pending" as const;
-          const accepted = await client.reauthenticate(token);
-          return accepted ? ("accepted" as const) : ("retry" as const);
-        },
-        catch: () => new Error("Session refresh failed. Reconnecting will retry."),
-      });
-      refreshing = false;
-      if (controller.signal.aborted) return;
-      const outcome = refreshed.match({ ok: (value) => value, err: () => "retry" as const });
-      if (outcome === "signed-out") {
-        await endSession();
-        return;
-      }
-      setError(outcome === "retry" ? "Session refresh failed. Reconnecting will retry." : "");
-    }
+    const refresh = createClerkSessionRefresh({
+      client,
+      getToken: () => getToken({ skipCache: true }),
+      signal: controller.signal,
+      onSignedOut: endSession,
+      onError: setError,
+    });
     void refresh();
     const timer = setInterval(() => {
       void refresh();

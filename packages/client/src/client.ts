@@ -93,6 +93,8 @@ export class NativeClient {
   >();
   private bootstrapSequence = 0;
   private bootstrapPending = true;
+  private bootstrapRequest: AbortController | undefined;
+  private state: Extract<ClientEvent, { kind: "connection" }>["state"] = "connecting";
 
   constructor(private readonly options: NativeClientOptions) {
     this.cache = options.cache ?? new NoNativeCache();
@@ -102,11 +104,15 @@ export class NativeClient {
   get rpc(): NativeRPC | undefined {
     return this.connection;
   }
+  get connectionState() {
+    return this.state;
+  }
   subscribe(listener: (event: ClientEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
   private emit(event: ClientEvent): void {
+    if (event.kind === "connection") this.state = event.state;
     for (const listener of this.listeners) listener(event);
   }
   thread(threadId: string): NativeThreadStore {
@@ -193,40 +199,72 @@ export class NativeClient {
       await this.loadCached(this.selectedThreadId);
     await this.bootstrap();
   }
+  reconnect(): void {
+    if (this.stopped) return;
+    clearTimeout(this.reconnectTimer);
+    clearTimeout(this.bootstrapTimer);
+    this.attempt = 0;
+    const streams = [...this.streamTasks];
+    this.abortStreams();
+    this.abortHistory();
+    const socket = this.socket;
+    this.socket = undefined;
+    // Stream cancellation sends an RPC abort before the socket can close.
+    void Promise.all(streams).then(() => socket?.close());
+    this.bootstrapPending = true;
+    this.open();
+    void this.bootstrap();
+  }
+  private connected(): void {
+    if (this.bootstrapPending || this.socket?.readyState !== WebSocket.OPEN) return;
+    this.attempt = 0;
+    this.emit({ kind: "connection", state: "online" });
+  }
   private open(): void {
     if (this.stopped) return;
     this.emit({ kind: "connection", state: "connecting" });
-    const socket = this.options.openSocket();
+    const opened = Result.try({ try: this.options.openSocket, catch: captureFailure });
+    const socket = opened.match({ ok: (value) => value, err: () => undefined });
+    if (!socket) {
+      this.disconnected();
+      return;
+    }
     this.socket = socket;
     this.connection = createNativeRPC(socket);
     socket.addEventListener("open", () => {
       if (this.socket !== socket) return;
-      this.attempt = 0;
-      this.emit({ kind: "connection", state: "online" });
+      this.connected();
     });
     if (socket.readyState === WebSocket.OPEN) {
-      this.attempt = 0;
-      this.emit({ kind: "connection", state: "online" });
+      this.connected();
     }
     socket.addEventListener("close", () => {
       if (this.socket !== socket || this.stopped) return;
-      this.emit({ kind: "connection", state: "offline" });
-      this.streams.clear();
-      this.connection = undefined;
-      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = setTimeout(
-        () => {
-          this.open();
-          void this.bootstrap();
-        },
-        reconnectDelay(this.attempt++),
-      );
+      this.disconnected();
     });
   }
+  private disconnected(): void {
+    this.bootstrapPending = true;
+    this.emit({ kind: "connection", state: "offline" });
+    this.abortStreams();
+    this.connection = undefined;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(
+      () => {
+        this.open();
+        void this.bootstrap();
+      },
+      reconnectDelay(this.attempt++),
+    );
+  }
+
   private async bootstrap(): Promise<void> {
     clearTimeout(this.bootstrapTimer);
     this.bootstrapTimer = undefined;
     this.bootstrapPending = true;
+    this.bootstrapRequest?.abort();
+    const request = new AbortController();
+    this.bootstrapRequest = request;
     const sequence = ++this.bootstrapSequence;
     const generation = this.generation;
     const threadId = this.selectedThreadId;
@@ -237,7 +275,8 @@ export class NativeClient {
       catalogRevision: this.catalogs.get(this.options.scope)?.revision,
     };
     const captured = await Result.tryPromise({
-      try: () => this.options.bootstrap(input, this.lifetime.signal),
+      try: () =>
+        this.options.bootstrap(input, AbortSignal.any([this.lifetime.signal, request.signal])),
       catch: captureFailure,
     });
     if (generation !== this.generation || this.stopped || sequence !== this.bootstrapSequence)
@@ -252,7 +291,6 @@ export class NativeClient {
         return;
       }
       await this.failure(outcome.error);
-      if (outcome.error.kind === "network" && !this.stopped) this.retryBootstrap();
       return;
     }
     const reply = outcome.reply;
@@ -270,6 +308,7 @@ export class NativeClient {
     if (threadId && reply.selectedThread && threadEpoch === this.threadEpochs.get(threadId))
       this.thread(threadId).replay(reply.selectedThread);
     this.bootstrapPending = false;
+    this.connected();
     this.emit({ kind: "bootstrap", bootstrap: reply });
     this.watchCatalog();
     if (
@@ -288,7 +327,7 @@ export class NativeClient {
       reconnectDelay(this.attempt++),
     );
   }
-  async selectThread(threadId: string): Promise<void> {
+  async selectThread(threadId?: string): Promise<void> {
     const previous = this.selectedThreadId;
     this.selectedThreadId = threadId;
     if (previous && previous !== threadId) {
@@ -296,6 +335,7 @@ export class NativeClient {
       this.abortHistory(previous);
     }
     this.trimStores(threadId);
+    if (!threadId) return;
     if (!this.thread(threadId).checkpoint) await this.loadCached(threadId);
     if (this.selectedThreadId !== threadId || this.stopped || this.bootstrapPending) return;
     this.watchThread(threadId);
@@ -547,6 +587,7 @@ export class NativeClient {
       try: () => rpc.connection.reauthenticate({ token }),
       catch: captureFailure,
     });
+    if (rpc !== this.connection || this.stopped) return false;
     const outcome = captured.match<{ accepted: boolean } | { error: ClientFailure }>({
       ok: (viewer) => ({ accepted: viewer.id === this.options.scope.principalId }),
       err: (error) => ({ error }),
@@ -621,6 +662,11 @@ export class NativeClient {
   private async failure(error: ClientFailure): Promise<void> {
     if (error.kind === "auth") {
       await this.logout();
+      return;
+    }
+    if (error.kind === "network") {
+      this.emit({ kind: "connection", state: "offline" });
+      if (!this.stopped) this.retryBootstrap();
       return;
     }
     this.emit({ kind: "error", error });

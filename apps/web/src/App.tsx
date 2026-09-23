@@ -1,3 +1,4 @@
+import { useConnectionNotice } from "./use-connection-notice";
 import { parseReferenceHref } from "@stanley2058/lilac-client-protocol";
 import { ThreadReferenceView } from "./components/ThreadReferenceView";
 import { SidebarEmptyState } from "./components/SidebarEmptyState";
@@ -148,7 +149,6 @@ function Workspace(props: AppProps) {
   const [catalog, setCatalog] = useState<DisplayCatalog | undefined>(() =>
     initial.catalog.kind === "catalog" ? initial.catalog.catalog : client.catalogs.get(props.scope),
   );
-  const [connection, setConnection] = useState("online");
   const [error, setError] = useState<string>();
   const search: WorkspaceSearch =
     useMatch({
@@ -353,7 +353,6 @@ function Workspace(props: AppProps) {
             setCatalog(client.catalogs.get(props.scope));
             return;
           case "connection":
-            setConnection(event.state);
             return;
           case "error":
             setError(event.error.message);
@@ -367,8 +366,7 @@ function Workspace(props: AppProps) {
     [client, props.scope, upsert],
   );
   useEffect(() => {
-    if (!selectedId || selectedId.startsWith("draft:")) return;
-    void client.selectThread(selectedId);
+    void client.selectThread(selectedId?.startsWith("draft:") ? undefined : selectedId);
   }, [client, selectedId]);
   const selectedMetadata = useQuery({
     ...threadOptions(client, selectedId ?? ""),
@@ -711,20 +709,8 @@ function Workspace(props: AppProps) {
     if (!error) return;
     toast.add({ id: "app-error", title: error, type: "error", onClose: () => setError(undefined) });
   }, [error]);
-  useEffect(() => {
-    if (connection === "online") {
-      toast.close("connection");
-      return;
-    }
-    toast.add({
-      id: "connection",
-      title: connection === "connecting" ? "Connecting…" : "You're offline",
-      description: "Cached conversations remain available.",
-      type: "info",
-      timeout: 0,
-    });
-    return () => toast.close("connection");
-  }, [connection]);
+  useConnectionNotice(online, () => client.reconnect());
+
   const renameSidebarThread = useEventCallback((id: string, title: string) =>
     setRename({ id, title }),
   );

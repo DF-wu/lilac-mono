@@ -1,3 +1,4 @@
+import { watchConnectionLifecycle } from "./connection-lifecycle";
 import { createPanelStore } from "./panel-store";
 import { createContext, useContext, useEffect, useMemo, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -26,6 +27,7 @@ export function useWorkspace() {
 
 export function WorkspaceProvider({ children, ...props }: AppProps & { children: ReactNode }) {
   const { client, scope, upload, resourceUrl, draftCache, accountProfile } = props;
+  useEffect(() => watchConnectionLifecycle(client), [client]);
   const panels = useMemo(() => createPanelStore(scope), [scope.installationId, scope.principalId]);
   const pool = useMemo(() => new UploadPool(client, upload), [client, upload]);
   const drafts = useMemo(() => createDraftStore(), [client]);

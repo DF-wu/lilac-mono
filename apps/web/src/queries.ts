@@ -1,4 +1,4 @@
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import {
   onlineManager,
   infiniteQueryOptions,
@@ -40,14 +40,15 @@ const subscribeBrowserOnline = onlineManager.subscribe.bind(onlineManager);
 const browserOnlineSnapshot = () => onlineManager.isOnline();
 
 export function useNativeOnline(client: NativeClient) {
-  const [online, setOnline] = useState(() => !!client.rpc);
-  useEffect(
-    () =>
+  const subscribe = useCallback(
+    (listener: () => void) =>
       client.subscribe((event) => {
-        if (event.kind === "connection") setOnline(event.state === "online");
+        if (event.kind === "connection") listener();
       }),
     [client],
   );
+  const snapshot = useCallback(() => client.connectionState === "online", [client]);
+  const online = useSyncExternalStore(subscribe, snapshot, snapshot);
   const browserOnline = useSyncExternalStore(
     subscribeBrowserOnline,
     browserOnlineSnapshot,
