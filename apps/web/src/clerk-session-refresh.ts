@@ -1,6 +1,28 @@
 import type { NativeClient } from "@stanley2058/lilac-client";
 import { Result } from "better-result";
 
+export async function resumeClerkSession(options: {
+  getToken: () => Promise<string | null>;
+  signal: AbortSignal;
+  onSignedIn: () => Promise<void>;
+  onError: (message: string) => void;
+}): Promise<void> {
+  const result = await Result.tryPromise({
+    try: options.getToken,
+    catch: () => "Could not refresh your session. Retry connection.",
+  });
+  if (options.signal.aborted) return;
+  const error = result.match({
+    ok: (token) => (token ? "" : "Your session has expired. Sign in again."),
+    err: (message) => message,
+  });
+  if (error) {
+    options.onError(error);
+    return;
+  }
+  await options.onSignedIn();
+}
+
 export function createClerkSessionRefresh(options: {
   client: Pick<NativeClient, "rpc" | "reauthenticate">;
   getToken: () => Promise<string | null>;

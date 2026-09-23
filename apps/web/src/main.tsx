@@ -32,7 +32,7 @@ function enterChat() {
   start();
 }
 const start = () => {
-  void sessions.start();
+  return sessions.start();
 };
 const logout = async () => {
   const auth = await authInfo;

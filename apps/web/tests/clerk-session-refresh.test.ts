@@ -91,3 +91,39 @@ test("current connection failures remain visible until a successful refresh", as
   await state.refresh();
   expect(state.errors.at(-1)).toBe("");
 });
+
+async function resumeSetup(outcome: "success" | "missing" | "failure" | "canceled") {
+  const { resumeClerkSession } = await import("../src/clerk-session-refresh");
+  const controller = new AbortController();
+  const token = Promise.withResolvers<string | null>();
+  const events: string[] = [];
+  const task = resumeClerkSession({
+    getToken: () => token.promise,
+    signal: controller.signal,
+    onSignedIn: async () => {
+      events.push("bootstrap");
+    },
+    onError: (message) => events.push(message),
+  });
+  expect(events).toEqual([]);
+  if (outcome === "canceled") controller.abort();
+  if (outcome === "failure") token.reject(new Error("refresh failed"));
+  else token.resolve(outcome === "missing" ? null : "refreshed-token");
+  await task;
+  return events;
+}
+
+test("restored Clerk sessions refresh credentials before restarting bootstrap", async () => {
+  expect(await resumeSetup("success")).toEqual(["bootstrap"]);
+});
+
+test("failed or expired Clerk sessions do not restart bootstrap", async () => {
+  expect(await resumeSetup("missing")).toEqual(["Your session has expired. Sign in again."]);
+  expect(await resumeSetup("failure")).toEqual([
+    "Could not refresh your session. Retry connection.",
+  ]);
+});
+
+test("leaving sign-in during refresh prevents a stale bootstrap", async () => {
+  expect(await resumeSetup("canceled")).toEqual([]);
+});
