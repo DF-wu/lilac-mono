@@ -816,7 +816,9 @@ function Messages() {
   );
 }
 function ComposerSpecimen() {
-  const [text, setText] = useState("Help me turn these **notes** into a weekend plan.");
+  const [text, setText] = useState(
+    "Help me turn these **notes** into a weekend plan.\n\nKeep Sunday free.\nhttps://example.com/weekend",
+  );
   const [disabled, setDisabled] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>(() => [
     {
@@ -855,6 +857,9 @@ function ComposerSpecimen() {
           expanded={false}
         />
       </div>
+      <Specimen title="Message preview">
+        <Markdown text={text} preserveLineBreaks />
+      </Specimen>
       <Collapsible>
         <CollapsibleTrigger render={<Button variant="ghost" />}>
           <ChevronRight />

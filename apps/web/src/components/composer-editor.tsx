@@ -64,6 +64,7 @@ import { IndentPlugin } from "@platejs/indent/react";
 import { MarkdownPlugin, defaultRules } from "@platejs/markdown";
 import remarkGfm from "remark-gfm";
 import { editableComposerLinks, protectComposerLinks } from "./composer-links";
+import { composerParagraphSpacing } from "./composer-line-breaks";
 import {
   Bold,
   Italic,
@@ -368,7 +369,14 @@ export const composerPlugins = [
     ],
     render: { belowNodes: BlockList },
   }),
-  MarkdownPlugin.configure({ options: { remarkPlugins: [remarkGfm, editableComposerLinks] } }),
+  MarkdownPlugin.configure({
+    options: {
+      remarkPlugins: [remarkGfm, editableComposerLinks, composerParagraphSpacing],
+      rules: {
+        text: { deserialize: (node, decoration) => ({ ...decoration, text: node.value }) },
+      },
+    },
+  }),
 ];
 
 function deserializeComposer(editor: PlateEditor, text: string) {
@@ -449,8 +457,26 @@ function serializeComposer(editor: PlateEditor, references: boolean): string {
   if (!value.some((node) => NodeApi.string(node))) return "";
   for (const block of value) block.children = trimEmptyInlineText(block.children);
   const restoreLinks = protectComposerLinks(editor, value);
-  return restoreLinks(editor.getApi(MarkdownPlugin).markdown.serialize({ value }))
-    .replace(/\n$/, "")
+  const last: (TElement & Partial<TListProps>) | undefined = value.at(-1);
+  const endsWithEmptyParagraph =
+    last?.type === KEYS.p && !last.listStyleType && !NodeApi.string(last);
+  return restoreLinks(
+    editor.getApi(MarkdownPlugin).markdown.serialize({
+      value,
+      preserveEmptyParagraphs: false,
+      remarkStringifyOptions: {
+        handlers: { break: () => "\n" },
+        // Composer paragraphs are adjacent lines; an empty block supplies the blank line.
+        join: [
+          (left, right, parent) =>
+            parent.type === "root" && left.type === "paragraph" && right.type === "paragraph"
+              ? 0
+              : undefined,
+        ],
+      },
+    }),
+  )
+    .replace(/\n$/, endsWithEmptyParagraph ? "\n" : "")
     .replace(/(?:&#x20;)+(?=\n|$)/g, (spaces) => " ".repeat(spaces.length / 6));
 }
 
@@ -493,8 +519,13 @@ export function restoreMessageAttachments(
     ]),
   );
   const value = editor.getApi(MarkdownPlugin).markdown.deserialize(text, {
-    remarkPlugins: [remarkGfm, () => editableComposerLinks(new Set(byUrl.keys()))],
+    remarkPlugins: [
+      remarkGfm,
+      () => editableComposerLinks(new Set(byUrl.keys())),
+      composerParagraphSpacing,
+    ],
     rules: {
+      ...editor.getOptions(MarkdownPlugin).rules,
       img: {
         deserialize: (node, decoration, options) => {
           const attachment = byUrl.get(node.url);

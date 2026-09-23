@@ -888,7 +888,7 @@ function MessageCard({
               </div>
             ) : null}
             {content.texts.map((text, index) => (
-              <Markdown key={index} text={text} />
+              <Markdown key={index} text={text} preserveLineBreaks={collapsible} />
             ))}
             {files.length > 0 ? (
               <div
