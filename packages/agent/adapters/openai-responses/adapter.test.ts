@@ -6,6 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { tool } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import { AiSdkAgentAdapter } from "../ai-sdk/adapter";
+import { createCodexWebSocketEventNormalizer } from "../codex/compatibility";
 import { Panic, Result, type Result as ResultType } from "better-result";
 import { z } from "zod";
 import {
@@ -179,6 +180,69 @@ function hasText(agent: AgentExecutor, text: string) {
     (message) => message.role === "user" && message.content === text,
   );
 }
+
+test.each([false, true])(
+  "settles reasoning before the turn ends, Codex normalization: %s",
+  async (codex) => {
+    const { socket, agent, observed, allEvents } = fixture();
+    const normalize = createCodexWebSocketEventNormalizer();
+    const emit = (event: object) =>
+      socket.emit(codex ? normalize(event as ResponsesServerEvent) : event);
+    const run = agent.prompt("question");
+    await socket.nextSend();
+    socket.created("r1");
+    emit({
+      type: "response.reasoning_summary_text.delta",
+      item_id: "rs1",
+      summary_index: 0,
+      delta: "Checking",
+    });
+    emit({
+      type: "response.reasoning_summary_text.done",
+      item_id: "rs1",
+      summary_index: 0,
+      text: "Checking the code",
+    });
+    emit({
+      type: "response.reasoning_summary_part.done",
+      item_id: "rs1",
+      summary_index: 0,
+      part: { type: "summary_text", text: "Checking the code" },
+    });
+    const item = {
+      type: "reasoning",
+      id: "rs1",
+      summary: [{ type: "summary_text", text: "Checking the code" }],
+    };
+    emit({ type: "response.output_item.done", item });
+    // A following item proves completion was delivered before the turn settled.
+    socket.emit({
+      type: "response.output_text.delta",
+      item_id: "m1",
+      content_index: 0,
+      delta: "Next step",
+    });
+    while (true) {
+      const event = await observed("output");
+      if (event.type === "output" && event.output.kind === "text") break;
+    }
+    const reasoning = allEvents.flatMap((event) =>
+      event.type === "output" && event.output.kind === "reasoning" ? [event.output] : [],
+    );
+    expect(reasoning.filter((output) => output.phase === "end")).toMatchObject([
+      { kind: "reasoning", phase: "end", id: "rs1:0" },
+    ]);
+    if (codex)
+      expect(
+        reasoning
+          .filter((output) => output.phase === "delta")
+          .map((output) => output.delta)
+          .join(""),
+      ).toBe("Checking the code");
+    socket.finished("r1", "Done");
+    await run;
+  },
+);
 
 function diagnosticFixture(
   flush: () => Promise<void> = async () => {},
