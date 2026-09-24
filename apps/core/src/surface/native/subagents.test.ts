@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { Result } from "better-result";
 import { displayMessageSchema, subagentSummarySchema } from "@stanley2058/lilac-client-protocol";
 import type { StoredMessageV1 } from "@stanley2058/lilac-event-bus";
-import type { WorkflowRun } from "../../workflow/workflow-domain";
+import type { WorkflowOperation, WorkflowRun } from "../../workflow/workflow-domain";
 import { NativeStore } from "./store";
 import { NativeSubagents, subagentMessages, type SubagentSnapshot } from "./subagents";
 
@@ -83,6 +83,33 @@ function fixture() {
     updatedAt: 2,
     terminalAt: null,
   };
+  const executionRequestId = "wfr:run:operation:0";
+  const operations: WorkflowOperation[] = [
+    {
+      runId: run.runId,
+      operationId: "operation",
+      callSiteId: "call",
+      parentOperationId: null,
+      phase: null,
+      label: null,
+      kind: "agent",
+      input: {},
+      inputSha256: "a".repeat(64),
+      state: "running",
+      attempt: 0,
+      requestId: executionRequestId,
+      output: null,
+      resultArtifact: null,
+      error: null,
+      usage: null,
+      claimedBy: null,
+      claimedAt: null,
+      createdAt: 1,
+      startedAt: 2,
+      updatedAt: 2,
+      terminalAt: null,
+    },
+  ];
   let workflowReads = 0;
   let transcriptReads = 0;
   let live: SubagentSnapshot | undefined;
@@ -101,12 +128,17 @@ function fixture() {
         workflowReads++;
         return Result.ok([run]);
       },
+      listOperations: (runId) => {
+        workflowReads++;
+        return Result.ok(runId === run.runId ? operations : []);
+      },
     },
     transcripts: {
-      getRequestTranscript: () => {
+      getRequestTranscript: ({ requestId }) => {
         transcriptReads++;
+        if (requestId !== executionRequestId) return Result.ok(null);
         return Result.ok({
-          requestId: target.childRequestId,
+          requestId,
           sessionId: target.childSessionId,
           requestClient: "native",
           createdTs: 1,
@@ -115,7 +147,10 @@ function fixture() {
         });
       },
     },
-    live: () => ({ readSubagentSnapshot: () => live }),
+    live: () => ({
+      readSubagentSnapshot: (sessionId, requestId) =>
+        sessionId === target.childSessionId && requestId === executionRequestId ? live : undefined,
+    }),
   });
   return {
     native,
@@ -123,6 +158,7 @@ function fixture() {
     input,
     run,
     target,
+    operations,
     service,
     counters: () => ({ workflowReads, transcriptReads }),
     setLive: (value: SubagentSnapshot | undefined) => {
@@ -180,6 +216,11 @@ test("live named-session history and streaming content preserve IDs at completio
     ],
   });
   const live = f.read().unwrap();
+  expect(live.agent.title).toBe("Responding…");
+  expect(live.messages).toHaveLength(4);
+  expect(f.service.list("owner", { threadId: f.thread.id }).unwrap().items[0]?.title).toBe(
+    "Responding…",
+  );
   expect(subagentSummarySchema.safeParse(live.agent).success).toBe(true);
   expect(live.messages.at(-1)?.metadata?.incomplete).toBe(true);
   expect(f.counters().transcriptReads).toBe(0);
@@ -193,10 +234,37 @@ test("live named-session history and streaming content preserve IDs at completio
   f.run.state = "succeeded";
   const saved = f.read().unwrap();
   expect(saved.agent.state).toBe("complete");
+  expect(saved.unavailable).toBe(false);
   expect(saved.messages.map((message) => message.id)).toEqual(
     live.messages.map((message) => message.id),
   );
   expect(saved.messages.at(-1)?.metadata?.incomplete).toBeUndefined();
+});
+
+test("completed subagent reads the execution transcript rather than the delegation ID", () => {
+  const f = fixture();
+  f.run.state = "succeeded";
+  expect(f.operations[0]!.requestId).not.toBe(f.target.childRequestId);
+  const page = f.read().unwrap();
+  expect(page.unavailable).toBe(false);
+  expect(page.messages.map((message) => message.parts[0])).toEqual([
+    { type: "text", text: "Research" },
+    { type: "text", text: "Done" },
+  ]);
+});
+
+test("subagents without a dispatched operation stay waiting or report unavailable after termination", () => {
+  for (const operationPending of [false, true]) {
+    const f = fixture();
+    if (operationPending) f.operations[0]!.requestId = null;
+    else f.operations.length = 0;
+    const waiting = f.read().unwrap();
+    expect(waiting.agent.title).toBe("Waiting…");
+    expect(waiting.unavailable).toBe(false);
+    expect(waiting.messages).toEqual([]);
+    f.run.state = "failed";
+    expect(f.read().unwrap().unavailable).toBe(true);
+  }
 });
 
 test("transcript pagination bounds large messages and omits private provider data", () => {
