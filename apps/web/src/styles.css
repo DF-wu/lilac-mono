@@ -30,6 +30,11 @@
     margin: 0;
     min-width: 20rem;
   }
+  html:has(.app-shell),
+  body:has(.app-shell) {
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
   button,
   input,
   textarea,

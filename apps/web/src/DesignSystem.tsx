@@ -1,4 +1,5 @@
 import { AgentAvatar } from "./components/AgentAvatar";
+import { MobileChatControls } from "./components/MobileChatControls";
 import { useAppShortcuts, useThreadTargets } from "./shortcuts";
 import { KeybindingsSettings } from "./components/KeybindingsSettings";
 import { createKeybindings } from "./keybindings";
@@ -36,6 +37,8 @@ import {
   Pencil,
   Plus,
   Trash2,
+  Users,
+  MoreHorizontal,
 } from "lucide-react";
 import type { DisplayMessage } from "@stanley2058/lilac-client-protocol";
 import logo from "./assets/logo.svg";
@@ -88,7 +91,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./component
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "./components/ui/resizable";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { Markdown } from "./components/Markdown";
-import ComposerEditor from "./components/composer-editor";
+import { Composer } from "./components/Composer";
 import { Message, ThinkingIndicator } from "./components/Timeline";
 import { ThreadQueueDemo } from "./components/ThreadQueueDemo";
 import { DeploymentSettingsForm } from "./components/DeploymentSettings";
@@ -861,6 +864,8 @@ function Messages() {
   );
 }
 function ComposerSpecimen() {
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [rightOpen, setRightOpen] = useState(false);
   const [text, setText] = useState(
     "Help me turn these **notes** into a weekend plan.\n\nKeep Sunday free.\nhttps://example.com/weekend",
   );
@@ -884,9 +889,58 @@ function ComposerSpecimen() {
         <Button variant="secondary" onClick={() => setDisabled((value) => !value)}>
           {disabled ? "Enable editor" : "Disable editor"}
         </Button>
+        <Button
+          variant="secondary"
+          onClick={() => setText("Review [missing.txt](attachment:missing)")}
+        >
+          Missing attachment
+        </Button>
       </div>
-      <div className="composer bg-surface rounded-lg p-3 ds-composer my-4">
-        <ComposerEditor
+      <div className="ds-composer my-4">
+        <MobileChatControls
+          sidebarOpen={sidebarOpen}
+          rightOpen={rightOpen}
+          onToggleSidebar={() => setSidebarOpen((open) => !open)}
+          onToggleRight={() => setRightOpen((open) => !open)}
+        >
+          <IconButton
+            label="Share conversation"
+            onClick={() => toast.add({ title: "Share selected", type: "info" })}
+          >
+            <Users />
+          </IconButton>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <IconButton label="Conversation actions">
+                  <MoreHorizontal />
+                </IconButton>
+              }
+            />
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                onClick={() => toast.add({ title: "Rename selected", type: "info" })}
+              >
+                <Pencil />
+                Rename
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => toast.add({ title: "Archive selected", type: "info" })}
+              >
+                <Archive />
+                Archive
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                variant="destructive"
+                onClick={() => toast.add({ title: "Delete selected", type: "info" })}
+              >
+                <Trash2 />
+                Delete
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </MobileChatControls>
+        <Composer
           text={text}
           onText={setText}
           attachments={attachments}
@@ -894,12 +948,16 @@ function ComposerSpecimen() {
             setAttachments((items) => items.filter((item) => item.key !== key))
           }
           disabled={disabled}
-          placeholder="Message Lilac…"
-          onPlainText={noop}
-          onPrefix={noop}
-          onKeyDown={noop}
-          onPaste={noop}
-          expanded={false}
+          skillIds={[]}
+          onSkills={noop}
+          onCommand={noop}
+          onAttach={noop}
+          onRetryAttachment={noop}
+          active={false}
+          canCancel={false}
+          onModelChange={noop}
+          onSubmit={() => setText("")}
+          onCancel={noop}
         />
       </div>
       <Specimen title="Message preview">

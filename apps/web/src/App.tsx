@@ -1,3 +1,5 @@
+import { MobileChatControls } from "./components/MobileChatControls";
+import { useWorkspaceViewport } from "./use-workspace-viewport";
 import { Kbd } from "./components/ui/kbd";
 import {
   useAppShortcuts,
@@ -105,6 +107,7 @@ export function App(props: AppProps) {
   );
 }
 function Workspace(props: AppProps) {
+  const viewport = useWorkspaceViewport();
   const navigate = useNavigate();
   const router = useRouter();
   const active = useMatch({ from: "/chat", shouldThrow: false, select: () => true }) ?? false;
@@ -901,6 +904,7 @@ function Workspace(props: AppProps) {
         >
           <Tooltip.Provider delay={350}>
             <main
+              ref={viewport}
               className={`app-shell group/workspace relative flex h-dvh overflow-hidden ${sidebar ? "" : "sidebar-hidden"} ${rightOpen ? "" : "right-panel-hidden"}`}
               aria-label="Chat workspace"
             >
@@ -1089,6 +1093,55 @@ function Workspace(props: AppProps) {
                     {!reference && !external && selectedId && routeDraftExists
                       ? (() => {
                           const thread = selected ?? selectedMetadata.data;
+                          const conversationActions = thread ? (
+                            <>
+                              {owner ? (
+                                <IconButton
+                                  label="Share conversation"
+                                  tooltip="Share"
+                                  onClick={() => setSharing(true)}
+                                >
+                                  <Users />
+                                </IconButton>
+                              ) : null}
+                              {thread.capabilities.edit ? (
+                                <DropdownMenu>
+                                  <DropdownMenuTrigger
+                                    render={
+                                      <IconButton label="Conversation actions" tooltip="Options">
+                                        <MoreHorizontal />
+                                      </IconButton>
+                                    }
+                                  />
+                                  <DropdownMenuContent align="end">
+                                    <DropdownMenuItem
+                                      onClick={() =>
+                                        setRename({ id: thread.id, title: thread.title })
+                                      }
+                                    >
+                                      <Pencil />
+                                      Rename
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      onClick={() =>
+                                        void update(thread.id, { archived: !thread.archived })
+                                      }
+                                    >
+                                      {thread.archived ? <ArchiveRestore /> : <Archive />}
+                                      {thread.archived ? "Unarchive" : "Archive"}
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      variant="destructive"
+                                      onClick={() => setConfirmDelete(thread.id)}
+                                    >
+                                      <Trash2 />
+                                      Delete
+                                    </DropdownMenuItem>
+                                  </DropdownMenuContent>
+                                </DropdownMenu>
+                              ) : null}
+                            </>
+                          ) : null;
                           return (
                             <Chat
                               threadId={selectedId}
@@ -1114,6 +1167,16 @@ function Workspace(props: AppProps) {
                                   ? "This conversation is unavailable while offline."
                                   : undefined)
                               }
+                              composerControls={
+                                <MobileChatControls
+                                  sidebarOpen={sidebar}
+                                  rightOpen={rightOpen}
+                                  onToggleSidebar={panels.getState().toggleSidebar}
+                                  onToggleRight={() => panels.getState().toggle(selectedId)}
+                                >
+                                  {thread ? conversationActions : null}
+                                </MobileChatControls>
+                              }
                               header={
                                 thread ? (
                                   <header className="thread-header flex items-center gap-2 h-8 min-h-0 px-6 py-0.5 [&_h1]:truncate [&_.icon-button]:size-[var(--ui-control-compact)] max-workspace:gap-1 max-workspace:pl-15 group-[.sidebar-hidden]/workspace:pl-15 group-[.right-panel-hidden]/workspace:pr-[calc(var(--ui-space-unit)*5+var(--ui-control-compact))]">
@@ -1124,54 +1187,9 @@ function Workspace(props: AppProps) {
                                       </span>
                                     ) : null}
                                     <span className="toolbar-spacer flex-1" />
-                                    {owner ? (
-                                      <IconButton
-                                        label="Share conversation"
-                                        tooltip="Share"
-                                        onClick={() => setSharing(true)}
-                                      >
-                                        <Users />
-                                      </IconButton>
-                                    ) : null}
-                                    {thread.capabilities.edit ? (
-                                      <DropdownMenu>
-                                        <DropdownMenuTrigger
-                                          render={
-                                            <IconButton
-                                              label="Conversation actions"
-                                              tooltip="Options"
-                                            >
-                                              <MoreHorizontal />
-                                            </IconButton>
-                                          }
-                                        />
-                                        <DropdownMenuContent align="end">
-                                          <DropdownMenuItem
-                                            onClick={() =>
-                                              setRename({ id: thread.id, title: thread.title })
-                                            }
-                                          >
-                                            <Pencil />
-                                            Rename
-                                          </DropdownMenuItem>
-                                          <DropdownMenuItem
-                                            onClick={() =>
-                                              void update(thread.id, { archived: !thread.archived })
-                                            }
-                                          >
-                                            {thread.archived ? <ArchiveRestore /> : <Archive />}
-                                            {thread.archived ? "Unarchive" : "Archive"}
-                                          </DropdownMenuItem>
-                                          <DropdownMenuItem
-                                            variant="destructive"
-                                            onClick={() => setConfirmDelete(thread.id)}
-                                          >
-                                            <Trash2 />
-                                            Delete
-                                          </DropdownMenuItem>
-                                        </DropdownMenuContent>
-                                      </DropdownMenu>
-                                    ) : null}
+                                    <div className="hidden workspace:flex items-center gap-2">
+                                      {conversationActions}
+                                    </div>
                                   </header>
                                 ) : undefined
                               }

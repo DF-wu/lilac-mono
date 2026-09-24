@@ -1,3 +1,4 @@
+import { toast } from "./ui/toast";
 import { Kbd } from "./ui/kbd";
 import { useEventCallback } from "../use-event-callback";
 import { Result } from "better-result";
@@ -25,7 +26,7 @@ import "./composer-drop.css";
 import type { Completion } from "@stanley2058/lilac-client";
 import type { ChatCommon, ComposerSubmission, Attachment } from "../types";
 import { readMessageClipboard, type MessageClipboard } from "../message-clipboard";
-import { IconButton, VirtualList, ErrorNotice, attempt } from "./ui";
+import { IconButton, VirtualList, attempt } from "./ui";
 import type { ComposerEditorHandle } from "./composer-editor";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "./ui/select";
 import { Popover, PopoverTrigger, PopoverContent } from "./ui/popover";
@@ -76,7 +77,6 @@ export const Composer = memo(function Composer(props: ComposerProps) {
   const [mode, setMode] = useState<"steer" | "followup">("steer");
   const commandId = props.commandId;
   const setCommandId = props.onCommand;
-  const [error, setError] = useState<string>();
   const skillIds = props.skillIds;
   const setSkills = props.onSkills;
   const [editorValue, setEditorValue] = useState<{
@@ -109,7 +109,6 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     setSelected(0);
     setMenuHidden(false);
     setDragging(false);
-    setError(undefined);
   }
   const dropProps = useRef(props);
   dropProps.current = props;
@@ -146,7 +145,6 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     input.current?.complete(item.insertText, (match?.[2]?.length ?? 0) + 1);
     if (item.kind === "skill") setSkills([...new Set([...skillIds, item.id])].slice(0, 32));
     if (item.kind !== "skill") setCommandId(item.id);
-    setError(undefined);
     setMenuHidden(true);
   }
 
@@ -160,20 +158,20 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     )
       return;
     if (input.current?.hasMissingAttachments()) {
-      setError("Reattach or remove the missing files before sending.");
+      toast.add({ title: "Reattach or remove the missing files before sending.", type: "error" });
       return;
     }
     if (text.length > 65_536) {
-      setError("Messages can contain up to 65,536 characters.");
+      toast.add({ title: "Messages can contain up to 65,536 characters.", type: "error" });
       return;
     }
     if (!commandId && matching.length > 1) {
-      setError("Choose the command from the menu to resolve its name.");
+      toast.add({ title: "Choose the command from the menu to resolve its name.", type: "error" });
       return;
     }
     if (commandId && !command) {
       setCommandId(undefined);
-      setError("The selected command changed. Choose it again.");
+      toast.add({ title: "The selected command changed. Choose it again.", type: "error" });
       return;
     }
     if (command?.kind === "builtin" && command.id === "cancel") {
@@ -201,7 +199,6 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     });
     setSkills([]);
     setCommandId(undefined);
-    setError(undefined);
     setMenuHidden(true);
   }
 
@@ -272,7 +269,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           ok: (files) => files,
           err: (message) => {
             if (!controller.signal.aborted && dropProps.current.documentKey === documentKey)
-              setError(message);
+              toast.add({ title: message, type: "error" });
             return undefined;
           },
         });
@@ -285,12 +282,12 @@ export const Composer = memo(function Composer(props: ComposerProps) {
         )
           return;
         if (dropProps.current.attachments.length + files.length > 32) {
-          setError("A message can contain at most 32 attachments.");
+          toast.add({ title: "A message can contain at most 32 attachments.", type: "error" });
           return;
         }
         const added = dropProps.current.onAttach(files, true);
         if (!added || added.length !== files.length) {
-          setError("A message can contain at most 32 attachments.");
+          toast.add({ title: "A message can contain at most 32 attachments.", type: "error" });
           return;
         }
         target.insert(
@@ -304,7 +301,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       },
       (message) => {
         if (!controller.signal.aborted && dropProps.current.documentKey === documentKey)
-          setError(message);
+          toast.add({ title: message, type: "error" });
       },
     );
     controller.abort();
@@ -448,7 +445,6 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           />
         </PopoverContent>
       </Popover>
-      <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
       <div className="composer bg-surface text-card-foreground rounded-lg p-3">
         {skillIds.length ? (
           <div className="skill-chips">
