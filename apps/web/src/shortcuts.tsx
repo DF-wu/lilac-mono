@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect } from "react";
 import { useStore } from "zustand";
-import { useOptionalWorkspace, useWorkspace } from "./workspace-context";
+import { useOptionalWorkspace } from "./workspace-context";
 import { useEventCallback } from "./use-event-callback";
 import {
   ariaBinding,
@@ -35,7 +35,8 @@ export function useThreadShortcut(id?: string) {
   return { label: formatBinding(binding), aria: ariaBinding(binding), held };
 }
 export function useThreadTargets(ids: readonly string[], select: (id: string) => void) {
-  const { keybindings } = useWorkspace();
+  const workspace = useOptionalWorkspace();
+  const keybindings = workspace?.keybindings ?? previewKeybindings;
   const onSelect = useEventCallback(select);
   useLayoutEffect(() => {
     const next = [...new Set(ids)];
@@ -89,7 +90,8 @@ export function useAppShortcuts(options: {
   sidebar: () => void;
   rightPanel: () => void;
 }) {
-  const { keybindings } = useWorkspace();
+  const workspace = useOptionalWorkspace();
+  const keybindings = workspace?.keybindings ?? previewKeybindings;
   const handle = useEventCallback((event: KeyboardEvent) => {
     if (!options.enabled || options.blocked || shortcutOverlayOpen()) {
       if (keybindings.getState().heldTargets) keybindings.setState({ heldTargets: undefined });

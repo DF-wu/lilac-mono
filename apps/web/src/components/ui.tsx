@@ -1,3 +1,4 @@
+import { Kbd } from "./ui/kbd";
 import { useShortcut } from "../shortcuts";
 import type { ShortcutAction } from "../keybindings";
 import {
@@ -28,7 +29,7 @@ export function IconButton({
   ...props
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
   label: string;
-  tooltip?: string;
+  tooltip?: ReactNode;
   shortcut?: ShortcutAction;
   variant?: ComponentProps<typeof Button>["variant"];
 }) {
@@ -52,7 +53,7 @@ export function IconButton({
       </TooltipTrigger>
       <TooltipContent>
         {tooltip}
-        {keys.label ? ` (${keys.label})` : ""}
+        {keys.label ? <Kbd>{keys.label}</Kbd> : null}
       </TooltipContent>
     </Tooltip>
   );

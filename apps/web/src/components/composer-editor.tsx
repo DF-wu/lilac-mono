@@ -1,3 +1,4 @@
+import { Kbd } from "./ui/kbd";
 import { shortcutOverlayOpen } from "../shortcuts";
 import { formatBinding, ariaBinding } from "../keybindings";
 import { parseReferenceHref, referenceHref } from "@stanley2058/lilac-client-protocol";
@@ -824,7 +825,11 @@ const ComposerFormatting = memo(function ComposerFormatting({
       onMouseDown={(event) => event.preventDefault()}
     >
       <IconButton
-        tooltip={`Bold (${formatBinding({ code: "KeyB", mod: true, alt: false, shift: false })})`}
+        tooltip={
+          <>
+            Bold <Kbd>{formatBinding({ code: "KeyB", mod: true, alt: false, shift: false })}</Kbd>
+          </>
+        }
         aria-keyshortcuts={ariaBinding({ code: "KeyB", mod: true, alt: false, shift: false })}
         label="Bold"
         disabled={disabled}
@@ -833,7 +838,11 @@ const ComposerFormatting = memo(function ComposerFormatting({
         <Bold />
       </IconButton>
       <IconButton
-        tooltip={`Italic (${formatBinding({ code: "KeyI", mod: true, alt: false, shift: false })})`}
+        tooltip={
+          <>
+            Italic <Kbd>{formatBinding({ code: "KeyI", mod: true, alt: false, shift: false })}</Kbd>
+          </>
+        }
         aria-keyshortcuts={ariaBinding({ code: "KeyI", mod: true, alt: false, shift: false })}
         label="Italic"
         disabled={disabled}

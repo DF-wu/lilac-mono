@@ -1,3 +1,4 @@
+import { Kbd } from "./ui/kbd";
 import { useThreadShortcut } from "../shortcuts";
 import { LoadingSpinner } from "./ui/loading-spinner";
 import { useWorkspace } from "../workspace-context";
@@ -71,7 +72,6 @@ export function ThreadCard({
         variant="ghost"
         className="thread-card-select absolute inset-0 w-full h-full rounded-[inherit]"
         onClick={onSelect}
-        title={shortcut.label ? `Open thread (${shortcut.label})` : undefined}
         aria-keyshortcuts={shortcut.aria}
         aria-label={`${title || "Untitled"}, ${states[state].label}${draft && !selected ? ", Draft" : ""}`}
       />
@@ -123,12 +123,12 @@ export function ThreadCard({
         </span>
       </span>
       {shortcut.held && shortcut.label ? (
-        <kbd
+        <Kbd
           data-ui="thread-shortcut"
-          className="absolute bottom-2 right-2 pointer-events-none rounded-sm bg-popover px-2 py-1 text-xs text-popover-foreground shadow-sm"
+          className="absolute bottom-2 right-2 bg-popover px-2 text-popover-foreground shadow-sm"
         >
           {shortcut.label}
-        </kbd>
+        </Kbd>
       ) : null}
     </div>
   );
@@ -171,7 +171,6 @@ export function ThreadSelect({
   pinned?: boolean;
   draft?: "new" | "reply";
 }) {
-  const shortcut = useThreadShortcut(thread.id);
   const { client } = useWorkspace();
   const [open, setOpen] = useState(false);
   const online = useNativeOnline(client);
@@ -212,7 +211,6 @@ export function ThreadSelect({
       >
         <div className="thread-details flex flex-col gap-2 text-sm wrap-anywhere">
           <strong>{thread.title || "Untitled"}</strong>
-          {shortcut.label ? <kbd>{shortcut.label}</kbd> : null}
           <span>
             <UserRound />
             Started by {starter}

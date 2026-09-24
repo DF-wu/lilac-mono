@@ -1,3 +1,4 @@
+import { Kbd } from "./ui/kbd";
 import { useEventCallback } from "../use-event-callback";
 import { Result } from "better-result";
 import { useOptionalWorkspace } from "../workspace-context";
@@ -564,7 +565,12 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           ) : null}
           <IconButton
             label={active && custom ? "Queue command as follow-up" : "Send message"}
-            tooltip={`${active && custom ? "Queue command as follow-up" : "Send message"} (Enter)`}
+            tooltip={
+              <>
+                {active && custom ? "Queue command as follow-up" : "Send message"}
+                <Kbd>Enter</Kbd>
+              </>
+            }
             aria-keyshortcuts="Enter"
             variant="default"
             className="rounded-full"

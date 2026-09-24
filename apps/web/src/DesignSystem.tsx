@@ -1,3 +1,4 @@
+import { useAppShortcuts, useThreadTargets } from "./shortcuts";
 import { KeybindingsSettings } from "./components/KeybindingsSettings";
 import { createKeybindings } from "./keybindings";
 import { CopyReferenceButton } from "./components/ConversationReference";
@@ -468,11 +469,23 @@ function Foundations() {
 function Threads() {
   const [selected, setSelected] = useState("working");
   const [action, setAction] = useState("");
+  useThreadTargets(
+    threadStates.map(({ state }) => state),
+    setSelected,
+  );
+  useAppShortcuts({
+    enabled: true,
+    blocked: false,
+    newThread: noop,
+    settings: noop,
+    sidebar: noop,
+    rightPanel: noop,
+  });
   return (
     <Section
       id="threads"
       title="Threads"
-      description="Hover or focus a row to inspect its actions. The input state is visual only."
+      description="Hover or focus a row to inspect its actions. Hold Ctrl or ⌘ to reveal thread shortcuts."
     >
       <div className="ds-grid grid grid-cols-1 workspace:grid-cols-2 gap-6">
         <div className="ds-thread-list flex flex-col gap-6 p-3 bg-surface rounded-lg">
@@ -480,6 +493,7 @@ function Threads() {
             <div key={state}>
               <h3 className="ds-state-label">{label}</h3>
               <ThreadCard
+                shortcutId={state}
                 title={title}
                 starterName={index % 2 ? "Morgan Lee" : "Alex Chen"}
                 updatedAt={now - index * 3_600_000}

@@ -1,3 +1,4 @@
+import { Kbd } from "./components/ui/kbd";
 import {
   useAppShortcuts,
   useThreadShortcut,
@@ -1299,16 +1300,15 @@ function SearchThreadButton({
       type="button"
       variant="ghost"
       className="search-result relative flex w-full gap-1 p-3 text-left rounded-sm h-auto flex-col items-start whitespace-normal"
-      title={shortcut.label ? `Open thread (${shortcut.label})` : undefined}
       aria-keyshortcuts={shortcut.aria}
       onClick={onSelect}
     >
       <strong>{title}</strong>
       <span>{excerpt}</span>
       {shortcut.held && shortcut.label ? (
-        <kbd className="absolute bottom-2 right-2 rounded-sm bg-popover px-2 py-1 text-xs text-popover-foreground shadow-sm">
+        <Kbd className="absolute bottom-2 right-2 bg-popover px-2 text-popover-foreground shadow-sm">
           {shortcut.label}
-        </kbd>
+        </Kbd>
       ) : null}
     </Button>
   );
