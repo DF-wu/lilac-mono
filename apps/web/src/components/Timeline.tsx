@@ -1084,8 +1084,9 @@ const MessageBody = memo(function MessageBody(
     ) : null;
   const copy = copyButton ? (
     <>
-      {copyButton}
+      {self ? null : copyButton}
       <CopyReferenceButton target={copyReference} disabled={!!props.optimistic} />
+      {self ? copyButton : null}
     </>
   ) : null;
   return (
