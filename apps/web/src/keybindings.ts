@@ -131,11 +131,13 @@ export function createKeybindings(scope?: Pick<CacheScope, "installationId" | "p
     storageError?: string;
     targets: readonly string[];
     heldTargets?: readonly string[];
+    showThreadHints: boolean;
     selectThread?: (id: string) => void;
     setBinding: (action: ShortcutAction, value: Keybinding | null) => void;
   }>((set, get) => ({
     bindings,
     targets: [],
+    showThreadHints: false,
     setBinding(action, value) {
       if (bindingConflict(get().bindings, action, value)) return;
       const next = { ...get().bindings, [action]: value };

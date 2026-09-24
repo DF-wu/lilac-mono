@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { useStore } from "zustand";
 import { useOptionalWorkspace } from "./workspace-context";
 import { useEventCallback } from "./use-event-callback";
@@ -31,7 +31,7 @@ export function useThreadShortcut(id?: string) {
     return threadActions[index];
   });
   const binding = useStore(store, (state) => (action ? state.bindings[action] : null));
-  const held = useStore(store, (state) => !!state.heldTargets);
+  const held = useStore(store, (state) => state.showThreadHints);
   return { label: formatBinding(binding), aria: ariaBinding(binding), held };
 }
 export function useThreadTargets(ids: readonly string[], select: (id: string) => void) {
@@ -52,7 +52,12 @@ export function useThreadTargets(ids: readonly string[], select: (id: string) =>
   useLayoutEffect(
     () => () => {
       if (keybindings.getState().selectThread === onSelect)
-        keybindings.setState({ targets: [], heldTargets: undefined, selectThread: undefined });
+        keybindings.setState({
+          targets: [],
+          heldTargets: undefined,
+          showThreadHints: false,
+          selectThread: undefined,
+        });
     },
     [keybindings, onSelect],
   );
@@ -92,15 +97,32 @@ export function useAppShortcuts(options: {
 }) {
   const workspace = useOptionalWorkspace();
   const keybindings = workspace?.keybindings ?? previewKeybindings;
+  const hintTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const clear = useEventCallback(() => {
+    clearTimeout(hintTimer.current);
+    hintTimer.current = undefined;
+    if (keybindings.getState().heldTargets)
+      keybindings.setState({ heldTargets: undefined, showThreadHints: false });
+  });
+  const showHints = useEventCallback(() => {
+    hintTimer.current = undefined;
+    if (!options.enabled || options.blocked || shortcutOverlayOpen()) {
+      clear();
+      return;
+    }
+    if (keybindings.getState().heldTargets) keybindings.setState({ showThreadHints: true });
+  });
   const handle = useEventCallback((event: KeyboardEvent) => {
     if (!options.enabled || options.blocked || shortcutOverlayOpen()) {
-      if (keybindings.getState().heldTargets) keybindings.setState({ heldTargets: undefined });
+      clear();
       return;
     }
     if (event.isComposing || event.repeat || event.getModifierState("AltGraph")) return;
     const state = keybindings.getState();
-    if ((isMacKeyboard() ? event.metaKey : event.ctrlKey) && !state.heldTargets)
+    if ((isMacKeyboard() ? event.metaKey : event.ctrlKey) && !state.heldTargets) {
       keybindings.setState({ heldTargets: state.targets.slice(0, 10) });
+      hintTimer.current = setTimeout(showHints, 500);
+    }
     if (event.defaultPrevented) return;
     const pressed = recordedBinding(event);
     if (!pressed) return;
@@ -135,9 +157,6 @@ export function useAppShortcuts(options: {
     }
   });
   useEffect(() => {
-    const clear = () => {
-      if (keybindings.getState().heldTargets) keybindings.setState({ heldTargets: undefined });
-    };
     const release = (event: KeyboardEvent) => {
       if (!(isMacKeyboard() ? event.metaKey : event.ctrlKey)) clear();
     };
@@ -160,8 +179,8 @@ export function useAppShortcuts(options: {
       document.removeEventListener("visibilitychange", visibility);
       clear();
     };
-  }, [handle, keybindings]);
+  }, [handle, keybindings, clear]);
   useEffect(() => {
-    if (options.blocked || !options.enabled) keybindings.setState({ heldTargets: undefined });
-  }, [options.blocked, options.enabled, keybindings]);
+    if (options.blocked || !options.enabled) clear();
+  }, [options.blocked, options.enabled, clear]);
 }
