@@ -1,3 +1,4 @@
+import { expandConversationReferencesForModel } from "./conversation-references";
 import type { NativeOutputFrontier } from "@stanley2058/lilac-event-bus";
 import {
   McpImageCheckpointRegistry,
@@ -6551,7 +6552,9 @@ export async function startBusAgentRunner(params: {
                 })
               : scrubbed;
 
-            return compacted;
+            return next.requestClient === "native"
+              ? compacted
+              : expandConversationReferencesForModel(compacted, cfg.surface.native.publicUrl);
           };
           const toolPruneTransform: PrepareFullModelView = (messages, transformContext) =>
             prepareModelView(messages, transformContext, false);

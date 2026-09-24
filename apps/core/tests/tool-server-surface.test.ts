@@ -453,6 +453,19 @@ describe("tool-server surface", () => {
     expect(out.context.alias).toBe("ops");
   });
 
+  it("explains reference parsing and the native cross-surface read path", async () => {
+    const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
+    const out = (await tool.call("surface.help", {})) as {
+      terminology: { conversationLinks: string[] };
+    };
+    const help = out.terminology.conversationLinks.join("\n");
+    expect(help).toContain("http://localhost:8789/?ref=");
+    expect(help).toContain("split ref at the first colon");
+    expect(help).toContain("Always pass the target client explicitly");
+    expect(help).toContain("conversation.thread.read");
+    expect(help).toContain("threadId=native:<threadId>");
+  });
+
   it.each(["github", "native"])(
     "allows an explicit Discord target from %s",
     async (requestClient) => {

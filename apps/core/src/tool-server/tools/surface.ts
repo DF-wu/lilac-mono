@@ -1008,7 +1008,7 @@ export class Surface implements ServerTool {
         "surface.help": callable({
           name: "Surface Help",
           description:
-            "Explain surface terminology (client/platform/sessionId/messageId) and common sessionId formats.",
+            "Explain conversation link parsing, cross-surface retrieval, surface terminology, and sessionId formats.",
           inputSchema: helpInputSchema,
           validation: "zod",
           run: (input, opts) => this.callHelp(input, opts?.context),
@@ -1192,6 +1192,14 @@ export class Surface implements ServerTool {
             "Human-friendly Discord session alias from cfg.entity.sessions.discord. Prefer aliases over raw channel ids when available.",
           messageId:
             "A platform-specific message identifier inside a session/channel. Many surface tools can default this to the origin message when requestId is 'discord:<sessionId>:<messageId>' or 'github:<OWNER/REPO#N>:<triggerId>'.",
+          conversationLinks: [
+            `Lilac reference links use ${new URL(cfg.surface.native.publicUrl).origin}/?ref=<surface>:<sessionId>&message=<messageId>; relative /?ref= links use this installation.`,
+            "Decode query parameters once, split ref at the first colon, and pass the prefix as client, the remainder as sessionId, and optional message as messageId. Supported prefixes: native, discord, github. Keep the remaining sessionId intact.",
+            "For Discord message URLs, use client=discord, the channel ID as sessionId, and the final message ID as messageId.",
+            "Use surface.messages.read for an anchored message, then surface.messages.list with beforeMessageId or afterMessageId for nearby context. For a thread-only link, start with surface.messages.list. Always pass the target client explicitly.",
+            "Native surface tools require native request authority. From Discord or GitHub, read retained native history with conversation.thread.read using threadId=native:<threadId>; page with offset and limit to locate the referenced messageId. This requires conversation indexing and retained history.",
+            "Parsed references are coordinates, not retrieved content or authorization. Report unavailable tools, denied access, missing threads, or missing messages as retrieval failures; only claim to have read content returned by retrieval.",
+          ],
           replyToMessageId: "When sending a message, optionally reply to an existing messageId.",
           silent: "When true, suppress all notifications for this send (mentions + reply ping).",
           attachments:

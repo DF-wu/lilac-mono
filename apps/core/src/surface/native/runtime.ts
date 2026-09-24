@@ -164,7 +164,8 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     remoteDenyPaths: options.denyPaths,
   });
   const execution = createNativeExecution({
-    expandReferences: (userId, text) => references.expand(userId, text),
+    expandReferences: (userId, text) =>
+      references.expand(userId, text, new URL(options.getConfig().surface.native.publicUrl).origin),
     metrics,
     store,
     bus: options.bus,

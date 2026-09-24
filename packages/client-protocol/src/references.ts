@@ -45,7 +45,7 @@ export function referenceKey(target: ConversationReference): string {
   return `${target.surface}:${target.sessionId}`;
 }
 
-export function referencedConversations(text: string): ConversationReference[] {
+export function referencedConversations(text: string, origin?: string): ConversationReference[] {
   const refs = new Map<string, ConversationReference>();
   // Code examples must not become agent context, including unfinished fenced blocks.
   let fence: string | undefined;
@@ -71,9 +71,21 @@ export function referencedConversations(text: string): ConversationReference[] {
     })
     .join("\n")
     .replace(/(`+)[\s\S]*?\1/g, "");
-  for (const match of prose.matchAll(/(?<!\\)\[[^\]\n]*\]\((\/\?ref=[^\s)]+)\)/g)) {
-    const target = parseReferenceHref(match[1]!.replace(/\\&/g, "&"));
+  const add = (href: string) => {
+    const target = parseReferenceHref(href.replace(/\\&/g, "&"), origin);
     if (target) refs.set(referenceHref(target), target);
+  };
+  const withoutMarkdownLinks = prose.replace(
+    /\\?\[[^\]\n]*\]\(([^\s)]+)\)/g,
+    (link, href: string) => {
+      if (!link.startsWith("\\")) add(href);
+      return " ";
+    },
+  );
+  for (const match of withoutMarkdownLinks.matchAll(
+    /(?:^|[\s<(])((?:https?:\/\/[^\s<>]+|\/\?[^\s<>]+))/g,
+  )) {
+    add(match[1]!.replace(/[.,;!?)]+$/u, ""));
   }
   return [...refs.values()];
 }

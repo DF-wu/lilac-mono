@@ -5660,6 +5660,58 @@ describe("bus agent runner terminal cleanup", () => {
 });
 
 describe("startBusAgentRunner production path", () => {
+  it.each(["discord", "github"] as const)(
+    "normalizes native links in %s model input",
+    async (requestClient) => {
+      const config = parseCoreConfigV2ToUniversal({});
+      config.models.main = { model: "openai/reference-input" };
+      config.surface.native.publicUrl = "https://chat.example/";
+      const bus = createLilacBus(createInMemoryRawBus());
+      const pluginManager = corePrimaryTestPluginManager();
+      let modelInput = "";
+      const runner = await startBusAgentRunner({
+        bus,
+        subscriptionId: `references-${requestClient}`,
+        reportFatalPanic: () => undefined,
+        config,
+        pluginManager,
+        issueControlCapability: () => ({ capability: "reference-input", principal: null }),
+        createAgent: (options) =>
+          new AiSdkPiAgent({
+            ...options,
+            model: new MockLanguageModelV4({
+              modelId: "reference-input",
+              doStream: async ({ prompt }) => {
+                modelInput = JSON.stringify(prompt);
+                return level1TextStep("reference received");
+              },
+            }),
+          }),
+      });
+      const requestId = `${requestClient}:reference-session:reference-message`;
+      const lifecycle = await observeRequestLifecycle(bus, requestId);
+      try {
+        await publishRunnerRequest({
+          bus,
+          requestId,
+          sessionId: "reference-session",
+          requestClient,
+          text: "Read https://chat.example/?ref=native%3Atarget&message=anchor",
+        });
+        expect(await lifecycle.terminal, JSON.stringify(lifecycle.details)).toBe("resolved");
+        expect(modelInput).toContain("Conversation references (coordinates only");
+        expect(modelInput).toContain("native:target");
+        expect(modelInput).toContain('\\"client\\":\\"native\\"');
+        expect(modelInput).toContain('\\"messageId\\":\\"anchor\\"');
+      } finally {
+        await lifecycle.stop();
+        await runner.stop();
+        await pluginManager.destroy();
+        await bus.close();
+      }
+    },
+  );
+
   it("carries one projected origin through capability issuance and Level 1 context", async () => {
     const config = parseCoreConfigV2ToUniversal({});
     config.models.main = { model: "openai/identity-propagation" };

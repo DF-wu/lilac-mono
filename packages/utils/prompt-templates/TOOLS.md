@@ -26,6 +26,6 @@ Keep a compact existence map for tools hidden behind the `tools` CLI. Add detail
 - Remote files: prefer native filesystem tools with `<host>:<path>` targets; use `ssh.run` for multi-step remote shell work.
 - `<redacted>` in command output is a display transform; the runtime value is unchanged. Never print the underlying secret.
 
-## Surface gotcha
+## Conversation links
 
-For Discord URLs, pass the channel ID as `sessionId` and the final message ID as `messageId`; pass neither the full URL nor the guild ID.
+Use conversation tools first for Lilac reference links (`/?ref=...`, including absolute links on this installation) and Discord message URLs. Load `surface.help` for URL parsing and retrieval rules.

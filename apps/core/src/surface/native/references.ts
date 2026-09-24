@@ -79,8 +79,8 @@ export class NativeReferences {
     }, this);
   }
 
-  expand(userId: string, text: string): NativeStoreResult<string> {
-    const references = referencedConversations(text);
+  expand(userId: string, text: string, origin?: string): NativeStoreResult<string> {
+    const references = referencedConversations(text, origin);
     if (!references.length) return Result.ok(text);
     const context: string[] = [];
     for (const target of references) {
@@ -88,7 +88,12 @@ export class NativeReferences {
         ok: (value) => value,
         err: () => null,
       });
-      context.push(JSON.stringify(resolution ?? { ...target, unavailable: true }));
+      context.push(
+        JSON.stringify({
+          client: target.surface,
+          ...(resolution ?? { ...target, unavailable: true }),
+        }),
+      );
     }
     return Result.ok(`${text}\n\nConversation references:\n${context.join("\n")}`);
   }
