@@ -147,7 +147,7 @@ export function NativeSubagentPanel({
       embedded={embedded}
       items={items}
       selected={selected}
-      messages={error ? [] : messages}
+      messages={messages}
       loading={loading}
       error={error}
       unavailable={page?.unavailable}

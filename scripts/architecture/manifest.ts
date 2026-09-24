@@ -5459,7 +5459,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "ce7691fc060ecb09947750dcb2ec15c073d3027e2ffeec6019ab50ab54b8efeb";
+  "7eb0da266c16ad20af3962a60c658e232417120404d6d82a7b316c0873d1e3a5";
 
 export const architectureManifest = {
   version: 1,
