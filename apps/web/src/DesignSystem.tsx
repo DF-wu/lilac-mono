@@ -44,6 +44,7 @@ import type { Attachment } from "./types";
 import { AttachmentPreviewBody, ReadyAttachment } from "./components/ResourcePreview";
 import { MessageIdentityContext } from "./components/message-identity";
 import { toast } from "./components/ui/toast";
+import { showAppUpdateToast } from "./app-update-toast";
 import { IconButton, Modal, VirtualList } from "./components/ui";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
@@ -1372,15 +1373,7 @@ function Overlays() {
           <Button
             variant="secondary"
             onClick={() =>
-              toast.add({
-                title: "New version available",
-                description: "Reload to use the latest version.",
-                type: "info",
-                actionProps: {
-                  children: "Reload",
-                  onClick: () => setAction("Reload selected in preview"),
-                },
-              })
+              showAppUpdateToast(() => setAction("Reload selected in preview"), "app-update-demo")
             }
           >
             Update

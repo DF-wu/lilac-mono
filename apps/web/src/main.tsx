@@ -10,7 +10,8 @@ import { Result } from "better-result";
 import { WebSessionController, webCache } from "./bootstrap";
 import { LocalLogin } from "./auth";
 import { readAuthInfo, resourceUrl, uploadResource, type AuthInfo } from "./http";
-import { watchAppUpdates, type AppUpdate } from "./updates";
+import { watchAppUpdates, watchAppUpdateChecks, type AppUpdate } from "./updates";
+import { showAppUpdateToast } from "./app-update-toast";
 import { AccountLoadBoundary } from "./AccountLoadBoundary";
 import App from "./App";
 import "./styles.css";
@@ -59,10 +60,13 @@ function Root() {
   const [auth, setAuth] = useState<AuthInfo>();
   const [authError, setAuthError] = useState("");
   const [update, setUpdate] = useState<AppUpdate>();
+  const client = state.kind === "ready" ? state.session.client : undefined;
   useEffect(() => {
     void authInfo?.then((result) =>
       result.match({ ok: setAuth, err: (error) => setAuthError(error.message) }),
     );
+  }, []);
+  useEffect(() => {
     let stop: (() => void) | undefined;
     let disposed = false;
     void watchAppUpdates(setUpdate).then((cleanup) => {
@@ -78,14 +82,13 @@ function Root() {
     };
   }, []);
   useEffect(() => {
+    if (!client) return;
+    return watchAppUpdateChecks(client);
+  }, [client]);
+  useEffect(() => {
     if (!update) return;
-    toast.add({
-      id: "app-update",
-      title: "Update available",
-      timeout: 0,
-      actionProps: { children: "Reload", onClick: update.activate },
-    });
-    return () => toast.close("app-update");
+    const id = showAppUpdateToast(update.activate);
+    return () => toast.close(id);
   }, [update]);
   const stateMessage =
     state.kind === "offline" || state.kind === "login" ? state.message : undefined;
