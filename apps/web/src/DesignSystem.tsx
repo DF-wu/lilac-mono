@@ -1,3 +1,4 @@
+import { AgentAvatar } from "./components/AgentAvatar";
 import { useAppShortcuts, useThreadTargets } from "./shortcuts";
 import { KeybindingsSettings } from "./components/KeybindingsSettings";
 import { createKeybindings } from "./keybindings";
@@ -803,6 +804,22 @@ function Messages() {
               </Avatar>
               <AvatarGroupCount>+2</AvatarGroupCount>
             </AvatarGroup>
+          </div>
+        </Specimen>
+        <Specimen title="Agent avatars">
+          <div className="ds-row flex items-center flex-wrap gap-4">
+            {(["general", "explore", "self"] as const).map((profile) => (
+              <div key={profile} className="flex items-center gap-2">
+                <AgentAvatar profile={profile} displayName={`${profile} agent`} size="lg" />
+                <span className="text-sm capitalize">{profile}</span>
+              </div>
+            ))}
+            <MessageIdentityContext value={identities}>
+              <div className="flex items-center gap-2">
+                <AgentAvatar profile="self" displayName="Self with configured avatar" size="lg" />
+                <span className="text-sm">Self with custom avatar</span>
+              </div>
+            </MessageIdentityContext>
           </div>
         </Specimen>
         <Specimen title="Bubble variants">

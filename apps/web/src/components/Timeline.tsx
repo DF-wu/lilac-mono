@@ -1,3 +1,4 @@
+import { AgentAvatar } from "./AgentAvatar";
 import { LoadingSpinner } from "./ui/loading-spinner";
 import { AddReaction, MessageReactions } from "./MessageReactions";
 import { OptimisticTurns, type OptimisticTurn } from "../optimistic-turns";
@@ -1046,12 +1047,14 @@ const MessageBody = memo(function MessageBody(
     externalAuthor ??
     (message.role === "assistant"
       ? identities.agent
-      : (identities.users.get(message.metadata?.authorId ?? "") ?? { displayName: "Participant" }));
+      : (identities.users.get(message.metadata?.authorId ?? "") ??
+        identities.promptingAgent ?? { displayName: "Participant" }));
   const conversational = groups.some(
     (group) =>
       group.kind === "text" || (group.kind === "part" && group.part.type === "data-resource"),
   );
   let authorRole = externalAuthor ? "User" : "Participant";
+  if (identities.promptingAgent) authorRole = "Main agent";
   if (message.role === "assistant") authorRole = "Agent";
   else if (authorId !== undefined && authorId === identities.viewerId) authorRole = "You";
   const self =
@@ -1365,7 +1368,12 @@ export function ActivityItem({ part }: { part: ActivityPart }) {
           className="subagent-activity w-full h-auto text-left justify-start text-muted-foreground py-1 px-2"
           onClick={() => openAgent(agent.id ?? part.id)}
         >
-          <Bot />
+          <AgentAvatar
+            decorative
+            profile={agent.profile}
+            displayName={subagentProfileName(agent.profile)}
+            size="sm"
+          />
           <span>
             {subagentProfileName(agent.profile)} -{" "}
             <span

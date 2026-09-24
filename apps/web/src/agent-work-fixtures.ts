@@ -739,6 +739,15 @@ export function demoSubagentTranscript(agent: SubagentSummary): DisplayMessage[]
           : "I'll check the museum's own schedule and booking page.",
       },
     ]),
+    message("child_thought", [
+      activity(
+        "child_reasoning",
+        "thinking",
+        "Thought",
+        "complete",
+        "Check the original source before summarizing.",
+      ),
+    ]),
     message("child_work", [
       activity(
         "child_tool",

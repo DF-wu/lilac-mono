@@ -39,3 +39,24 @@
   --ui-motion-shine-duration: 4s;
   --ui-motion-pulse-duration: 4s;
 }
+
+/* Agent artwork colors stay stable across application themes. */
+[data-agent-profile] {
+  --ui-agent-eyes: #101010;
+  --ui-agent-highlight: #b5d6f9;
+  --ui-agent-light: #62a9f3;
+  --ui-agent-base: #3b93f0;
+  --ui-agent-shadow: #275c95;
+}
+[data-agent-profile="explore"] {
+  --ui-agent-highlight: #c1f3da;
+  --ui-agent-light: #72d5a8;
+  --ui-agent-base: #39b583;
+  --ui-agent-shadow: #24735a;
+}
+[data-agent-profile="self"] {
+  --ui-agent-highlight: #e3ceff;
+  --ui-agent-light: #bc94ef;
+  --ui-agent-base: #9c72d4;
+  --ui-agent-shadow: #65468f;
+}

@@ -1,6 +1,11 @@
+import { AgentAvatar, type AgentProfile } from "./AgentAvatar";
 import { Avatar, AvatarFallback, AvatarImage } from "./ui/avatar";
 
-export type ActorIdentity = { displayName: string; avatarUrl?: string };
+export type ActorIdentity = {
+  displayName: string;
+  avatarUrl?: string;
+  agentProfile?: AgentProfile;
+};
 
 export function initials(name: string): string {
   return (
@@ -18,8 +23,18 @@ export function initials(name: string): string {
 export function ActorAvatar({
   displayName,
   avatarUrl,
+  agentProfile,
   size = "default",
 }: ActorIdentity & { size?: "default" | "sm" | "lg" }) {
+  if (agentProfile)
+    return (
+      <AgentAvatar
+        profile={agentProfile}
+        displayName={displayName}
+        size={size}
+        avatarUrl={avatarUrl}
+      />
+    );
   return (
     <Avatar size={size} role="img" aria-label={displayName}>
       {avatarUrl ? <AvatarImage src={avatarUrl} alt="" referrerPolicy="no-referrer" /> : null}

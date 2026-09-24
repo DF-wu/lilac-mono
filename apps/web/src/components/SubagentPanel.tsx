@@ -1,3 +1,4 @@
+import { AgentAvatar } from "./AgentAvatar";
 import { LoadingSpinner } from "./ui/loading-spinner";
 import { defaultRightPanel } from "../panel-store";
 import { useContext, useMemo, useEffect, type ReactNode } from "react";
@@ -11,7 +12,11 @@ import {
   PanelRightClose,
   PanelRightOpen,
 } from "lucide-react";
-import type { DisplayMessage, SubagentSummary } from "@stanley2058/lilac-client-protocol";
+import type {
+  DisplayMessage,
+  ReadyTurnSlot,
+  SubagentSummary,
+} from "@stanley2058/lilac-client-protocol";
 import { useWorkspace } from "../workspace-context";
 import {
   subagentsOptions,
@@ -21,11 +26,20 @@ import {
 } from "../queries";
 import { SubagentContext, subagentProfileName } from "./subagent-context";
 import { MessageIdentityContext } from "./message-identity";
-import { Message } from "./Timeline";
+import { Turn } from "./Timeline";
+import { MessageServicesContext, type MessageServices } from "./message-services";
 import { Button } from "./ui/button";
 import { IconButton } from "./ui";
 import { PanelToggleButton } from "./PanelToggleButton";
 import "./subagent-panel.css";
+
+const transcriptServices: MessageServices = {
+  canEdit: false,
+  resourceUrl: () => "",
+  onAction: () => {},
+  onReaction: () => {},
+};
+const ignoreTurnAction = () => {};
 
 export function NativeSubagentProvider({
   threadId,
@@ -194,10 +208,45 @@ export function SubagentPanelView({
     () => ({
       ...identity,
       viewerId: undefined,
-      agent: { displayName: selected ? subagentProfileName(selected.profile) : "Agent" },
+      promptingAgent: identity.agent,
+      agent: {
+        displayName: selected ? subagentProfileName(selected.profile) : "Agent",
+        agentProfile: selected?.profile,
+      },
     }),
     [identity, selected?.profile],
   );
+  const turn = useMemo<ReadyTurnSlot | undefined>(() => {
+    if (!selected) return undefined;
+    // The transcript splits long prompts into consecutive user messages.
+    const firstResponse = messages.findIndex((message) => message.role !== "user");
+    const promptChunks = messages.slice(0, firstResponse < 0 ? messages.length : firstResponse);
+    const transcript =
+      promptChunks.length > 1
+        ? [
+            { ...promptChunks[0]!, parts: promptChunks.flatMap((message) => message.parts) },
+            ...messages.slice(promptChunks.length),
+          ]
+        : messages;
+    // Transcript projection has no final-phase metadata. The completed reply follows the last activity or prompt.
+    const lastWork = transcript.findLastIndex(
+      (message) =>
+        message.role !== "assistant" || message.parts.some((part) => part.type !== "text"),
+    );
+    return {
+      kind: "ready",
+      slotId: selected.id,
+      turnId: selected.id,
+      position: 0,
+      state: selected.state,
+      startedAt: selected.startedAt,
+      messages: transcript.map((message, index) =>
+        selected.state === "complete" && index > lastWork
+          ? { ...message, metadata: { ...message.metadata, phase: "final" } }
+          : message,
+      ),
+    };
+  }, [selected, messages]);
   const more = hasMore ? (
     <Button variant="ghost" disabled={loadingMore} onClick={onMore}>
       {selected ? "Load older messages" : "Load more agents"}
@@ -262,16 +311,17 @@ export function SubagentPanelView({
               </p>
             ) : null}
             <MessageIdentityContext value={transcriptIdentity}>
-              {messages.map((message) => (
-                <Message
-                  key={message.id}
-                  message={message}
-                  canEdit={false}
-                  resourceUrl={() => ""}
-                  onAction={() => {}}
-                  onReaction={() => {}}
-                />
-              ))}
+              <MessageServicesContext value={transcriptServices}>
+                {turn && messages.length > 0 ? (
+                  <Turn
+                    key={turn.turnId}
+                    slot={turn}
+                    animateArrivals={false}
+                    onRewind={ignoreTurnAction}
+                    onLoadMore={ignoreTurnAction}
+                  />
+                ) : null}
+              </MessageServicesContext>
             </MessageIdentityContext>
           </div>
         </div>
@@ -291,7 +341,12 @@ export function SubagentPanelView({
               className="subagent-card flex items-start justify-start w-full h-auto p-3 text-left gap-3"
               onClick={() => onSelect(agent.id)}
             >
-              <Bot />
+              <AgentAvatar
+                decorative
+                profile={agent.profile}
+                displayName={subagentProfileName(agent.profile)}
+                size="sm"
+              />
               <span>
                 <strong>{subagentProfileName(agent.profile)}</strong>
                 <span className="subagent-name overflow-hidden text-ellipsis whitespace-nowrap">
