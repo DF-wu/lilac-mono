@@ -253,3 +253,27 @@ test("work duration uses the prompt timestamp for older turns without a start ti
     "Worked for 12s",
   );
 });
+
+test("only the last folded section and sections with running agents shine", () => {
+  const html = renderStage("folded-activity-running");
+  expect(html.match(/class="working-text"/gu)).toHaveLength(2);
+  expect(html).toContain(">Thought</span>");
+  expect(html).toContain(">Spawned 1 agent</span>");
+  expect(html).toContain('<span class="working-text">Thinking</span>');
+});
+
+test("terminal turns suppress stale running activity even in final messages", () => {
+  const slot = agentWorkStages.find((stage) => stage.id === "folded-activity-complete")!.frames[0]!;
+  for (const state of ["complete", "failed", "canceled"] as const) {
+    const html = renderStage("folded-activity-complete", {
+      ...slot,
+      state,
+      messages: slot.messages.map((message) => ({
+        ...message,
+        metadata: { ...message.metadata, phase: "final" },
+      })),
+    });
+    expect(html).not.toContain('class="working-text"');
+    expect(html.match(/>Thought<\/span>/gu)).toHaveLength(2);
+  }
+});

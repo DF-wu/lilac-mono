@@ -427,6 +427,9 @@ const SlotRow = memo(function SlotRow(props: {
   );
 });
 
+const RequestActiveContext = createContext<boolean | undefined>(undefined);
+const LastActivityContext = createContext<ActivityPart | undefined>(undefined);
+
 export const Turn = memo(function Turn(props: {
   slot: ReadyTurnSlot;
   animateArrivals?: boolean;
@@ -446,6 +449,13 @@ export const Turn = memo(function Turn(props: {
   const remaining = useMemo(
     () => groupActivityMessages(slot.messages.filter((message) => message.id !== firstUser?.id)),
     [slot.messages, firstUser?.id],
+  );
+  const lastActivity = useMemo(
+    () =>
+      remaining
+        .flatMap((message) => message.parts)
+        .findLast((part) => part.type === "data-activity"),
+    [remaining],
   );
   const lastIntermediate = remaining.findLastIndex(
     (message) => message.role !== "assistant" || message.metadata?.phase !== "final",
@@ -489,70 +499,76 @@ export const Turn = memo(function Turn(props: {
           />
         </div>
       ) : null}
-      <div className="agent-response flex flex-col gap-2">
-        {waiting ||
-        (remaining.length > 0 &&
-          (settled ||
-            remaining.find((message) => message.role !== "system")?.role === "assistant")) ? (
-          <AuthorAvatar author={identities.agent} role="Agent" />
-        ) : null}
-        {waiting ? (
-          <MessageBody
-            live={true}
-            showAvatar={false}
-            message={{
-              id: `${slot.turnId}:thinking`,
-              role: "assistant",
-              parts: [
-                {
-                  type: "data-activity",
+      <RequestActiveContext value={!settled}>
+        <LastActivityContext value={lastActivity}>
+          <div className="agent-response flex flex-col gap-2">
+            {waiting ||
+            (remaining.length > 0 &&
+              (settled ||
+                remaining.find((message) => message.role !== "system")?.role === "assistant")) ? (
+              <AuthorAvatar author={identities.agent} role="Agent" />
+            ) : null}
+            {waiting ? (
+              <MessageBody
+                live={true}
+                showAvatar={false}
+                message={{
                   id: `${slot.turnId}:thinking`,
-                  data: { kind: "thinking", state: "running", label: "Thinking…" },
-                },
-              ],
-            }}
-          />
-        ) : null}
-        {settled && intermediate.length > 0 ? (
-          <Collapsible open={expanded} onOpenChange={setExpanded}>
-            <CollapsibleTrigger
-              render={
-                <Button
-                  variant="ghost"
-                  className="work-summary w-full flex items-center gap-2 text-muted-foreground text-sm p-2 rounded-lg text-left h-auto justify-start"
-                />
-              }
-            >
-              <Marker render={<span />}>
-                <MarkerContent className="work-summary-label flex flex-1 flex-wrap items-center gap-2">
-                  <span>
-                    {duration === undefined ? "Worked" : `Worked for ${formatDuration(duration)}`}
-                  </span>
-                  <TurnParticipants messages={slot.messages} />
-                </MarkerContent>
-                {slot.state !== "complete" ? (
-                  <span className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap">
-                    {slot.state}
-                  </span>
-                ) : null}
-                <ChevronRight className={expanded ? "rotated [transform:rotate(90deg)]" : ""} />
-              </Marker>
-            </CollapsibleTrigger>
-            <CollapsibleContent data-ui="expanded-work" className="expanded-work mb-4">
-              <TurnMessages messages={intermediate} live={false} showFirstAvatar={false} />
-            </CollapsibleContent>
-          </Collapsible>
-        ) : (
-          <TurnMessages messages={intermediate} live={!settled} showFirstAvatar={false} />
-        )}
-        <TurnMessages
-          messages={finals}
-          live={props.animateArrivals ?? true}
-          showFirstAvatar={!settled && intermediate.at(-1)?.role === "user"}
-          finalMessageId={settled ? finals.at(-1)?.id : undefined}
-          finalText={finals.map(messageText).filter(Boolean).join("\n\n")}
-        />
-      </div>
+                  role: "assistant",
+                  parts: [
+                    {
+                      type: "data-activity",
+                      id: `${slot.turnId}:thinking`,
+                      data: { kind: "thinking", state: "running", label: "Thinking…" },
+                    },
+                  ],
+                }}
+              />
+            ) : null}
+            {settled && intermediate.length > 0 ? (
+              <Collapsible open={expanded} onOpenChange={setExpanded}>
+                <CollapsibleTrigger
+                  render={
+                    <Button
+                      variant="ghost"
+                      className="work-summary w-full flex items-center gap-2 text-muted-foreground text-sm p-2 rounded-lg text-left h-auto justify-start"
+                    />
+                  }
+                >
+                  <Marker render={<span />}>
+                    <MarkerContent className="work-summary-label flex flex-1 flex-wrap items-center gap-2">
+                      <span>
+                        {duration === undefined
+                          ? "Worked"
+                          : `Worked for ${formatDuration(duration)}`}
+                      </span>
+                      <TurnParticipants messages={slot.messages} />
+                    </MarkerContent>
+                    {slot.state !== "complete" ? (
+                      <span className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap">
+                        {slot.state}
+                      </span>
+                    ) : null}
+                    <ChevronRight className={expanded ? "rotated [transform:rotate(90deg)]" : ""} />
+                  </Marker>
+                </CollapsibleTrigger>
+                <CollapsibleContent data-ui="expanded-work" className="expanded-work mb-4">
+                  <TurnMessages messages={intermediate} live={false} showFirstAvatar={false} />
+                </CollapsibleContent>
+              </Collapsible>
+            ) : (
+              <TurnMessages messages={intermediate} live={!settled} showFirstAvatar={false} />
+            )}
+            <TurnMessages
+              messages={finals}
+              live={props.animateArrivals ?? true}
+              showFirstAvatar={!settled && intermediate.at(-1)?.role === "user"}
+              finalMessageId={settled ? finals.at(-1)?.id : undefined}
+              finalText={finals.map(messageText).filter(Boolean).join("\n\n")}
+            />
+          </div>
+        </LastActivityContext>
+      </RequestActiveContext>
       {settled && !intermediate.length && slot.state !== "complete" ? (
         <Marker className="turn-status">
           <MarkerContent>{slot.state}</MarkerContent>
@@ -1201,6 +1217,7 @@ type ActivityPart = Extract<DisplayPart, { type: "data-activity" }>;
 export function activitySummary(
   parts: readonly ActivityPart[],
   agents: ReadonlyMap<string, SubagentSummary> = new Map(),
+  active = true,
 ): string {
   const spawned = parts.filter((part) => subagentActivity(part, agents)).length;
   if (spawned) {
@@ -1215,11 +1232,11 @@ export function activitySummary(
     return labels.join(" and ");
   }
   const running = parts.find((part) => part.data.state === "running");
-  if (running && parts.length === 1) return running.data.label;
+  if (running && parts.length === 1) return activityLabel(running, active);
   const only = parts.length === 1 ? parts[0] : undefined;
   if (only?.data.state === "complete" && only.data.durationMs !== undefined)
     return `${only.data.kind === "thinking" ? "Thought" : "Worked"} for ${formatDuration(only.data.durationMs)}`;
-  if (parts.length === 1) return parts[0]!.data.label;
+  if (parts.length === 1) return activityLabel(parts[0]!, false);
   const tools = parts.filter((part) => part.data.kind === "tool").length;
   const workflows = parts.filter((part) => part.data.kind === "workflow").length;
   const thinking = parts.some((part) => part.data.kind === "thinking");
@@ -1234,8 +1251,14 @@ export function activitySummary(
   return labels.join(" and ");
 }
 
-function ActivityIcon({ part }: { part: ActivityPart }) {
-  if (part.data.state === "running") return <LoadingSpinner />;
+function activityLabel(part: ActivityPart, running: boolean): string {
+  if (part.data.kind === "thinking" && !running && /^thinking[.…]*$/i.test(part.data.label))
+    return "Thought";
+  return part.data.label;
+}
+
+function ActivityIcon({ part, running }: { part: ActivityPart; running: boolean }) {
+  if (running) return <LoadingSpinner />;
   if (part.data.kind === "thinking") return <Brain />;
   if (part.data.kind === "workflow") return <Workflow />;
   return <Wrench />;
@@ -1243,7 +1266,12 @@ function ActivityIcon({ part }: { part: ActivityPart }) {
 
 export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdAt?: number }) {
   const { agents } = useSubagents();
-  const live = useContext(LiveMessageContext);
+  const requestActive = useContext(RequestActiveContext);
+  const lastActivity = useContext(LastActivityContext);
+  const runningAgent = parts.some((part) => subagentActivity(part, agents)?.state === "running");
+  const active = requestActive ?? parts.some((part) => part.data.state === "running");
+  const working =
+    active && (runningAgent || lastActivity === undefined || parts.at(-1) === lastActivity);
   const spawned = parts.some((part) => subagentActivity(part, agents));
   const arrivalRef = useMessageArrival(`activity:${parts[0]?.id}`);
   const [open, setOpen] = useState(false);
@@ -1265,14 +1293,19 @@ export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdA
         }
       >
         <Marker render={<span />}>
-          <MarkerIcon>{spawned ? <Bot /> : <ActivityIcon part={representative} />}</MarkerIcon>
+          <MarkerIcon>
+            {spawned ? (
+              <Bot />
+            ) : (
+              <ActivityIcon
+                part={representative}
+                running={working && representative.data.state === "running"}
+              />
+            )}
+          </MarkerIcon>
           <MarkerContent className="activity-label flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
-            <span
-              className={
-                live || representative.data.state === "running" ? "working-text" : undefined
-              }
-            >
-              {activitySummary(parts, agents)}
+            <span className={working ? "working-text" : undefined}>
+              {activitySummary(parts, agents, working)}
             </span>
           </MarkerContent>
           {createdAt !== undefined ? (
@@ -1320,6 +1353,8 @@ function subagentActivity(
 export function ActivityItem({ part }: { part: ActivityPart }) {
   const { agents, open: openAgent } = useSubagents();
   const agent = subagentActivity(part, agents);
+  const requestActive = useContext(RequestActiveContext);
+  const running = requestActive !== false && part.data.state === "running";
   const arrivalRef = useMessageArrival(`activity-item:${part.id}`);
   const [open, setOpen] = useState(false);
   if (agent)
@@ -1333,7 +1368,11 @@ export function ActivityItem({ part }: { part: ActivityPart }) {
           <Bot />
           <span>
             {subagentProfileName(agent.profile)} -{" "}
-            <span className={agent.state === "running" ? "working-text" : undefined}>
+            <span
+              className={
+                requestActive !== false && agent.state === "running" ? "working-text" : undefined
+              }
+            >
               {agent.title}
             </span>
           </span>
@@ -1344,12 +1383,10 @@ export function ActivityItem({ part }: { part: ActivityPart }) {
   const row = (
     <Marker render={<span />}>
       <MarkerIcon>
-        <ActivityIcon part={part} />
+        <ActivityIcon part={part} running={running} />
       </MarkerIcon>
       <MarkerContent className="activity-label flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
-        <span className={part.data.state === "running" ? "working-text" : undefined}>
-          {part.data.label}
-        </span>
+        <span className={running ? "working-text" : undefined}>{activityLabel(part, running)}</span>
       </MarkerContent>
       {part.data.state === "failed" ? (
         <span className="activity-state text-danger">Failed</span>

@@ -285,6 +285,28 @@ const parentRouteDone = message("demo_parent_work", [
   ),
 ]);
 
+const foldedActivityMessages = [
+  message("demo_old_thought", [
+    activity("thinking", "thinking", "Thinking", "complete", "Compared both options."),
+  ]),
+  message("demo_first_update", [{ type: "text", text: "The route comparison is ready." }]),
+  message("demo_background_agent", [
+    activity(
+      "demo_background_agent_part",
+      "tool",
+      "subagent (general)",
+      "running",
+      "Checking museum hours.",
+    ),
+  ]),
+  message("demo_second_update", [
+    { type: "text", text: "The agent is checking opening hours while I finish the plan." },
+  ]),
+  message("demo_latest_thought", [
+    activity("thinking", "thinking", "Thinking", "running", "Finishing the recommendation."),
+  ]),
+];
+
 export const agentWorkStages: AgentWorkStage[] = [
   {
     id: "sent",
@@ -322,6 +344,18 @@ export const agentWorkStages: AgentWorkStage[] = [
         ]),
       ]),
     ],
+  },
+  {
+    id: "folded-activity-running",
+    label: "Folded activity running",
+    description: "Only the last section and the section with a running agent shine.",
+    frames: [turn(foldedActivityMessages)],
+  },
+  {
+    id: "folded-activity-complete",
+    label: "Folded activity complete",
+    description: "Completed work stops shining even when activity records still say running.",
+    frames: [turn([...foldedActivityMessages, final], "complete")],
   },
   {
     id: "tool-call",
