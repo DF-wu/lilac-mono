@@ -62,7 +62,6 @@ export type ChatProps = Pick<ChatCommon, "catalog" | "onError"> & {
   onLocalChange: (id: string, update: (thread: DraftThread) => DraftThread) => void;
   onLocalSubmit: (id: string, submission: ComposerSubmission) => void;
   header: ReactNode;
-  composerControls?: ReactNode;
   draft?: Draft;
   onDraft: (id: string, draft: Draft) => void;
   readTurns: Map<string, string>;
@@ -740,7 +739,6 @@ export function Chat(props: ChatProps) {
           Restore previous draft
         </Button>
       ) : null}
-      {props.composerControls}
       <div hidden={!editable}>
         <Composer
           documentKey={threadId}

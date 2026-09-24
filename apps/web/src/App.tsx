@@ -1,4 +1,4 @@
-import { MobileChatControls } from "./components/MobileChatControls";
+import { FloatingChatMenu } from "./components/FloatingChatMenu";
 import { useWorkspaceViewport } from "./use-workspace-viewport";
 import { Kbd } from "./components/ui/kbd";
 import {
@@ -894,6 +894,7 @@ function Workspace(props: AppProps) {
     ),
     [viewer, props.sessionControl, openSettings, openDesign, logout, settingsKeys.label],
   );
+  const actionThread = !external && !reference ? (selected ?? selectedMetadata.data) : undefined;
   return (
     <MessageIdentityContext.Provider value={identities}>
       <FileViewerProvider threadId={selectedId}>
@@ -921,6 +922,29 @@ function Workspace(props: AppProps) {
               <RightPanelToggle
                 open={rightOpen}
                 onToggle={() => panels.getState().toggle(selectedId)}
+              />
+              <FloatingChatMenu
+                sidebarOpen={sidebar}
+                rightOpen={rightOpen}
+                onToggleSidebar={panels.getState().toggleSidebar}
+                onToggleRight={() => panels.getState().toggle(selectedId)}
+                archived={actionThread?.archived}
+                onShare={owner && actionThread ? () => setSharing(true) : undefined}
+                onRename={
+                  actionThread?.capabilities.edit
+                    ? () => setRename({ id: actionThread.id, title: actionThread.title })
+                    : undefined
+                }
+                onArchive={
+                  actionThread?.capabilities.edit
+                    ? () => void update(actionThread.id, { archived: !actionThread.archived })
+                    : undefined
+                }
+                onDelete={
+                  actionThread?.capabilities.edit
+                    ? () => setConfirmDelete(actionThread.id)
+                    : undefined
+                }
               />
               <WorkspacePanels
                 leftOpen={sidebar}
@@ -1166,16 +1190,6 @@ function Workspace(props: AppProps) {
                                 (!online && !thread
                                   ? "This conversation is unavailable while offline."
                                   : undefined)
-                              }
-                              composerControls={
-                                <MobileChatControls
-                                  sidebarOpen={sidebar}
-                                  rightOpen={rightOpen}
-                                  onToggleSidebar={panels.getState().toggleSidebar}
-                                  onToggleRight={() => panels.getState().toggle(selectedId)}
-                                >
-                                  {thread ? conversationActions : null}
-                                </MobileChatControls>
                               }
                               header={
                                 thread ? (

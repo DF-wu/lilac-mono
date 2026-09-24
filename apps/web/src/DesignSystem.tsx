@@ -1,5 +1,5 @@
 import { AgentAvatar } from "./components/AgentAvatar";
-import { MobileChatControls } from "./components/MobileChatControls";
+import { FloatingChatMenu } from "./components/FloatingChatMenu";
 import { useAppShortcuts, useThreadTargets } from "./shortcuts";
 import { KeybindingsSettings } from "./components/KeybindingsSettings";
 import { createKeybindings } from "./keybindings";
@@ -37,8 +37,6 @@ import {
   Pencil,
   Plus,
   Trash2,
-  Users,
-  MoreHorizontal,
 } from "lucide-react";
 import type { DisplayMessage } from "@stanley2058/lilac-client-protocol";
 import logo from "./assets/logo.svg";
@@ -897,49 +895,16 @@ function ComposerSpecimen() {
         </Button>
       </div>
       <div className="ds-composer my-4">
-        <MobileChatControls
+        <FloatingChatMenu
           sidebarOpen={sidebarOpen}
           rightOpen={rightOpen}
           onToggleSidebar={() => setSidebarOpen((open) => !open)}
           onToggleRight={() => setRightOpen((open) => !open)}
-        >
-          <IconButton
-            label="Share conversation"
-            onClick={() => toast.add({ title: "Share selected", type: "info" })}
-          >
-            <Users />
-          </IconButton>
-          <DropdownMenu>
-            <DropdownMenuTrigger
-              render={
-                <IconButton label="Conversation actions">
-                  <MoreHorizontal />
-                </IconButton>
-              }
-            />
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem
-                onClick={() => toast.add({ title: "Rename selected", type: "info" })}
-              >
-                <Pencil />
-                Rename
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                onClick={() => toast.add({ title: "Archive selected", type: "info" })}
-              >
-                <Archive />
-                Archive
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                variant="destructive"
-                onClick={() => toast.add({ title: "Delete selected", type: "info" })}
-              >
-                <Trash2 />
-                Delete
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </MobileChatControls>
+          onShare={() => toast.add({ title: "Share selected", type: "info" })}
+          onRename={() => toast.add({ title: "Rename selected", type: "info" })}
+          onArchive={() => toast.add({ title: "Archive selected", type: "info" })}
+          onDelete={() => toast.add({ title: "Delete selected", type: "info" })}
+        />
         <Composer
           text={text}
           onText={setText}
