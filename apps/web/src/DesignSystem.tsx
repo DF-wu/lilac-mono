@@ -1295,10 +1295,16 @@ function Controls() {
             orientation="vertical"
             className="rounded-lg bg-surface-raised p-4 text-surface-raised-foreground"
           >
-            <TabsList variant="navigation" aria-label="Settings sections">
-              <TabsTrigger value="account">Account</TabsTrigger>
-              <TabsTrigger value="appearance">Appearance</TabsTrigger>
-              <TabsTrigger value="options">Options</TabsTrigger>
+            <TabsList activateOnFocus variant="navigation" aria-label="Settings sections">
+              <TabsTrigger tabIndex={0} value="account">
+                Account
+              </TabsTrigger>
+              <TabsTrigger tabIndex={0} value="appearance">
+                Appearance
+              </TabsTrigger>
+              <TabsTrigger tabIndex={0} value="options">
+                Options
+              </TabsTrigger>
             </TabsList>
             <TabsContent value="account">Account settings.</TabsContent>
             <TabsContent value="appearance">Appearance settings.</TabsContent>

@@ -154,6 +154,7 @@ export function Settings({
           }}
         >
           <TabsList
+            activateOnFocus
             variant="navigation"
             className="settings-navigation w-40 flex-none items-stretch justify-start self-stretch h-auto overflow-y-auto overflow-x-hidden min-w-0 py-4 px-0 gap-6 bg-transparent"
             aria-label="Settings sections"
@@ -165,11 +166,21 @@ export function Settings({
               >
                 Preferences
               </span>
-              <TabsTrigger value="account">Account</TabsTrigger>
-              <TabsTrigger value="theme">Appearance</TabsTrigger>
-              <TabsTrigger value="options">Options</TabsTrigger>
-              <TabsTrigger value="keybindings">Keybindings</TabsTrigger>
-              <TabsTrigger value="notifications">Notifications</TabsTrigger>
+              <TabsTrigger tabIndex={0} value="account">
+                Account
+              </TabsTrigger>
+              <TabsTrigger tabIndex={0} value="theme">
+                Appearance
+              </TabsTrigger>
+              <TabsTrigger tabIndex={0} value="options">
+                Options
+              </TabsTrigger>
+              <TabsTrigger tabIndex={0} value="keybindings">
+                Keybindings
+              </TabsTrigger>
+              <TabsTrigger tabIndex={0} value="notifications">
+                Notifications
+              </TabsTrigger>
             </div>
             {viewer.role === "owner" ? (
               <div className="settings-navigation-group flex flex-col gap-1">
@@ -179,11 +190,21 @@ export function Settings({
                 >
                   Runtime
                 </span>
-                <TabsTrigger value="deployment">Deployment</TabsTrigger>
-                <TabsTrigger value="core">Core</TabsTrigger>
-                <TabsTrigger value="mcp">MCP</TabsTrigger>
-                <TabsTrigger value="agent">Agent</TabsTrigger>
-                <TabsTrigger value="users">User</TabsTrigger>
+                <TabsTrigger tabIndex={0} value="deployment">
+                  Deployment
+                </TabsTrigger>
+                <TabsTrigger tabIndex={0} value="core">
+                  Core
+                </TabsTrigger>
+                <TabsTrigger tabIndex={0} value="mcp">
+                  MCP
+                </TabsTrigger>
+                <TabsTrigger tabIndex={0} value="agent">
+                  Agent
+                </TabsTrigger>
+                <TabsTrigger tabIndex={0} value="users">
+                  User
+                </TabsTrigger>
               </div>
             ) : null}
           </TabsList>
