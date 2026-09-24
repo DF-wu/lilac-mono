@@ -142,7 +142,12 @@ export const nativeContract = {
     preferences: procedure.input(z.strictObject({})).output(sidebarPreferencesSchema),
     configure: procedure.input(sidebarPreferencesSchema).output(sidebarPreferencesSchema),
     list: procedure
-      .input(pageInputSchema.extend({ section: sidebarSectionSchema }))
+      .input(
+        pageInputSchema.extend({
+          section: sidebarSectionSchema,
+          limit: z.number().int().min(0).max(100).default(30),
+        }),
+      )
       .output(sidebarPageSchema),
     move: procedure
       .input(
@@ -173,6 +178,7 @@ export const nativeContract = {
       .input(
         pageInputSchema.extend({
           archived: z.boolean().optional(),
+          excludeSettled: z.boolean().optional(),
           query: z.string().max(256).optional(),
         }),
       )

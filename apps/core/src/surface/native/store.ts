@@ -499,12 +499,14 @@ export class NativeStore {
       before?: number;
       cursor?: string;
       archived?: boolean;
+      excludeSettled?: boolean;
       query?: string;
     } = {},
   ): NativeStoreResult<NativeThread[]> {
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
         const user = yield* this.getUser(actorId);
+        if (options.excludeSettled) yield* this.reconcileSidebarPreferences(user);
         const limit = Math.min(100, Math.max(1, options.limit ?? 50));
         const cursorSeparator = options.cursor?.indexOf("_") ?? -1;
         const cursorTime =
@@ -516,7 +518,7 @@ export class NativeStore {
         if (!Number.isSafeInteger(cursorTime) || cursorTime < 0)
           return Result.err(nativeFailure("invalid", "Thread cursor is invalid"));
         const records = yield* this.readRows(
-          `SELECT r.* FROM native_records r WHERE r.kind='thread' AND (r.updated_at < ? OR (r.updated_at = ? AND r.id > ?)) AND ( ? = 'owner' OR json_extract(r.data_json,'$.value.starterId') = ? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?)) AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.archived')=? AND json_extract(r.data_json,'$.value.title') LIKE ? ESCAPE '\\' ORDER BY r.updated_at DESC,r.id LIMIT ?`,
+          `SELECT r.* FROM native_records r WHERE r.kind='thread' AND (r.updated_at < ? OR (r.updated_at = ? AND r.id > ?)) AND ( ? = 'owner' OR json_extract(r.data_json,'$.value.starterId') = ? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?)) AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.archived')=? AND json_extract(r.data_json,'$.value.title') LIKE ? ESCAPE '\\' AND (?=0 OR NOT EXISTS(SELECT 1 FROM native_thread_preferences p WHERE p.user_id=? AND p.thread_id=r.id AND p.section='settled')) ORDER BY r.updated_at DESC,r.id LIMIT ?`,
           [
             cursorTime,
             cursorTime,
@@ -526,6 +528,8 @@ export class NativeStore {
             actorId,
             options.archived ? 1 : 0,
             `%${(options.query ?? "").replace(/[\\%_]/g, "\\$&")}%`,
+            options.excludeSettled ? 1 : 0,
+            actorId,
             limit,
           ],
         );
@@ -568,31 +572,58 @@ export class NativeStore {
     );
   }
 
-  private reconcileSidebar(user: NativeUser, days: number): void {
+  isSidebarThreadSettled(actorId: string, threadId: string): NativeStoreResult<boolean> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const user = yield* this.getUser(actorId);
+        yield* this.reconcileSidebarPreferences(user, threadId);
+        const row = this.db
+          .query<{ section: string }, [string, string]>(
+            "SELECT section FROM native_thread_preferences WHERE user_id=? AND thread_id=?",
+          )
+          .get(actorId, threadId);
+        return Result.ok(row?.section === "settled");
+      }, this),
+    );
+  }
+
+  private reconcileSidebarPreferences(
+    user: NativeUser,
+    threadId?: string,
+  ): NativeStoreResult<void> {
+    return this.getSidebarPreferences(user.id).map((preferences) =>
+      this.reconcileSidebar(user, preferences.autoSettleDays, threadId),
+    );
+  }
+
+  private reconcileSidebar(user: NativeUser, days: number, threadId?: string): void {
     const now = this.now();
+    const recordFilter = threadId ? " AND r.id=?" : "";
+    const preferenceFilter = threadId ? " AND thread_id=?" : "";
+    const threadParams = threadId ? [threadId] : [];
     this.db
       .query(`INSERT OR IGNORE INTO native_thread_preferences(user_id,thread_id,section,position,last_activity,touched_at)
       SELECT ?,r.id,'active',MIN(COALESCE((SELECT MIN(p.position) FROM native_thread_preferences p WHERE p.user_id=? AND p.section='active'),0),-json_extract(r.data_json,'$.value.createdAt'))-1,${sidebarActivity},0
       FROM native_records r WHERE r.kind='thread' AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL
       AND (?='owner' OR json_extract(r.data_json,'$.value.starterId')=? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?))
-      AND NOT EXISTS(SELECT 1 FROM native_thread_preferences p WHERE p.user_id=? AND p.thread_id=r.id)`)
-      .run(user.id, user.id, user.role, user.id, user.id, user.id);
+      AND NOT EXISTS(SELECT 1 FROM native_thread_preferences p WHERE p.user_id=? AND p.thread_id=r.id)${recordFilter}`)
+      .run(user.id, user.id, user.role, user.id, user.id, user.id, ...threadParams);
     const activity = `(SELECT ${sidebarActivity} FROM native_records r WHERE r.kind='thread' AND r.id=native_thread_preferences.thread_id)`;
     this.db
       .query(
-        `UPDATE native_thread_preferences SET section='active',position=COALESCE((SELECT MIN(position)-1 FROM native_thread_preferences WHERE user_id=? AND section='active'),0),touched_at=${activity} WHERE user_id=? AND section='settled' AND last_activity < ${activity}`,
+        `UPDATE native_thread_preferences SET section='active',position=COALESCE((SELECT MIN(position)-1 FROM native_thread_preferences WHERE user_id=? AND section='active'),0),touched_at=${activity} WHERE user_id=? AND section='settled' AND last_activity < ${activity}${preferenceFilter}`,
       )
-      .run(user.id, user.id);
+      .run(user.id, user.id, ...threadParams);
     this.db
       .query(
-        `UPDATE native_thread_preferences SET last_activity=${activity} WHERE user_id=? AND last_activity < ${activity}`,
+        `UPDATE native_thread_preferences SET last_activity=${activity} WHERE user_id=? AND last_activity < ${activity}${preferenceFilter}`,
       )
-      .run(user.id);
+      .run(user.id, ...threadParams);
     this.db
       .query(
-        `UPDATE native_thread_preferences SET section='settled',position=-last_activity WHERE user_id=? AND section='active' AND MAX(last_activity,touched_at)<=? AND NOT EXISTS(SELECT 1 FROM native_records r WHERE r.kind='thread' AND r.id=native_thread_preferences.thread_id AND json_extract(r.data_json,'$.value.activeRunId') IS NOT NULL)`,
+        `UPDATE native_thread_preferences SET section='settled',position=-last_activity WHERE user_id=? AND section='active' AND MAX(last_activity,touched_at)<=? AND NOT EXISTS(SELECT 1 FROM native_records r WHERE r.kind='thread' AND r.id=native_thread_preferences.thread_id AND json_extract(r.data_json,'$.value.activeRunId') IS NOT NULL)${preferenceFilter}`,
       )
-      .run(user.id, now - days * 86_400_000);
+      .run(user.id, now - days * 86_400_000, ...threadParams);
   }
 
   listSidebar(
@@ -619,6 +650,7 @@ export class NativeStore {
           this.db
             .query<{ total: number }, string[]>(`SELECT COUNT(*) AS total ${predicate}`)
             .get(...params)?.total ?? 0;
+        if (input.limit === 0) return Result.ok({ items: [], total });
         const rows = this.db
           .query<{ thread_id: string; position: number }, (string | number)[]>(
             `SELECT p.thread_id,p.position ${predicate} AND (p.position>? OR (p.position=? AND p.thread_id>?)) ORDER BY p.position,p.thread_id LIMIT ?`,

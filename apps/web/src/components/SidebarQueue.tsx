@@ -4,6 +4,7 @@ import { useEventCallback } from "../use-event-callback";
 import { memo, useEffect, useState } from "react";
 import {
   useInfiniteQuery,
+  useQuery,
   useMutation,
   useQueryClient,
   type InfiniteData,
@@ -15,7 +16,7 @@ import type {
   DisplayCatalog,
 } from "@stanley2058/lilac-client-protocol";
 import { useWorkspace } from "../workspace-context";
-import { sidebarOptions, refreshSidebar } from "../sidebar-queries";
+import { sidebarOptions, settledCountOptions, refreshSidebar } from "../sidebar-queries";
 import { useNativeOnline } from "../queries";
 import { moveInQueues, sidebarSections, type ThreadMove, sidebarSnapshot } from "../sidebar-order";
 import { SidebarThread } from "./SidebarThread";
@@ -56,7 +57,8 @@ export const SidebarQueue = memo(function SidebarQueue({
   const [settledOpen, setSettledOpen] = useState(false);
   const pinned = useInfiniteQuery(sidebarOptions(client, "pinned", online));
   const active = useInfiniteQuery(sidebarOptions(client, "active", online));
-  const settled = useInfiniteQuery(sidebarOptions(client, "settled", online));
+  const settled = useInfiniteQuery(sidebarOptions(client, "settled", online && settledOpen));
+  const settledCount = useQuery(settledCountOptions(client, online));
   const sections = { pinned, active, settled };
   const queues = sidebarSnapshot(
     sidebarSections.map((section) => ({
@@ -70,7 +72,7 @@ export const SidebarQueue = memo(function SidebarQueue({
   const totals = {
     pinned: pinned.data?.pages[0]?.total ?? 0,
     active: active.data?.pages[0]?.total ?? queues.active.length,
-    settled: settled.data?.pages[0]?.total ?? 0,
+    settled: settledCount.data?.total ?? 0,
   };
   useEffect(
     () =>
@@ -126,7 +128,7 @@ export const SidebarQueue = memo(function SidebarQueue({
       sections[section].hasNextPage &&
       !sections[section].isError,
   );
-  const error = move.error ?? pinned.error ?? active.error ?? settled.error;
+  const error = move.error ?? pinned.error ?? active.error ?? settledCount.error ?? settled.error;
   function remember(id: string) {
     const source = sidebarSections
       .flatMap((section) => visible[section])

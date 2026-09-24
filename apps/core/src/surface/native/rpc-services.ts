@@ -382,7 +382,7 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
     let catalogChanged = false;
     const pending = new Set<string>();
     const visible = new Map(
-      store.listThreads(principal.userId, { limit: 100 }).match({
+      store.listThreads(principal.userId, { limit: 100, excludeSettled: true }).match({
         ok: (threads) =>
           threads.map((thread) => [thread.id, catalogThreadSignature(thread)] as const),
         err: () => [],
@@ -465,6 +465,13 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
         }
         const signature = catalogThreadSignature(thread);
         if (visible.get(threadId) === signature) continue;
+        const settled = store
+          .isSidebarThreadSettled(principal.userId, threadId)
+          .match({ ok: (value) => value, err: () => false });
+        if (settled) {
+          yield { kind: "resync", cursor: catalogCursor };
+          continue;
+        }
         visible.set(threadId, signature);
         if (visible.size > 1000) {
           const oldest = visible.keys().next().value;
@@ -496,7 +503,7 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
           const items =
             principal.provider === "operator"
               ? []
-              : yield* store.listThreads(principal.userId, { limit: 30 });
+              : yield* store.listThreads(principal.userId, { limit: 30, excludeSettled: true });
           const lastListed = items.at(-1);
           const nextCursor =
             items.length === 30 && lastListed
@@ -551,6 +558,7 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
             limit,
             cursor: input.cursor,
             archived: input.archived,
+            excludeSettled: input.excludeSettled,
             query: input.query,
           });
           return Result.ok({

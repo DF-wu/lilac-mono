@@ -12,7 +12,7 @@ import {
   refreshQueue,
 } from "../src/queries";
 
-import { sidebarOptions, refreshSidebar } from "../src/sidebar-queries";
+import { sidebarOptions, settledCountOptions, refreshSidebar } from "../src/sidebar-queries";
 
 type Rpc = NonNullable<NativeClient["rpc"]>;
 function clientWith(rpc: {
@@ -267,5 +267,36 @@ test("draft handoff replaces sidebar hydration and retains live attachments when
   const stopReopened = reopened.subscribe(() => {});
   expect(reopened.getCurrentResult().data).toEqual(followUp);
   stopReopened();
+  queries.clear();
+});
+
+test("collapsed settled queues fetch only counts across refreshes and load rows on expansion", async () => {
+  const limits: number[] = [];
+  const client = clientWith({
+    sidebar: {
+      list: async ({ limit }) => {
+        limits.push(limit ?? 30);
+        return { items: [], total: 42 };
+      },
+    },
+  });
+  const queries = cache();
+  const list = new InfiniteQueryObserver(queries, sidebarOptions(client, "settled", false));
+  const count = new QueryObserver(queries, settledCountOptions(client, true));
+  const stopList = list.subscribe(() => {});
+  const stopCount = count.subscribe(() => {});
+  await queries.fetchQuery(settledCountOptions(client, true));
+  expect(limits).toEqual([0]);
+  await refreshSidebar(queries);
+  expect(limits).toEqual([0, 0]);
+  expect(count.getCurrentResult().data?.total).toBe(42);
+  list.setOptions(sidebarOptions(client, "settled", true));
+  await queries.fetchInfiniteQuery(sidebarOptions(client, "settled", true));
+  expect(limits).toEqual([0, 0, 100]);
+  list.setOptions(sidebarOptions(client, "settled", false));
+  await refreshSidebar(queries);
+  expect(limits).toEqual([0, 0, 100, 0]);
+  stopList();
+  stopCount();
   queries.clear();
 });

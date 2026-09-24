@@ -753,3 +753,59 @@ test("unchanged Clerk reads do not notify catalog watchers", async () => {
   expect(notifications).toBe(0);
   stop();
 });
+
+test("bootstrap omits settled threads unless explicitly selected", async () => {
+  const state = fixture();
+  state.store
+    .moveSidebarThread(principal.userId, { threadId: state.thread.id, section: "settled" })
+    .unwrap();
+  const initial = (await state.services.bootstrap.get(principal, {})).unwrap();
+  expect(initial.threads.items).toEqual([]);
+  const selected = (
+    await state.services.bootstrap.get(principal, { threadId: state.thread.id })
+  ).unwrap();
+  expect(selected.threads.items.map((thread) => thread.id)).toEqual([state.thread.id]);
+  state.store.close();
+});
+
+test("default-view lists omit settled threads while unfiltered lists retain them", async () => {
+  using state = fixture();
+  state.store
+    .moveSidebarThread(principal.userId, { threadId: state.thread.id, section: "settled" })
+    .unwrap();
+  expect(
+    (await state.services.threads.list(principal, { excludeSettled: true })).unwrap().items,
+  ).toEqual([]);
+  expect(
+    (await state.services.threads.list(principal, {})).unwrap().items.map((thread) => thread.id),
+  ).toEqual([state.thread.id]);
+});
+
+test("catalog changes refresh settled counts without sending settled records", async () => {
+  using state = fixture();
+  state.store
+    .moveSidebarThread(principal.userId, { threadId: state.thread.id, section: "settled" })
+    .unwrap();
+  const bootstrap = (await state.services.bootstrap.get(principal, {})).unwrap();
+  const controller = new AbortController();
+  const stream = (
+    await state.services.bootstrap.watch(
+      principal,
+      { cursor: bootstrap.catalogCursor },
+      controller.signal,
+    )
+  ).unwrap();
+  const next = stream.next();
+  state.store
+    .updateThread(principal.userId, {
+      threadId: state.thread.id,
+      commandId: "rename-settled",
+      revision: state.thread.revision,
+      title: "Still settled",
+    })
+    .unwrap();
+  expect((await next).value).toMatchObject({ kind: "resync" });
+  expect((await state.services.bootstrap.get(principal, {})).unwrap().threads.items).toEqual([]);
+  controller.abort();
+  await stream.return();
+});

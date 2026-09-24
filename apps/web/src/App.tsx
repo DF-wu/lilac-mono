@@ -676,7 +676,13 @@ function Workspace(props: AppProps) {
     setThreadListError(false);
     if (!cursor) setNextCursor(undefined);
     const page = await attempt(
-      () => client.rpc!.threads.list({ archived: showArchived, limit: 100, cursor }),
+      () =>
+        client.rpc!.threads.list({
+          archived: showArchived,
+          excludeSettled: !showArchived,
+          limit: 100,
+          cursor,
+        }),
       (message) => {
         if (threadListRequest.current === request) setError(message);
       },
