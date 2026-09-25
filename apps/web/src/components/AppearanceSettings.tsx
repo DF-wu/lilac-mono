@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { Moon, Sun } from "lucide-react";
 import {
   cachedThemePair,
@@ -8,6 +8,7 @@ import {
   type ThemeId,
 } from "../theme/catalog";
 import type { ResolvedTheme, ThemeKind } from "../theme/resolve-theme";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { selectTheme, themeStyle, useInstalledThemes, useThemeSelection } from "../theme/theme";
 
 const schemes = [
@@ -16,6 +17,11 @@ const schemes = [
   { value: "dark", label: "Dark" },
 ] as const;
 const swatchRoles = ["background", "info", "danger", "primary"] as const;
+type SwatchStyle = CSSProperties & {
+  "--swatch-count"?: number;
+  "--swatch-index"?: number;
+  "--swatch-distance"?: number;
+};
 
 export function AppearanceSettings({
   theme,
@@ -122,11 +128,12 @@ function ThemePicker() {
         return (
           <div
             key={entry.id}
-            className="relative flex flex-col gap-4 rounded-lg bg-surface p-3 text-surface-foreground has-[.theme-card-select:hover]:bg-surface-hover"
+            className="relative flex flex-col gap-4 rounded-lg bg-surface p-3 text-surface-foreground has-[[data-theme-card-select]:hover]:bg-surface-hover"
           >
             <button
               type="button"
-              className="theme-card-select self-start rounded-sm text-sm font-medium outline-none after:absolute after:inset-0 after:rounded-lg focus-visible:ring-3 focus-visible:ring-ring/50"
+              data-theme-card-select
+              className="self-start rounded-sm text-sm font-medium outline-none after:absolute after:inset-0 after:rounded-lg focus-visible:ring-3 focus-visible:ring-ring/50"
               aria-label={`Use ${entry.name} for light and dark`}
               onClick={() => void selectTheme(entry.id, ["light", "dark"])}
             >
@@ -169,27 +176,41 @@ function SwatchStack({
   selected: boolean;
 }) {
   const Icon = kind === "light" ? Sun : Moon;
+  const center = (swatchRoles.length - 1) / 2;
+  const stackStyle: SwatchStyle = { "--swatch-count": swatchRoles.length };
   return (
-    <button
-      type="button"
-      className="theme-swatches group relative z-10 rounded-full outline-none focus-visible:ring-3 focus-visible:ring-ring/50 aria-pressed:ring-2 aria-pressed:ring-primary aria-pressed:ring-offset-3 aria-pressed:ring-offset-surface"
-      aria-pressed={selected}
-      aria-label={`Use ${name} ${kind} theme`}
-      onClick={() => void selectTheme(id, [kind])}
-    >
-      {swatchRoles.map((role, index) => (
-        <span
-          key={role}
-          className="theme-swatch absolute top-0 size-8 rounded-full border-2 border-surface bg-muted ring-1 ring-foreground/15"
-          style={{
-            left: `calc(${index} * var(--theme-swatch-step))`,
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            type="button"
+            className="theme-swatches group relative z-10 rounded-full outline-none hover:z-20 focus-visible:z-20 focus-visible:ring-3 focus-visible:ring-ring/50 aria-pressed:ring-2 aria-pressed:ring-primary aria-pressed:ring-offset-3 aria-pressed:ring-offset-surface"
+            style={stackStyle}
+            aria-pressed={selected}
+            aria-label={`Use ${name} ${kind} theme`}
+            onClick={() => void selectTheme(id, [kind])}
+          />
+        }
+      >
+        {swatchRoles.map((role, index) => {
+          const style: SwatchStyle = {
+            "--swatch-index": index,
+            "--swatch-distance": Math.abs(index - center),
             backgroundColor: theme?.variables[role],
-          }}
-        />
-      ))}
-      <span className="absolute -right-1.5 -bottom-1.5 grid size-4 place-items-center rounded-full bg-surface-raised text-muted-foreground [&_svg]:size-3 group-aria-pressed:bg-primary group-aria-pressed:text-primary-foreground">
-        <Icon />
-      </span>
-    </button>
+          };
+          return (
+            <span
+              key={role}
+              className="theme-swatch absolute top-0 rounded-full border-2 border-surface bg-muted ring-1 ring-foreground/15"
+              style={style}
+            />
+          );
+        })}
+        <span className="absolute -right-1.5 -bottom-1.5 grid size-4 place-items-center rounded-full bg-surface-raised text-muted-foreground [&_svg]:size-3 group-aria-pressed:bg-primary group-aria-pressed:text-primary-foreground">
+          <Icon />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{`${name} ${kind}`}</TooltipContent>
+    </Tooltip>
   );
 }

@@ -13,6 +13,7 @@ const selectionSchema = z.object({ light: z.enum(themeIds), dark: z.enum(themeId
 const lilac = cachedThemePair("lilac")!;
 const defaultSelection: ThemeSelection = { light: "lilac", dark: "lilac" };
 let mode: ThemeMode = "system";
+let appliedSelection = defaultSelection;
 const themeStore = createStore(() => ({
   selection: defaultSelection,
   themes: lilac,
@@ -54,25 +55,32 @@ export async function selectTheme(id: ThemeId, kinds: readonly ThemeKind[]) {
     dark: kinds.includes("dark") ? id : current.dark,
   };
   themeStore.setState({ selection });
+  if (!(await applySelection(selection))) return;
   const saved = Result.try({
     try: () => localStorage.setItem(selectionKey, JSON.stringify(selection)),
     catch: () => "Storage unavailable",
   });
   saved.match({ ok: () => {}, err: () => {} });
-  await applySelection(selection);
 }
 
+// The picker shows a choice before its themes load, so a failed load restores the installed one.
 async function applySelection(selection: ThemeSelection) {
   const [light, dark] = await Promise.all([
     loadThemePair(selection.light),
     loadThemePair(selection.dark),
   ]);
-  if (themeStore.getState().selection !== selection) return;
+  if (themeStore.getState().selection !== selection) return false;
   const pair = Result.all([light, dark]).match({
     ok: ([lightPair, darkPair]) => ({ light: lightPair.light, dark: darkPair.dark }),
     err: () => undefined,
   });
-  if (pair) installThemes(pair);
+  if (!pair) {
+    themeStore.setState({ selection: appliedSelection });
+    return false;
+  }
+  appliedSelection = selection;
+  installThemes(pair);
+  return true;
 }
 
 function effectiveKind(): ThemeKind {
@@ -130,8 +138,8 @@ export function watchSystemTheme() {
   return () => media.removeEventListener("change", applyTheme);
 }
 
-export function loadSavedTheme() {
+export async function loadSavedTheme() {
   const selection = readSelection();
   themeStore.setState({ selection });
-  return applySelection(selection);
+  await applySelection(selection);
 }
