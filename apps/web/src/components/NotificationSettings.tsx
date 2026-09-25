@@ -76,7 +76,7 @@ export function NotificationSettings({
         disabled={!values.enabled || permission !== "granted"}
         onChange={(failure) => preferences.update({ failure })}
       />
-      <p className="text-sm text-muted-foreground">
+      <p className="text-sm text-muted-foreground mb-8">
         Notifications show the conversation title without message previews. No alert appears while
         you are viewing that conversation.
       </p>

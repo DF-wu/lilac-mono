@@ -23,7 +23,12 @@ export function resolveTheme(
   );
   const surface = color("sideBar.background", background);
   const surfaceForeground = color("sideBar.foreground", foreground);
-  const raised = color("editorWidget.background", surface);
+  const widget = color("editorWidget.background", surface);
+  // Dialogs and menus sit on sidebar-colored controls, so they need a distinct surface.
+  const raised =
+    widget.toLowerCase() === surface.toLowerCase()
+      ? `color-mix(in srgb, ${foreground} 6%, ${surface})`
+      : widget;
   const raisedForeground = color("editorWidget.foreground", foreground);
   const primary = base("button.background");
   const hover = color("list.hoverBackground", `color-mix(in srgb, ${foreground} 8%, ${surface})`);

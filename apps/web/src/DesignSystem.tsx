@@ -6,6 +6,7 @@ import { createKeybindings } from "./keybindings";
 import { CopyReferenceButton } from "./components/ConversationReference";
 import { Switch } from "./components/ui/switch";
 import { NotificationSettings } from "./components/NotificationSettings";
+import { AppearanceSettings } from "./components/AppearanceSettings";
 import { createNotificationPreferences } from "./notifications";
 import { SPINNERS } from "loading-dev";
 import { LoadingSpinner } from "./components/ui/loading-spinner";
@@ -106,6 +107,7 @@ const sections = [
   ["threads", "Threads"],
   ["messages", "Messages"],
   ["agent-work", "Agent work"],
+  ["appearance", "Appearance"],
   ["notifications", "Notifications"],
   ["keybindings", "Keybindings"],
   ["deployment", "Deployment settings"],
@@ -1339,16 +1341,18 @@ function Controls() {
               <TabsTrigger tabIndex={0} value="account">
                 Account
               </TabsTrigger>
-              <TabsTrigger tabIndex={0} value="appearance">
-                Appearance
-              </TabsTrigger>
               <TabsTrigger tabIndex={0} value="options">
-                Options
+                Settings
+              </TabsTrigger>
+              <TabsTrigger tabIndex={0} value="keybindings">
+                Keybindings
               </TabsTrigger>
             </TabsList>
             <TabsContent value="account">Account settings.</TabsContent>
-            <TabsContent value="appearance">Appearance settings.</TabsContent>
-            <TabsContent value="options">Thread preferences and access.</TabsContent>
+            <TabsContent value="options">
+              Appearance, thread, notification, and access settings.
+            </TabsContent>
+            <TabsContent value="keybindings">Keyboard shortcuts.</TabsContent>
           </Tabs>
         </Specimen>
       </div>
@@ -1620,6 +1624,11 @@ export default function DesignSystem() {
                 description="Choose a stage to inspect, or play through the examples. Expand work summaries and tool details. These use the conversation renderer with local sample data."
               >
                 <AgentWorkDemo />
+              </Section>
+              <Section id="appearance" title="Appearance">
+                <div className="max-w-2xl">
+                  <AppearanceSettings theme={theme} onTheme={setTheme} />
+                </div>
               </Section>
               <Section id="keybindings" title="Keybindings">
                 <KeybindingsDemo />

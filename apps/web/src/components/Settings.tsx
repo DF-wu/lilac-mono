@@ -9,6 +9,7 @@ import { DeploymentSettings } from "./DeploymentSettings";
 import { SidebarPreferences } from "./SidebarPreferences";
 import { AccountProfile } from "./AccountProfile";
 import { AgentIdentity } from "./AgentIdentity";
+import { AppearanceSettings } from "./AppearanceSettings";
 import type { ActorIdentity } from "./ActorAvatar";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { RefreshCw, Save, UserPlus } from "lucide-react";
@@ -140,8 +141,6 @@ export function Settings({
               value === "account" ||
               value === "options" ||
               value === "keybindings" ||
-              value === "notifications" ||
-              value === "theme" ||
               value === "deployment" ||
               value === "core" ||
               value === "mcp" ||
@@ -169,17 +168,11 @@ export function Settings({
               <TabsTrigger tabIndex={0} value="account">
                 Account
               </TabsTrigger>
-              <TabsTrigger tabIndex={0} value="theme">
-                Appearance
-              </TabsTrigger>
               <TabsTrigger tabIndex={0} value="options">
-                Options
+                Settings
               </TabsTrigger>
               <TabsTrigger tabIndex={0} value="keybindings">
                 Keybindings
-              </TabsTrigger>
-              <TabsTrigger tabIndex={0} value="notifications">
-                Notifications
               </TabsTrigger>
             </div>
             {viewer.role === "owner" ? (
@@ -223,62 +216,12 @@ export function Settings({
                 </>
               )}
             </TabsContent>
-            <TabsContent value="notifications" className="settings-section">
-              <NotificationSettings preferences={notifications} />
-            </TabsContent>
             <TabsContent value="keybindings" className="settings-section">
               <KeybindingsSettings store={keybindings} />
             </TabsContent>
             <TabsContent value="options" className="settings-section">
-              <h2>Thread</h2>
-              <SidebarPreferences />
-              <h2>Access</h2>
-              <dl className="settings-account grid gap-4 mb-6">
-                <div>
-                  <dt>Role</dt>
-                  <dd>{viewer.role}</dd>
-                </div>
-                <div>
-                  <dt>Tool access</dt>
-                  <dd>{viewer.toolMode === "full" ? "Full access" : "Restricted"}</dd>
-                </div>
-              </dl>
-            </TabsContent>
-            {viewer.role === "owner" ? (
-              <TabsContent value="deployment" className="settings-section">
-                <h2>Deployment</h2>
-                <DeploymentSettings />
-              </TabsContent>
-            ) : null}
-            <TabsContent value="agent" className="settings-section">
-              <h2>Agent</h2>
-              <AgentIdentity client={client} identity={agent} />
-            </TabsContent>
-            <TabsContent value="theme" className="settings-section">
               <h2>Appearance</h2>
-              <div className="settings-row flex items-start justify-between gap-6 mb-8">
-                <span>Theme</span>
-                <Select
-                  items={[
-                    { value: "system", label: "System" },
-                    { value: "dark", label: "Dark" },
-                    { value: "light", label: "Light" },
-                  ]}
-                  value={theme}
-                  onValueChange={(value) => {
-                    if (value) onTheme(value);
-                  }}
-                >
-                  <SelectTrigger aria-label="Theme">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="system">System</SelectItem>
-                    <SelectItem value="dark">Dark</SelectItem>
-                    <SelectItem value="light">Light</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
+              <AppearanceSettings theme={theme} onTheme={onTheme} />
               <div className="settings-row flex items-start justify-between gap-6 mb-8">
                 <div className="settings-row-description min-w-0">
                   <span>Animation speed</span>
@@ -309,6 +252,30 @@ export function Settings({
                   </SelectContent>
                 </Select>
               </div>
+              <h2>Thread</h2>
+              <SidebarPreferences />
+              <NotificationSettings preferences={notifications} />
+              <h2>Access</h2>
+              <dl className="settings-account grid gap-4 mb-6">
+                <div>
+                  <dt>Role</dt>
+                  <dd>{viewer.role}</dd>
+                </div>
+                <div>
+                  <dt>Tool access</dt>
+                  <dd>{viewer.toolMode === "full" ? "Full access" : "Restricted"}</dd>
+                </div>
+              </dl>
+            </TabsContent>
+            {viewer.role === "owner" ? (
+              <TabsContent value="deployment" className="settings-section">
+                <h2>Deployment</h2>
+                <DeploymentSettings />
+              </TabsContent>
+            ) : null}
+            <TabsContent value="agent" className="settings-section">
+              <h2>Agent</h2>
+              <AgentIdentity client={client} identity={agent} />
             </TabsContent>
             <TabsContent value="users" className="settings-section">
               <h2>User</h2>

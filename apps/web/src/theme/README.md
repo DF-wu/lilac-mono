@@ -23,9 +23,16 @@ import { installThemes } from "./theme";
 installThemes({ light: resolveTheme(light, "light"), dark: resolveTheme(dark, "dark") });
 ```
 
-The current user preference still selects Light, Dark, or System. Registration is internal and does
-not add a picker or store imported data. Treat registered objects as immutable; replacing a theme
-requires resolving and installing a new object.
+Treat registered objects as immutable; replacing a theme requires resolving and installing a new
+object.
+
+## Built-in themes
+
+`catalog.ts` lists the built-in light/dark pairs shown in Settings. Lilac resolves at startup; other
+pairs are dynamic imports of Shiki's bundled VS Code themes, so they stay out of the shell bundle.
+`selectTheme` sets one or both kinds and saves the choice in this browser under
+`lilac-theme-palette-v1`. Startup awaits the saved pair before the first render and keeps Lilac if the
+import fails. Light, Dark, or System remains a separate preference.
 
 `resolve-theme.ts` is the mapping table. Supplied hex colors, including alpha and transparent hex,
 win. Missing roles use a related color or the built-in palette for the effective kind. Derived tints,

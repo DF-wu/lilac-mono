@@ -3802,6 +3802,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               category: "persistence" as const,
             },
             {
+              identity: { module: "src/theme/theme.ts", exportName: "decodeThemeSelection" },
+              category: "persistence" as const,
+            },
+            {
               identity: {
                 module: "src/components/composer-editor.tsx",
                 exportName: "projectComposerNode",

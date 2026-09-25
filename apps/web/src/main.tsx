@@ -1,5 +1,5 @@
 import { ConnectionLoading } from "./components/ui/connection-loading";
-import { watchSystemTheme } from "./theme/theme";
+import { loadSavedTheme, watchSystemTheme } from "./theme/theme";
 import { SurfaceVisibilityContext } from "./components/ui/surface-visibility";
 import { Outlet, RouterProvider, useMatch } from "@tanstack/react-router";
 import { createAppRouter } from "./router";
@@ -196,6 +196,7 @@ function RouteShell() {
 }
 
 watchSystemTheme();
+await loadSavedTheme();
 
 const router = createAppRouter({ shellComponent: RouteShell, onChatEnter: enterChat });
 const root = document.getElementById("root");

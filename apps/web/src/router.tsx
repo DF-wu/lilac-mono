@@ -16,18 +16,7 @@ const workspaceSearchSchema = z.object({
   view: z.enum(["archived", "others"]).optional(),
   otherThread: z.string().min(1).optional(),
   settings: z
-    .enum([
-      "account",
-      "options",
-      "keybindings",
-      "notifications",
-      "theme",
-      "deployment",
-      "core",
-      "mcp",
-      "agent",
-      "users",
-    ])
+    .enum(["account", "options", "keybindings", "deployment", "core", "mcp", "agent", "users"])
     .optional(),
 });
 export type WorkspaceSearch = z.infer<typeof workspaceSearchSchema>;

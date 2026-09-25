@@ -153,6 +153,13 @@ requires thread edit access and uses the thread's filesystem permissions and den
 published-path records and file-serving routes are reused; no database migration is required.
 Update clients and servers together to enable inline-path previews.
 
+## Native web theme selection
+
+The web app stores the selected built-in theme for each color scheme under `lilac-theme-palette-v1`.
+The value is browser-wide, like the existing `lilac-theme-v1` scheme preference. The JSON value holds
+`light` and `dark` theme IDs. Missing, invalid, unknown, or unavailable values use Lilac for both.
+Older clients ignore the key. No backend data or existing browser preferences require migration.
+
 ## Native web local panel layouts
 
 The web app stores device-local panel preferences under `lilac-panels-v1`, scoped by installation and

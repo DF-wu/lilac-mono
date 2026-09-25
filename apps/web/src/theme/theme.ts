@@ -1,19 +1,40 @@
 import { Result } from "better-result";
+import type { CSSProperties } from "react";
+import { z } from "zod";
 import { createStore } from "zustand/vanilla";
 import { useStore } from "zustand";
-import { builtinThemes } from "./builtin";
-import { resolveTheme, type ResolvedTheme, type ThemeKind } from "./resolve-theme";
+import { cachedThemePair, loadThemePair, themeIds, type ThemeId } from "./catalog";
+import type { ResolvedTheme, ThemeKind } from "./resolve-theme";
 
 export type ThemeMode = "light" | "dark" | "system";
-let themes: Record<ThemeKind, ResolvedTheme> = {
-  light: resolveTheme(builtinThemes.light),
-  dark: resolveTheme(builtinThemes.dark),
-};
+export type ThemeSelection = Record<ThemeKind, ThemeId>;
+const selectionKey = "lilac-theme-palette-v1";
+const selectionSchema = z.object({ light: z.enum(themeIds), dark: z.enum(themeIds) });
+const lilac = cachedThemePair("lilac")!;
+const defaultSelection: ThemeSelection = { light: "lilac", dark: "lilac" };
 let mode: ThemeMode = "system";
-const syntaxStore = createStore(() => ({ syntax: themes.dark.syntax }));
+const themeStore = createStore(() => ({
+  selection: defaultSelection,
+  themes: lilac,
+  syntax: lilac.dark.syntax,
+}));
 
 export function useSyntaxTheme() {
-  return useStore(syntaxStore, (state) => state.syntax);
+  return useStore(themeStore, (state) => state.syntax);
+}
+
+export function useThemeSelection() {
+  return useStore(themeStore, (state) => state.selection);
+}
+
+export function useInstalledThemes() {
+  return useStore(themeStore, (state) => state.themes);
+}
+
+export function themeStyle(theme: ResolvedTheme): CSSProperties {
+  return Object.fromEntries(
+    Object.entries(theme.variables).map(([name, value]) => [`--ui-${name}`, value]),
+  );
 }
 
 export function setThemeMode(value: string) {
@@ -22,8 +43,36 @@ export function setThemeMode(value: string) {
 }
 
 export function installThemes(pair: { light: ResolvedTheme; dark: ResolvedTheme }) {
-  themes = pair;
+  themeStore.setState({ themes: pair });
   applyTheme();
+}
+
+export async function selectTheme(id: ThemeId, kinds: readonly ThemeKind[]) {
+  const current = themeStore.getState().selection;
+  const selection: ThemeSelection = {
+    light: kinds.includes("light") ? id : current.light,
+    dark: kinds.includes("dark") ? id : current.dark,
+  };
+  themeStore.setState({ selection });
+  const saved = Result.try({
+    try: () => localStorage.setItem(selectionKey, JSON.stringify(selection)),
+    catch: () => "Storage unavailable",
+  });
+  saved.match({ ok: () => {}, err: () => {} });
+  await applySelection(selection);
+}
+
+async function applySelection(selection: ThemeSelection) {
+  const [light, dark] = await Promise.all([
+    loadThemePair(selection.light),
+    loadThemePair(selection.dark),
+  ]);
+  if (themeStore.getState().selection !== selection) return;
+  const pair = Result.all([light, dark]).match({
+    ok: ([lightPair, darkPair]) => ({ light: lightPair.light, dark: darkPair.dark }),
+    err: () => undefined,
+  });
+  if (pair) installThemes(pair);
 }
 
 function effectiveKind(): ThemeKind {
@@ -33,14 +82,13 @@ function effectiveKind(): ThemeKind {
 
 function applyTheme() {
   const kind = effectiveKind();
-  const theme = themes[kind];
+  const theme = themeStore.getState().themes[kind];
   const root = document.documentElement;
   root.dataset.theme = mode;
   root.style.colorScheme = kind;
   for (const [name, value] of Object.entries(theme.variables))
     root.style.setProperty(`--ui-${name}`, value);
-  if (syntaxStore.getState().syntax !== theme.syntax)
-    syntaxStore.setState({ syntax: theme.syntax });
+  if (themeStore.getState().syntax !== theme.syntax) themeStore.setState({ syntax: theme.syntax });
 }
 
 export function readTheme(): ThemeMode {
@@ -53,10 +101,37 @@ export function readTheme(): ThemeMode {
   });
 }
 
+export function decodeThemeSelection(raw: string | null): ThemeSelection {
+  if (raw === null) return defaultSelection;
+  return Result.try({ try: () => JSON.parse(raw), catch: () => "Invalid theme selection" }).match({
+    ok: (value) => {
+      const parsed = selectionSchema.safeParse(value);
+      return parsed.success ? parsed.data : defaultSelection;
+    },
+    err: () => defaultSelection,
+  });
+}
+
+function readSelection(): ThemeSelection {
+  return Result.try({
+    try: () => localStorage.getItem(selectionKey),
+    catch: () => "Storage unavailable",
+  }).match({
+    ok: decodeThemeSelection,
+    err: () => defaultSelection,
+  });
+}
+
 export function watchSystemTheme() {
   mode = readTheme();
   const media = matchMedia("(prefers-color-scheme: light)");
   media.addEventListener("change", applyTheme);
   applyTheme();
   return () => media.removeEventListener("change", applyTheme);
+}
+
+export function loadSavedTheme() {
+  const selection = readSelection();
+  themeStore.setState({ selection });
+  return applySelection(selection);
 }
