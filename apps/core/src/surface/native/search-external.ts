@@ -155,9 +155,6 @@ function conversationGroup(
       path.push(current);
       // Seed before following retained parents so a corrupt cycle terminates.
       groups.set(current, runId(current));
-      const position = history ? cachedPosition(history, records.get(current)) : null;
-      if (position)
-        return Result.ok(rememberConversationGroup(groups, path, runId(position.threadId)));
       const lineage = yield* transcripts
         .getCorePrimaryLineageManifest({ requestId: current })
         .mapError(() => nativeFailure("sqlite", "Run history is unavailable"));
@@ -165,11 +162,17 @@ function conversationGroup(
         .filter((segment) => segment.canonicalStart < lineage.currentCanonicalStart)
         .flatMap((segment) => segment.atoms)
         .find((atom) => atom.kind === "request" || atom.kind === "checkpoint");
-      const first =
-        parent ??
-        lineage?.segments
-          .flatMap((segment) => segment.atoms)
-          .find((atom) => atom.kind !== "synthetic");
+      // Partial output indexing must not split a retained reply chain.
+      if (parent?.kind === "request" || parent?.kind === "checkpoint") {
+        current = parent.requestId;
+        continue;
+      }
+      const position = history ? cachedPosition(history, records.get(current)) : null;
+      if (position)
+        return Result.ok(rememberConversationGroup(groups, path, runId(position.threadId)));
+      const first = lineage?.segments
+        .flatMap((segment) => segment.atoms)
+        .find((atom) => atom.kind !== "synthetic");
       if (first?.kind === "request" || first?.kind === "checkpoint") {
         current = first.requestId;
         continue;
@@ -745,12 +748,10 @@ export class NativeExternalThreads {
       let messageFound = !input.messageId || !!input.cursor;
       let targetGroup: string | undefined;
       if (input.messageId) {
-        const position = this.params.history?.getMessagePosition(ref.sessionId, input.messageId);
-        if (position) targetGroup = runId(position.threadId);
         const linked = runs.find((run) =>
           run.record.surfaceRefs.some((item) => item.messageId === input.messageId),
         );
-        if (!targetGroup && linked)
+        if (linked)
           targetGroup = yield* conversationGroup(
             this.params.transcripts,
             linked.record.requestId,

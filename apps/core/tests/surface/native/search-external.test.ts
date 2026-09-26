@@ -251,72 +251,110 @@ describe("retained external runs", () => {
     ]);
   });
 
-  test("continuations share a divider group even when the retained context window moves", async () => {
-    const firstInput: StoredMessageV1 = { role: "user", content: "First" };
-    const secondInput: StoredMessageV1 = { role: "user", content: "Follow up" };
-    const first = snapshot("first", 1, [{ role: "assistant", content: "First answer" }]);
-    const second = snapshot("second", 2, [{ role: "assistant", content: "Second answer" }]);
-    const linked = buildCoreLineageManifestV2(
-      [
-        {
-          atoms: [
-            {
-              kind: "request",
-              requestId: "first",
-              transcriptDigest: "a".repeat(64),
-              providerFamily: "ai-sdk",
-              containsCrossFamilyTurns: false,
-            },
-          ],
-          canonicalMessages: first.messages,
-          requestSource: {
-            aliases: [
+  test.each(["absent", "partial", "conflicting"] as const)(
+    "continuations share a divider group with %s cached thread membership",
+    async (membership) => {
+      const firstInput: StoredMessageV1 = { role: "user", content: "First" };
+      const secondInput: StoredMessageV1 = {
+        role: "user",
+        content: `${formatSurfaceMetadataLine({ message_id: "followup", user_id: "42" })}\nFollow up`,
+      };
+      const first = snapshot("first", 1, [{ role: "assistant", content: "First answer" }]);
+      const second = snapshot("second", 2, [{ role: "assistant", content: "Second answer" }]);
+      const linked = buildCoreLineageManifestV2(
+        [
+          {
+            atoms: [
               {
+                kind: "request",
+                requestId: "first",
+                transcriptDigest: "a".repeat(64),
+                providerFamily: "ai-sdk",
+                containsCrossFamilyTurns: false,
+              },
+            ],
+            canonicalMessages: first.messages,
+            requestSource: {
+              aliases: [
+                {
+                  requestClient: "discord",
+                  surfaceId: "discord:123",
+                  sessionId: "123",
+                  messageId: "first-output",
+                },
+              ],
+            },
+          },
+          {
+            atoms: [
+              {
+                kind: "surface",
                 requestClient: "discord",
                 surfaceId: "discord:123",
                 sessionId: "123",
-                messageId: "first-output",
+                messageId: "followup",
               },
             ],
+            canonicalMessages: [secondInput],
           },
-        },
+        ],
+        { currentSegmentIndex: 1 },
+      ).unwrap() as CoreStoredLineageManifestV2;
+      const f = fixture(
+        [first, second, snapshot("unrelated", 3, [{ role: "assistant", content: "Other thread" }])],
+        new Map([
+          ["first", lineage([firstInput])],
+          ["second", linked],
+        ]),
+        undefined,
+        undefined,
         {
-          atoms: [
-            {
-              kind: "surface",
-              requestClient: "discord",
-              surfaceId: "discord:123",
-              sessionId: "123",
-              messageId: "followup",
-            },
-          ],
-          canonicalMessages: [secondInput],
+          getMessagePosition: (_channelId, messageId) => {
+            if (membership === "absent") return null;
+            if (messageId === "reply-second" || messageId === "followup")
+              return { threadId: "isolated-output-chunks", ordinal: 0, authorId: "bot" };
+            if (membership === "conflicting" && messageId === "reply-first")
+              return { threadId: "original-thread", ordinal: 0, authorId: "bot" };
+            return null;
+          },
+          listMessagePositionsBefore: () => [],
         },
-      ],
-      { currentSegmentIndex: 1 },
-    ).unwrap() as CoreStoredLineageManifestV2;
-    const f = fixture(
-      [first, second, snapshot("unrelated", 3, [{ role: "assistant", content: "Other thread" }])],
-      new Map([
-        ["first", lineage([firstInput])],
-        ["second", linked],
-      ]),
-    );
-    const page = (
-      await f.service.read("owner", { threadId: externalThreadId("discord", "123") })
-    ).unwrap();
-    expect(page.messages.map((m) => m.role)).toEqual([
-      "user",
-      "assistant",
-      "user",
-      "assistant",
-      "assistant",
-    ]);
-    expect(new Set(page.messages.slice(0, 4).map((m) => m.metadata?.externalRunId)).size).toBe(1);
-    expect(page.messages[4]!.metadata?.externalRunId).not.toBe(
-      page.messages[3]!.metadata?.externalRunId,
-    );
-  });
+      );
+      const page = (
+        await f.service.read("owner", { threadId: externalThreadId("discord", "123") })
+      ).unwrap();
+      expect(page.messages.map((m) => m.role)).toEqual([
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "assistant",
+      ]);
+      expect(new Set(page.messages.slice(0, 4).map((m) => m.metadata?.externalRunId)).size).toBe(1);
+      expect(page.messages[4]!.metadata?.externalRunId).not.toBe(
+        page.messages[3]!.metadata?.externalRunId,
+      );
+      const anchored = (
+        await f.service.readReference("owner", {
+          target: { surface: "discord", sessionId: "123", messageId: "reply-second" },
+        })
+      ).unwrap();
+      expect(anchored.messageFound).toBe(true);
+      expect(anchored.messages.map((message) => message.id)).toEqual(
+        page.messages.slice(0, 4).map((message) => message.id),
+      );
+      const inputAnchor = (
+        await f.service.readReference("owner", {
+          target: { surface: "discord", sessionId: "123", messageId: "followup" },
+        })
+      ).unwrap();
+      expect(inputAnchor.messageFound).toBe(true);
+      expect(inputAnchor.anchorMessageId).toBe(page.messages[2]!.id);
+      expect(inputAnchor.messages.map((message) => message.id)).toEqual(
+        page.messages.slice(0, 4).map((message) => message.id),
+      );
+    },
+  );
 
   test("keeps the attributed user and attachment after compaction without a lineage manifest", async () => {
     const run = snapshot("req:compacted", 1, [

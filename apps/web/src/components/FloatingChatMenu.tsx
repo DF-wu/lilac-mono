@@ -18,6 +18,20 @@ import {
   DropdownMenuItem,
 } from "./ui/dropdown-menu";
 
+// Keeps the dot's center 34px from each edge, outside the mobile edge-swipe back gesture zone,
+// which the page cannot cancel. Matches right-3 on the default position.
+const EDGE_GAP = 12;
+
+function visibleViewport() {
+  const viewport = window.visualViewport;
+  return {
+    left: viewport?.offsetLeft ?? 0,
+    top: viewport?.offsetTop ?? 0,
+    width: viewport?.width ?? window.innerWidth,
+    height: viewport?.height ?? window.innerHeight,
+  };
+}
+
 export function FloatingChatMenu({
   sidebarOpen,
   rightOpen,
@@ -40,6 +54,8 @@ export function FloatingChatMenu({
   onDelete?: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [pressed, setPressed] = useState(false);
+  const [side, setSide] = useState<"left" | "right">("right");
   const [position, setPosition] = useState<{ x: number; y: number }>();
   const anchor = useRef<HTMLDivElement>(null);
   const drag = useRef<
@@ -54,17 +70,32 @@ export function FloatingChatMenu({
     | undefined
   >(undefined);
   const suppressClick = useRef(false);
+  const expanded = open || pressed;
 
   function move(x: number, y: number) {
     const bounds = anchor.current?.getBoundingClientRect();
     if (!bounds) return;
-    const viewport = window.visualViewport;
-    const left = viewport?.offsetLeft ?? 0;
-    const top = viewport?.offsetTop ?? 0;
+    const view = visibleViewport();
     setPosition({
-      x: Math.max(left, Math.min(x, left + (viewport?.width ?? window.innerWidth) - bounds.width)),
-      y: Math.max(top, Math.min(y, top + (viewport?.height ?? window.innerHeight) - bounds.height)),
+      x: Math.max(
+        view.left + EDGE_GAP,
+        Math.min(x, view.left + view.width - bounds.width - EDGE_GAP),
+      ),
+      y: Math.max(
+        view.top + EDGE_GAP,
+        Math.min(y, view.top + view.height - bounds.height - EDGE_GAP),
+      ),
     });
+  }
+
+  function release() {
+    const current = drag.current;
+    drag.current = undefined;
+    setPressed(false);
+    const bounds = anchor.current?.getBoundingClientRect();
+    if (!current?.moved || !bounds) return;
+    const view = visibleViewport();
+    setSide(bounds.left + bounds.width / 2 < view.left + view.width / 2 ? "left" : "right");
   }
 
   useLayoutEffect(() => {
@@ -90,7 +121,7 @@ export function FloatingChatMenu({
     <div
       ref={anchor}
       data-floating-chat-menu
-      className="fixed right-4 top-1/2 z-40 workspace:hidden"
+      className="fixed right-3 top-1/2 z-40 workspace:hidden"
       style={
         position ? { left: position.x, top: position.y, right: "auto", bottom: "auto" } : undefined
       }
@@ -99,9 +130,10 @@ export function FloatingChatMenu({
         <DropdownMenuTrigger
           render={
             <Button
-              variant="default"
+              variant="ghost"
               size="icon"
-              className="size-11 rounded-full shadow-md ring-1 ring-foreground/20 touch-none"
+              data-expanded={expanded || undefined}
+              className="size-11 rounded-full touch-none hover:bg-transparent aria-expanded:bg-transparent focus-visible:border-transparent focus-visible:ring-0"
             />
           }
           aria-label="Conversation menu"
@@ -120,6 +152,7 @@ export function FloatingChatMenu({
               top: bounds.top,
               moved: false,
             };
+            setPressed(true);
             event.currentTarget.setPointerCapture(event.pointerId);
           }}
           onPointerMove={(event) => {
@@ -133,27 +166,26 @@ export function FloatingChatMenu({
             setOpen(false);
             move(current.left + dx, current.top + dy);
           }}
-          onPointerUp={() => {
-            drag.current = undefined;
-          }}
+          onPointerUp={release}
           onPointerCancel={() => {
-            drag.current = undefined;
             suppressClick.current = true;
+            release();
           }}
-          onLostPointerCapture={() => {
-            drag.current = undefined;
-          }}
+          onLostPointerCapture={release}
           onClick={(event) => {
             event.preventDefault();
             if (suppressClick.current && event.detail !== 0) return;
             setOpen((value) => !value);
           }}
         >
-          <Menu />
+          <span className="flex size-3 shrink-0 items-center justify-center overflow-hidden rounded-full bg-primary/60 text-primary-foreground ring-1 ring-foreground/20 transition-all group-focus-visible/button:size-11 group-focus-visible/button:bg-primary group-focus-visible/button:ring-3 group-focus-visible/button:ring-ring/50 group-data-expanded/button:size-11 group-data-expanded/button:bg-primary group-data-expanded/button:shadow-md">
+            <Menu className="opacity-0 transition-opacity group-focus-visible/button:opacity-100 group-data-expanded/button:opacity-100" />
+          </span>
         </DropdownMenuTrigger>
         <DropdownMenuContent
-          side="top"
-          align="end"
+          side="bottom"
+          align={side === "left" ? "start" : "end"}
+          finalFocus={(type) => type === "keyboard"}
           className="min-w-52 [&_[role=menuitem]]:min-h-11"
         >
           <DropdownMenuItem onClick={onToggleSidebar}>

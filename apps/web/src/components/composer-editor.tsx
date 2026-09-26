@@ -65,6 +65,8 @@ import { BulletedListRules, OrderedListRules, toggleList } from "@platejs/list";
 import { ListPlugin } from "@platejs/list/react";
 import { IndentPlugin } from "@platejs/indent/react";
 import { MarkdownPlugin, defaultRules } from "@platejs/markdown";
+import remarkCjkFriendly from "remark-cjk-friendly/bidi";
+import remarkCjkFriendlyGfmStrikethrough from "remark-cjk-friendly-gfm-strikethrough/bidi";
 import remarkGfm from "remark-gfm";
 import { editableComposerLinks, protectComposerLinks } from "./composer-links";
 import { composerParagraphSpacing } from "./composer-line-breaks";
@@ -305,6 +307,8 @@ const BlockList: RenderNodeWrapper = (props: ListElementProps) => {
     );
 };
 
+const composerMarkdownSyntax = [remarkGfm, remarkCjkFriendly, remarkCjkFriendlyGfmStrikethrough];
+
 export const composerPlugins = [
   AttachmentPlugin,
   ReferencePlugin,
@@ -374,7 +378,7 @@ export const composerPlugins = [
   }),
   MarkdownPlugin.configure({
     options: {
-      remarkPlugins: [remarkGfm, editableComposerLinks, composerParagraphSpacing],
+      remarkPlugins: [...composerMarkdownSyntax, editableComposerLinks, composerParagraphSpacing],
       rules: {
         text: { deserialize: (node, decoration) => ({ ...decoration, text: node.value }) },
       },
@@ -523,7 +527,7 @@ export function restoreMessageAttachments(
   );
   const value = editor.getApi(MarkdownPlugin).markdown.deserialize(text, {
     remarkPlugins: [
-      remarkGfm,
+      ...composerMarkdownSyntax,
       () => editableComposerLinks(new Set(byUrl.keys())),
       composerParagraphSpacing,
     ],
