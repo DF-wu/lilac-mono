@@ -217,3 +217,43 @@ describe("coreConfigSchema tools.experimental_hashline_edit", () => {
     expect(parsed.tools.experimental_hashline_edit).toBe(true);
   });
 });
+
+describe("core config tools.web openai search provider", () => {
+  it("accepts openai as a v2 extract provider and defaults its tuning block", () => {
+    const parsed = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      tools: { web: { extract: { providers: ["openai", "tavily", "openai"] }, openai: {} } },
+    });
+
+    expect(parsed.tools.web.extract.providers).toEqual(["openai", "tavily"]);
+    expect(parsed.tools.web.openai).toEqual({ model: "gpt-5-mini", searchContextSize: "medium" });
+  });
+
+  it("parses explicit openai tuning and leaves the block absent when omitted", () => {
+    const configured = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      tools: { web: { openai: { model: " gpt-5 ", searchContextSize: "high" } } },
+    });
+    expect(configured.tools.web.openai).toEqual({ model: "gpt-5", searchContextSize: "high" });
+
+    const absent = parseCoreConfigV2ToUniversal({ configVersion: 2 });
+    expect(absent.tools.web.openai).toBeUndefined();
+  });
+
+  it("rejects invalid openai tuning values", () => {
+    for (const openai of [{ model: "" }, { searchContextSize: "huge" }]) {
+      expect(() =>
+        parseCoreConfigV2ToUniversal({ configVersion: 2, tools: { web: { openai } } }),
+      ).toThrow();
+    }
+  });
+
+  it("keeps the frozen v1 provider enum without openai", () => {
+    expect(() =>
+      parseCoreConfigV1ToUniversal({
+        configVersion: 1,
+        tools: { web: { extract: { providers: ["openai"] } } },
+      }),
+    ).toThrow();
+  });
+});

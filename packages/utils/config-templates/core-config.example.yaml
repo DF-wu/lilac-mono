@@ -33,6 +33,12 @@ tools:
     # firecrawl:
     #   maxConcurrency: 2
     #   queueTtl: 3s
+    # `openai` in extract.providers runs web.search through the OpenAI Responses web_search tool
+    # (uses OPENAI_API_KEY; search-only, web.extract skips it). Dates are prompt
+    # guidance with this provider, not enforced publication-date filters.
+    # openai:
+    #   model: gpt-5-mini
+    #   searchContextSize: medium
   inspect:
     # Must start with google/.
     model: google/gemini-3.5-flash

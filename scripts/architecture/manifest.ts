@@ -1082,6 +1082,19 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     category: "wire",
   },
   ...[
+    "decodeOpenAIWebSearchResponse",
+    "decodeOutputItems",
+    "decodeOutputTexts",
+    "decodeUrlCitations",
+    "decodeWebSearchSources",
+  ].map((exportName) => ({
+    identity: {
+      module: "src/tool-server/tools/web-search/openai-web-search-provider.ts",
+      exportName,
+    },
+    category: "wire" as const,
+  })),
+  ...[
     "captureWebConfigFailure",
     "getNumericField",
     "getErrorStatus",
@@ -5048,6 +5061,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               exportName: "decodeFirecrawlSearchResponse",
             },
             {
+              module: "src/tool-server/tools/web-search/openai-web-search-provider.ts",
+              exportName: "decodeOpenAIWebSearchResponse",
+            },
+            {
               module: "src/tool-server/tools/web-search/firecrawl-permit-pool.ts",
               exportName: "FirecrawlPermitPool.acquire",
             },
@@ -5525,7 +5542,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "d4aee61eaaba0d470e8a6631f95f8ff13682ca06d2f974efea6354cafd87d4de";
+  "a8ea858281b35ee332debdb1df057055efefe979d6519ac1f630e3a0b47843da";
 
 export const architectureManifest = {
   version: 1,

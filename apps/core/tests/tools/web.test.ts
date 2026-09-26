@@ -6,6 +6,7 @@ import { Panic } from "better-result";
 import { Web, type WebDependencies } from "../../src/tool-server/tools/web";
 import {
   createDefaultWebSearchProviders,
+  OpenAIWebSearchProvider,
   type WebSearchProvider,
 } from "../../src/tool-server/tools/web-search";
 import { FirecrawlPermitPool } from "../../src/tool-server/tools/web-search/firecrawl-permit-pool";
@@ -63,6 +64,7 @@ const emptyEnvironment: WebProviderEnvironment = {
   firecrawl: {},
   exa: {},
   tavily: {},
+  openai: {},
 };
 
 const baseWebDependencies: WebDependencies = {
@@ -71,6 +73,7 @@ const baseWebDependencies: WebDependencies = {
     extractProviders: [],
     fetchMode: "auto",
     firecrawlPolicy: undefined,
+    openaiPolicy: undefined,
   }),
   getProviderEnvironment: () => emptyEnvironment,
   createSearchProviders: createDefaultWebSearchProviders,
@@ -105,6 +108,7 @@ function createTool(
         extractProviders: providers.map((provider) => provider.id),
         fetchMode: params.mode ?? "auto",
         firecrawlPolicy: params.firecrawlPolicy,
+        openaiPolicy: undefined,
       })),
     getProviderEnvironment: params.getProviderEnvironment ?? (() => emptyEnvironment),
     createSearchProviders: () => providers,
@@ -772,6 +776,38 @@ describe("web provider extraction", () => {
     });
     expect(calls).toEqual(["tavily"]);
   });
+  it("skips search-only providers for extraction", async () => {
+    const calls: string[] = [];
+    const tool = createTool({
+      providers: [configuredProvider("openai"), configuredProvider("tavily")],
+      extract: async (providerId) => {
+        calls.push(providerId);
+        return { isError: false, content: content("Extracted by tavily.") };
+      },
+    });
+    await expect(
+      toolValue(tool.call("fetch", { url: "https://example.com", mode: "provider-only" })),
+    ).resolves.toMatchObject({ isError: false, content: "Extracted by tavily." });
+    expect(calls).toEqual(["tavily"]);
+
+    const searchOnly = createTool({
+      providers: [configuredProvider("openai")],
+      extract: async (providerId) => {
+        calls.push(providerId);
+        throw new Error("extract must not run for a search-only provider");
+      },
+    });
+    await expect(
+      searchOnly.call("fetch", { url: "https://example.com", mode: "provider-only" }),
+    ).resolves.toMatchObject({
+      status: "error",
+      error: {
+        message:
+          "web.extract is unavailable: configured providers are search-only (openai); add tavily, exa, or firecrawl.",
+      },
+    });
+    expect(calls).toEqual(["tavily"]);
+  });
 });
 
 describe("web search and permits", () => {
@@ -869,6 +905,61 @@ describe("web search and permits", () => {
       error: { kind: "denied", message: "401 unauthorized" },
     });
     expect(calls).toEqual(["tavily"]);
+  });
+
+  it("falls back after retriable OpenAI HTTP errors even without retry keywords", async () => {
+    const recovered = [
+      { url: "https://example.com", title: "Fallback", content: "Recovered", score: null },
+    ];
+    for (const status of [409, 425, 429, 503]) {
+      const server = startServer(
+        () =>
+          new Response(JSON.stringify({ error: { message: "request failed" } }), {
+            status,
+            headers: { "content-type": "application/json" },
+          }),
+      );
+      const fallback = jest.fn(async () => recovered);
+      const tool = createTool({
+        providers: [
+          new OpenAIWebSearchProvider({
+            apiKey: "sk-test",
+            baseUrl: `http://127.0.0.1:${server.port}/v1`,
+          }),
+          configuredProvider("exa", fallback),
+        ],
+      });
+
+      await expect(toolValue(tool.call("search", { query: "fallback test" }))).resolves.toEqual(
+        recovered,
+      );
+      expect(fallback).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("falls back after a non-JSON OpenAI 500 but not after a 400", async () => {
+    for (const status of [500, 400]) {
+      const server = startServer(() => new Response("gateway error", { status }));
+      const fallback = jest.fn(async () => []);
+      const tool = createTool({
+        providers: [
+          new OpenAIWebSearchProvider({
+            apiKey: "sk-test",
+            baseUrl: `http://127.0.0.1:${server.port}/v1`,
+          }),
+          configuredProvider("exa", fallback),
+        ],
+      });
+
+      const result = await tool.call("search", { query: "fallback test" });
+      if (status === 500) {
+        expect(result.status).toBe("ok");
+        expect(fallback).toHaveBeenCalledTimes(1);
+        continue;
+      }
+      expect(result.status).toBe("error");
+      expect(fallback).not.toHaveBeenCalled();
+    }
   });
 
   it("queues Firecrawl searches and falls back when queue TTL expires", async () => {
