@@ -13,7 +13,7 @@ import type { NativeRpcOutputs } from "@stanley2058/lilac-client-protocol";
 export type LinkPreview = NativeRpcOutputs["links"]["preview"];
 class LinkPreviewFailure extends TaggedError("LinkPreviewFailure")<{ message: string }> {}
 const unavailable = () => new LinkPreviewFailure({ message: "Link preview unavailable" });
-const MAX_BYTES = 524_288;
+const MAX_BYTES = 1_048_576;
 const excluded = new BlockList();
 for (const [address, prefix] of [
   ["0.0.0.0", 8],

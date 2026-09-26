@@ -1,4 +1,5 @@
 import { Result } from "better-result";
+import type { NativeClient } from "@stanley2058/lilac-client";
 
 export type AppUpdate = { activate: () => void };
 type UpdateEnvironment = {
@@ -99,5 +100,36 @@ export async function watchAppUpdates(
     workers.removeEventListener("controllerchange", controllerChanged);
     workers.removeEventListener("message", message);
     cleanupPreload();
+  };
+}
+
+export function watchAppUpdateChecks(
+  client: Pick<NativeClient, "subscribe" | "connectionState">,
+  environment: Pick<UpdateEnvironment, "production" | "workers"> = {
+    production: import.meta.env.PROD,
+    workers: "serviceWorker" in navigator ? navigator.serviceWorker : undefined,
+  },
+): () => void {
+  const workers = environment.workers;
+  if (!environment.production || !workers) return () => {};
+  let disposed = false;
+  const check = async () => {
+    const result = await Result.tryPromise({
+      try: async () => {
+        const registration = await workers.getRegistration("/");
+        if (disposed) return;
+        await registration?.update();
+      },
+      catch: () => new Error("App update check is unavailable"),
+    });
+    result.match({ ok: () => {}, err: () => {} });
+  };
+  const stop = client.subscribe((event) => {
+    if (event.kind === "connection" && event.state === "online") void check();
+  });
+  if (client.connectionState === "online") void check();
+  return () => {
+    disposed = true;
+    stop();
   };
 }

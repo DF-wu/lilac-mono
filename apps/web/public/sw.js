@@ -140,3 +140,18 @@ self.addEventListener("fetch", (event) => {
     })(),
   );
 });
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const threadId = event.notification.data?.threadId;
+  if (typeof threadId !== "string" || !threadId || threadId.length > 512) return;
+  const url = new URL(`/threads/${encodeURIComponent(threadId)}`, self.location.origin).href;
+  event.waitUntil(
+    bestEffort(async () => {
+      const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      const existing = windows.find((client) => client.url === url);
+      if (existing) return existing.focus();
+      return self.clients.openWindow(url);
+    }),
+  );
+});

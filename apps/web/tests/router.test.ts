@@ -23,14 +23,14 @@ describe("web routes", () => {
     expect(router.state.location.search).toEqual({ view: "archived" });
     await router.navigate({
       to: ".",
-      search: { view: "others", otherThread: "discord:123", settings: "theme" },
+      search: { view: "others", otherThread: "discord:123", settings: "options" },
     });
     const reload = setup(history.location.href);
     await reload.router.load();
     expect(reload.router.state.location.search).toEqual({
       view: "others",
       otherThread: "discord:123",
-      settings: "theme",
+      settings: "options",
     });
     history.back();
     await router.load();
@@ -48,13 +48,13 @@ describe("web routes", () => {
     });
     await router.navigate({
       to: ".",
-      search: (previous) => ({ ...previous, settings: "theme" }),
+      search: (previous) => ({ ...previous, settings: "options" }),
       state: true,
       hash: true,
     });
     expect(history.location.hash).toBe("#/security");
     expect(history.location.state.draftThreadId).toBe("draft:one");
-    expect(router.state.location.search).toEqual({ settings: "theme" });
+    expect(router.state.location.search).toEqual({ settings: "options" });
   });
 
   test("draft promotion preserves settings and the selected view", async () => {

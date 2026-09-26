@@ -3,6 +3,7 @@ import { expect, it } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { KEYS, NodeApi } from "platejs";
+import { messageClipboard } from "../src/message-clipboard";
 import ComposerEditor, {
   createComposerEditor,
   replaceComposerDocument,
@@ -18,6 +19,47 @@ import ComposerEditor, {
   restoreMessageAttachments,
   captureComposerPaste,
 } from "../src/components/composer-editor";
+
+it("preserves typed line breaks through send, copy, paste, and draft reload", () => {
+  const lines = [
+    "sounds about right where I wanted it to be.",
+    "",
+    "btw, the new sol and luna are so cheap, intelligence cheaper than water (whatever that means)",
+    "https://simonwillison.net/2026/Sep/22/opus-and-sol-and-luna/",
+  ];
+  const text = lines.join("\n");
+  const editor = createComposerEditor();
+  editor.tf.select({ path: [0, 0], offset: 0 });
+  for (const [index, line] of lines.entries()) {
+    if (index) editor.tf.insertBreak();
+    editor.tf.insertText(line);
+  }
+  expect(composerMarkdown(editor)).toBe(text);
+  expect(composerSubmissionMarkdown(editor)).toBe(text);
+  const copied = messageClipboard(composerSubmissionMarkdown(editor), []).text;
+  expect(copied).toBe(text);
+  const pasted = createComposerEditor();
+  pasted.tf.select({ path: [0, 0], offset: 0 });
+  captureComposerPaste(pasted).insert(copied);
+  for (const restored of [createComposerEditor(text), pasted]) {
+    expect(composerMarkdown(restored)).toBe(text);
+    expect(restored.children.map((node) => NodeApi.string(node)).join("\n")).toBe(text);
+  }
+});
+
+it("keeps repeated blank lines and formatted lines without invisible filler", () => {
+  for (const text of [
+    "first\n\n\nlast",
+    "**first**\n_last_",
+    "first\n\nsecond\n\nthird",
+    "\nfirst",
+    "first\n",
+    "first\n\n",
+  ]) {
+    expect(composerMarkdown(createComposerEditor(text))).toBe(text);
+    expect(composerSubmissionMarkdown(createComposerEditor(text))).not.toContain("\u200b");
+  }
+});
 
 it("round trips basic rich Markdown through draft text", () => {
   const markdown =
@@ -334,8 +376,8 @@ it("restores copied resources inline and keeps unrelated links and code intact",
     "Before [notes.md](/api/resources/original) after [site](https://example.com).\n\n`/api/resources/original`",
     new Map([["original", attachment]]),
   );
-  expect(text).toContain(
-    "Before [notes.md](attachment:new-key) after [site](https://example.com).",
+  expect(text).toBe(
+    "Before [notes.md](attachment:new-key) after [site](https://example.com).\n\n`/api/resources/original`",
   );
   expect(text).toContain("`/api/resources/original`");
   const image = restoreMessageAttachments(

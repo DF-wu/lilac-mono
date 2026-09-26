@@ -13,17 +13,17 @@ Keep the web app responsive and preserve existing interaction performance.
 - Review frontend changes with the `vercel-react-best-practices` skill; install it if unavailable.
   Apply the React/Vite-relevant rules using this project's chosen libraries and fix bad patterns
   introduced or exposed by the change.
-- Verify affected interactions in the running app. Compare performance before and after changes to
-  rendering or data flow; treat added lag, flicker, layout shifts, and lost input or scroll state as
-  regressions.
 
 ## UI
 
 - Keep copy minimal and concrete. Labels and tooltips name the action or destination in familiar user
   terms. Omit redundant headings, explanatory filler, and internal terminology such as "surfaces".
-- Use shared shadcn/ui components and design tokens. Keep layouts compact, spacing and radii
-  consistent, and controls optically aligned. Wrap or bound content to prevent overflow; use borders
-  only when spacing, color, or shadow cannot provide enough separation.
+- Use shared shadcn/ui components. When a task benefits from a component missing from the repo, add it
+  and adapt it to the current design and shared tokens. Adding that component and its required
+  dependencies is preauthorized.
+- Keep layouts compact, spacing and radii consistent, and controls optically aligned. Wrap or bound
+  content to prevent overflow; use borders only when spacing, color, or shadow cannot provide enough
+  separation.
 - Use recognizable Lucide icons with short tooltips. Reveal secondary actions on hover or in context
   menus and details on expansion. Keep temporarily unavailable controls in place but disabled.
 - Preserve control positions and interaction state. Give immediate action feedback and use subtle
@@ -42,3 +42,13 @@ Keep the web app responsive and preserve existing interaction performance.
 - Use data attributes for behavior and test selectors. Keep dynamic measurements in inline styles.
 - When changing theme roles or registering theme data, read `src/theme/README.md` for the mapping,
   fallback policy, and syntax integration. Extend the gallery and theme tests with any new role.
+
+## Verification and handoff
+
+- Verify affected interactions in the running app. Compare performance before and after changes to
+  rendering or data flow; treat added lag, flicker, layout shifts, and lost input or scroll state as
+  regressions.
+- When changing the UI, capture the changed UI in the running app and include a screenshot in the
+  final response.
+- When interaction feel, animation, or delay matters to the change, leave the dev server running and
+  include a working link to the affected screen in the final response so the user can test it directly.

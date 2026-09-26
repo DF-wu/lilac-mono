@@ -15,6 +15,8 @@ import {
   MAX_REPLAY_BATCH_BYTES,
 } from "./replay.ts";
 import {
+  nativeDeploymentSettingsSchema,
+  nativeDeploymentDocumentSchema,
   subagentSummarySchema,
   catalogReplySchema,
   agentIdentitySchema,
@@ -140,7 +142,12 @@ export const nativeContract = {
     preferences: procedure.input(z.strictObject({})).output(sidebarPreferencesSchema),
     configure: procedure.input(sidebarPreferencesSchema).output(sidebarPreferencesSchema),
     list: procedure
-      .input(pageInputSchema.extend({ section: sidebarSectionSchema }))
+      .input(
+        pageInputSchema.extend({
+          section: sidebarSectionSchema,
+          limit: z.number().int().min(0).max(100).default(30),
+        }),
+      )
       .output(sidebarPageSchema),
     move: procedure
       .input(
@@ -171,6 +178,7 @@ export const nativeContract = {
       .input(
         pageInputSchema.extend({
           archived: z.boolean().optional(),
+          excludeSettled: z.boolean().optional(),
           query: z.string().max(256).optional(),
         }),
       )
@@ -330,22 +338,15 @@ export const nativeContract = {
       .output(resourceDisplaySchema),
   },
   config: {
-    readStreaming: procedure.input(z.strictObject({})).output(
-      z.strictObject({
-        mode: z.enum(["paragraph", "complete"]),
-        revision: identitySchema,
-      }),
-    ),
-    setStreaming: procedure
+    readDeployment: procedure.input(z.strictObject({})).output(nativeDeploymentDocumentSchema),
+    setDeployment: procedure
       .input(
         z.strictObject({
-          mode: z.enum(["paragraph", "complete"]),
-          expectedRevision: identitySchema,
+          settings: nativeDeploymentSettingsSchema,
+          expectedRevision: revisionSchema,
         }),
       )
-      .output(
-        z.strictObject({ mode: z.enum(["paragraph", "complete"]), revision: identitySchema }),
-      ),
+      .output(nativeDeploymentDocumentSchema),
     read: procedure
       .input(z.strictObject({ kind: z.enum(["core", "mcp"]) }))
       .output(configDocumentSchema),

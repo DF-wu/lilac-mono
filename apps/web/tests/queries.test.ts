@@ -4,6 +4,14 @@ import { NativeClient, type CacheScope } from "@stanley2058/lilac-client";
 import type { NativeRpcOutputs } from "@stanley2058/lilac-client-protocol";
 import {
   participantOptions,
+  threadOptions,
+  configOptions,
+  externalListOptions,
+  externalReadOptions,
+  profileOptions,
+  subagentsOptions,
+  subagentTranscriptOptions,
+  subagentHistoryOptions,
   composerDraftOptions,
   updateComposerDraft,
   searchOptions,
@@ -12,16 +20,11 @@ import {
   refreshQueue,
 } from "../src/queries";
 
-import { sidebarOptions, refreshSidebar } from "../src/sidebar-queries";
+import { sidebarOptions, settledCountOptions, refreshSidebar } from "../src/sidebar-queries";
 
 type Rpc = NonNullable<NativeClient["rpc"]>;
-function clientWith(rpc: {
-  sidebar?: Pick<Rpc["sidebar"], "list">;
-  search?: Pick<Rpc["search"], "query">;
-  participants?: Pick<Rpc["participants"], "list">;
-  users?: Pick<Rpc["users"], "list">;
-  runs?: Pick<Rpc["runs"], "queue">;
-}) {
+type QueryRPC = Partial<{ [K in keyof Rpc]: Partial<Rpc[K]> }>;
+function clientWith(rpc: QueryRPC | (() => QueryRPC | undefined)) {
   const client = new NativeClient({
     scope: {
       installationId: "fixture",
@@ -36,7 +39,7 @@ function clientWith(rpc: {
       throw new Error("No bootstrap needed for query fixtures");
     },
   });
-  Object.defineProperty(client, "rpc", { get: () => rpc });
+  Object.defineProperty(client, "rpc", { get: () => (typeof rpc === "function" ? rpc() : rpc) });
   return client;
 }
 function cache() {
@@ -267,5 +270,138 @@ test("draft handoff replaces sidebar hydration and retains live attachments when
   const stopReopened = reopened.subscribe(() => {});
   expect(reopened.getCurrentResult().data).toEqual(followUp);
   stopReopened();
+  queries.clear();
+});
+
+test("collapsed settled queues fetch only counts across refreshes and load rows on expansion", async () => {
+  const limits: number[] = [];
+  const client = clientWith({
+    sidebar: {
+      list: async ({ limit }) => {
+        limits.push(limit ?? 30);
+        return { items: [], total: 42 };
+      },
+    },
+  });
+  const queries = cache();
+  const list = new InfiniteQueryObserver(queries, sidebarOptions(client, "settled", false));
+  const count = new QueryObserver(queries, settledCountOptions(client, true));
+  const stopList = list.subscribe(() => {});
+  const stopCount = count.subscribe(() => {});
+  await queries.fetchQuery(settledCountOptions(client, true));
+  expect(limits).toEqual([0]);
+  await refreshSidebar(queries);
+  expect(limits).toEqual([0, 0]);
+  expect(count.getCurrentResult().data?.total).toBe(42);
+  list.setOptions(sidebarOptions(client, "settled", true));
+  await queries.fetchInfiniteQuery(sidebarOptions(client, "settled", true));
+  expect(limits).toEqual([0, 0, 100]);
+  list.setOptions(sidebarOptions(client, "settled", false));
+  await refreshSidebar(queries);
+  expect(limits).toEqual([0, 0, 100, 0]);
+  stopList();
+  stopCount();
+  queries.clear();
+});
+
+test("cached query options use the replacement RPC and recover when created offline", async () => {
+  let current: QueryRPC | undefined;
+  let calls = 0;
+  const connection = (name: string): QueryRPC => {
+    const request = async () => {
+      calls++;
+      throw new Error(name);
+    };
+    return {
+      participants: { list: request },
+      threads: { get: request },
+      users: { list: request },
+      search: { query: request },
+      config: { read: request },
+      external: { list: request, read: request },
+      runs: { queue: request },
+      profile: { get: request },
+      subagents: { list: request, read: request },
+    };
+  };
+  const client = clientWith(() => current);
+  const queries = cache();
+  const participants = participantOptions(client, "thread");
+  const thread = threadOptions(client, "thread");
+  const users = userOptions(client);
+  const search = searchOptions(client, "query");
+  const config = configOptions(client, "core");
+  const externalList = externalListOptions(client);
+  const externalRead = externalReadOptions(client, "thread");
+  const queue = queueOptions(client, "thread");
+  const profile = profileOptions(client);
+  const agents = subagentsOptions(client, "thread");
+  const transcript = subagentTranscriptOptions(client, queries, "thread", "agent");
+  const history = subagentHistoryOptions(client, "thread", "agent", 20);
+  const readAll = () =>
+    Promise.allSettled([
+      queries.fetchQuery(participants),
+      queries.fetchQuery(thread),
+      queries.fetchInfiniteQuery(users),
+      queries.fetchInfiniteQuery(search),
+      queries.fetchQuery(config),
+      queries.fetchInfiniteQuery(externalList),
+      queries.fetchInfiniteQuery(externalRead),
+      queries.fetchQuery(queue),
+      queries.fetchQuery(profile),
+      queries.fetchInfiniteQuery(agents),
+      queries.fetchQuery(transcript),
+      queries.fetchInfiniteQuery(history),
+    ]);
+  for (const name of [undefined, "first connection", undefined, "replacement connection"]) {
+    current = name ? connection(name) : undefined;
+    const previousCalls = calls;
+    const results = await readAll();
+    for (const result of results) {
+      expect(result.status).toBe("rejected");
+      if (result.status === "rejected")
+        expect(result.reason.message).toBe(
+          name ?? "Connection unavailable. Please retry when connected.",
+        );
+    }
+    expect(calls - previousCalls).toBe(name ? 12 : 0);
+  }
+  queries.clear();
+});
+
+test("subagent polling retains successful data on disconnect and refreshes through the replacement RPC", async () => {
+  const { agentWorkStages, demoSubagents, demoSubagentTranscript } =
+    await import("../src/agent-work-fixtures");
+  const slot = agentWorkStages.find((stage) => stage.id === "subagents-working")!.frames[0]!;
+  const agent = demoSubagents(slot)[0]!;
+  const messages = demoSubagentTranscript(agent);
+  const signals: AbortSignal[] = [];
+  const connection = (title: string): QueryRPC => ({
+    subagents: {
+      read: async (_, options) => {
+        if (options?.signal) signals.push(options.signal);
+        return {
+          agent: { ...agent, title },
+          messages,
+          offset: 0,
+          total: messages.length,
+          unavailable: false,
+        };
+      },
+    },
+  });
+  let current: QueryRPC | undefined = connection("First connection");
+  const client = clientWith(() => current);
+  const queries = cache();
+  const options = subagentTranscriptOptions(client, queries, "thread", agent.id);
+  await queries.fetchQuery(options);
+  await queries.invalidateQueries({ queryKey: options.queryKey });
+  current = undefined;
+  await expect(queries.fetchQuery(options)).rejects.toThrow("Connection unavailable");
+  expect(queries.getQueryData(options.queryKey)?.messages).toEqual(messages);
+  current = connection("Replacement connection");
+  expect((await queries.fetchQuery(options)).agent.title).toBe("Replacement connection");
+  expect(signals).toHaveLength(2);
+  expect(signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
   queries.clear();
 });

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { referenceHref, parseReferenceHref, referencedConversations } from "./references";
+import { referenceHref, parseReferenceHref, referencedConversations } from "../src/references";
 
 test("reference URLs preserve exact session and message coordinates", () => {
   for (const target of [
@@ -42,4 +42,46 @@ test("unfinished fences, indented code and escaped link examples do not expand",
     "\\[example](/?ref=native%3Ahidden)",
   ])
     expect(referencedConversations(text)).toEqual([]);
+});
+
+test("agent references accept same-origin pasted URLs, autolinks and Markdown links", () => {
+  const target = { surface: "native" as const, sessionId: "thread", messageId: "message" };
+  const href = referenceHref(target);
+  const absolute = `https://chat.example${href}`;
+  expect(
+    referencedConversations(
+      `${absolute}. <${absolute}> [thread](${absolute}) ${href}`,
+      "https://chat.example",
+    ),
+  ).toEqual([target]);
+  expect(referencedConversations(`https://other.example${href}`, "https://chat.example")).toEqual(
+    [],
+  );
+  expect(referencedConversations(absolute)).toEqual([]);
+  expect(
+    referencedConversations(
+      "https://chat.example/?message=message&ref=native%3Athread",
+      "https://chat.example",
+    ),
+  ).toEqual([target]);
+});
+
+test("absolute references preserve code exclusion and reject malformed targets", () => {
+  const url = "https://chat.example/?ref=native%3Athread";
+  for (const text of [
+    `\`${url}\``,
+    `\`\`\`\n${url}\n\`\`\``,
+    `    ${url}`,
+    `\\[example](${url})`,
+    `${url}#fragment`,
+    `${url}&message=`,
+    "https://chat.example/other?ref=native%3Athread",
+  ])
+    expect(referencedConversations(text, "https://chat.example")).toEqual([]);
+  expect(
+    referencedConversations(
+      "[issue](https://chat.example/?ref=github%3Aowner%2Frepo%2345&message=99)",
+      "https://chat.example",
+    ),
+  ).toEqual([{ surface: "github", sessionId: "owner/repo#45", messageId: "99" }]);
 });

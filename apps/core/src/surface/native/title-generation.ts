@@ -24,6 +24,7 @@ export type NativeTitleInput = {
   user: string;
   assistant?: string;
   config: CoreConfig;
+  titleModel: string;
   signal: AbortSignal;
 };
 export type NativeTitleGenerator = (
@@ -45,10 +46,10 @@ export function parseNativeTitle(text: string) {
 
 export const generateNativeTitle: NativeTitleGenerator = (input) =>
   Result.gen(async function* () {
-    const model = input.config.surface.native.titleModel;
+    const model = input.titleModel;
     const resolved = yield* model === "main" || model === "fast"
       ? resolveModelSlotResult(input.config, model)
-      : resolveModelRefResult(input.config, { model }, "surface.native.titleModel");
+      : resolveModelRefResult(input.config, { model }, "native deployment titleModel");
     const generated = yield* Result.await(
       Result.tryPromise({
         try: async () => {
@@ -102,7 +103,16 @@ export function createNativeTitleGeneration(options: {
       },
     });
     if (!job || abort.signal.aborted) return;
+    const settings = options.store.getDeployment().match({
+      ok: (value) => value.settings,
+      err: (error) => {
+        options.warn("Native deployment settings lookup failed", error);
+        return null;
+      },
+    });
+    if (!settings) return;
     const result = await generate({
+      titleModel: settings.titleModel,
       ...job,
       config: options.getConfig(),
       signal: AbortSignal.any([abort.signal, AbortSignal.timeout(30_000)]),

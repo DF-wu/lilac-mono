@@ -3857,7 +3857,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     );
   }
 
-  private readCoreOwnedBlob(
+  readCoreOwnedBlob(
     ownerId: string,
   ): ResultType<CoreOwnedBlob | null, CoreOwnedBlobIntegrityError> {
     const row = this.db

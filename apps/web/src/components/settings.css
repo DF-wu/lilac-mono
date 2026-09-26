@@ -133,3 +133,22 @@
     flex-basis: 100%;
   }
 }
+
+.theme-swatches {
+  width: calc(var(--ui-swatch-size) + (var(--swatch-count) - 1) * var(--ui-swatch-step));
+  height: var(--ui-swatch-size);
+}
+.theme-swatch {
+  --swatch-offset: calc(var(--swatch-index) - (var(--swatch-count) - 1) / 2);
+  left: calc(var(--swatch-index) * var(--ui-swatch-step));
+  width: var(--ui-swatch-size);
+  height: var(--ui-swatch-size);
+  transition: transform var(--ui-motion-duration) ease-out;
+}
+/* Hovered stacks spread around their center and rise more toward the middle, forming an arc. */
+.theme-swatches:is(:hover, :focus-visible) .theme-swatch {
+  transform: translate(
+    calc(var(--swatch-offset) * (var(--ui-swatch-fan) - var(--ui-swatch-step))),
+    calc((var(--swatch-distance) - 2) * var(--ui-swatch-lift))
+  );
+}

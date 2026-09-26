@@ -15,6 +15,15 @@ function fixture(autoTitle = true) {
   const store = new NativeStore(new Database(":memory:"));
   store.initialize().unwrap();
   store
+    .initializeDeployment({
+      titleModel: "fast",
+      outputStreaming: "paragraph",
+      oldMessageSelectionMaxAgeMs: null,
+      storageRetentionMaxAgeMs: null,
+      crossThreadSend: { triggerRun: true },
+    })
+    .unwrap();
+  store
     .upsertUser({
       id: "owner",
       providerId: "owner",
@@ -108,7 +117,7 @@ test("initial title is non-blocking and requests only user context", async () =>
   const request = await c.first.promise;
   expect(request.user).toBe("First line\nExplain the problem");
   expect(request.assistant).toBeUndefined();
-  expect(request.config.surface.native.titleModel).toBe("fast");
+  expect(request.titleModel).toBe("fast");
   c.firstResult.resolve(Result.ok({ title: "Specific subject", needsRefinement: false }));
   await waitForTitle(f, "Specific subject");
   complete(f);

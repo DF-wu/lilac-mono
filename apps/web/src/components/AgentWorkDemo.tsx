@@ -55,9 +55,8 @@ export function AgentWorkDemo() {
         ? stage.frames
         : stage.frames.filter(
             (frame) =>
-              !frame.messages.some(
-                (message) => message.metadata?.phase === "final" && message.metadata.incomplete,
-              ),
+              frame.state !== "running" ||
+              !frame.messages.some((message) => message.metadata?.phase === "final"),
           ),
     [stage, streaming],
   );

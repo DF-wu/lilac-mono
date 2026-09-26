@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { watchAppUpdates, type AppUpdate } from "../src/updates";
+import type { ClientEvent } from "@stanley2058/lilac-client";
+import { watchAppUpdates, watchAppUpdateChecks, type AppUpdate } from "../src/updates";
 
 class Worker extends EventTarget {
   sent: unknown[] = [];
@@ -10,11 +11,37 @@ class Worker extends EventTarget {
 class Registration extends EventTarget {
   waiting: Worker | null = null;
   installing: Worker | null = null;
+  checks = 0;
+  failUpdate = false;
+  checked = Promise.withResolvers<void>();
+  async update() {
+    this.checks++;
+    this.checked.resolve();
+    this.checked = Promise.withResolvers<void>();
+    if (this.failUpdate) throw new Error("Offline");
+    return this;
+  }
+}
+class Client {
+  connectionState: "online" | "offline" = "offline";
+  listeners = new Set<(event: ClientEvent) => void>();
+  subscribe(listener: (event: ClientEvent) => void) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  connection(state: "online" | "offline") {
+    this.connectionState = state;
+    for (const listener of this.listeners) listener({ kind: "connection", state });
+  }
 }
 class Workers extends EventTarget {
   controller: Worker | null = new Worker();
   registration = new Registration();
   unavailable = false;
+  lookup: Promise<Registration | undefined> | undefined;
+  async getRegistration() {
+    return this.lookup ?? this.registration;
+  }
   async register() {
     if (this.unavailable) throw new Error("Unsupported context");
     return this.registration;
@@ -43,6 +70,92 @@ function fixture(unavailable = false) {
   };
 }
 describe("app update notifications", () => {
+  test("replacing a client preserves the visible update while pending checks are discarded", async () => {
+    const f = fixture();
+    const registration = f.workers.registration;
+    registration.waiting = new Worker();
+    const cleanup = await watchAppUpdates((value) => f.updates.push(value), f.environment);
+    const update = f.updates[0]!;
+    const pending = Promise.withResolvers<Registration>();
+    f.workers.lookup = pending.promise;
+    const previous = new Client();
+    previous.connection("online");
+    const stopPrevious = watchAppUpdateChecks(previous, f.environment);
+    stopPrevious();
+    pending.resolve(registration);
+    await f.workers.getRegistration();
+    expect(registration.checks).toBe(0);
+    expect(previous.listeners.size).toBe(0);
+
+    f.workers.lookup = undefined;
+    registration.failUpdate = true;
+    const current = new Client();
+    current.connection("online");
+    const stopCurrent = watchAppUpdateChecks(current, f.environment);
+    await registration.checked.promise;
+    expect(registration.checks).toBe(1);
+    expect(f.updates).toEqual([update]);
+    update.activate();
+    expect(registration.waiting.sent).toEqual(["activate-update"]);
+    f.workers.dispatchEvent(new Event("controllerchange"));
+    expect(f.reloads()).toBe(1);
+    stopCurrent();
+    cleanup();
+  });
+  test("reconnecting checks for an update and offers reload after it installs", async () => {
+    const f = fixture();
+    const client = new Client();
+    const cleanup = await watchAppUpdates((value) => f.updates.push(value), f.environment);
+    const stopChecks = watchAppUpdateChecks(client, f.environment);
+    const registration = f.workers.registration;
+    expect(registration.checks).toBe(0);
+    const checked = registration.checked.promise;
+    client.connection("online");
+    await checked;
+    expect(registration.checks).toBe(1);
+    client.connection("offline");
+    expect(registration.checks).toBe(1);
+    const rechecked = registration.checked.promise;
+    client.connection("online");
+    await rechecked;
+    expect(registration.checks).toBe(2);
+    expect(f.updates).toHaveLength(0);
+    registration.installing = new Worker();
+    registration.dispatchEvent(new Event("updatefound"));
+    registration.waiting = registration.installing;
+    registration.installing.dispatchEvent(new Event("statechange"));
+    expect(f.updates).toHaveLength(1);
+    expect(f.reloads()).toBe(0);
+    f.updates[0]!.activate();
+    expect(registration.waiting.sent).toEqual(["activate-update"]);
+    f.workers.dispatchEvent(new Event("controllerchange"));
+    expect(f.reloads()).toBe(1);
+    stopChecks();
+    cleanup();
+    client.connection("online");
+    expect(registration.checks).toBe(2);
+    expect(client.listeners.size).toBe(0);
+  });
+  test("an already online client checks and a failed check can retry on reconnect", async () => {
+    const f = fixture();
+    const client = new Client();
+    client.connection("online");
+    f.workers.registration.failUpdate = true;
+    const cleanup = await watchAppUpdates((value) => f.updates.push(value), f.environment);
+    const stopChecks = watchAppUpdateChecks(client, f.environment);
+    await f.workers.registration.checked.promise;
+    expect(f.workers.registration.checks).toBe(1);
+    f.workers.registration.failUpdate = false;
+    client.connection("offline");
+    const checked = f.workers.registration.checked.promise;
+    client.connection("online");
+    await checked;
+    expect(f.workers.registration.checks).toBe(2);
+    expect(f.updates).toHaveLength(0);
+    expect(f.reloads()).toBe(0);
+    stopChecks();
+    cleanup();
+  });
   test("service-worker absence and registration rejection are optional", async () => {
     const f = fixture(true);
     const cleanup = await watchAppUpdates((value) => f.updates.push(value), f.environment);

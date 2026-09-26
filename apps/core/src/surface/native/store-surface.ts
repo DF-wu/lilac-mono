@@ -287,15 +287,35 @@ export class NativeSurfaceStore {
       Result.gen(function* () {
         yield* this.store.authorizeThread(actorId, threadId);
         const rows = this.db
-          .query<{ emoji: string }, [string, string, string]>(
-            "SELECT emoji FROM native_surface_reactions WHERE thread_id=? AND message_id=? AND actor_id=?",
+          .query<{ emoji: string; actor_id: string }, [string, string]>(
+            "SELECT emoji,actor_id FROM native_surface_reactions WHERE thread_id=? AND message_id=? ORDER BY emoji,actor_id",
           )
-          .all(threadId, messageId, actorId);
-        const reacted = new Set(rows.map((row) => row.emoji));
+          .all(threadId, messageId);
+        const reacted = new Set<string>();
+        const names = new Map<string, string[]>();
+        const displayNames = new Map<string, string>();
+        for (const row of rows) {
+          if (row.actor_id === actorId) reacted.add(row.emoji);
+          const users = names.get(row.emoji) ?? [];
+          if (users.length >= 5) continue;
+          let displayName = displayNames.get(row.actor_id);
+          if (displayName === undefined) {
+            const user = yield* this.store.getUser(row.actor_id);
+            displayName = user.displayName;
+            displayNames.set(row.actor_id, displayName);
+          }
+          users.push(displayName);
+          names.set(row.emoji, users);
+        }
         return Result.ok({
           ...part,
           data: {
-            items: part.data.items.map((item) => ({ ...item, reacted: reacted.has(item.emoji) })),
+            items: part.data.items.map((item) => ({
+              ...item,
+              reacted: reacted.has(item.emoji),
+              userNames: names.get(item.emoji) ?? [],
+              overflowCount: Math.max(0, item.count - (names.get(item.emoji)?.length ?? 0)),
+            })),
           },
         });
       }, this),

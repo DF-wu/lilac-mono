@@ -1,3 +1,4 @@
+import { reactionTooltip } from "../src/components/MessageReactions";
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { AttachmentPreviewBody } from "../src/components/ResourcePreview";
@@ -12,6 +13,27 @@ import MarkdownContent from "../src/components/MarkdownContent";
 import type { DisplayMessage, DisplayPart } from "@stanley2058/lilac-client-protocol";
 
 describe("message presentation", () => {
+  test("reaction tooltips show five names and the remaining count", () => {
+    expect(
+      reactionTooltip({
+        emoji: "👍",
+        count: 7,
+        reacted: false,
+        userNames: ["Alex", "Morgan", "Sam", "Jo", "Casey"],
+        overflowCount: 2,
+      }),
+    ).toBe("Alex, Morgan, Sam, Jo, Casey, +2");
+    expect(
+      reactionTooltip({
+        emoji: "👍",
+        count: 1,
+        reacted: true,
+        userNames: ["Alex"],
+        overflowCount: 0,
+      }),
+    ).toBe("Alex");
+  });
+
   test("linked Discord messages use the viewer alignment and keep the source label", () => {
     const html = renderToStaticMarkup(
       <MessageIdentityContext
@@ -324,18 +346,32 @@ describe("message presentation", () => {
     ])
       expect(faviconUrl(href)).toBeUndefined();
   });
-  test("file preview renders bounded text literally and exposes binary errors", () => {
-    const html = renderToStaticMarkup(
-      <AttachmentPreviewBody
-        name="source.ts"
-        href="/api/resources/id"
-        kind="text"
-        text={{ status: "ready", text: "<script>untrusted</script>", truncated: true }}
-      />,
-    );
-    expect(html).toContain("&lt;script&gt;");
-    expect(html).toContain("Download source.ts");
-    expect(html).not.toContain("<script>");
+  test("file preview fallback escapes text and both loading states retain truncation and download", async () => {
+    // A fresh process keeps the lazy FileCode module cold regardless of test order.
+    const child = Bun.spawn([process.execPath, "tests/fixtures/file-preview-render.tsx"], {
+      cwd: new URL("..", import.meta.url).pathname,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    const { cold, warm } = JSON.parse(stdout) as { cold: string; warm: string };
+    expect(cold).toContain("&lt;script&gt;untrusted&lt;/script&gt;");
+    expect(cold).toContain("file-code-fallback");
+    expect(warm).toContain('aria-label="File contents"');
+    expect(warm).not.toContain("file-code-fallback");
+    for (const html of [cold, warm]) {
+      expect(html).toContain("Showing the first 64 KB.");
+      expect(html).toContain("Download source.ts");
+      expect(html).not.toContain("<script>");
+    }
+  });
+  test("file preview exposes binary errors", () => {
     const error = renderToStaticMarkup(
       <AttachmentPreviewBody
         name="file.bin"

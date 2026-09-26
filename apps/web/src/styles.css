@@ -30,6 +30,11 @@
     margin: 0;
     min-width: 20rem;
   }
+  html:has(.app-shell),
+  body:has(.app-shell) {
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
   button,
   input,
   textarea,
@@ -290,16 +295,11 @@
     padding: calc(var(--ui-space-unit) * 2) 0;
   }
 
-  .action-list,
-  .reaction-list {
+  .action-list {
     display: flex;
     flex-wrap: wrap;
     gap: calc(var(--ui-space-unit) * 2);
     padding: calc(var(--ui-space-unit) * 2) 0;
-  }
-  .reaction-list [aria-pressed="true"] {
-    color: var(--ui-primary);
-    background: var(--ui-surface-raised);
   }
   .empty-chat,
   .welcome {
@@ -457,7 +457,7 @@
     background: var(--ui-background);
     color: var(--ui-foreground);
     border-radius: var(--ui-radius-sm);
-    padding: calc(var(--ui-space-unit) * 1);
+    padding: calc(var(--ui-space-unit) * 0.5) var(--ui-space-unit);
   }
   .markdown pre {
     padding: calc(var(--ui-space-unit) * 4);
@@ -484,13 +484,17 @@
   }
   .markdown table {
     border-collapse: collapse;
-    width: 100%;
+    width: max-content;
+    min-width: 100%;
     font-size: var(--ui-text-sm);
   }
   .markdown th,
   .markdown td {
+    max-width: var(--ui-table-cell-max-width);
     padding: calc(var(--ui-space-unit) * 2) calc(var(--ui-space-unit) * 3);
     text-align: left;
+    vertical-align: top;
+    overflow-wrap: anywhere;
   }
   .markdown th {
     background: var(--ui-surface-hover);
@@ -634,9 +638,6 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-.markdown[data-wrap="true"] table {
-  table-layout: fixed;
-}
 
 .virtual-list.scroll-fade {
   mask-image: linear-gradient(
@@ -700,9 +701,12 @@
 :root[data-animation] :where([class*="transition"], [class*="duration"], .work-summary svg) {
   transition-duration: var(--ui-motion-duration) !important;
 }
-:root[data-animation] .animate-spin,
-:root[data-animation] .thread-card[data-state="working"] .thread-state-icon svg {
+:root[data-animation] .animate-spin {
   animation-duration: var(--ui-motion-spin-duration) !important;
+}
+:root[data-animation] [data-slot="loading-spinner"],
+:root[data-animation] [data-slot="loading-spinner"] * {
+  animation-duration: var(--ld-duration) !important;
 }
 :root[data-animation] [data-slot="skeleton"] {
   animation-duration: var(--ui-motion-pulse-duration) !important;

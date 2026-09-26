@@ -48,6 +48,9 @@
 .native-message .message-bubble .markdown > :last-child {
   margin-bottom: 0;
 }
+.message-bubble .markdown :is(p, li) {
+  text-wrap: pretty;
+}
 
 .message-bubble .markdown + .message-attachments {
   margin-top: calc(var(--ui-space-unit) * 3);
@@ -164,6 +167,9 @@
 .message-card-preview[data-collapsed="true"] {
   max-height: 24rem;
   overflow: hidden;
+}
+.message-card-preview[data-streaming="true"] {
+  overflow: clip;
 }
 .message-card-preview[data-collapsed="true"][data-overflow="true"] {
   mask-image: linear-gradient(to bottom, black calc(100% - 3rem), transparent);

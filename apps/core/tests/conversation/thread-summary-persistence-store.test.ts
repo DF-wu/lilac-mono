@@ -51,39 +51,21 @@ function createLegacySummaryTable(database: Database): void {
 }
 
 describe("conversation thread summary persisted store", () => {
-  it("additively migrates the old schema and reads v0 without rewriting it", async () => {
+  it("rebuilds legacy derived state once and preserves subsequent summaries", async () => {
     const filename = await databasePath();
     const oldDatabase = new Database(filename, { create: true, strict: true });
     createLegacySummaryTable(oldDatabase);
     oldDatabase.close();
 
     const store = new ConversationThreadStore(filename);
-    try {
-      const summary = store.getSummary("legacy-thread");
-      expect(summary.status).toBe("ok");
-      if (summary.status === "ok") {
-        expect(summary.value).toMatchObject({
-          title: "Legacy title",
-          topics: ["legacy"],
-          retrievalHints: [],
-          importance: "medium",
-        });
-      }
-
-      const inspection = new Database(filename, { strict: true });
-      try {
-        const row = inspection
-          .query<{ summary_format_version: number | null }, []>(
-            "SELECT summary_format_version FROM conversation_thread_summaries WHERE thread_id = 'legacy-thread'",
-          )
-          .get();
-        expect(row?.summary_format_version).toBeNull();
-      } finally {
-        inspection.close();
-      }
-    } finally {
-      store.close();
-    }
+    expect(store.getSummary("legacy-thread").unwrap()).toBeNull();
+    store
+      .upsertSummary("new-thread", "hash", { title: "New", brief: "Rebuilt", topics: [] })
+      .unwrap();
+    store.close();
+    const reopened = new ConversationThreadStore(filename);
+    expect(reopened.getSummary("new-thread").unwrap()?.title).toBe("New");
+    reopened.close();
   });
 
   it("writes only the current row format version", async () => {

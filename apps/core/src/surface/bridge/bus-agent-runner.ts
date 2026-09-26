@@ -1,3 +1,4 @@
+import { expandConversationReferencesForModel } from "./conversation-references";
 import type { NativeOutputFrontier } from "@stanley2058/lilac-event-bus";
 import {
   McpImageCheckpointRegistry,
@@ -1043,6 +1044,7 @@ const AUTO_INJECTED_THREAD_BRIEF_FULL_THRESHOLD = Math.floor(
 
 export type AutoInjectedThreadSearchPayload = {
   entries: Array<{
+    surface: "discord" | "native";
     threadId: string;
     title: string;
     brief?: string;
@@ -1084,6 +1086,7 @@ export function buildAutoInjectedThreadSearchMessages(params: {
   const payload: AutoInjectedThreadSearchPayload = {
     entries: params.entries.map((entry) => ({
       threadId: entry.threadId,
+      surface: entry.surface,
       title: entry.title,
       ...(entry.brief ? { brief: entry.brief } : {}),
       ...(entry.timeRange ? { timeRange: entry.timeRange } : {}),
@@ -1138,6 +1141,7 @@ function formatRankedAutoInjectedThread(
   const brief = formatAutoInjectedThreadBrief(candidate.result.brief);
   return {
     threadId: candidate.result.threadId,
+    surface: candidate.result.surface,
     title: candidate.result.title,
     ...(brief ? { brief } : {}),
     ...(timeRange ? { timeRange } : {}),
@@ -1197,6 +1201,7 @@ function formatInjectedThreadTimeRange(input: { start: string; end: string }): s
 }
 
 export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
+  surface?: "discord" | "native";
   cfg: CoreConfig;
   conversationThreads?: ConversationThreadToolService;
   requestId: string;
@@ -1236,10 +1241,10 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
     return [];
   }
 
-  const participantIds = autoInject.filterCurrentParticipants
-    ? getParticipantUserIdsFromRaw(params.raw)
-    : [];
-  if (autoInject.filterCurrentParticipants && participantIds.length === 0) return [];
+  const participantIds =
+    autoInject.filterCurrentParticipants && params.surface !== "native"
+      ? getParticipantUserIdsFromRaw(params.raw)
+      : [];
 
   const autoInjectUsage =
     params.autoInjectUsage ??
@@ -1311,7 +1316,9 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
               mode: autoInject.mode,
               verbose: true,
               autoInjectUsage,
-              ...(participantIds.length > 0 ? { participantIdsAny: participantIds } : {}),
+              ...(participantIds.length > 0
+                ? { participantIdsAny: participantIds, participantSurface: params.surface }
+                : {}),
             }),
           ),
         );
@@ -1350,7 +1357,8 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
           return [];
         }
         usageStatus = fulfilledSearches === plan.searches.length ? "completed" : "partial";
-        const corpusDocuments = conversationThreads.getAutoInjectRankingCorpusDocuments?.() ?? [];
+        const corpusDocuments =
+          (await conversationThreads.getAutoInjectRankingCorpusDocuments?.()) ?? [];
         const rankingResult = rankAutoInjectedThreadSearchResults({
           plan,
           searches: successfulSearches,
@@ -6544,7 +6552,9 @@ export async function startBusAgentRunner(params: {
                 })
               : scrubbed;
 
-            return compacted;
+            return next.requestClient === "native"
+              ? compacted
+              : expandConversationReferencesForModel(compacted, cfg.surface.native.publicUrl);
           };
           const toolPruneTransform: PrepareFullModelView = (messages, transformContext) =>
             prepareModelView(messages, transformContext, false);
@@ -7754,6 +7764,7 @@ export async function startBusAgentRunner(params: {
               !control.requiresActive
                 ? await waitForPreAgent(
                     maybeBuildAutoInjectedThreadSearchMessages({
+                      surface: next.requestClient === "native" ? "native" : "discord",
                       cfg,
                       conversationThreads:
                         next.requestClient === "native"

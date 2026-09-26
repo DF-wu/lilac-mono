@@ -181,3 +181,47 @@ test("old unobserved activity does not extend the inactivity deadline", () => {
   expect(f.list("settled")).toEqual([a]);
   f.store.close();
 });
+
+test("count-only pages reconcile settlement without projecting thread records", () => {
+  const f = fixture();
+  const manual = f.create("manual");
+  const automatic = f.create("automatic");
+  const pinned = f.create("pinned");
+  f.move(manual, "settled");
+  f.move(pinned, "pinned");
+  f.advance(3);
+  expect(f.store.listSidebar("alice", { section: "settled", limit: 0 }).unwrap()).toEqual({
+    items: [],
+    total: 2,
+  });
+  expect(
+    f.store
+      .listThreads("alice", { excludeSettled: true })
+      .unwrap()
+      .map((t) => t.id),
+  ).toEqual([pinned]);
+  expect(new Set(f.list("settled"))).toEqual(new Set([automatic, manual]));
+  f.activity(manual);
+  expect(f.store.listSidebar("alice", { section: "settled", limit: 0 }).unwrap().total).toBe(1);
+  expect(f.store.listSidebar("bob", { section: "settled", limit: 0 }).unwrap().total).toBe(0);
+  f.store.close();
+});
+
+test("catalog settlement checks reconcile only the changed thread and reactivate on activity", () => {
+  const f = fixture();
+  const changed = f.create("changed");
+  const untouched = f.create("untouched");
+  f.list("active");
+  f.advance(3);
+  expect(f.store.isSidebarThreadSettled("alice", changed).unwrap()).toBe(true);
+  expect(
+    f.db
+      .query<{ section: string }, [string]>(
+        "SELECT section FROM native_thread_preferences WHERE user_id='alice' AND thread_id=?",
+      )
+      .get(untouched)?.section,
+  ).toBe("active");
+  f.activity(changed);
+  expect(f.store.isSidebarThreadSettled("alice", changed).unwrap()).toBe(false);
+  f.store.close();
+});

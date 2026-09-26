@@ -54,6 +54,7 @@ afterEach(async () => {
 function harness(
   options: {
     delayedSubmit?: Promise<void>;
+    beforeOpen?: () => void;
     delayedCatalog?: Promise<void>;
     bootstrap?: () => Promise<BootstrapReply>;
   } = {},
@@ -125,6 +126,7 @@ function harness(
     cache,
     openSocket: () => {
       socketCount++;
+      options.beforeOpen?.();
       const socket = new WebSocket(`ws://127.0.0.1:${server.port}`);
       socket.addEventListener("open", () => opened.resolve());
       return socket;
@@ -417,4 +419,117 @@ test("HTTP retry does not cancel socket reconnection after both transports fail"
   expect(socketCount).toBe(2);
   expect(bootstrapCount).toBeGreaterThanOrEqual(2);
   expect(client.rpc).toBeDefined();
+});
+
+test("foreground reconnect replaces the socket immediately and preserves selected history", async () => {
+  const test = harness();
+  await test.client.start("thread");
+  await test.watching;
+  const store = test.client.thread("thread");
+  const online = Promise.withResolvers<void>();
+  const stop = test.client.subscribe((event) => {
+    if (event.kind === "connection" && event.state === "online") online.resolve();
+  });
+  test.client.reconnect();
+  expect(test.socketCount()).toBe(2);
+  expect(test.client.thread("thread")).toBe(store);
+  await online.promise;
+  stop();
+  expect(test.client.connectionState).toBe("online");
+  expect(test.events.filter((event) => event.kind === "error")).toEqual([]);
+});
+
+test("a superseded bootstrap cannot log out the resumed session", async () => {
+  const old = Promise.withResolvers<BootstrapReply>();
+  const requested = Promise.withResolvers<void>();
+  let requests = 0;
+  const test = harness({
+    bootstrap: async () => {
+      if (requests++ === 0) {
+        requested.resolve();
+        return old.promise;
+      }
+      return bootstrap;
+    },
+  });
+  const starting = test.client.start("thread");
+  await requested.promise;
+  const recovered = Promise.withResolvers<void>();
+  test.client.subscribe((event) => {
+    if (event.kind === "connection" && event.state === "online") recovered.resolve();
+  });
+  test.client.reconnect();
+  await recovered.promise;
+  old.reject(new ORPCError("UNAUTHENTICATED"));
+  await starting;
+  expect(test.client.connectionState).toBe("online");
+  expect(
+    test.events.some((event) => event.kind === "connection" && event.state === "logged-out"),
+  ).toBe(false);
+});
+
+test("opening a local draft deselects the previous server thread across reconnects", async () => {
+  const test = harness();
+  await test.client.start("thread");
+  await test.watching;
+  await test.client.selectThread(undefined);
+  const recovered = Promise.withResolvers<void>();
+  test.client.subscribe((event) => {
+    if (event.kind === "bootstrap") recovered.resolve();
+  });
+  test.client.reconnect();
+  await recovered.promise;
+  expect(test.watches).toHaveLength(1);
+});
+
+test("the socket alone does not report recovery before bootstrap succeeds", async () => {
+  const response = Promise.withResolvers<BootstrapReply>();
+  const requested = Promise.withResolvers<void>();
+  const test = harness({
+    bootstrap: async () => {
+      requested.resolve();
+      return response.promise;
+    },
+  });
+  const starting = test.client.start("thread");
+  await requested.promise;
+  expect(test.client.connectionState).toBe("connecting");
+  response.resolve(bootstrap);
+  await starting;
+  expect(test.client.connectionState).toBe("online");
+});
+
+test("retryable bootstrap failures use connection status without duplicate error events", async () => {
+  const test = harness({
+    bootstrap: async () => {
+      throw new Error("Network unavailable");
+    },
+  });
+  await test.client.start("thread");
+  expect(test.client.connectionState).toBe("offline");
+  expect(test.events.filter((event) => event.kind === "error")).toEqual([]);
+});
+
+test("a socket constructor failure during resume remains retryable", async () => {
+  let fail = false;
+  const test = harness({
+    beforeOpen: () => {
+      if (fail) throw new Error("Socket temporarily unavailable");
+    },
+  });
+  await test.client.start("thread");
+  await test.watching;
+  fail = true;
+  expect(() => test.client.reconnect()).not.toThrow();
+  expect(test.client.connectionState).toBe("offline");
+  expect(test.client.rpc).toBeUndefined();
+  fail = false;
+  const recovered = Promise.withResolvers<void>();
+  test.client.subscribe((event) => {
+    if (event.kind === "connection" && event.state === "online") recovered.resolve();
+  });
+  test.client.reconnect();
+  await recovered.promise;
+  expect(test.socketCount()).toBe(3);
+  expect(test.client.thread("thread").get("slot")).toBeDefined();
 });

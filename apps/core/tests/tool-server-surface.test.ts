@@ -453,21 +453,59 @@ describe("tool-server surface", () => {
     expect(out.context.alias).toBe("ops");
   });
 
-  it("uses a registered request context as authoritative and rejects an explicit conflict", async () => {
+  it("explains reference parsing and the native cross-surface read path", async () => {
     const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
+    const out = (await tool.call("surface.help", {})) as {
+      terminology: { conversationLinks: string[] };
+    };
+    const help = out.terminology.conversationLinks.join("\n");
+    expect(help).toContain("http://localhost:8789/?ref=");
+    expect(help).toContain("split ref at the first colon");
+    expect(help).toContain("Always pass the target client explicitly");
+    expect(help).toContain("conversation.thread.read");
+    expect(help).toContain("threadId=native:<threadId>");
+  });
 
+  it.each(["github", "native"])(
+    "allows an explicit Discord target from %s",
+    async (requestClient) => {
+      const adapter = new FakeAdapter([], {});
+      const tool = new Surface({
+        adapter,
+        config: testConfig({
+          surface: {
+            discord: {
+              tokenEnv: "DISCORD_TOKEN",
+              allowedChannelIds: ["123456789012345678"],
+              allowedGuildIds: [],
+              botName: "lilac",
+            },
+          },
+        }),
+      });
+
+      await tool.call(
+        "surface.messages.read",
+        { client: "discord", sessionId: "123456789012345678", messageId: "message-1" },
+        { context: { requestClient } },
+      );
+      expect(adapter.readCalls).toEqual([
+        { platform: "discord", channelId: "123456789012345678", messageId: "message-1" },
+      ]);
+    },
+  );
+
+  it("does not fall back to the origin when an explicit target is unavailable", async () => {
+    const adapter = new FakeAdapter([], {});
+    const tool = new Surface({ adapter, config: testConfig({}) });
     const result = await tool.callResult(
-      "surface.messages.read",
-      { client: "discord", sessionId: "channel-1", messageId: "message-1" },
-      { context: { requestClient: "github" } },
+      "surface.messages.list",
+      { client: "slack", sessionId: "channel-1" },
+      { context: { requestClient: "discord" } },
     );
     expect(result.status).toBe("error");
-    if (result.status === "error") {
-      expect(result.error).toMatchObject({
-        kind: "conflict",
-        message: "Client mismatch: context requestClient is 'github' but input client is 'discord'",
-      });
-    }
+    if (result.status === "error") expect(result.error.kind).toBe("unavailable");
+    expect(adapter.listCalls).toEqual([]);
   });
 
   it("distinguishes unregistered wire clients from malformed context values", async () => {
@@ -2498,6 +2536,13 @@ describe("tool-server surface", () => {
       expect(out[0]?.updatedTs).toBeTypeOf("number");
       expect(out[0]?.preview).toBe(longText.replace(/\s+/g, " ").trim().slice(0, 128));
       expect(out[0]?.truncated).toBe(true);
+
+      const fromNative = await tool.call(
+        "surface.activities.recentAgentWrites",
+        { client: "discord", limit: 5 },
+        { context: { requestClient: "native" } },
+      );
+      expect(fromNative).toEqual(out);
     } finally {
       transcriptStore.close();
     }

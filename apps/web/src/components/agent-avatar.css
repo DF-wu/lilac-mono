@@ -1,0 +1,8 @@
+:root[data-animation="off"] .agent-avatar-eyes {
+  transform: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-avatar-eyes {
+    transform: none !important;
+  }
+}

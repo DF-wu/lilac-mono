@@ -1,4 +1,4 @@
-import { useContext, useState, type ReactNode } from "react";
+import { useContext, useEffect, useState, type ReactNode } from "react";
 import { Check, Code, Copy, FileCode, FileJson, Terminal, WrapText } from "lucide-react";
 import { IconButton, attempt } from "./ui";
 import "./message-presentation.css";
@@ -22,7 +22,13 @@ export function CodeBlock({
 }) {
   const forceWrap = useContext(MarkdownWrapContext);
   const [wrap, setWrap] = useState(true);
-  const [copied, setCopied] = useState(false);
+  const [copiedAt, setCopiedAt] = useState(0);
+  const copied = copiedAt !== 0;
+  useEffect(() => {
+    if (!copiedAt) return;
+    const timer = setTimeout(() => setCopiedAt(0), 2000);
+    return () => clearTimeout(timer);
+  }, [copiedAt]);
   const [copyError, setCopyError] = useState<string>();
   return (
     <div className="code-block" data-wrap={forceWrap || wrap}>
@@ -47,7 +53,7 @@ export function CodeBlock({
               void attempt(
                 async () => {
                   await navigator.clipboard.writeText(source);
-                  setCopied(true);
+                  setCopiedAt(Date.now());
                 },
                 () => setCopyError("Copy unavailable"),
               );

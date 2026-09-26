@@ -53,7 +53,10 @@ Allocate one `commandId` when the user sends. `submit(input)` returns `accepted`
 the exact payload and ID; do not construct another command. Resolved receipt memory is bounded to
 256 commands. Pending sends are retained in memory, not presented as durable offline admission.
 
-Connection errors emit `offline`/`error`; a close reconnects with bounded jittered exponential backoff.
+Retryable connection failures emit `offline`; other failures emit `error`. A close reconnects with
+bounded jittered exponential backoff. `reconnect()` bypasses backoff and replaces the socket without
+clearing thread stores or pending commands. `connectionState` becomes `online` after both the socket
+and bootstrap are ready. Web clients call `reconnect()` when returning to the foreground or network.
 `reauthenticate(token)` refreshes the connection identity. Switching principal logs out rather than
 reusing a private store. `dispose()` aborts subscriptions, waits for their protocol cleanup and closes
 the socket. Await it when shutting down a test or terminal process.

@@ -24,9 +24,11 @@ export class RichRenderBoundary extends Component<
 export const Markdown = memo(function Markdown({
   text,
   wrap = false,
+  preserveLineBreaks = false,
 }: {
   text: string;
   wrap?: boolean;
+  preserveLineBreaks?: boolean;
 }) {
   const fallback = <div className="markdown-source">{text}</div>;
   return (
@@ -34,7 +36,7 @@ export const Markdown = memo(function Markdown({
       <MarkdownWrapContext value={wrap}>
         <RichRenderBoundary resetKey={text} fallback={fallback}>
           <Suspense fallback={fallback}>
-            <MarkdownContent text={text} />
+            <MarkdownContent text={text} preserveLineBreaks={preserveLineBreaks} />
           </Suspense>
         </RichRenderBoundary>
       </MarkdownWrapContext>

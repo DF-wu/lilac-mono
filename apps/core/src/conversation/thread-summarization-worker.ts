@@ -112,7 +112,7 @@ function respond(response: ThreadSummarizationWorkerMessage): void {
 const pendingHydrations = new Map<
   string,
   {
-    refs: readonly { channelId: string; messageId: string }[];
+    refs: Parameters<ConversationThreadAttachmentHydrator>[0]["refs"];
     resolve: (response: ThreadSummarizationHydrationResponse) => void;
   }
 >();
@@ -133,9 +133,10 @@ const hydrateAttachments: ConversationThreadAttachmentHydrator = async ({ refs }
     );
   }
   const hydrated: Array<{
-    ref: { channelId: string; messageId: string };
+    ref: { surface?: "discord" | "native"; channelId: string; messageId: string };
     attachments: Array<{
       id?: string;
+      data?: Uint8Array;
       url: string;
       filename?: string;
       mimeType?: string;
@@ -146,6 +147,7 @@ const hydrateAttachments: ConversationThreadAttachmentHydrator = async ({ refs }
     const result = response.results[index]!;
     const expected = pendingRefs[index]!;
     if (
+      (result.ref.surface ?? "discord") !== (expected.surface ?? "discord") ||
       result.ref.channelId !== expected.channelId ||
       result.ref.messageId !== expected.messageId
     ) {
@@ -192,6 +194,7 @@ async function runJob(request: ThreadSummarizationWorkerRequest): Promise<void> 
 
       store = new ConversationThreadStore(request.searchDbPath, {
         surfaceDbPath: request.surfaceDbPath,
+        nativeDbPath: request.nativeDbPath,
         mainAgentUserNames: [cfg.surface.discord.botName],
       });
       const entityMapper = request.surfaceDbPath

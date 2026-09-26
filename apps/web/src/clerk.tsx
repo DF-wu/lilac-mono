@@ -1,8 +1,10 @@
+import { ConnectionLoading } from "./components/ui/connection-loading";
+import { createClerkSessionRefresh, resumeClerkSession } from "./clerk-session-refresh";
 import { Button } from "./components/ui/button";
 import { ClerkProvider, SignIn, UserProfile, useAuth, useClerk, useUser } from "@clerk/react";
 import { useQueryClient } from "@tanstack/react-query";
 import { clerkAppearance, clerkProfileAppearance } from "./theme/clerk";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import type { NativeClient } from "@stanley2058/lilac-client";
 import { Result } from "better-result";
 
@@ -23,18 +25,28 @@ function Provider({ publishableKey, children }: { publishableKey: string; childr
   );
 }
 
-function SignInView({ onSignedIn }: { onSignedIn: () => void }) {
-  const { isLoaded, isSignedIn } = useAuth();
+function SignInView({ onSignedIn }: { onSignedIn: () => Promise<void> }) {
+  const { isLoaded, isSignedIn, getToken } = useAuth();
   const clerk = useClerk();
-  const previous = useRef<boolean | undefined>(undefined);
+  const [resuming, setResuming] = useState(true);
+  const [attempt, setAttempt] = useState(0);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   useEffect(() => {
-    if (!isLoaded) return;
-    const completedSignIn = previous.current === false && isSignedIn;
-    previous.current = isSignedIn;
-    if (completedSignIn) onSignedIn();
-  }, [isLoaded, isSignedIn, onSignedIn]);
+    if (!isLoaded || !isSignedIn) return;
+    const controller = new AbortController();
+    setResuming(true);
+    setError("");
+    void resumeClerkSession({
+      getToken: () => getToken({ skipCache: true }),
+      signal: controller.signal,
+      onSignedIn,
+      onError: setError,
+    }).then(() => {
+      if (!controller.signal.aborted) setResuming(false);
+    });
+    return () => controller.abort();
+  }, [isLoaded, isSignedIn, getToken, onSignedIn, attempt]);
   async function switchAccount() {
     setBusy(true);
     setError("");
@@ -45,11 +57,12 @@ function SignInView({ onSignedIn }: { onSignedIn: () => void }) {
     setBusy(false);
     result.match({ ok: () => {}, err: (failure) => setError(failure.message) });
   }
-  if (!isLoaded) return null;
+  if (!isLoaded) return <ConnectionLoading />;
+  if (isSignedIn && resuming) return <ConnectionLoading />;
   if (isSignedIn)
     return (
       <div className="login-form grid gap-4">
-        <Button type="button" onClick={onSignedIn}>
+        <Button type="button" onClick={() => setAttempt((value) => value + 1)}>
           Retry connection
         </Button>
         <Button
@@ -79,7 +92,7 @@ export function ClerkLogin({
   onSignedIn,
 }: {
   publishableKey: string;
-  onSignedIn: () => void;
+  onSignedIn: () => Promise<void>;
 }) {
   return (
     <Provider publishableKey={publishableKey}>
@@ -100,7 +113,6 @@ function SessionStatus({
   useEffect(() => {
     if (!isLoaded) return;
     const controller = new AbortController();
-    let refreshing = false;
     async function endSession() {
       const result = await Result.tryPromise({
         try: onLogout,
@@ -113,29 +125,13 @@ function SessionStatus({
       void endSession();
       return () => controller.abort();
     }
-    async function refresh() {
-      if (refreshing || controller.signal.aborted) return;
-      refreshing = true;
-      const refreshed = await Result.tryPromise({
-        try: async () => {
-          const token = await getToken({ skipCache: true });
-          if (controller.signal.aborted) return "canceled" as const;
-          if (!token) return "signed-out" as const;
-          if (!client.rpc) return "pending" as const;
-          const accepted = await client.reauthenticate(token);
-          return accepted ? ("accepted" as const) : ("retry" as const);
-        },
-        catch: () => new Error("Session refresh failed. Reconnecting will retry."),
-      });
-      refreshing = false;
-      if (controller.signal.aborted) return;
-      const outcome = refreshed.match({ ok: (value) => value, err: () => "retry" as const });
-      if (outcome === "signed-out") {
-        await endSession();
-        return;
-      }
-      setError(outcome === "retry" ? "Session refresh failed. Reconnecting will retry." : "");
-    }
+    const refresh = createClerkSessionRefresh({
+      client,
+      getToken: () => getToken({ skipCache: true }),
+      signal: controller.signal,
+      onSignedOut: endSession,
+      onError: setError,
+    });
     void refresh();
     const timer = setInterval(() => {
       void refresh();

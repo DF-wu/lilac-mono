@@ -2899,38 +2899,14 @@ const CORE_NATIVE_RECORD_PERSISTED_CONSUMERS = [
     exportName,
   })),
   { module: "src/surface/native/store-surface.ts", exportName: "decodeMessageRow" },
-  {
-    module: "src/surface/native/store-search-summary.ts",
-    exportName: "NativeSummaryStore.candidates",
-  },
+  ...["readNativeConversationThreads", "readNativeConversationMessages"].map((exportName) => ({
+    module: "src/surface/native/conversation-source.ts",
+    exportName,
+  })),
 ].map(
   (identity): PersistedStoreConsumerRegistration => ({
     identity,
     codecs: [CORE_NATIVE_RECORD_PERSISTED_CODEC.identity],
-  }),
-);
-
-const CORE_NATIVE_SUMMARY_PERSISTED_CODEC = {
-  identity: {
-    module: "src/surface/native/search-summary-codec.ts",
-    exportName: "decodeNativeSummary",
-  },
-  inputParameter: 0,
-  fixtureCatalog: {
-    module: "src/surface/native/search-summary-codec.ts",
-    exportName: "nativeSummaryCodecCases",
-  },
-  provenance: ["current"],
-  legacyOutcome: "rejected",
-} as const satisfies PersistedCodecRegistration;
-
-const CORE_NATIVE_SUMMARY_PERSISTED_CONSUMERS = [
-  "NativeSummaryStore.get",
-  "NativeSummaryStore.search",
-].map(
-  (exportName): PersistedStoreConsumerRegistration => ({
-    identity: { module: "src/surface/native/store-search-summary.ts", exportName },
-    codecs: [CORE_NATIVE_SUMMARY_PERSISTED_CODEC.identity],
   }),
 );
 
@@ -3560,8 +3536,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 { include: CORE_NATIVE_RECORD_PERSISTED_CODEC.identity.module },
                 { include: "src/surface/native/store.ts" },
                 { include: "src/surface/native/store-surface.ts" },
-                { include: CORE_NATIVE_SUMMARY_PERSISTED_CODEC.identity.module },
-                { include: "src/surface/native/store-search-summary.ts" },
+                { include: "src/surface/native/conversation-source.ts" },
                 {
                   include: "src/conversation/thread-summary-persistence-codec.ts",
                 },
@@ -3608,7 +3583,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
         : root === "apps/core"
           ? [
               { include: CORE_NATIVE_RECORD_PERSISTED_CODEC.identity.module },
-              { include: CORE_NATIVE_SUMMARY_PERSISTED_CODEC.identity.module },
               {
                 include: "src/conversation/thread-summary-persistence-codec.ts",
               },
@@ -3678,7 +3652,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           : root === "apps/core"
             ? [
                 CORE_NATIVE_RECORD_PERSISTED_CODEC,
-                CORE_NATIVE_SUMMARY_PERSISTED_CODEC,
                 ...CORE_THREAD_PERSISTED_CODECS,
                 ...CORE_TRANSCRIPT_PERSISTED_CODECS,
                 CORE_RESOURCE_PERSISTED_CODEC,
@@ -3701,7 +3674,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             : root === "apps/core"
               ? [
                   ...CORE_NATIVE_RECORD_PERSISTED_CONSUMERS,
-                  ...CORE_NATIVE_SUMMARY_PERSISTED_CONSUMERS,
                   ...CORE_THREAD_PERSISTED_CONSUMERS,
                   ...CORE_TRANSCRIPT_PERSISTED_CONSUMERS,
                   CORE_CLAUDE_ATTEMPT_PERSISTED_CONSUMER,
@@ -3825,7 +3797,19 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               category: "wire" as const,
             },
             {
+              identity: { module: "src/keybindings.ts", exportName: "recordedBinding" },
+              category: "projection" as const,
+            },
+            {
+              identity: { module: "src/keybindings.ts", exportName: "decodeKeybindings" },
+              category: "persistence" as const,
+            },
+            {
               identity: { module: "src/panel-store.ts", exportName: "decodePanelLayouts" },
+              category: "persistence" as const,
+            },
+            {
+              identity: { module: "src/theme/theme.ts", exportName: "decodeThemeSelection" },
               category: "persistence" as const,
             },
             {
@@ -3940,16 +3924,18 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               identity: { module: "src/surface/native/title-generation.ts", exportName },
               category: "wire" as const,
             })),
+            ...[
+              "decodeNativeThreadProjection",
+              "decodeNativeMessageProjection",
+              "decodeNativeAttachmentProjection",
+            ].map((exportName) => ({
+              identity: { module: "src/surface/native/conversation-source.ts", exportName },
+              category: "projection" as const,
+            })),
             ...["decodeSearchRows", "decodeSearchCount"].map((exportName) => ({
               identity: { module: "src/surface/native/store-search.ts", exportName },
               category: "projection" as const,
             })),
-            ...["decodeNativeSummary", "decodeNativeSummary.andThen.<callback@1>"].map(
-              (exportName) => ({
-                identity: { module: "src/surface/native/search-summary-codec.ts", exportName },
-                category: "persistence" as const,
-              }),
-            ),
             ...["decodeMetricRequest", "decodeMetricResponse"].map((exportName) => ({
               identity: { module: "src/surface/native/metrics.ts", exportName },
               category: "wire" as const,
@@ -4667,11 +4653,16 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       ...(root === "apps/core"
         ? [
             CORE_NATIVE_RECORD_PERSISTED_CODEC.identity,
+            ...[
+              "decodeNativeThreadProjection",
+              "decodeNativeMessageProjection",
+              "decodeNativeAttachmentProjection",
+              "readNativeConversationAttachments",
+            ].map((exportName) => ({
+              module: "src/surface/native/conversation-source.ts",
+              exportName,
+            })),
             { module: "src/surface/native/gateway.ts", exportName: "validateNativeFrame" },
-            {
-              module: "src/runtime/native-summarization.ts",
-              exportName: "withNativeThreadSummaries.runSummarization",
-            },
             { module: "src/surface/native/store.ts", exportName: "nullableAuthority" },
             ...[
               "createNativeRuntime",
@@ -4717,9 +4708,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               module: "src/surface/native/execution.ts",
               exportName: `createNativeExecution.${method}`,
             })),
-            CORE_NATIVE_SUMMARY_PERSISTED_CODEC.identity,
             ...CORE_NATIVE_RECORD_PERSISTED_CONSUMERS.map(({ identity }) => identity),
-            ...CORE_NATIVE_SUMMARY_PERSISTED_CONSUMERS.map(({ identity }) => identity),
             {
               module: "src/surface/native/resources-live.ts",
               exportName: "NativeLiveFileService.read",
@@ -4728,20 +4717,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               module: "src/surface/native/resources-live.ts",
               exportName: "rewriteNativePublishedFileLinks",
             },
-            ...[
-              "NativeSummaryStore.initialize",
-              "NativeSummaryStore.put",
-              "NativeSummaryStore.pruneDeleted",
-            ].map((exportName) => ({
-              module: "src/surface/native/store-search-summary.ts",
-              exportName,
-            })),
-            ...["NativeSummaryRefresher.refresh", "NativeSummaryRefresher.refreshThread"].map(
-              (exportName) => ({
-                module: "src/surface/native/search-summary.ts",
-                exportName,
-              }),
-            ),
             ...[
               "NativeSurfaceStore.initialize",
               "NativeSurfaceStore.readMessage",
@@ -4802,9 +4777,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "NativeSearchService.starter",
               "NativeSearchService.principal",
               "NativeSearchService.discovery",
-              "NativeSearchService.conversationSearch",
-              "NativeSearchService.conversationRead",
-              "NativeSearchService.conversationMetadata",
             ].map((exportName) => ({
               module: "src/surface/native/search.ts",
               exportName,
@@ -4832,6 +4804,11 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             })),
             ...[
               "NativeStore.initialize",
+              "NativeStore.initializeDeployment",
+              "NativeStore.getDeployment",
+              "NativeStore.readDeployment",
+              "NativeStore.setDeployment",
+
               "NativeStore.setInputCanonicalHistoryStart",
               "NativeStore.cleanupDeletedThread",
               "NativeStore.lookupInputReceipt",
@@ -4926,9 +4903,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "NativeConfigService.save",
               "NativeConfigService.saveSerialized",
               "NativeConfigService.reloadMcp",
-              "NativeConfigService.readStreaming",
-              "NativeConfigService.setStreaming",
-              "streamingDocument",
               "validateDocument",
               "writeAtomic",
             ].map((exportName) => ({
@@ -5529,7 +5503,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "37bdf2fd88df1494822f8ec640d4e9b33aac2ce04c660671919ad3f9b66803ff";
+  "d4aee61eaaba0d470e8a6631f95f8ff13682ca06d2f974efea6354cafd87d4de";
 
 export const architectureManifest = {
   version: 1,

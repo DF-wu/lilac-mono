@@ -25,7 +25,13 @@ function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } 
   const stores = new Map<string, Map<string, Response>>();
   const requests: string[] = [];
   const requestCacheModes: RequestCache[] = [];
-  const clients: { id: string; postMessage: (value: object) => void }[] = [];
+  const clients: {
+    id: string;
+    postMessage: (value: object) => void;
+    url?: string;
+    focus?: () => void;
+  }[] = [];
+  const opened: string[] = [];
   const cacheKey = (key: string | Request) =>
     new URL(typeof key === "string" ? key : key.url, "https://lilac.test").pathname;
   const caches = {
@@ -50,7 +56,12 @@ function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } 
       location: { origin: "https://lilac.test" },
       addEventListener: (name: string, callback: (event: object) => void) =>
         handlers.set(name, callback),
-      clients: { matchAll: async () => clients },
+      clients: {
+        matchAll: async () => clients,
+        openWindow: async (url: string) => {
+          opened.push(url);
+        },
+      },
       skipWaiting: async () => {},
     },
     caches,
@@ -76,6 +87,7 @@ function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } 
   });
   return {
     stores,
+    opened,
     requests,
     requestCacheModes,
     clients,
@@ -242,4 +254,31 @@ describe("app shell service worker", () => {
     ).toBe("old");
     expect(f.requests).toEqual([]);
   });
+});
+
+test("notification clicks open only local thread routes and reuse matching windows", async () => {
+  const f = fixture();
+  let closed = false;
+  let focused = false;
+  const close = () => {
+    closed = true;
+  };
+  await f.dispatch("notificationclick", { notification: { data: { threadId: "a/b" }, close } });
+  expect(closed).toBe(true);
+  expect(f.opened).toEqual(["https://lilac.test/threads/a%2Fb"]);
+  f.clients.push({
+    id: "chat",
+    url: "https://lilac.test/threads/existing",
+    postMessage() {},
+    focus() {
+      focused = true;
+    },
+  });
+  await f.dispatch("notificationclick", {
+    notification: { data: { threadId: "existing" }, close },
+  });
+  expect(focused).toBe(true);
+  expect(f.opened).toHaveLength(1);
+  await f.dispatch("notificationclick", { notification: { data: { threadId: 42 }, close } });
+  expect(f.opened).toHaveLength(1);
 });

@@ -24,7 +24,7 @@ test("agents panel starts closed and retains its selected transcript across clos
   expect(store.getState().selection).toBeUndefined();
 });
 
-test("agent preview uses a bot and readable profile and work title, with no raw tool tree", () => {
+test("agent preview uses an agent avatar and readable profile and work title, with no raw tool tree", () => {
   const agent = agents[0]!;
   const part = slot.messages
     .flatMap((message) => message.parts)
@@ -35,7 +35,7 @@ test("agent preview uses a bot and readable profile and work title, with no raw 
       <ActivityItem part={part} />
     </SubagentContext>,
   );
-  expect(html).toContain("lucide-bot");
+  expect(html).toContain('data-agent-profile="explore"');
   expect(html).toContain("Explore Agent");
   expect(html).toContain(agent.title);
   expect(html).not.toContain("subagent (explore;");
@@ -51,14 +51,27 @@ test("shared panel shows agent status and production messages without editing co
       state,
       title: state === "running" ? "Thinking…" : "Completed",
     };
-    const messages = demoSubagentTranscript(selected);
+    const messages = demoSubagentTranscript(selected).map((message) => ({
+      ...message,
+      metadata: undefined,
+    }));
     const html = renderToStaticMarkup(
       <SubagentPanelView items={agents} selected={selected} messages={messages} {...actions} />,
     );
     expect(html).toContain("Subagent transcript");
     expect(html).toContain("Read-only");
     expect(html).toContain(selected.title);
-    for (const message of messages) expect(html).toContain(`data-message-id="${message.id}"`);
+    expect(html).toContain('aria-label="About Lilac"');
+    expect(html).not.toContain("Participant");
+    expect(html).toContain('data-message-id="child_prompt"');
+    if (state === "running") {
+      expect(html).toContain('data-message-id="child_thought"');
+      expect(html.match(/class="activity-block/g)).toHaveLength(1);
+    } else {
+      expect(html).toContain("Worked");
+      expect(html).toContain('data-message-id="child_final"');
+      expect(html).not.toContain('data-message-id="child_work"');
+    }
     expect(html).not.toContain('contenteditable="true"');
     expect(html).not.toContain("Rewind to this turn");
     expect(html).toContain("Copy message");
@@ -95,4 +108,28 @@ test("live refresh retains loaded tail messages and catches up without gaps afte
   expect(complete.total).toBe(150);
   const reset = mergeSubagentTranscript(complete, page(10, 30));
   expect(reset).toEqual(page(10, 30));
+});
+
+test("completed transcripts keep every initial prompt chunk outside folded work", () => {
+  const selected = { ...agents[0]!, state: "complete" as const };
+  const messages = demoSubagentTranscript(selected);
+  const html = renderToStaticMarkup(
+    <SubagentPanelView
+      items={agents}
+      selected={selected}
+      messages={[
+        { id: "prompt_0", role: "user", parts: [{ type: "text", text: "x".repeat(2000) }] },
+        {
+          id: "prompt_2000",
+          role: "user",
+          parts: [{ type: "text", text: "End of the long prompt." }],
+        },
+        ...messages.slice(1),
+      ]}
+      {...actions}
+    />,
+  );
+  expect(html).toContain("x".repeat(2000) + "End of the long prompt.");
+  expect(html).toContain("Worked");
+  expect(html).not.toContain('data-message-id="child_thought"');
 });

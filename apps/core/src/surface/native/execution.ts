@@ -1,10 +1,18 @@
 import { isDeepStrictEqual } from "node:util";
-import { lilacEventTypes, type LilacBus, type StoredMessageV1 } from "@stanley2058/lilac-event-bus";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
+import {
+  EventPublishContractInvalid,
+  lilacEventTypes,
+  type LilacBus,
+  type StoredMessageV1,
+} from "@stanley2058/lilac-event-bus";
 import { Result, type Result as ResultType } from "better-result";
 import { CUSTOM_COMMAND_TEXT_PREFIX } from "@stanley2058/lilac-utils/custom-commands";
 import type { CustomCommandManager } from "../../custom-commands/manager";
 import type { TranscriptStore } from "../../transcript/transcript-store";
 import { parseNativeRequestEnvelope } from "../authenticated-request";
+import { deleteDiscordRequestBlobHandles } from "../bridge/request-composition/attachments";
+import { prepareStoredMessagesForBus } from "../bridge/request-composition/prepare-bus-messages";
 import { escapeSurfaceMetadataTags, formatSurfaceMetadataLine } from "../bridge/surface-metadata";
 import type { NativeRunnerLifecycle, NativeRunnerRequest } from "../bridge/bus-agent-runner";
 import type { NativeInputRecord } from "./codec";
@@ -22,6 +30,7 @@ export function createNativeExecution(options: {
   store: NativeStore;
   bus: Pick<LilacBus, "publish">;
   transcriptStore: TranscriptStore;
+  blobStore?: BlobStore;
   runner: () => NativeRunnerControl | undefined;
   customCommands?: CustomCommandManager;
   expandReferences?: (userId: string, text: string) => ResultType<string, Error>;
@@ -246,49 +255,67 @@ export function createNativeExecution(options: {
         return Result.err(nativeFailure("invalid", "Native input has no admitted turn"));
       if (input.mode !== "steer" && thread.activeRunId !== requestId)
         yield* store.setActiveRun(input.threadId, input.historyGeneration, requestId);
-      yield* Result.await(
-        options.bus.publish(
-          lilacEventTypes.CmdRequestMessage,
-          {
-            requestDeliveryId: input.deliveryId,
-            queue: input.mode === "steer" ? "steer" : "prompt",
-            messages,
-            ...(input.mode !== "steer" && input.modelId ? { modelOverride: input.modelId } : {}),
-            raw: {
-              native: {
-                threadId: input.threadId,
-                authorUserId: input.authorId,
-                starterUserId: thread.starterId,
-                turnId: input.turnId,
-                historyGeneration: input.historyGeneration,
-                inputId: input.id,
-                requestId,
-                requestDeliveryId: input.deliveryId,
-              },
-              authenticatedActor: { platform: "native", userId: thread.starterId },
-              authenticatedOrigin: {
-                platform: "native",
-                userId: thread.starterId,
-                messageRef: {
-                  platform: "native",
-                  channelId: input.threadId,
-                  messageId: input.messageId,
-                },
-              },
-              ...(input.mode === "steer" ? { requiresActive: true } : {}),
-              ...custom,
-            },
-          },
-          {
-            headers: {
-              request_id: requestId,
-              session_id: nativeSessionId(input.threadId),
-              request_client: "native",
-            },
-          },
-        ),
+      const prepared = yield* Result.await(
+        prepareStoredMessagesForBus({ blobStore: options.blobStore, messages }),
       );
-      return Result.ok(undefined);
+      const published = await options.bus.publish(
+        lilacEventTypes.CmdRequestMessage,
+        {
+          requestDeliveryId: input.deliveryId,
+          queue: input.mode === "steer" ? "steer" : "prompt",
+          messages: prepared.messages,
+          ...(input.mode !== "steer" && input.modelId ? { modelOverride: input.modelId } : {}),
+          raw: {
+            native: {
+              threadId: input.threadId,
+              authorUserId: input.authorId,
+              starterUserId: thread.starterId,
+              turnId: input.turnId,
+              historyGeneration: input.historyGeneration,
+              inputId: input.id,
+              requestId,
+              requestDeliveryId: input.deliveryId,
+            },
+            authenticatedActor: { platform: "native", userId: thread.starterId },
+            authenticatedOrigin: {
+              platform: "native",
+              userId: thread.starterId,
+              messageRef: {
+                platform: "native",
+                channelId: input.threadId,
+                messageId: input.messageId,
+              },
+            },
+            ...(input.mode === "steer" ? { requiresActive: true } : {}),
+            ...custom,
+          },
+        },
+        {
+          headers: {
+            request_id: requestId,
+            session_id: nativeSessionId(input.threadId),
+            request_client: "native",
+          },
+        },
+      );
+      const contractError = published.match({
+        ok: () => undefined,
+        err: (error) => (EventPublishContractInvalid.is(error) ? error : undefined),
+      });
+      if (contractError && options.blobStore)
+        yield* Result.await(
+          deleteDiscordRequestBlobHandles(options.blobStore, prepared.inputHandles).then(
+            (cleanup) =>
+              cleanup.mapError(
+                (error) =>
+                  new AggregateError(
+                    [contractError, error],
+                    "Native request validation and input handle cleanup failed",
+                  ),
+              ),
+          ),
+        );
+      return published.map(() => undefined);
     });
   }
 

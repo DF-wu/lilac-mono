@@ -45,7 +45,8 @@ These rules apply to all tasks. Use the linked documents for detailed rules and 
 - Use the root `package.json` scripts for build, test, typecheck, lint, and format operations.
 - If a type is not visible, follow the `node_modules` symlink into `node_modules/.bun`. Inspect the
   package `exports` or `types` entry to find its type declarations.
-- Follow `apps/web/AGENTS.md` for frontend work.
+- Before you change anything under `apps/web/`, read `apps/web/AGENTS.md` and follow it, including
+  its verification and handoff steps.
 
 ## Work And Verification
 

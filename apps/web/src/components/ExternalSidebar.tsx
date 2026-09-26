@@ -1,3 +1,4 @@
+import { useThreadTargets } from "../shortcuts";
 import { SidebarEmptyState } from "./SidebarEmptyState";
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { externalListOptions, useNativeOnline } from "../queries";
@@ -38,6 +39,10 @@ export function ExternalSidebar({
       (list.data?.pages.flatMap((page) => page.items) ?? []).map((thread) => [thread.id, thread]),
     ).values(),
   ];
+  useThreadTargets(
+    threads.map((thread) => thread.id),
+    onSelect,
+  );
   return (
     <div className="relative flex flex-1 min-h-0 flex-col">
       <ErrorNotice message={list.error?.message} />
@@ -57,6 +62,7 @@ export function ExternalSidebar({
         }}
         render={(thread) => (
           <ThreadCard
+            shortcutId={thread.id}
             title={thread.title}
             starterName={thread.surface === "discord" ? "Discord" : "GitHub"}
             updatedAt={thread.updatedAt}

@@ -30,6 +30,7 @@ const metadataOutput: ConversationThreadMetadataOutput = {
 
 const readOutput: ConversationThreadReadOutput = {
   thread: {
+    surface: "discord" as const,
     threadId: "thread-1",
     session: { platform: "discord", channelId: "channel-1" },
     anchors: { startMessageId: "message-1", endMessageId: "message-1" },

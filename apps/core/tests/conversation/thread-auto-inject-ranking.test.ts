@@ -61,6 +61,7 @@ describe("auto-injected thread ranking", () => {
           searchIndex: 0,
           result: search(queryPlan, [
             {
+              surface: "discord" as const,
               threadId: "rare-thread",
               title: "Possibly related",
               brief: "Sparse old summary without structured aboutness.",
@@ -91,6 +92,7 @@ describe("auto-injected thread ranking", () => {
           searchIndex: 0,
           result: search(queryPlan, [
             {
+              surface: "discord" as const,
               threadId: "specific-one",
               title: "OAuth callback login loop",
               brief: "Safari lost the session after the callback.",
@@ -105,6 +107,7 @@ describe("auto-injected thread ranking", () => {
               },
             },
             {
+              surface: "discord" as const,
               threadId: "specific-two",
               title: "OAuth callback login loop on mobile",
               brief: "A second relevant incident.",
@@ -119,6 +122,7 @@ describe("auto-injected thread ranking", () => {
               },
             },
             {
+              surface: "discord" as const,
               threadId: "generic",
               title: "Authentication project notes",
               brief: "General notes.",
@@ -155,6 +159,7 @@ describe("auto-injected thread ranking", () => {
     const queryPlan = plan();
     const result = search(queryPlan, [
       {
+        surface: "discord" as const,
         threadId: "first",
         title: "OAuth callback login loop",
         brief: "",
@@ -168,6 +173,7 @@ describe("auto-injected thread ranking", () => {
         },
       },
       {
+        surface: "discord" as const,
         threadId: "second",
         title: "OAuth callback login loop",
         brief: "",
@@ -208,8 +214,20 @@ describe("auto-injected thread ranking", () => {
         {
           searchIndex: 0,
           result: search(queryPlan, [
-            { threadId: "discord-only", title: "Discord", brief: "", score: 0.9 },
-            { threadId: "oauth-only", title: "OAuth", brief: "", score: 0.2 },
+            {
+              surface: "discord" as const,
+              threadId: "discord-only",
+              title: "Discord",
+              brief: "",
+              score: 0.9,
+            },
+            {
+              surface: "discord" as const,
+              threadId: "oauth-only",
+              title: "OAuth",
+              brief: "",
+              score: 0.2,
+            },
           ]),
         },
       ],
@@ -232,6 +250,7 @@ describe("auto-injected thread ranking", () => {
       ],
     };
     const shared = {
+      surface: "discord" as const,
       threadId: "shared",
       title: "OAuth callback mobile login loop",
       brief: "",

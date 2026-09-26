@@ -35,7 +35,8 @@ test("streaming frames preserve message identity and grow into the completed ans
     expect(message.id).toBe(final.id);
     expect(text.startsWith(previous)).toBe(true);
     expect(fullText.startsWith(text)).toBe(true);
-    expect(message.metadata?.incomplete).toBe(true);
+    expect(message.metadata?.incomplete).not.toBe(true);
+    if (slot !== streaming.frames.at(-1)) expect(text.endsWith("\n\n")).toBe(true);
     previous = text;
   }
   expect(previous).toBe(fullText);
@@ -201,7 +202,7 @@ test("one participant is omitted even when they steer repeatedly", () => {
   expect(renderStage("complete")).not.toContain('data-ui="work-participation"');
 });
 
-test("rewind stays between time and copy and is disabled for an active agent", () => {
+test("reaction sits between time and rewind, and rewind is disabled for an active agent", () => {
   const slot = agentWorkStages.find((stage) => stage.id === "complete")!.frames[0]!;
   for (const rewindDisabled of [false, true]) {
     const html = renderToStaticMarkup(
@@ -222,7 +223,8 @@ test("rewind stays between time and copy and is disabled for an active agent", (
       </MessageIdentityContext>,
     );
     const controls = html.slice(html.indexOf('data-ui="message-controls"'));
-    expect(controls.indexOf("<time")).toBeLessThan(
+    expect(controls.indexOf("<time")).toBeLessThan(controls.indexOf('aria-label="Add reaction"'));
+    expect(controls.indexOf('aria-label="Add reaction"')).toBeLessThan(
       controls.indexOf('aria-label="Rewind to this turn"'),
     );
     expect(controls.indexOf('aria-label="Rewind to this turn"')).toBeLessThan(
@@ -237,7 +239,7 @@ test("rewind stays between time and copy and is disabled for an active agent", (
 test("a sent prompt immediately shows thinking and suppresses the queue marker", () => {
   const html = renderStage("sent");
   expect(html).toContain("activity-summary");
-  expect(html).toContain("animate-spin");
+  expect(html).toContain('data-slot="loading-spinner"');
   expect(html).toContain("working-text");
   expect(html).toContain('aria-expanded="false"');
   expect(html).toContain("Thinking…");
@@ -250,4 +252,28 @@ test("work duration uses the prompt timestamp for older turns without a start ti
   expect(renderStage("complete", { ...complete, startedAt: undefined })).toContain(
     "Worked for 12s",
   );
+});
+
+test("only the last folded section and sections with running agents shine", () => {
+  const html = renderStage("folded-activity-running");
+  expect(html.match(/class="working-text"/gu)).toHaveLength(2);
+  expect(html).toContain(">Thought</span>");
+  expect(html).toContain(">Spawned 1 agent</span>");
+  expect(html).toContain('<span class="working-text">Thinking</span>');
+});
+
+test("terminal turns suppress stale running activity even in final messages", () => {
+  const slot = agentWorkStages.find((stage) => stage.id === "folded-activity-complete")!.frames[0]!;
+  for (const state of ["complete", "failed", "canceled"] as const) {
+    const html = renderStage("folded-activity-complete", {
+      ...slot,
+      state,
+      messages: slot.messages.map((message) => ({
+        ...message,
+        metadata: { ...message.metadata, phase: "final" },
+      })),
+    });
+    expect(html).not.toContain('class="working-text"');
+    expect(html.match(/>Thought<\/span>/gu)).toHaveLength(2);
+  }
 });

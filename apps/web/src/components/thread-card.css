@@ -18,9 +18,6 @@
 .thread-card[data-state="working"] .thread-state-icon {
   color: var(--ui-primary);
 }
-.thread-card[data-state="working"] .thread-state-icon svg {
-  animation: thread-working-spin 1.5s linear infinite;
-}
 .thread-card[data-state="error"] .thread-state-icon {
   color: var(--ui-danger);
 }
@@ -70,16 +67,6 @@
   .thread-card:has(.thread-card-actions):hover .thread-starter,
   .thread-card:has(.thread-card-actions):focus-within .thread-starter {
     max-width: calc(100% - var(--ui-control-compact) * 3);
-  }
-}
-@keyframes thread-working-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .thread-card[data-state="working"] .thread-state-icon svg {
-    animation: none;
   }
 }
 @media (hover: none) {
