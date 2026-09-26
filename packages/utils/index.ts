@@ -16,6 +16,7 @@ export * from "./vcs-env";
 export * from "./model-edit-mode";
 export * from "./tool-call-input-normalization";
 export * from "./custom-commands";
+export * from "./custom-commands-menu";
 export * from "./runtime-utils";
 export * from "./friendly-units";
 export * from "./ai-error";

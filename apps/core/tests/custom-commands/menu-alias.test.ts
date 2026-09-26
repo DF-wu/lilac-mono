@@ -9,7 +9,8 @@ import {
   parseCustomCommandToken,
 } from "@stanley2058/lilac-utils";
 
-import { assignMenuAliases, CustomCommandManager } from "../../src/custom-commands/manager";
+import { CustomCommandManager } from "../../src/custom-commands/manager";
+import { assignMenuAliases } from "../../src/custom-commands/menu-aliases";
 
 /**
  * The command menu has to advertise something Telegram will accept
