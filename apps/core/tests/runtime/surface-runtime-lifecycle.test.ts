@@ -11,6 +11,7 @@ import {
   prepareSurfaceRecovery,
   startSurfaceAdapterIngress,
   startSurfaceOutputs,
+  startSurfaceRequestIngress,
   stopIngressAndDrainSurfaceRecovery,
   stopSurfaceAdapterIngress,
   stopSurfaceOutputs,
@@ -346,22 +347,22 @@ describe("surface runtime lifecycle", () => {
     });
     const handles = maps();
 
+    await startSurfaceRequestIngress({ registry, handles: handles.requestIngress });
     await startSurfaceAdapterIngress({ registry, handles: handles.adapterIngress });
     await connectAndValidateSurfaceAdapters({ registry, connected: handles.connected });
     await startSurfaceOutputs({
       registry,
-      requestIngress: handles.requestIngress,
       relays: handles.relays,
     });
 
     expect(calls).toEqual([
+      "github-request-ingress",
       "discord-adapter-ingress",
       "discord-connect",
       "github-connect",
       "discord-validate",
       "github-validate",
       "discord-relay",
-      "github-request-ingress",
       "github-relay",
     ]);
     expect([...handles.connected.keys()]).toEqual(["discord", "github"]);
@@ -371,7 +372,7 @@ describe("surface runtime lifecycle", () => {
   });
 
   it.each([
-    ["request ingress", true, false, ["discord-relay", "github-request-ingress"]],
+    ["request ingress", true, false, ["github-request-ingress", "discord-relay"]],
     ["relay", false, true, ["discord-relay", "github-relay"]],
     ["neither", false, false, ["discord-relay"]],
   ] as const)("activates GitHub %s independently", async (_, requestIngress, relay, expected) => {
@@ -401,11 +402,8 @@ describe("surface runtime lifecycle", () => {
     });
     const handles = maps();
 
-    await startSurfaceOutputs({
-      registry,
-      requestIngress: handles.requestIngress,
-      relays: handles.relays,
-    });
+    await startSurfaceRequestIngress({ registry, handles: handles.requestIngress });
+    await startSurfaceOutputs({ registry, relays: handles.relays });
 
     expect(calls).toEqual([...expected]);
   });
@@ -436,10 +434,10 @@ describe("surface runtime lifecycle", () => {
     });
     const handles = maps();
 
+    await startSurfaceRequestIngress({ registry, handles: handles.requestIngress });
     await expect(
       startSurfaceOutputs({
         registry,
-        requestIngress: handles.requestIngress,
         relays: handles.relays,
       }),
     ).rejects.toBe(relayFailure);
@@ -448,21 +446,29 @@ describe("surface runtime lifecycle", () => {
 
     await stopSurfaceOutputs({
       registry,
-      requestIngress: handles.requestIngress,
       relays: handles.relays,
       runCleanup: async (label, cleanup) => {
         calls.push(label);
         await cleanup?.();
       },
     });
+    await stopSurfaceRequestIngress({
+      registry,
+      handles: handles.requestIngress,
+      graceful: false,
+      runCleanup: async (label, cleanup) => {
+        calls.push(label);
+        await cleanup?.();
+      },
+    });
     expect(calls).toEqual([
-      "discord-relay-started",
       "github-ingress-started",
+      "discord-relay-started",
       "github-relay-failed",
-      "surface.github.request-ingress.stop",
-      "github-ingress-stopped",
       "surface.discord.relay.stop",
       "discord-relay-stopped",
+      "surface.github.request-ingress.stop",
+      "github-ingress-stopped",
     ]);
   });
 
@@ -1289,13 +1295,18 @@ describe("surface runtime lifecycle", () => {
 
     await stopSurfaceOutputs({
       registry,
-      requestIngress: handles.requestIngress,
       relays: handles.relays,
       runCleanup,
     });
     await stopSurfaceAdapterIngress({
       registry,
       handles: handles.adapterIngress,
+      runCleanup,
+      graceful: false,
+    });
+    await stopSurfaceRequestIngress({
+      registry,
+      handles: handles.requestIngress,
       runCleanup,
       graceful: false,
     });
@@ -1308,12 +1319,12 @@ describe("surface runtime lifecycle", () => {
     expect(calls).toEqual([
       "surface.github.relay.stop",
       "github-relay-stopped",
-      "surface.github.request-ingress.stop",
-      "github-ingress-stopped",
       "surface.discord.relay.stop",
       "discord-relay-stopped",
       "surface.discord.adapter-ingress.stop",
       "discord-ingress-stopped",
+      "surface.github.request-ingress.stop",
+      "github-ingress-stopped",
       "surface.github.adapter.disconnect",
       "github-disconnected",
       "surface.discord.adapter.disconnect",

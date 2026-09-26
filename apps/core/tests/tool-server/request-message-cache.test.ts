@@ -5,6 +5,7 @@ import {
   createRequestMessageCache,
   estimateCachedMessageBytes,
   projectCachedRequestMessageLineage,
+  RequestMessageCacheConfigurationInvalid,
   type AuthenticatedRequestOrigin,
 } from "../../src/tool-server/request-message-cache";
 import {
@@ -623,6 +624,10 @@ describe("request message cache", () => {
 });
 
 describe("byte-weighted lineage clamping", () => {
+  it("counts UTF-8 bytes instead of UTF-16 code units", () => {
+    expect(estimateCachedMessageBytes("é")).toBe(Buffer.byteLength("é", "utf8"));
+  });
+
   it("drops the oldest messages once the byte budget is exceeded", () => {
     const oldMessage = { role: "user", content: "x".repeat(600) };
     const midMessage = { role: "user", content: "y".repeat(600) };
@@ -638,12 +643,12 @@ describe("byte-weighted lineage clamping", () => {
     expect(projected).toEqual([midMessage, newMessage]);
   });
 
-  it("always retains the newest message even when it alone exceeds the budget", () => {
+  it("does not project a newest message that alone exceeds the budget", () => {
     const oversized = { role: "user", content: "x".repeat(10_000) };
 
     const projected = projectCachedRequestMessageLineage([], [oversized], 512, 100);
 
-    expect(projected).toEqual([oversized]);
+    expect(projected).toEqual([]);
   });
 
   it("keeps the count clamp when the byte budget is unbounded", () => {
@@ -691,5 +696,153 @@ describe("byte-weighted lineage clamping", () => {
     expect(messages).toHaveLength(1);
     expect(JSON.stringify(messages)).toContain("y".repeat(32));
     expect(JSON.stringify(messages)).not.toContain("x".repeat(32));
+  });
+
+  it("rejects invalid per-request and aggregate limits at construction", () => {
+    expect(() =>
+      createRequestMessageCache({
+        maxBytesPerRequest: 101,
+        maxTotalBytes: 100,
+      }),
+    ).toThrow(RequestMessageCacheConfigurationInvalid);
+  });
+
+  it("rejects an oversized incoming lineage without creating cache state", () => {
+    const cache = createRequestMessageCache({
+      maxBytesPerRequest: 256,
+      maxTotalBytes: 512,
+    });
+    const oversized = requestMessage({
+      eventId: "oversized-1",
+      requestId: "oversized-request",
+      text: "é".repeat(256),
+    });
+
+    const admitted = cache.cacheMessage(oversized);
+
+    expect(admitted.status).toBe("error");
+    if (admitted.status === "ok") throw new Error("expected oversized admission failure");
+    expect(admitted.error._tag).toBe("RequestMessageCacheRequestTooLarge");
+    expect(cache.get(oversized.key)).toBeUndefined();
+    expect(cache.snapshot(oversized.key)).toBeUndefined();
+  });
+
+  it("rejects aggregate capacity without mutating retained or incoming entries", () => {
+    const retained = requestMessage({
+      eventId: "retained-1",
+      requestId: "retained-request",
+      text: "x".repeat(200),
+    });
+    const incoming = requestMessage({
+      eventId: "incoming-1",
+      requestId: "incoming-request",
+      text: "y".repeat(200),
+    });
+    const retainedBytes = retained.data.messages.reduce(
+      (total, message) => total + estimateCachedMessageBytes(message),
+      0,
+    );
+    const incomingBytes = incoming.data.messages.reduce(
+      (total, message) => total + estimateCachedMessageBytes(message),
+      0,
+    );
+    const cache = createRequestMessageCache({
+      maxBytesPerRequest: Math.max(retainedBytes, incomingBytes),
+      maxTotalBytes: retainedBytes + incomingBytes - 1,
+    });
+    const firstAdmission = cache.cacheMessage(retained);
+    if (firstAdmission.status === "error") throw firstAdmission.error;
+    const owner = cache.acquireOwner(retained.key);
+    if (owner.status === "error") throw owner.error;
+    cache.finishDelivery({
+      requestId: retained.key,
+      eventId: retained.id,
+      disposition: "release",
+    });
+    const retainedBefore = cache.get(retained.key);
+    const snapshotBefore = cache.snapshot(retained.key);
+
+    const admitted = cache.cacheMessage(incoming);
+
+    expect(admitted.status).toBe("error");
+    if (admitted.status === "ok") throw new Error("expected aggregate capacity failure");
+    expect(admitted.error._tag).toBe("RequestMessageCacheCapacityExceeded");
+    expect(cache.get(retained.key)).toEqual(retainedBefore);
+    expect(cache.snapshot(retained.key)).toEqual(snapshotBefore);
+    expect(cache.get(incoming.key)).toBeUndefined();
+    expect(cache.snapshot(incoming.key)).toBeUndefined();
+  });
+
+  it("admits a retry after retained aggregate capacity is released", () => {
+    const retained = requestMessage({
+      eventId: "retry-retained-1",
+      requestId: "retry-retained-request",
+      text: "x".repeat(200),
+    });
+    const incoming = requestMessage({
+      eventId: "retry-incoming-1",
+      requestId: "retry-incoming-request",
+      text: "y".repeat(200),
+    });
+    const retainedBytes = retained.data.messages.reduce(
+      (total, message) => total + estimateCachedMessageBytes(message),
+      0,
+    );
+    const incomingBytes = incoming.data.messages.reduce(
+      (total, message) => total + estimateCachedMessageBytes(message),
+      0,
+    );
+    const cache = createRequestMessageCache({
+      maxBytesPerRequest: Math.max(retainedBytes, incomingBytes),
+      maxTotalBytes: retainedBytes + incomingBytes - 1,
+    });
+    const firstAdmission = cache.cacheMessage(retained);
+    if (firstAdmission.status === "error") throw firstAdmission.error;
+    const owner = cache.acquireOwner(retained.key);
+    if (owner.status === "error") throw owner.error;
+    cache.finishDelivery({
+      requestId: retained.key,
+      eventId: retained.id,
+      disposition: "release",
+    });
+    expect(cache.cacheMessage(incoming).status).toBe("error");
+
+    expect(cache.releaseOwner(owner.value)).toBe(true);
+    const retried = cache.cacheMessage(incoming);
+
+    expect(retried.status).toBe("ok");
+    expect(cache.get(incoming.key)).toEqual(incoming.data.messages);
+  });
+
+  it("counts a distinct alias lineage again and rejects it transactionally", () => {
+    const source = requestMessage({
+      eventId: "alias-source-1",
+      requestId: "alias-source-request",
+      text: "x".repeat(200),
+    });
+    const sourceBytes = source.data.messages.reduce(
+      (total, message) => total + estimateCachedMessageBytes(message),
+      0,
+    );
+    const cache = createRequestMessageCache({
+      maxBytesPerRequest: sourceBytes,
+      maxTotalBytes: sourceBytes * 2 - 1,
+    });
+    const admitted = cache.cacheMessage(source);
+    if (admitted.status === "error") throw admitted.error;
+    const sourceBefore = cache.get(source.key);
+
+    const alias = cache.createAliasOwner({
+      sourceRequestId: source.key,
+      aliasRequestId: "alias-capacity-target",
+      requestClient: "discord",
+      sessionId: "channel-1",
+    });
+
+    expect(alias.status).toBe("error");
+    if (alias.status === "ok") throw new Error("expected alias capacity failure");
+    expect(alias.error._tag).toBe("RequestMessageCacheCapacityExceeded");
+    expect(cache.get(source.key)).toEqual(sourceBefore);
+    expect(cache.get("alias-capacity-target")).toBeUndefined();
   });
 });

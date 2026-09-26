@@ -224,7 +224,12 @@ export class FakeBotApiServer {
   /** Downloadable files, keyed by file_id, served under /file/bot<token>/<path>. */
   private readonly files = new Map<
     string,
-    { filePath: string; bytes: Uint8Array; declaredSize?: number | null }
+    {
+      filePath: string;
+      bytes: Uint8Array;
+      declaredSize?: number | null;
+      contentType?: string;
+    }
   >();
 
   private nextUpdateId = 1;
@@ -290,11 +295,13 @@ export class FakeBotApiServer {
     filePath: string;
     bytes: Uint8Array;
     declaredSize?: number | null;
+    contentType?: string;
   }): void {
     this.files.set(input.fileId, {
       filePath: input.filePath,
       bytes: input.bytes,
       ...(input.declaredSize === undefined ? {} : { declaredSize: input.declaredSize }),
+      ...(input.contentType === undefined ? {} : { contentType: input.contentType }),
     });
   }
 
@@ -370,7 +377,10 @@ export class FakeBotApiServer {
       this.recordCall("downloadFile", { file_path: filePath });
       const stored = [...this.files.values()].find((file) => file.filePath === filePath);
       if (!stored) return new Response("Not Found", { status: 404 });
-      return new Response(stored.bytes.slice());
+      return new Response(
+        stored.bytes.slice(),
+        stored.contentType === undefined ? {} : { headers: { "Content-Type": stored.contentType } },
+      );
     }
 
     // grammY calls POST {apiRoot}/bot{token}/{method}

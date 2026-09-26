@@ -139,6 +139,7 @@ fi
 # --dry-run first if another run may be in flight.
 SCRATCH_PREFIXES=(
   "/tmp/lilac-telegram-it-"
+  "/tmp/lilac-telegram-media-"
   "/tmp/lilac-telegram-menu-"
   "/tmp/lilac-telegram-e2e-"
   "/tmp/lilac-telegram-poll-"

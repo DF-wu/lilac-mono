@@ -7403,6 +7403,11 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 ["src/surface/telegram/telegram-request-router-composition.ts", "telegramFlags"],
                 ["src/surface/telegram/telegram-inbound-media.ts", "telegramInboundMediaFromRaw"],
                 ["src/tool-server/request-message-cache.ts", "estimateCachedMessageBytes"],
+                ["src/tool-server/request-message-cache.ts", "estimateCachedMessagesBytes"],
+                [
+                  "src/transcript/transcript-persistence-projection.ts",
+                  "isTransientTelegramInboundFile",
+                ],
               ] as const
             ).map(([module, exportName]) => ({
               identity: { module, exportName },
@@ -7876,6 +7881,41 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
         : []),
       ...(root === "apps/core"
         ? ([
+            {
+              identity: {
+                module: "src/surface/telegram/telegram-request-router.ts",
+                exportName: "startTelegramRequestRouter.getCurrentConfig",
+              },
+              category: "external-to-result",
+              externalApi: {
+                package: "external",
+                exportName: "StartTelegramRequestRouterInput.getConfig",
+              },
+              direction: "capture-external",
+              reason:
+                "Keeps the last known valid Telegram configuration when an injected live refresh rejects.",
+            },
+            {
+              identity: {
+                module: "src/surface/telegram/telegram-request-router.ts",
+                exportName: "startTelegramRequestRouter.getCurrentConfig",
+              },
+              category: "defect-supervisor",
+              externalApi: { package: "better-result", exportName: "Panic.is" },
+              direction: "observe-panic",
+              reason: "Preserves Panic identity across Telegram live configuration refresh.",
+            },
+            {
+              identity: {
+                module: "src/tool-server/request-message-cache.ts",
+                exportName: "createRequestMessageCache",
+              },
+              category: "compatibility",
+              externalApi: { package: "global", exportName: "constructor" },
+              direction: "signal-host",
+              reason:
+                "Signals invalid cache byte-limit configuration through the constructor host contract.",
+            },
             ...[
               [
                 "src/runtime/graceful-restart-store.ts",
@@ -8342,12 +8382,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 "readMessage.err",
                 "Telegram request composition",
                 "Signals a failed adapter read through the established request-composition Promise contract.",
-              ],
-              [
-                "src/surface/telegram/telegram-request-router.ts",
-                "configFromOverride.err",
-                "startTelegramRequestRouter",
-                "Signals invalid injected configuration through the router startup Promise contract.",
               ],
               [
                 "src/surface/telegram/telegram-request-router.ts",
@@ -8844,6 +8878,12 @@ const PRECISE_EXCEPTION_ADAPTER_KEYS = new Set(
 const REVIEWED_INJECTED_EXTERNAL_EFFECT_KEYS = new Set([
   preciseExceptionAdapterKey(
     "apps/core",
+    "src/surface/telegram/telegram-request-router.ts",
+    "startTelegramRequestRouter.getCurrentConfig",
+    "capture-external",
+  ),
+  preciseExceptionAdapterKey(
+    "apps/core",
     "src/mcp/config-file.ts",
     "captureFileOperation",
     "capture-external",
@@ -9024,7 +9064,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "2024d7a1ead9ed0c4e027cb81c0c5b6ed071a847f069261c3b6a2941ec96a557";
+  "6df368effbae3f8b5329529aa29a1e893f2c98547e46dc8337874e223c73211a";
 
 export const architectureManifest = {
   version: 1,

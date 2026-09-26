@@ -13,7 +13,7 @@ The comparison baseline is `main` as of 2026-08-16: this fork includes upstream 
 
 | Area | Difference | Entry point | Limitations or considerations |
 | --- | --- | --- | --- |
-| Telegram surface | Adds DM, group, and forum topic ingress; streamed HTML output; cancellation, reactions, command menus, outbound attachments, workflow cards/actions, and same-surface tools | [`telegram-surface.md`](./telegram-surface.md), fork PR [#45](https://github.com/DF-wu/lilac-mono/pull/45) | Disabled by default; no inbound attachment bytes; long polling only; history comes from the local SQLite index |
+| Telegram surface | Adds DM, group, and forum topic ingress; streamed HTML output; cancellation, reactions, command menus, inbound photos/documents, outbound attachments, workflow cards/actions, and same-surface tools | [`telegram-surface.md`](./telegram-surface.md), fork PR [#45](https://github.com/DF-wu/lilac-mono/pull/45) | Disabled by default; long polling only; history comes from the local SQLite index; inbound bytes are omitted from persisted transcripts |
 | OpenAI-compatible image routing | Uses v2 config to route all existing `generate.image` aliases to a single operator-specified endpoint | [`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md), fork PR [#47](https://github.com/DF-wu/lilac-mono/pull/47) | No custom alias mapping, official-provider fallback, or cross-provider retry; `aspectRatio` produces only a warning for some aliases |
 | GitHub reply permalinks | `In reply to` links point to the specified issue/PR body or comment anchor | [`github-reply-permalinks.md`](./github-reply-permalinks.md), fork PR [#49](https://github.com/DF-wu/lilac-mono/pull/49) | Body targets require the issue database ID; falls back to the thread URL when unavailable |
 | Custom media plugin example | Provides an external Level 2 image/video plugin using an OpenAI-compatible image API and a QuantumNous/new-api-compatible video flow | [`custom-media/README.md`](../examples/plugins/custom-media/README.md), fork PR [#30](https://github.com/DF-wu/lilac-mono/pull/30) | Plugins are trusted in-process code; restricted callers currently cannot use external callables directly |
@@ -29,11 +29,10 @@ Telegram is currently the largest fork-only product delta. The main implemented 
 - DMs, groups, supergroups, and forum topics.
 - Mention/active routing, streamed edits, HTML rendering, and 4096-character chunking.
 - Reply context, cancellation, typing indicators, reactions, custom commands, and menu aliases.
-- Outbound attachments, workflow progress/actions, `waitForReply`, and allowlist-bound surface tools.
+- Bounded inbound photos/documents, outbound attachments, workflow progress/actions, `waitForReply`, and allowlist-bound surface tools.
 
 Items that remain unimplemented or are constrained by the platform:
 
-- Inbound photo/document bytes are not sent to the model; captions can still trigger a request. Tracked in [issue #42](https://github.com/DF-wu/lilac-mono/issues/42).
 - Only long polling is supported; there is no webhook ingress.
 - There is no Telegram-native conversation search index, inline query support, business account support, or voice/video transcription.
 - Message history includes only content the bot actually observed or sent, not Telegram's complete pre-existing history.

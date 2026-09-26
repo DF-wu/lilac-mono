@@ -129,15 +129,8 @@ async function startChain(cfg: CoreConfig = testConfig(), customCommands?: Custo
     adapter: created,
     bus,
     subscriptionId: "e2e-router",
+    getConfig: async () => cfg,
     ...(customCommands ? { customCommands } : {}),
-    config: {
-      configVersion: 2,
-      surface: {
-        discord: { botName: "lilac" },
-        telegram: cfg.surface.telegram,
-        router: cfg.surface.router,
-      },
-    },
   });
 
   await created.connect();

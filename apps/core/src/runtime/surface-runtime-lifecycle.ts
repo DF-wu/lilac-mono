@@ -152,6 +152,17 @@ export async function startSurfaceAdapterIngress(input: {
   }
 }
 
+export async function startSurfaceRequestIngress(input: {
+  readonly registry: SurfaceRuntimeRegistry;
+  readonly handles: SurfaceRequestIngressHandles;
+}): Promise<void> {
+  for (const descriptor of input.registry.entries()) {
+    if (!descriptor.requestIngress) continue;
+    const handle = await descriptor.requestIngress.start();
+    input.handles.set(descriptor.platform, handle);
+  }
+}
+
 export async function connectAndValidateSurfaceAdapters(input: {
   readonly registry: SurfaceRuntimeRegistry;
   readonly connected: ConnectedSurfaceAdapters;
@@ -165,14 +176,9 @@ export async function connectAndValidateSurfaceAdapters(input: {
 
 export async function startSurfaceOutputs(input: {
   readonly registry: SurfaceRuntimeRegistry;
-  readonly requestIngress: SurfaceRequestIngressHandles;
   readonly relays: SurfaceRelayHandles;
 }): Promise<void> {
   for (const descriptor of input.registry.entries()) {
-    if (descriptor.requestIngress) {
-      const handle = await descriptor.requestIngress.start();
-      input.requestIngress.set(descriptor.platform, handle);
-    }
     if (descriptor.relay) {
       const handle = await descriptor.relay.lifecycle.start();
       requireDescriptorPlatform(
@@ -604,7 +610,6 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
 
 export async function stopSurfaceOutputs(input: {
   readonly registry: SurfaceRuntimeRegistry;
-  readonly requestIngress: SurfaceRequestIngressHandles;
   readonly relays: SurfaceRelayHandles;
   readonly runCleanup: CleanupRunner;
 }): Promise<void> {
@@ -620,18 +625,6 @@ export async function stopSurfaceOutputs(input: {
         () => relay.stop(),
       );
       input.relays.delete(descriptor.platform);
-    }
-    const ingress = input.requestIngress.get(descriptor.platform);
-    if (ingress) {
-      await input.runCleanup(
-        surfaceCleanupLabel({
-          platform: descriptor.platform,
-          resource: "request-ingress",
-          operation: "stop",
-        }),
-        () => ingress.stop(),
-      );
-      input.requestIngress.delete(descriptor.platform);
     }
   }
 }

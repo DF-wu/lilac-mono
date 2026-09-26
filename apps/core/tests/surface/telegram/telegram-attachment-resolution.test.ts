@@ -29,6 +29,9 @@ const PNG_BYTES = Uint8Array.from(
   (char) => char.charCodeAt(0),
 );
 
+const PDF_BYTES = new TextEncoder().encode("%PDF-1.7\n%%EOF\n");
+const UNKNOWN_BINARY_BYTES = Uint8Array.from([0, 0xff, 0xfe, 0xfd]);
+
 let server: FakeBotApiServer;
 let adapter: TelegramAdapter | null = null;
 let scratchDir = "";
@@ -92,22 +95,21 @@ describe("TelegramAdapter.resolveAttachment", () => {
     ]);
   });
 
-  it("rejects on the declared ref size before any HTTP request", async () => {
+  it("downloads a small body when the attachment ref overdeclares its size", async () => {
     const connected = await connectAdapter(testConfig());
+    server.setFile({ fileId: "big-1", filePath: "documents/big-1.bin", bytes: PNG_BYTES });
 
     const resolved = await connected.resolveAttachment(
       { platform: "telegram", fileId: "big-1", size: 2048 },
       { maxBytes: 1024 },
     );
 
-    expect(resolved.match({ ok: () => "", err: (error) => error._tag })).toBe(
-      "SurfaceAttachmentTooLarge",
-    );
-    expect(server.callsOf("getFile")).toHaveLength(0);
-    expect(server.callsOf("downloadFile")).toHaveLength(0);
+    expect([...resolved.unwrap().bytes]).toEqual([...PNG_BYTES]);
+    expect(server.callsOf("getFile")).toHaveLength(1);
+    expect(server.callsOf("downloadFile")).toHaveLength(1);
   });
 
-  it("rejects on the getFile-declared size before downloading", async () => {
+  it("downloads a small body when getFile overdeclares its size", async () => {
     const connected = await connectAdapter(testConfig());
     server.setFile({
       fileId: "big-2",
@@ -121,10 +123,135 @@ describe("TelegramAdapter.resolveAttachment", () => {
       { maxBytes: 1024 },
     );
 
-    expect(resolved.match({ ok: () => "", err: (error) => error._tag })).toBe(
-      "SurfaceAttachmentTooLarge",
+    expect([...resolved.unwrap().bytes]).toEqual([...PNG_BYTES]);
+    expect(server.callsOf("downloadFile")).toHaveLength(1);
+  });
+
+  it("delivers a sniffed image despite hostile declared metadata", async () => {
+    const connected = await connectAdapter(testConfig());
+    server.setFile({ fileId: "spoof-image", filePath: "documents/archive.zip", bytes: PNG_BYTES });
+
+    const resolved = await connected.resolveAttachment(
+      {
+        platform: "telegram",
+        fileId: "spoof-image",
+        filename: "archive.zip",
+        mimeType: "application/zip",
+      },
+      { maxBytes: 1024 },
     );
-    expect(server.callsOf("downloadFile")).toHaveLength(0);
+
+    expect(resolved.unwrap().mediaType).toBe("image/png");
+    expect(server.callsOf("downloadFile")).toHaveLength(1);
+  });
+
+  it("delivers a sniffed PDF despite hostile declared metadata", async () => {
+    const connected = await connectAdapter(testConfig());
+    server.setFile({ fileId: "spoof-pdf", filePath: "documents/photo.jpg", bytes: PDF_BYTES });
+
+    const resolved = await connected.resolveAttachment(
+      {
+        platform: "telegram",
+        fileId: "spoof-pdf",
+        filename: "photo.jpg",
+        mimeType: "image/jpeg",
+      },
+      { maxBytes: 1024 },
+    );
+
+    expect(resolved.unwrap().mediaType).toBe("application/pdf");
+    expect(server.callsOf("downloadFile")).toHaveLength(1);
+  });
+
+  it("does not classify unknown binary bytes from a declared image MIME type", async () => {
+    const connected = await connectAdapter(testConfig());
+    server.setFile({
+      fileId: "spoof-declared-image",
+      filePath: "documents/spoof-declared-image.bin",
+      bytes: UNKNOWN_BINARY_BYTES,
+    });
+
+    const resolved = await connected.resolveAttachment(
+      { platform: "telegram", fileId: "spoof-declared-image", mimeType: "image/png" },
+      { maxBytes: 1024 },
+    );
+
+    expect(resolved.unwrap().mediaType).toBeUndefined();
+    expect(server.callsOf("downloadFile")).toHaveLength(1);
+  });
+
+  it("does not classify unknown binary bytes from a declared text MIME type", async () => {
+    const connected = await connectAdapter(testConfig());
+    server.setFile({
+      fileId: "spoof-declared-text",
+      filePath: "documents/spoof-declared-text.bin",
+      bytes: UNKNOWN_BINARY_BYTES,
+    });
+
+    const resolved = await connected.resolveAttachment(
+      { platform: "telegram", fileId: "spoof-declared-text", mimeType: "text/plain" },
+      { maxBytes: 1024 },
+    );
+
+    expect(resolved.unwrap().mediaType).toBeUndefined();
+    expect(server.callsOf("downloadFile")).toHaveLength(1);
+  });
+
+  it("does not classify unknown binary bytes from the filename", async () => {
+    const connected = await connectAdapter(testConfig());
+    server.setFile({
+      fileId: "spoof-filename",
+      filePath: "documents/spoof-filename.bin",
+      bytes: UNKNOWN_BINARY_BYTES,
+    });
+
+    const resolved = await connected.resolveAttachment(
+      { platform: "telegram", fileId: "spoof-filename", filename: "photo.png" },
+      { maxBytes: 1024 },
+    );
+
+    expect(resolved.unwrap().mediaType).toBeUndefined();
+    expect(server.callsOf("downloadFile")).toHaveLength(1);
+  });
+
+  it("does not classify unknown binary bytes from the HTTP Content-Type", async () => {
+    const connected = await connectAdapter(testConfig());
+    server.setFile({
+      fileId: "spoof-http-type",
+      filePath: "documents/spoof-http-type.bin",
+      bytes: UNKNOWN_BINARY_BYTES,
+      contentType: "image/png",
+    });
+
+    const resolved = await connected.resolveAttachment(
+      { platform: "telegram", fileId: "spoof-http-type" },
+      { maxBytes: 1024 },
+    );
+
+    expect(resolved.unwrap().mediaType).toBeUndefined();
+    expect(server.callsOf("downloadFile")).toHaveLength(1);
+  });
+
+  it("leaves unknown valid UTF-8 unclassified despite hostile declared metadata", async () => {
+    const connected = await connectAdapter(testConfig());
+    server.setFile({
+      fileId: "unknown-text",
+      filePath: "documents/archive.zip",
+      bytes: new TextEncoder().encode("alpha: 1\n"),
+    });
+
+    const resolved = await connected.resolveAttachment(
+      {
+        platform: "telegram",
+        fileId: "unknown-text",
+        filename: "archive.zip",
+        mimeType: "application/zip",
+      },
+      { maxBytes: 1024 },
+    );
+
+    expect(resolved.unwrap().mediaType).toBeUndefined();
+    expect(server.callsOf("downloadFile")).toHaveLength(1);
   });
 
   it("aborts mid-download when the declared size lies", async () => {
@@ -250,6 +377,14 @@ describe("composeTelegramMessages with inbound media", () => {
         type: "file",
         data: Buffer.from(PNG_BYTES).toString("base64"),
         mediaType: "image/png",
+        providerOptions: {
+          lilac: {
+            transient: {
+              version: 1,
+              source: "telegram-inbound-file",
+            },
+          },
+        },
       },
     ]);
 

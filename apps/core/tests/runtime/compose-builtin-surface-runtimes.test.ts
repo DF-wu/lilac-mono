@@ -58,6 +58,8 @@ function createComposition(input: {
                 isReady: true,
               }),
             },
+            getConfig: () =>
+              Promise.reject(new Panic({ message: "Unexpected Telegram config request" })),
           },
         }
       : {}),
@@ -111,6 +113,7 @@ describe("built-in surface runtime composition", () => {
     ]);
     const telegram = enabled.registry.entries()[2];
     expect(telegram?.adapterIngress).toBeDefined();
+    expect(telegram?.requestIngress).toBeDefined();
     expect(telegram?.relay).toBeDefined();
     expect(telegram?.health).toBeDefined();
     expect(telegram?.workflowProgress).toBeDefined();

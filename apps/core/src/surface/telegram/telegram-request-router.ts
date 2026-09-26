@@ -5,10 +5,11 @@ import {
   type EvtAdapterMessageCreatedData,
   type LilacBus,
 } from "@stanley2058/lilac-event-bus";
-import { getCoreConfig, parseCoreConfigResult, type CoreConfig } from "@stanley2058/lilac-utils";
+import { createLogger, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { CustomCommandManager } from "../../custom-commands/manager";
+import { safeRuntimeErrorText } from "../../runtime/error-format";
 import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
 import type { SurfaceAdapter } from "../adapter";
 import { formatTelegramMessageRequestId } from "../bridge/request-ids";
@@ -32,7 +33,6 @@ import {
 
 export type { RouterGateDecision, RouterGateInput };
 
-type TelegramRouterConfig = Record<string, unknown>;
 type DebounceBuffer = {
   readonly event: EvtAdapterMessageCreatedData;
   timer: ReturnType<typeof setTimeout> | null;
@@ -52,8 +52,8 @@ export type StartTelegramRequestRouterInput = {
   readonly adapter: SurfaceAdapter;
   readonly bus: LilacBus;
   readonly subscriptionId: string;
+  readonly getConfig: () => Promise<CoreConfig>;
   readonly customCommands?: CustomCommandManager;
-  readonly config?: TelegramRouterConfig;
   readonly routerGate?: (input: RouterGateInput) => Promise<RouterGateDecision>;
   readonly shouldSuppressAdapterEvent?: (input: {
     readonly evt: EvtAdapterMessageCreatedData;
@@ -64,22 +64,31 @@ function deliveryPolicy(_error: TelegramRequestRoutingFailed): DeliveryDispositi
   return "park-pending";
 }
 
-function configFromOverride(config: TelegramRouterConfig): CoreConfig {
-  return parseCoreConfigResult(config).match({
-    ok: (value) => value,
-    err: (error) => {
-      throw error;
-    },
-  });
-}
-
 export async function startTelegramRequestRouter(
   input: StartTelegramRequestRouterInput,
 ): Promise<TelegramRequestRouter> {
-  const cfg = input.config ? configFromOverride(input.config) : await getCoreConfig();
+  let lastKnownConfig = await input.getConfig();
   const buffers = new Map<string, DebounceBuffer>();
+  const logger = createLogger({ module: "surface:telegram:request-router" });
 
-  const publishEvent = async (event: EvtAdapterMessageCreatedData): Promise<void> => {
+  const getCurrentConfig = async (): Promise<CoreConfig> => {
+    try {
+      const cfg = await input.getConfig();
+      lastKnownConfig = cfg;
+      return cfg;
+    } catch (cause) {
+      if (Panic.is(cause)) throw cause;
+      logger.warn("telegram_request_router.config_refresh_failed", {
+        errorMessage: safeRuntimeErrorText(cause, "Telegram config refresh failed"),
+      });
+      return lastKnownConfig;
+    }
+  };
+
+  const publishEvent = async (
+    event: EvtAdapterMessageCreatedData,
+    cfg: CoreConfig,
+  ): Promise<void> => {
     const self = await input.adapter.getSelf();
     if (self.platform !== "telegram") {
       throw new Panic({ message: "Telegram request router requires a Telegram adapter" });
@@ -188,7 +197,8 @@ export async function startTelegramRequestRouter(
     if (!buffer) return;
     buffers.delete(sessionId);
     if (buffer.timer) clearTimeout(buffer.timer);
-    await publishEvent(buffer.event);
+    const cfg = await getCurrentConfig();
+    await publishEvent(buffer.event, cfg);
   };
 
   const started = await input.bus.subscribeTopic(
@@ -208,6 +218,7 @@ export async function startTelegramRequestRouter(
       try {
         const suppressed = await input.shouldSuppressAdapterEvent?.({ evt: message.data });
         if (suppressed?.suppress) return Result.ok(undefined);
+        const cfg = await getCurrentConfig();
         const flags = telegramFlags(message.data);
         const mode = flags.isDMBased
           ? "active"
@@ -223,7 +234,7 @@ export async function startTelegramRequestRouter(
           buffers.set(message.data.channelId, buffer);
           return Result.ok(undefined);
         }
-        await publishEvent(message.data);
+        await publishEvent(message.data, cfg);
         return Result.ok(undefined);
       } catch (cause) {
         if (Panic.is(cause)) throw cause;

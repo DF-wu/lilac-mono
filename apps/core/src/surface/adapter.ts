@@ -322,8 +322,8 @@ export type SurfaceAttachmentRef = {
 export type ResolvedSurfaceAttachment = {
   readonly kind: "bytes";
   readonly bytes: Uint8Array;
-  /** Sniffed from the bytes when possible, falling back to declared metadata. */
-  readonly mediaType: string;
+  /** Present only when the downloaded bytes identify a media type. */
+  readonly mediaType?: string;
 };
 
 /**

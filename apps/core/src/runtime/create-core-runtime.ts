@@ -141,6 +141,7 @@ import {
   prepareSurfaceRecovery,
   startSurfaceAdapterIngress,
   startSurfaceOutputs,
+  startSurfaceRequestIngress,
   stopIngressAndDrainSurfaceRecovery,
   stopSurfaceAdapterIngress,
   stopSurfaceOutputs,
@@ -1685,6 +1686,8 @@ export async function createCoreRuntime(
                   adapter: telegramAdapter,
                   eventSource: createDescriptorBoundSurfaceEventSource("telegram", telegramAdapter),
                   healthProvider: telegramAdapter,
+                  getConfig: () => getCoreConfig(),
+                  customCommands,
                 },
               }
             : {}),
@@ -1930,6 +1933,11 @@ export async function createCoreRuntime(
           dbPath: discordSearchDbPath,
         });
 
+        await startSurfaceRequestIngress({
+          registry,
+          handles: surfaceRequestIngressHandles,
+        });
+
         // Subscribe to adapter events before connecting, so we don't miss early messages.
         await startSurfaceAdapterIngress({
           registry,
@@ -2173,7 +2181,6 @@ export async function createCoreRuntime(
 
         await startSurfaceOutputs({
           registry,
-          requestIngress: surfaceRequestIngressHandles,
           relays: surfaceRelayHandles,
         });
 
@@ -2703,7 +2710,6 @@ export async function createCoreRuntime(
           registry,
           runCleanup: safe,
           relays: surfaceRelayHandles,
-          requestIngress: surfaceRequestIngressHandles,
         });
       }
 
@@ -2755,6 +2761,13 @@ export async function createCoreRuntime(
         await stopSurfaceAdapterIngress({
           registry,
           handles: surfaceAdapterIngressHandles,
+          runCleanup: safe,
+          graceful: false,
+        });
+
+        await stopSurfaceRequestIngress({
+          registry,
+          handles: surfaceRequestIngressHandles,
           runCleanup: safe,
           graceful: false,
         });

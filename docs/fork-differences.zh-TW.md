@@ -13,7 +13,7 @@
 
 | 領域 | 差異 | 使用入口 | 限制或注意事項 |
 | --- | --- | --- | --- |
-| Telegram surface | 新增 DM、group、forum topic ingress；streamed HTML output；cancel、reaction、command menu、outbound attachments、workflow cards/actions 與 same-surface tools | [`telegram-surface.md`](./telegram-surface.md)、fork PR [#45](https://github.com/DF-wu/lilac-mono/pull/45) | 預設停用；沒有 inbound attachment bytes；僅 long polling；history 來自 local SQLite index |
+| Telegram surface | 新增 DM、group、forum topic ingress；streamed HTML output；cancel、reaction、command menu、inbound photos/documents、outbound attachments、workflow cards/actions 與 same-surface tools | [`telegram-surface.md`](./telegram-surface.md)、fork PR [#45](https://github.com/DF-wu/lilac-mono/pull/45) | 預設停用；僅 long polling；history 來自 local SQLite index；inbound bytes 不會寫入 persisted transcripts |
 | OpenAI-compatible image routing | 以 v2 config 將所有既有 `generate.image` aliases 路由到單一 operator endpoint | [`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md)、fork PR [#47](https://github.com/DF-wu/lilac-mono/pull/47) | 無 custom alias mapping、official-provider fallback 或 cross-provider retry；部分 aliases 的 `aspectRatio` 只產生 warning |
 | GitHub reply permalinks | `In reply to` 連結會指向指定 issue/PR body 或 comment anchor | [`github-reply-permalinks.md`](./github-reply-permalinks.md)、fork PR [#49](https://github.com/DF-wu/lilac-mono/pull/49) | Body target 需要 issue database ID；取不到時退回 thread URL |
 | Custom media plugin example | 提供 external Level 2 image/video plugin，使用 OpenAI-compatible image API 與 QuantumNous/new-api-compatible video flow | [`custom-media/README.md`](../examples/plugins/custom-media/README.md)、fork PR [#30](https://github.com/DF-wu/lilac-mono/pull/30) | Plugin 是 trusted in-process code；restricted callers 目前不能直接使用 external callables |
@@ -29,11 +29,10 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 - DMs、groups、supergroups 與 forum topics。
 - Mention/active routing、streamed edits、HTML rendering 與 4096-character chunking。
 - Reply context、cancel、typing indicators、reactions、custom commands 與 menu aliases。
-- Outbound attachments、workflow progress/actions、`waitForReply` 與 allowlist-bound surface tools。
+- 有大小限制的 inbound photos/documents、outbound attachments、workflow progress/actions、`waitForReply` 與 allowlist-bound surface tools。
 
 仍未實作或受平台限制的項目：
 
-- Inbound photo/document bytes 不會送入 model；caption 仍可觸發 request。追蹤於 [issue #42](https://github.com/DF-wu/lilac-mono/issues/42)。
 - 只有 long polling，沒有 webhook ingress。
 - 沒有 Telegram-native conversation search index、inline queries、business accounts 或 voice/video transcription。
 - Message history 只包含 bot 實際觀察或送出的內容，不是 Telegram 既有完整歷史。

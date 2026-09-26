@@ -111,6 +111,7 @@ import {
   resolveCorePrimaryTranscriptProviderState,
   resolveCoreStableNamedContinuation,
   rethrowBusAgentRunnerPanic,
+  projectRequestMessageCacheError,
   signalBusAgentRunnerHostFailure,
   toIdleRetryDecision,
   toOpenAIPromptCacheKey,
@@ -153,7 +154,11 @@ import {
   SqliteTranscriptStore,
 } from "../../../src/transcript/transcript-store";
 import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
-import { createRequestMessageCache } from "../../../src/tool-server/request-message-cache";
+import {
+  createRequestMessageCache,
+  RequestMessageCacheCapacityExceeded,
+  RequestMessageCacheRequestTooLarge,
+} from "../../../src/tool-server/request-message-cache";
 import { DurableWorkflowStore } from "../../../src/workflow/durable-workflow-store";
 import {
   adaptDiscordRequestRouterStartOutcomeToHost,
@@ -2045,6 +2050,34 @@ describe("bus agent runner delivery policy", () => {
       message: "request intake failed",
     });
 
+    expect(busAgentRunnerDeliveryDisposition(error)).toBe("park-pending");
+  });
+
+  it("dead-letters a permanently oversized cache admission", () => {
+    const cause = new RequestMessageCacheRequestTooLarge({
+      requestId: "oversized-request",
+      estimatedBytes: 257,
+      maxBytesPerRequest: 256,
+      message: "request too large",
+    });
+
+    const error = projectRequestMessageCacheError(cause);
+
+    expect(error._tag).toBe("BusAgentRunnerRequestMessageTooLarge");
+    expect(busAgentRunnerDeliveryDisposition(error)).toBe("dead-letter");
+  });
+
+  it("parks aggregate cache capacity for retry", () => {
+    const cause = new RequestMessageCacheCapacityExceeded({
+      requestId: "capacity-request",
+      estimatedTotalBytes: 513,
+      maxTotalBytes: 512,
+      message: "retained capacity",
+    });
+
+    const error = projectRequestMessageCacheError(cause);
+
+    expect(error._tag).toBe("BusAgentRunnerCacheCapacityExceeded");
     expect(busAgentRunnerDeliveryDisposition(error)).toBe("park-pending");
   });
 

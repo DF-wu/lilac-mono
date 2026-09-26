@@ -293,10 +293,13 @@ in the local index) and asks the adapter to resolve it at request time:
 byte budget is exceeded — Telegram's declared sizes are treated as advisory
 because they can be absent or wrong. Historical messages in a reply chain
 re-resolve the same way, which is what makes re-composition after a restart
-work. Delivered bytes are inlined as base64 file parts: base64 survives every
-JSON serialization boundary (bus, request cache, transcripts) with a fixed 4/3
-expansion, so the configured decoded-byte budgets bound the on-wire payload by
-construction. Images and PDFs become file parts, text-extractable documents are
+work. Delivered bytes are inlined as base64 file parts while a request crosses
+the bus and request cache. Before SQLite transcript persistence, marked Telegram
+file parts are replaced with `[telegram_attachment …]` metadata placeholders so
+downloaded bytes and transient provider metadata are not retained. Base64 has a
+fixed 4/3 expansion, so the configured decoded-byte budgets bound the live
+on-wire payload by construction. Images and PDFs become file parts,
+text-extractable documents are
 inlined as text, and audio/video/voice degrade to one-line
 `[telegram_attachment …]` markers — a partial file would be corrupt rather than
 smaller, so oversized or unavailable media degrades to a marker too. A

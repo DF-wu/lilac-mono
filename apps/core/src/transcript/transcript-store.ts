@@ -64,6 +64,7 @@ import {
   type PersistedTranscriptRow,
   type TranscriptStorePersistedRowKind,
 } from "./transcript-persistence-codec";
+import { projectTranscriptForPersistence } from "./transcript-persistence-projection";
 
 const logger = createLogger({ module: "transcript-store" });
 const TRANSCRIPT_SCHEMA_VERSION = TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION;
@@ -1694,7 +1695,9 @@ export class SqliteTranscriptStore implements TranscriptStore {
     corePrimaryLineage?: CoreLineageManifestV1;
   }): ResultType<void, TranscriptStoreWriteError> {
     const now = Date.now();
-    const normalizedMessages = parseNormalizedCanonicalMessages(input.messages);
+    const normalizedMessages = parseNormalizedCanonicalMessages(
+      projectTranscriptForPersistence(input.messages),
+    );
     const transcriptDigest = hashCanonicalMessagesV1(normalizedMessages).hash;
     const providerState = input.providerState ?? null;
     const stableNamedRequestClient = input.stableNamedRequestClient ?? null;

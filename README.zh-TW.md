@@ -47,7 +47,7 @@ Mini Lilac 是上游持續發展的產品，本 fork 會隨上游同步。若你
 
 | 領域 | 本 fork 提供的差異 | 重要限制 |
 | --- | --- | --- |
-| Telegram surface | DMs、群組、forum topics、串流 HTML 回覆、取消、reaction、command menu、outbound attachments、workflow cards 與同 surface tools | 預設停用；沒有 inbound attachment bytes；僅 long polling |
+| Telegram surface | DMs、群組、forum topics、串流 HTML 回覆、取消、reaction、command menu、inbound photos/documents、outbound attachments、workflow cards 與同 surface tools | 預設停用；僅 long polling；inbound bytes 不會寫入 persisted transcripts |
 | OpenAI-compatible 圖像路由 | 將既有 `generate.image` aliases 統一路由到 operator 指定的 OpenAI-compatible endpoint | 僅 `configVersion: 2`；無自動 fallback 或自訂 alias mapping |
 | GitHub 回覆 UX | `In reply to` 可直接連到 issue/PR body 或指定 comment 的 canonical permalink | GitHub comment self-loop 防護已被上游接收，不再列為 fork-only |
 | Custom media plugin | 可部署的 Level 2 image/video plugin 範例，示範嚴格設定與檔案安全處理 | Plugin 是 trusted in-process code；restricted caller 目前不能使用 external callables |

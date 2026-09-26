@@ -121,12 +121,13 @@ import type { WorkflowUsage } from "../../workflow/workflow-domain";
 import type { WorkflowRequestPolicy } from "../../workflow/workflow-request-authority";
 import {
   createRequestMessageCache,
-  type RequestIdentityAliasTargetOccupied,
-  type RequestIdentitySourceMissing,
   type RequestMessageCache,
   type RequestMessageCacheAdmissionError,
   type RequestMessageCacheAliasOwner,
+  type RequestMessageCacheCapacityExceeded,
   type RequestMessageCacheOwner,
+  type RequestMessageCacheOwnerError,
+  type RequestMessageCacheRequestTooLarge,
   type RequestMessageCacheRestoreAttempt,
 } from "../../tool-server/request-message-cache";
 import {
@@ -374,11 +375,54 @@ export class BusAgentRunnerAuthenticationProjectionInvalid extends TaggedError(
   readonly cause:
     | AuthenticatedRequestProjectionInvalid
     | RequestMessageCacheAdmissionError
-    | RequestIdentitySourceMissing
-    | RequestIdentityAliasTargetOccupied
-    | AuthenticatedRequestProjectionInvalid;
+    | RequestMessageCacheOwnerError;
   readonly message: string;
 }> {}
+
+export class BusAgentRunnerRequestMessageTooLarge extends TaggedError(
+  "BusAgentRunnerRequestMessageTooLarge",
+)<{
+  readonly cause: RequestMessageCacheRequestTooLarge;
+  readonly message: string;
+}> {}
+
+export class BusAgentRunnerCacheCapacityExceeded extends TaggedError(
+  "BusAgentRunnerCacheCapacityExceeded",
+)<{
+  readonly cause: RequestMessageCacheCapacityExceeded;
+  readonly message: string;
+}> {}
+
+export type BusAgentRunnerCacheError =
+  | BusAgentRunnerAuthenticationProjectionInvalid
+  | BusAgentRunnerRequestMessageTooLarge
+  | BusAgentRunnerCacheCapacityExceeded;
+
+export function projectRequestMessageCacheError(
+  error: RequestMessageCacheAdmissionError | RequestMessageCacheOwnerError,
+): BusAgentRunnerCacheError {
+  switch (error._tag) {
+    case "RequestMessageCacheRequestTooLarge":
+      return new BusAgentRunnerRequestMessageTooLarge({
+        cause: error,
+        message: "cmd.request.message exceeds the request cache byte limit",
+      });
+    case "RequestMessageCacheCapacityExceeded":
+      return new BusAgentRunnerCacheCapacityExceeded({
+        cause: error,
+        message: "cmd.request.message is waiting for request cache byte capacity",
+      });
+    case "RequestMessageCacheRequestIdMissing":
+    case "AuthenticatedRequestProjectionInvalid":
+    case "AuthenticatedRequestIdentityConflict":
+    case "RequestIdentitySourceMissing":
+    case "RequestIdentityAliasTargetOccupied":
+      return new BusAgentRunnerAuthenticationProjectionInvalid({
+        cause: error,
+        message: "cmd.request.message cache admission is invalid",
+      });
+  }
+}
 
 export class BusAgentRunnerOperationFailed extends TaggedError("BusAgentRunnerOperationFailed")<{
   readonly operation: string;
@@ -481,6 +525,8 @@ export type BusAgentRunnerDeliveryError =
   | BusAgentRunnerQueueAttemptRouteInvalid
   | BusAgentRunnerRecoveryStopped
   | BusAgentRunnerAuthenticationProjectionInvalid
+  | BusAgentRunnerRequestMessageTooLarge
+  | BusAgentRunnerCacheCapacityExceeded
   | BusAgentRunnerIntakeFailed;
 
 export function busAgentRunnerDeliveryDisposition(
@@ -490,10 +536,12 @@ export function busAgentRunnerDeliveryDisposition(
     case "BusAgentRunnerRequestHeadersInvalid":
     case "BusAgentRunnerQueueAttemptRouteInvalid":
     case "BusAgentRunnerAuthenticationProjectionInvalid":
+    case "BusAgentRunnerRequestMessageTooLarge":
       return "dead-letter";
     case "BusAgentRunnerRecoveryStopped":
       return "stop";
     case "BusAgentRunnerIntakeFailed":
+    case "BusAgentRunnerCacheCapacityExceeded":
       return "park-pending";
   }
 }
@@ -2848,11 +2896,7 @@ export async function startBusAgentRunner(params: {
     }
     const raw = preserveAgentRunnerRaw(msg.data.raw);
     let cacheAdmitted = false;
-    let identityError:
-      | RequestIdentitySourceMissing
-      | RequestIdentityAliasTargetOccupied
-      | AuthenticatedRequestProjectionInvalid
-      | undefined;
+    let cacheError: BusAgentRunnerCacheError | undefined;
     let intakeError: BusAgentRunnerOperationFailed | undefined;
     let parkPending = false;
     try {
@@ -2869,12 +2913,7 @@ export async function startBusAgentRunner(params: {
       });
       const externalProjection = selectExternalProjection();
       if (cachedExternalError) {
-        return Result.err(
-          new BusAgentRunnerAuthenticationProjectionInvalid({
-            cause: cachedExternalError,
-            message: "cmd.request.message cache admission is invalid",
-          }),
-        );
+        return Result.err(projectRequestMessageCacheError(cachedExternalError));
       }
       if (!externalProjection) return Result.ok(undefined);
       cacheAdmitted = true;
@@ -2896,12 +2935,7 @@ export async function startBusAgentRunner(params: {
       });
       const authenticatedRequest = selectAuthenticatedRequest();
       if (cachedTrustedError) {
-        return Result.err(
-          new BusAgentRunnerAuthenticationProjectionInvalid({
-            cause: cachedTrustedError,
-            message: "cmd.request.message trusted cache admission is invalid",
-          }),
-        );
+        return Result.err(projectRequestMessageCacheError(cachedTrustedError));
       }
       if (!authenticatedRequest) return Result.ok(undefined);
       await (async () => {
@@ -3245,7 +3279,7 @@ export async function startBusAgentRunner(params: {
           const owner = requestMessageCache.acquireOwner(requestId);
           const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
             err: (error) => () => {
-              identityError = error;
+              cacheError = projectRequestMessageCacheError(error);
               return null;
             },
             ok: (identityOwner) => () => identityOwner,
@@ -3323,7 +3357,10 @@ export async function startBusAgentRunner(params: {
               });
               const selectAlias = aliased.match<() => RequestMessageCacheAliasOwner | null>({
                 err: (error) => () => {
-                  identityError = error;
+                  cacheError = projectRequestMessageCacheError(error);
+                  if (cacheError._tag === "BusAgentRunnerCacheCapacityExceeded") {
+                    parkPending = true;
+                  }
                   return null;
                 },
                 ok: (aliasOwner) => () => aliasOwner,
@@ -3480,7 +3517,7 @@ export async function startBusAgentRunner(params: {
             const owner = requestMessageCache.acquireOwner(requestId);
             const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
               err: (error) => () => {
-                identityError = error;
+                cacheError = projectRequestMessageCacheError(error);
                 return null;
               },
               ok: (identityOwner) => () => identityOwner,
@@ -3514,14 +3551,7 @@ export async function startBusAgentRunner(params: {
           }),
         );
       }
-      if (identityError) {
-        return Result.err(
-          new BusAgentRunnerAuthenticationProjectionInvalid({
-            cause: identityError,
-            message: "cmd.request.message identity ownership is invalid",
-          }),
-        );
-      }
+      if (cacheError) return Result.err(cacheError);
       return Result.ok(undefined);
     } catch (cause) {
       rethrowBusAgentRunnerPanic(cause);

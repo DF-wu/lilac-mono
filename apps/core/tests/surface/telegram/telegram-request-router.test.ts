@@ -2,6 +2,8 @@ import { describe, expect, it } from "bun:test";
 import { Result } from "better-result";
 
 import { createLilacBus, lilacEventTypes, type Message } from "@stanley2058/lilac-event-bus";
+import type { CoreConfig } from "@stanley2058/lilac-utils";
+import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils/core-config/v2";
 
 import type {
   RouterGateDecision,
@@ -9,7 +11,9 @@ import type {
 } from "../../../src/surface/telegram/telegram-request-router";
 import { startTelegramRequestRouter } from "../../../src/surface/telegram/telegram-request-router";
 import type {
+  ResolvedSurfaceAttachment,
   SurfaceAdapter,
+  SurfaceAttachmentRef,
   SurfaceOperationResult,
   SurfaceOutputStream,
 } from "../../../src/surface/adapter";
@@ -33,6 +37,8 @@ const TELEGRAM_BOT_ID = "8792842071";
 
 /** Serves the Telegram history the router asks for during composition. */
 class FakeTelegramAdapter extends SurfaceAdapterTestBase implements SurfaceAdapter {
+  readonly resolvedAttachmentFileIds: string[] = [];
+
   constructor(private readonly messages: Record<string, SurfaceMessage> = {}) {
     super();
   }
@@ -103,6 +109,14 @@ class FakeTelegramAdapter extends SurfaceAdapterTestBase implements SurfaceAdapt
   async markRead() {
     return Result.ok(undefined);
   }
+  async resolveAttachment(ref: SurfaceAttachmentRef) {
+    this.resolvedAttachmentFileIds.push(ref.fileId);
+    return Result.ok<ResolvedSurfaceAttachment>({
+      kind: "bytes",
+      bytes: Uint8Array.from([1, 2, 3]),
+      mediaType: "image/png",
+    });
+  }
 }
 
 /**
@@ -113,9 +127,11 @@ function routerConfig(
   input: {
     defaultMode?: "active" | "mention";
     sessionModes?: Record<string, { mode: "active" | "mention"; gate?: boolean }>;
+    activeDebounceMs?: number;
+    inboundMediaEnabled?: boolean;
   } = {},
-): Record<string, unknown> {
-  return {
+): CoreConfig {
+  return parseCoreConfigV2ToUniversal({
     configVersion: 2,
     surface: {
       discord: { botName: DISCORD_BOT_NAME },
@@ -124,15 +140,18 @@ function routerConfig(
         botName: TELEGRAM_BOT_NAME,
         botUsername: TELEGRAM_HANDLE,
         allowedChatIds: [CHAT],
+        ...(input.inboundMediaEnabled === undefined
+          ? {}
+          : { inboundMedia: { enabled: input.inboundMediaEnabled } }),
       },
       router: {
         defaultMode: input.defaultMode ?? "active",
         sessionModes: input.sessionModes ?? {},
-        activeDebounceMs: 1,
+        activeDebounceMs: input.activeDebounceMs ?? 1,
         activeGate: { enabled: false, timeoutMs: 2500 },
       },
     },
-  };
+  });
 }
 
 function surfaceMessage(input: {
@@ -166,16 +185,33 @@ function telegramRaw(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function fixedConfigProvider(providers: readonly (() => Promise<CoreConfig>)[]): {
+  readonly getConfig: () => Promise<CoreConfig>;
+  readonly callCount: () => number;
+} {
+  let callCount = 0;
+  return {
+    getConfig: async () => {
+      const provider = providers.at(callCount);
+      callCount += 1;
+      if (!provider) throw new Error(`unexpected config provider call ${callCount}`);
+      return await provider();
+    },
+    callCount: () => callCount,
+  };
+}
+
 async function startRouter(
   adapter: SurfaceAdapter,
   opts: {
-    config?: Record<string, unknown>;
+    getConfig?: () => Promise<CoreConfig>;
     routerGate?: (input: RouterGateInput) => Promise<RouterGateDecision>;
     shouldSuppressAdapterEvent?: Parameters<
       typeof startTelegramRequestRouter
     >[0]["shouldSuppressAdapterEvent"];
   } = {},
 ) {
+  const config = routerConfig();
   const deliveries: string[] = [];
   const bus = createLilacBus(
     createInMemoryDeliveryBus((observation) => {
@@ -198,7 +234,7 @@ async function startRouter(
     adapter,
     bus,
     subscriptionId: "telegram-router-test",
-    config: opts.config ?? routerConfig(),
+    getConfig: opts.getConfig ?? (async () => config),
     routerGate: opts.routerGate,
     shouldSuppressAdapterEvent: opts.shouldSuppressAdapterEvent,
   });
@@ -223,13 +259,22 @@ async function publishTelegramMessage(
 }
 
 /** Rejection-only guard; it never delays the successful path. */
-async function waitForPublish(published: Array<Message<unknown>>): Promise<Message<unknown>> {
+async function waitForPublishCount(
+  published: Array<Message<unknown>>,
+  expectedCount: number,
+): Promise<void> {
   const deadline = Date.now() + 5_000;
-  while (published.length === 0) {
+  while (published.length < expectedCount) {
     if (Date.now() > deadline) throw new Error("router published no cmd.request.message");
     await new Promise((resolve) => setImmediate(resolve));
   }
-  return published[0] as Message<unknown>;
+}
+
+async function waitForPublish(published: Array<Message<unknown>>): Promise<Message<unknown>> {
+  await waitForPublishCount(published, 1);
+  const message = published[0];
+  if (!message) throw new Error("router published no cmd.request.message");
+  return message;
 }
 
 describe("the Telegram request router", () => {
@@ -279,6 +324,100 @@ describe("the Telegram request router", () => {
     } finally {
       await router.stop();
     }
+  });
+
+  it("uses last-known-good config after a refresh failure and applies a later recovery", async () => {
+    const firstRaw = telegramRaw({
+      messageId: "20",
+      message: {
+        photo: [{ file_id: "photo-20", file_unique_id: "unique-20", width: 1, height: 1 }],
+      },
+    });
+    const secondRaw = telegramRaw({
+      messageId: "21",
+      message: {
+        photo: [{ file_id: "photo-21", file_unique_id: "unique-21", width: 1, height: 1 }],
+      },
+    });
+    const adapter = new FakeTelegramAdapter({
+      [`${CHAT}:20`]: surfaceMessage({ messageId: "20", text: "first", raw: firstRaw }),
+      [`${CHAT}:21`]: surfaceMessage({ messageId: "21", text: "second", raw: secondRaw }),
+    });
+    const withoutMedia = routerConfig({ inboundMediaEnabled: false });
+    const withMedia = routerConfig({ inboundMediaEnabled: true });
+    const provider = fixedConfigProvider([
+      async () => withoutMedia,
+      async (): Promise<CoreConfig> => {
+        throw new Error("temporary config read failure");
+      },
+      async () => withMedia,
+    ]);
+    const { bus, published, router } = await startRouter(adapter, {
+      getConfig: provider.getConfig,
+    });
+
+    try {
+      await publishTelegramMessage(bus, { messageId: "20", text: "first", raw: firstRaw });
+      await waitForPublish(published);
+      expect(published).toHaveLength(1);
+      expect(adapter.resolvedAttachmentFileIds).toEqual([]);
+
+      await publishTelegramMessage(bus, { messageId: "21", text: "second", raw: secondRaw });
+      await waitForPublishCount(published, 2);
+
+      expect(provider.callCount()).toBe(3);
+      expect(adapter.resolvedAttachmentFileIds).toEqual(["photo-21"]);
+      expect(JSON.stringify(published[1]?.data)).toContain('"type":"file"');
+    } finally {
+      await router.stop();
+    }
+  });
+
+  it("uses the arrival snapshot to choose active-mode debounce", async () => {
+    const raw = telegramRaw({ messageId: "22", isDMBased: false, mentionsBot: false });
+    const adapter = new FakeTelegramAdapter({
+      [`${CHAT}:22`]: surfaceMessage({ messageId: "22", text: "buffer me", raw }),
+    });
+    const provider = fixedConfigProvider([
+      async () => routerConfig({ defaultMode: "mention", activeDebounceMs: 60_000 }),
+      async () => routerConfig({ defaultMode: "active", activeDebounceMs: 60_000 }),
+      async () => routerConfig({ defaultMode: "active", activeDebounceMs: 60_000 }),
+    ]);
+    const { bus, published, router } = await startRouter(adapter, {
+      getConfig: provider.getConfig,
+    });
+
+    await publishTelegramMessage(bus, { messageId: "22", text: "buffer me", raw });
+    expect(provider.callCount()).toBe(2);
+    expect(published).toHaveLength(0);
+
+    await router.stop();
+
+    expect(provider.callCount()).toBe(3);
+    expect(published).toHaveLength(1);
+  });
+
+  it("fetches a fresh snapshot and re-evaluates a debounced event before publishing", async () => {
+    const raw = telegramRaw({ messageId: "23", isDMBased: false, mentionsBot: false });
+    const adapter = new FakeTelegramAdapter({
+      [`${CHAT}:23`]: surfaceMessage({ messageId: "23", text: "policy changed", raw }),
+    });
+    const provider = fixedConfigProvider([
+      async () => routerConfig({ defaultMode: "active", activeDebounceMs: 60_000 }),
+      async () => routerConfig({ defaultMode: "active", activeDebounceMs: 60_000 }),
+      async () => routerConfig({ defaultMode: "mention", activeDebounceMs: 60_000 }),
+    ]);
+    const { bus, published, router } = await startRouter(adapter, {
+      getConfig: provider.getConfig,
+    });
+
+    await publishTelegramMessage(bus, { messageId: "23", text: "policy changed", raw });
+    expect(provider.callCount()).toBe(2);
+
+    await router.stop();
+
+    expect(provider.callCount()).toBe(3);
+    expect(published).toHaveLength(0);
   });
 
   it("flushes active debounce buffers before stopping", async () => {
@@ -473,7 +612,7 @@ describe("the Telegram request router", () => {
       sessionModes: { [CHAT]: { mode: "mention", gate: true } },
     });
     const { bus, published, router } = await startRouter(adapter, {
-      config,
+      getConfig: async () => config,
       routerGate: async (input) => {
         gateInputs.push(input);
         return { forward: false, reason: "addressed-to-peer" };

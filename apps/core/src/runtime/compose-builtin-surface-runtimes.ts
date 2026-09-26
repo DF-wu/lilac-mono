@@ -1,5 +1,7 @@
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
+import type { CoreConfig } from "@stanley2058/lilac-utils";
 
+import type { CustomCommandManager } from "../custom-commands/manager";
 import type { TranscriptStore } from "../transcript/transcript-store";
 import type { SurfaceAdapter, SurfaceAdapterEventSource } from "../surface/adapter";
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
@@ -23,6 +25,7 @@ import {
 } from "../surface/telegram/telegram-runtime-descriptor";
 import type { TelegramRuntimeHealthProvider } from "../surface/telegram/telegram-runtime-health";
 import { createTelegramRuntimeHealthPort } from "../surface/telegram/telegram-runtime-health";
+import { startTelegramRequestRouter } from "../surface/telegram/telegram-request-router";
 import { startGithubWebhookServer } from "../github/webhook/github-webhook-server";
 
 type BuiltinSurfaceRuntimeLogger = {
@@ -40,6 +43,8 @@ export type ComposeBuiltinSurfaceRuntimesInput = {
     readonly adapter: SurfaceAdapter & { stopIngress(): Promise<void> };
     readonly eventSource: SurfaceAdapterEventSource;
     readonly healthProvider: TelegramRuntimeHealthProvider;
+    readonly getConfig: () => Promise<CoreConfig>;
+    readonly customCommands?: CustomCommandManager;
   };
   readonly bus: LilacBus;
   readonly subscriptionPrefix: string;
@@ -139,6 +144,16 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
           createTelegramSurfaceRuntimeDescriptor({
             adapter: input.telegram.adapter,
             health: createTelegramRuntimeHealthPort(input.telegram.healthProvider),
+            requestIngress: {
+              start: async () =>
+                await startTelegramRequestRouter({
+                  adapter: telegram.adapter,
+                  bus: input.bus,
+                  subscriptionId: subscriptionId("telegram-request-router"),
+                  getConfig: telegram.getConfig,
+                  ...(telegram.customCommands ? { customCommands: telegram.customCommands } : {}),
+                }),
+            },
             adapterIngress: {
               start: async () => {
                 const id = subscriptionId("telegram-adapter-to-bus");
@@ -149,7 +164,6 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
                   subscriptionId: id,
                   transcriptStore: input.getTranscriptStore(),
                 });
-                await telegram.adapter.connect();
                 input.logger.debug("Telegram adapter ingress started", { subscriptionId: id });
                 return {
                   platform: "telegram" as const,

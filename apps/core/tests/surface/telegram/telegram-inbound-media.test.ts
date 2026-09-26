@@ -28,6 +28,8 @@ const PNG_BYTES = Uint8Array.from(
   (char) => char.charCodeAt(0),
 );
 
+const UNKNOWN_BINARY_BYTES = Uint8Array.from([0, 0xff, 0xfe, 0xfd]);
+
 type ResolveCall = { ref: SurfaceAttachmentRef; maxBytes: number };
 
 function stubResolver(input: {
@@ -152,6 +154,11 @@ describe("appendTelegramMediaToUserContent", () => {
         type: "file",
         data: Buffer.from(PNG_BYTES).toString("base64"),
         mediaType: "image/png",
+        providerOptions: {
+          lilac: {
+            transient: { version: 1, source: "telegram-inbound-file" },
+          },
+        },
       },
     ]);
     expect(resolver.calls).toEqual([
@@ -159,7 +166,7 @@ describe("appendTelegramMediaToUserContent", () => {
     ]);
   });
 
-  it("delivers a PDF document as a file part with its filename", async () => {
+  it("delivers a sniffed PDF despite hostile declared metadata", async () => {
     const resolver = stubResolver({
       fallback: { kind: "bytes", bytes: PNG_BYTES, mediaType: "application/pdf" },
     });
@@ -171,8 +178,8 @@ describe("appendTelegramMediaToUserContent", () => {
         {
           kind: "document",
           fileId: "d-1",
-          filename: "report.pdf",
-          mimeType: "application/pdf",
+          filename: "photo.jpg",
+          mimeType: "image/jpeg",
         },
       ],
       resolver,
@@ -184,7 +191,12 @@ describe("appendTelegramMediaToUserContent", () => {
         type: "file",
         data: Buffer.from(PNG_BYTES).toString("base64"),
         mediaType: "application/pdf",
-        filename: "report.pdf",
+        filename: "photo.jpg",
+        providerOptions: {
+          lilac: {
+            transient: { version: 1, source: "telegram-inbound-file" },
+          },
+        },
       },
     ]);
   });
@@ -244,8 +256,10 @@ describe("appendTelegramMediaToUserContent", () => {
     );
   });
 
-  it("degrades an unsupported binary document to a marker without resolving", async () => {
-    const resolver = stubResolver({});
+  it("downloads a document before rejecting a sniffed unsupported binary type", async () => {
+    const resolver = stubResolver({
+      fallback: { kind: "bytes", bytes: UNKNOWN_BINARY_BYTES, mediaType: "application/zip" },
+    });
     const parts: Exclude<UserContent, string> = [];
     const ref: TelegramInboundMediaRef = {
       kind: "document",
@@ -261,7 +275,99 @@ describe("appendTelegramMediaToUserContent", () => {
       budget: budget(1024, 4096),
     });
 
-    expect(resolver.calls).toEqual([]);
+    expect(resolver.calls).toEqual([
+      {
+        ref: {
+          platform: "telegram",
+          fileId: "d-3",
+          filename: "backup.zip",
+          mimeType: "application/zip",
+        },
+        maxBytes: 1024,
+      },
+    ]);
+    expect(parts).toEqual([
+      {
+        type: "text",
+        text: `${formatTelegramAttachmentMarker(ref)}\n(unsupported media type; not delivered)`,
+      },
+    ]);
+  });
+
+  it("inlines unknown valid UTF-8 despite hostile declared metadata", async () => {
+    const text = "alpha: 1\nbeta: 2\n";
+    const resolver = stubResolver({
+      fallback: { kind: "bytes", bytes: new TextEncoder().encode(text) },
+    });
+    const parts: Exclude<UserContent, string> = [];
+    const ref: TelegramInboundMediaRef = {
+      kind: "document",
+      fileId: "d-unknown-text",
+      filename: "archive.zip",
+      mimeType: "application/zip",
+    };
+
+    await appendTelegramMediaToUserContent({
+      parts,
+      media: [ref],
+      resolver,
+      budget: budget(1024, 4096),
+    });
+
+    expect(resolver.calls).toHaveLength(1);
+    expect(parts).toEqual([
+      { type: "text", text: `${formatTelegramAttachmentMarker(ref)}\n${text}` },
+    ]);
+  });
+
+  it("does not authorize unknown binary bytes from a declared image MIME type", async () => {
+    const resolver = stubResolver({
+      fallback: { kind: "bytes", bytes: UNKNOWN_BINARY_BYTES },
+    });
+    const parts: Exclude<UserContent, string> = [];
+    const ref: TelegramInboundMediaRef = {
+      kind: "document",
+      fileId: "d-image-spoof",
+      filename: "photo.png",
+      mimeType: "image/png",
+    };
+
+    await appendTelegramMediaToUserContent({
+      parts,
+      media: [ref],
+      resolver,
+      budget: budget(1024, 4096),
+    });
+
+    expect(resolver.calls).toHaveLength(1);
+    expect(parts).toEqual([
+      {
+        type: "text",
+        text: `${formatTelegramAttachmentMarker(ref)}\n(unsupported media type; not delivered)`,
+      },
+    ]);
+  });
+
+  it("does not authorize unknown binary bytes from a declared text MIME type", async () => {
+    const resolver = stubResolver({
+      fallback: { kind: "bytes", bytes: UNKNOWN_BINARY_BYTES },
+    });
+    const parts: Exclude<UserContent, string> = [];
+    const ref: TelegramInboundMediaRef = {
+      kind: "document",
+      fileId: "d-text-spoof",
+      filename: "notes.txt",
+      mimeType: "text/plain",
+    };
+
+    await appendTelegramMediaToUserContent({
+      parts,
+      media: [ref],
+      resolver,
+      budget: budget(1024, 4096),
+    });
+
+    expect(resolver.calls).toHaveLength(1);
     expect(parts).toEqual([
       {
         type: "text",
@@ -360,6 +466,11 @@ describe("appendTelegramMediaToUserContent", () => {
         type: "file",
         data: Buffer.from(PNG_BYTES).toString("base64"),
         mediaType: "image/png",
+        providerOptions: {
+          lilac: {
+            transient: { version: 1, source: "telegram-inbound-file" },
+          },
+        },
       },
       {
         type: "text",

@@ -33,8 +33,6 @@ import type {
   SurfaceAction,
 } from "../types";
 import type { CustomCommandManager } from "../../custom-commands/manager";
-import { inferMimeTypeFromFilename } from "../../shared/attachment-utils";
-
 import type { AdapterEvent } from "../events";
 import {
   SurfaceAttachmentTooLarge,
@@ -768,16 +766,6 @@ export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolve
     const token = resolveTelegramToken(cfg);
     const sanitize = (message: string) => sanitizeTelegramErrorMessage(message, token);
 
-    if (typeof ref.size === "number" && ref.size > opts.maxBytes) {
-      return Result.err(
-        new SurfaceAttachmentTooLarge({
-          platform: "telegram",
-          maxBytes: opts.maxBytes,
-          message: `Telegram attachment declares ${ref.size} bytes; limit is ${opts.maxBytes}`,
-        }),
-      );
-    }
-
     const file = await Result.tryPromise({
       try: () => bot.api.getFile(ref.fileId),
       catch: projectTelegramError("Telegram getFile failed"),
@@ -818,16 +806,6 @@ export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolve
             }),
           );
         }
-        if (typeof fileInfo.file_size === "number" && fileInfo.file_size > opts.maxBytes) {
-          return Result.err(
-            new SurfaceAttachmentTooLarge({
-              platform: "telegram",
-              maxBytes: opts.maxBytes,
-              message: `Telegram file declares ${fileInfo.file_size} bytes; limit is ${opts.maxBytes}`,
-            }),
-          );
-        }
-
         const apiRoot =
           this.opts?.apiRoot ?? cfg.surface.telegram.apiRoot ?? "https://api.telegram.org";
         const downloadUrl = `${apiRoot.replace(/\/+$/u, "")}/file/bot${token}/${filePath}`;
@@ -912,15 +890,11 @@ export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolve
             }
             const bytes = outcome.bytes;
             const sniffed = await fileTypeFromBuffer(bytes);
-            const inferredFromName = ref.filename
-              ? inferMimeTypeFromFilename(ref.filename)
-              : inferMimeTypeFromFilename(filePath.split("/").pop() ?? "");
-            const mediaType =
-              sniffed?.mime ??
-              ref.mimeType ??
-              (inferredFromName !== "application/octet-stream" ? inferredFromName : undefined) ??
-              "application/octet-stream";
-            return Result.ok({ kind: "bytes" as const, bytes, mediaType });
+            return Result.ok({
+              kind: "bytes" as const,
+              bytes,
+              ...(sniffed === undefined ? {} : { mediaType: sniffed.mime }),
+            });
           },
         });
         return await continueDownloaded();

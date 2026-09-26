@@ -65,6 +65,7 @@ describe("telegram development cleanup", () => {
     expect([...prefixes].sort()).toEqual([
       "/tmp/lilac-telegram-e2e-",
       "/tmp/lilac-telegram-it-",
+      "/tmp/lilac-telegram-media-",
       "/tmp/lilac-telegram-menu-",
       "/tmp/lilac-telegram-outbox-",
       "/tmp/lilac-telegram-poll-",

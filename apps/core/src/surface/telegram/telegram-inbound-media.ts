@@ -5,7 +5,7 @@ import { z } from "zod";
 
 import type { Message, PhotoSize } from "grammy/types";
 
-import { inferMimeTypeFromFilename } from "../../shared/attachment-utils";
+import { TELEGRAM_INBOUND_FILE_TRANSIENT_PROVIDER_OPTIONS } from "../../transcript/transcript-persistence-projection";
 import {
   decodeUtf8BestEffort,
   escapeMetadataValue,
@@ -229,15 +229,6 @@ function markerPart(ref: TelegramInboundMediaRef, reason: string): TelegramMedia
   return { type: "text", text: `${formatTelegramAttachmentMarker(ref)}\n(${reason})` };
 }
 
-function declaredOrInferredMimeType(ref: TelegramInboundMediaRef): string | undefined {
-  if (ref.mimeType) return ref.mimeType.split(";")[0]?.trim().toLowerCase() || undefined;
-  if (ref.filename) {
-    const inferred = inferMimeTypeFromFilename(ref.filename);
-    if (inferred !== "application/octet-stream") return inferred;
-  }
-  return undefined;
-}
-
 function isImageMimeType(mimeType: string): boolean {
   return mimeType.startsWith("image/");
 }
@@ -261,17 +252,6 @@ export async function appendTelegramMediaToUserContent(input: {
 }): Promise<void> {
   for (const ref of input.media) {
     if (ref.kind === "video" || ref.kind === "audio" || ref.kind === "voice") {
-      input.parts.push(markerPart(ref, "unsupported media type; not delivered"));
-      continue;
-    }
-
-    const knownMime = ref.kind === "photo" ? "image/jpeg" : declaredOrInferredMimeType(ref);
-    const deliverable =
-      knownMime === undefined ||
-      isImageMimeType(knownMime) ||
-      isPdfMimeType(knownMime) ||
-      isTextExtractableMimeType(knownMime);
-    if (!deliverable) {
       input.parts.push(markerPart(ref, "unsupported media type; not delivered"));
       continue;
     }
@@ -300,23 +280,28 @@ export async function appendTelegramMediaToUserContent(input: {
           : markerPart(ref, "media unavailable; not delivered"),
       ok: (attachment) => {
         input.budget.remainingRequestBytes -= attachment.bytes.byteLength;
+        const mediaType = attachment.mediaType;
 
-        if (isImageMimeType(attachment.mediaType) || isPdfMimeType(attachment.mediaType)) {
+        if (mediaType !== undefined && (isImageMimeType(mediaType) || isPdfMimeType(mediaType))) {
           return {
             type: "file",
-            // Base64 rather than a typed array: it survives every JSON
-            // serialization boundary (bus, cache, transcript) with a
-            // predictable 4/3 expansion instead of SuperJSON's ~4x numeric
-            // encoding, and providers accept it as DataContent unchanged.
+            // Base64 rather than a typed array: it survives the live bus and
+            // cache boundaries with a predictable 4/3 expansion instead of
+            // SuperJSON's ~4x numeric encoding. Persistence projects this
+            // transient part to metadata before writing the transcript.
             data: Buffer.from(attachment.bytes).toString("base64"),
-            mediaType: attachment.mediaType,
+            mediaType,
+            providerOptions: TELEGRAM_INBOUND_FILE_TRANSIENT_PROVIDER_OPTIONS,
             ...(ref.filename === undefined ? {} : { filename: ref.filename }),
           };
         }
 
-        if (isTextExtractableMimeType(attachment.mediaType)) {
+        if (mediaType === undefined || isTextExtractableMimeType(mediaType)) {
           const decoded = decodeUtf8BestEffort(attachment.bytes);
-          if (!decoded.text) {
+          if (decoded.text === undefined) {
+            if (mediaType === undefined) {
+              return markerPart(ref, "unsupported media type; not delivered");
+            }
             return markerPart(
               ref,
               `text extraction failed: ${decoded.reason ?? "unknown"}; not delivered`,

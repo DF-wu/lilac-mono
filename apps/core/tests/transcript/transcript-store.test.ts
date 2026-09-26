@@ -461,6 +461,93 @@ function downgradePrimaryBindingSchemaToV4(dbPath: string, corruptHead = false):
 }
 
 describe("SqliteTranscriptStore", () => {
+  it("projects marked Telegram user files before SQLite persistence", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath);
+    const telegramBase64 = "telegram-secret-base64";
+    const ordinaryBase64 = "ordinary-user-base64";
+    const messageProviderOptions = { lilac: { conversationMetadata: "preserved" } } as const;
+    const messages = [
+      {
+        role: "user",
+        providerOptions: messageProviderOptions,
+        content: [
+          { type: "text", text: "before" },
+          {
+            type: "file",
+            data: telegramBase64,
+            mediaType: "application/pdf",
+            filename: 'quarterly\n"report".pdf',
+            providerOptions: {
+              lilac: {
+                transient: { version: 1, source: "telegram-inbound-file" },
+              },
+            },
+          },
+          { type: "text", text: "after" },
+          {
+            type: "file",
+            data: ordinaryBase64,
+            mediaType: "image/png",
+            filename: "ordinary.png",
+          },
+        ],
+      },
+      { role: "assistant", content: "acknowledged" },
+    ] satisfies ModelMessage[];
+
+    resultValue(
+      store.saveRequestTranscript({
+        requestId: "telegram-file-projection",
+        sessionId: "telegram:chat:1",
+        requestClient: "telegram",
+        messages,
+      }),
+    );
+    expect(JSON.stringify(messages)).toContain(telegramBase64);
+    expect(JSON.stringify(messages)).toContain("telegram-inbound-file");
+
+    const snapshot = getLatestTranscriptBySession(store, {
+      sessionId: "telegram:chat:1",
+    });
+    expect(snapshot?.messages).toEqual([
+      {
+        role: "user",
+        providerOptions: messageProviderOptions,
+        content: [
+          { type: "text", text: "before" },
+          {
+            type: "text",
+            text: '[telegram_attachment filename="quarterly__report_.pdf" mime="application/pdf"]\n(file content omitted from persisted transcript)',
+          },
+          { type: "text", text: "after" },
+          {
+            type: "file",
+            data: ordinaryBase64,
+            mediaType: "image/png",
+            filename: "ordinary.png",
+          },
+        ],
+      },
+      { role: "assistant", content: "acknowledged" },
+    ]);
+
+    const sqlite = new Database(dbPath, { readonly: true });
+    const row = sqlite
+      .query<{ messages_json: string }, [string]>(
+        "SELECT messages_json FROM request_transcripts WHERE request_id = ?",
+      )
+      .get("telegram-file-projection");
+    expect(row?.messages_json).not.toContain(telegramBase64);
+    expect(row?.messages_json).not.toContain("telegram-inbound-file");
+    expect(row?.messages_json).toContain(ordinaryBase64);
+
+    sqlite.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("roundtrips transcripts without mutating tool outputs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
     const dbPath = path.join(dir, "transcripts.db");

@@ -1,6 +1,7 @@
 import { lilacEventTypes, type LilacMessageForTopic } from "@stanley2058/lilac-event-bus";
 import { createLogger } from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Buffer } from "node:buffer";
 
 import {
   AuthenticatedRequestIdentityConflict,
@@ -44,7 +45,7 @@ export function estimateCachedMessageBytes(message: unknown): number {
   while (pending.length > 0) {
     const value = pending.pop();
     if (typeof value === "string") {
-      weight += value.length;
+      weight += Buffer.byteLength(value, "utf8");
     } else if (typeof value === "number" || typeof value === "boolean") {
       weight += 8;
     } else if (value === null || value === undefined) {
@@ -57,7 +58,7 @@ export function estimateCachedMessageBytes(message: unknown): number {
     } else if (typeof value === "object") {
       weight += 2;
       for (const [key, entry] of Object.entries(value)) {
-        weight += key.length + 4;
+        weight += Buffer.byteLength(key, "utf8") + 4;
         pending.push(entry);
       }
     } else {
@@ -67,6 +68,13 @@ export function estimateCachedMessageBytes(message: unknown): number {
 
   if (memoizable) messageWeightCache.set(message, weight);
   return weight;
+}
+
+export function estimateCachedMessagesBytes(messages: readonly unknown[]): number {
+  return messages.reduce<number>(
+    (total, message) => total + estimateCachedMessageBytes(message),
+    0,
+  );
 }
 
 export function projectCachedRequestMessageLineage(
@@ -82,13 +90,12 @@ export function projectCachedRequestMessageLineage(
 
   let total = 0;
   // Walk newest-first so the byte clamp drops the oldest messages, mirroring
-  // the count clamp. The newest message is always retained even when it alone
-  // exceeds the budget: an empty lineage would break follow-up composition
-  // outright, which is worse than one oversized entry.
+  // the count clamp. Admission validates incoming lineage before this projection,
+  // so an oversized newest message is not retained speculatively.
   let firstKept = clamped.length;
   for (let index = clamped.length - 1; index >= 0; index -= 1) {
     const weight = estimateCachedMessageBytes(clamped[index]);
-    if (index < clamped.length - 1 && total + weight > maxBytes) break;
+    if (total + weight > maxBytes) break;
     total += weight;
     firstKept = index;
   }
@@ -99,6 +106,32 @@ export class RequestMessageCacheRequestIdMissing extends TaggedError(
   "RequestMessageCacheRequestIdMissing",
 )<{
   readonly messageType: string;
+  readonly message: string;
+}> {}
+
+export class RequestMessageCacheRequestTooLarge extends TaggedError(
+  "RequestMessageCacheRequestTooLarge",
+)<{
+  readonly requestId: string;
+  readonly estimatedBytes: number;
+  readonly maxBytesPerRequest: number;
+  readonly message: string;
+}> {}
+
+export class RequestMessageCacheCapacityExceeded extends TaggedError(
+  "RequestMessageCacheCapacityExceeded",
+)<{
+  readonly requestId: string;
+  readonly estimatedTotalBytes: number;
+  readonly maxTotalBytes: number;
+  readonly message: string;
+}> {}
+
+export class RequestMessageCacheConfigurationInvalid extends TaggedError(
+  "RequestMessageCacheConfigurationInvalid",
+)<{
+  readonly maxBytesPerRequest: number;
+  readonly maxTotalBytes: number;
   readonly message: string;
 }> {}
 
@@ -116,12 +149,15 @@ export class RequestIdentityAliasTargetOccupied extends TaggedError(
 
 export type RequestMessageCacheAdmissionError =
   | RequestMessageCacheRequestIdMissing
+  | RequestMessageCacheRequestTooLarge
+  | RequestMessageCacheCapacityExceeded
   | AuthenticatedRequestProjectionInvalid
   | AuthenticatedRequestIdentityConflict;
 
 export type RequestMessageCacheOwnerError =
   | RequestIdentitySourceMissing
   | RequestIdentityAliasTargetOccupied
+  | RequestMessageCacheCapacityExceeded
   | AuthenticatedRequestProjectionInvalid;
 
 export type RequestMessageCacheOwner = {
@@ -136,6 +172,7 @@ export type RequestMessageCacheAliasOwner = RequestMessageCacheOwner & {
 
 type CacheEntry = {
   messages: readonly unknown[];
+  estimatedBytes: number;
   projection: AuthenticatedRequestProjection;
   readonly intakeEventIds: Set<string>;
   readonly parkedEventIds: Set<string>;
@@ -149,6 +186,8 @@ export type RequestMessageCacheOptions = {
   readonly maxEntries?: number;
   /** Byte-weighted clamp for one request's retained lineage. */
   readonly maxBytesPerRequest?: number;
+  /** Hard byte bound across all retained request and alias lineages. */
+  readonly maxTotalBytes?: number;
   readonly now?: () => number;
 };
 
@@ -202,16 +241,32 @@ export function createRequestMessageCache(
   const {
     ttlMs = 30 * 60 * 1000,
     maxEntries = 256,
-    // Bounds worst-case retention at maxEntries * maxBytesPerRequest (~8 GiB
-    // with defaults) only if every request actually carries the full media
-    // budget; the ingestion caps upstream make that the pathological case,
-    // not the normal one.
     maxBytesPerRequest = 32 * 1024 * 1024,
+    maxTotalBytes = 128 * 1024 * 1024,
     now = Date.now,
   } = options;
+  if (
+    !Number.isFinite(maxBytesPerRequest) ||
+    maxBytesPerRequest < 0 ||
+    !Number.isFinite(maxTotalBytes) ||
+    maxTotalBytes < 0 ||
+    maxBytesPerRequest > maxTotalBytes
+  ) {
+    throw new RequestMessageCacheConfigurationInvalid({
+      maxBytesPerRequest,
+      maxTotalBytes,
+      message: "request message cache byte limits must be finite, non-negative, and ordered",
+    });
+  }
   const maxMessagesPerRequest = 512;
   const logger = createLogger({ module: "tool-server:request-message-cache" });
   const entries = new Map<string, CacheEntry>();
+
+  function estimateEntriesBytes(target: ReadonlyMap<string, CacheEntry>): number {
+    let total = 0;
+    for (const entry of target.values()) total += entry.estimatedBytes;
+    return total;
+  }
 
   function isRetained(entry: CacheEntry): boolean {
     return entry.owners.size > 0 || entry.intakeEventIds.size > 0 || entry.parkedEventIds.size > 0;
@@ -221,47 +276,108 @@ export function createRequestMessageCache(
     if (!isRetained(entry)) entries.delete(requestId);
   }
 
-  function pruneExpired(at = now()): void {
-    for (const [requestId, entry] of entries) {
+  function pruneExpiredMap(
+    target: Map<string, CacheEntry>,
+    at: number,
+  ): readonly { readonly requestId: string; readonly expiresAt: number }[] {
+    const expired: { readonly requestId: string; readonly expiresAt: number }[] = [];
+    for (const [requestId, entry] of target) {
       if (entry.expiresAt > at || isRetained(entry)) continue;
-      entries.delete(requestId);
+      target.delete(requestId);
+      expired.push({ requestId, expiresAt: entry.expiresAt });
+    }
+    return expired;
+  }
+
+  function logExpired(
+    expired: readonly { readonly requestId: string; readonly expiresAt: number }[],
+  ): void {
+    for (const entry of expired) {
       logger.debug("request_message_cache.expired", {
-        requestId,
+        requestId: entry.requestId,
         expiresAt: entry.expiresAt,
       });
     }
   }
 
-  function pruneMapToCapacity(target: Map<string, CacheEntry>): string[] {
+  function pruneExpired(at = now()): void {
+    logExpired(pruneExpiredMap(entries, at));
+  }
+
+  function findOldestEvictable(
+    target: ReadonlyMap<string, CacheEntry>,
+    protectedRequestIds: ReadonlySet<string>,
+  ): readonly [string, CacheEntry] | undefined {
+    let oldest: readonly [string, CacheEntry] | undefined;
+    let oldestUpdatedAt = Infinity;
+    for (const [requestId, entry] of target) {
+      if (
+        protectedRequestIds.has(requestId) ||
+        isRetained(entry) ||
+        entry.updatedAt >= oldestUpdatedAt
+      ) {
+        continue;
+      }
+      oldestUpdatedAt = entry.updatedAt;
+      oldest = [requestId, entry];
+    }
+    return oldest;
+  }
+
+  function pruneMapToEntryCapacity(
+    target: Map<string, CacheEntry>,
+    protectedRequestIds: ReadonlySet<string> = new Set(),
+  ): string[] {
     const evicted: string[] = [];
     while (target.size > maxEntries) {
-      let oldestKey: string | undefined;
-      let oldestUpdatedAt = Infinity;
-      for (const [requestId, entry] of target) {
-        if (isRetained(entry) || entry.updatedAt >= oldestUpdatedAt) continue;
-        oldestUpdatedAt = entry.updatedAt;
-        oldestKey = requestId;
-      }
-      if (!oldestKey) break;
-      target.delete(oldestKey);
-      evicted.push(oldestKey);
+      const oldest = findOldestEvictable(target, protectedRequestIds);
+      if (!oldest) break;
+      target.delete(oldest[0]);
+      evicted.push(oldest[0]);
     }
     return evicted;
   }
 
-  function logCapacityEvictions(evicted: readonly string[], sizeAfter: number): void {
+  function planAggregateCapacity(input: {
+    readonly target: Map<string, CacheEntry>;
+    readonly protectedRequestIds: ReadonlySet<string>;
+    readonly requestId: string;
+  }): ResultType<readonly string[], RequestMessageCacheCapacityExceeded> {
+    const evicted: string[] = [];
+    let estimatedTotalBytes = estimateEntriesBytes(input.target);
+    while (estimatedTotalBytes > maxTotalBytes) {
+      const oldest = findOldestEvictable(input.target, input.protectedRequestIds);
+      if (!oldest) {
+        return Result.err(
+          new RequestMessageCacheCapacityExceeded({
+            requestId: input.requestId,
+            estimatedTotalBytes,
+            maxTotalBytes,
+            message: "request message cache aggregate byte capacity is retained",
+          }),
+        );
+      }
+      input.target.delete(oldest[0]);
+      estimatedTotalBytes -= oldest[1].estimatedBytes;
+      evicted.push(oldest[0]);
+    }
+    return Result.ok(evicted);
+  }
+
+  function logCapacityEvictions(
+    evicted: readonly string[],
+    sizeAfter: number,
+    reason: "max_entries" | "max_total_bytes",
+  ): void {
     for (const requestId of evicted) {
       logger.info("request_message_cache.evicted", {
         requestId,
-        reason: "max_entries",
+        reason,
         maxEntries,
+        maxTotalBytes,
         sizeAfter,
       });
     }
-  }
-
-  function pruneMax(): void {
-    logCapacityEvictions(pruneMapToCapacity(entries), entries.size);
   }
 
   function cacheMessage(
@@ -296,85 +412,122 @@ export function createRequestMessageCache(
     const projected = trustedProjection
       ? Result.ok(trustedProjection)
       : projectAuthenticatedRequest(msg);
-    const continueProjected = projected.match<
-      () => ResultType<AuthenticatedRequestOrigin | undefined, RequestMessageCacheAdmissionError>
-    >({
-      err: (error) => () => Result.err(error),
-      ok: (projection) => () => {
-        if (!projection) return Result.ok(undefined);
+    const projectionError = projected.match({ err: (error) => error, ok: () => null });
+    if (projectionError) return Result.err(projectionError);
+    const projection = projected.match({ err: () => undefined, ok: (value) => value });
+    if (!projection) return Result.ok(undefined);
 
-        pruneExpired();
-        const at = now();
-        const existing = entries.get(requestId);
-        if (existing) {
-          const updateExisting = (
-            nextProjection: AuthenticatedRequestProjection,
-          ): ResultType<
-            AuthenticatedRequestOrigin | undefined,
-            RequestMessageCacheAdmissionError
-          > => {
-            existing.projection = nextProjection;
-            const alreadyPending =
-              existing.intakeEventIds.has(msg.id) || existing.parkedEventIds.has(msg.id);
-            existing.intakeEventIds.add(msg.id);
-            if (!alreadyPending) {
-              existing.messages = projectCachedRequestMessageLineage(
-                existing.messages,
-                msg.data.messages,
-                maxMessagesPerRequest,
-                maxBytesPerRequest,
-              );
-            }
-            existing.expiresAt = at + ttlMs;
-            existing.updatedAt = at;
-            return Result.ok(existing.projection);
-          };
-          const trustedDelegatedUpgrade =
-            trustedProjection?.source === "internal-delegated" &&
-            existing.projection.source === "external" &&
-            existing.projection.requestId === trustedProjection.requestId &&
-            existing.projection.requestClient === "unknown" &&
-            existing.projection.requestClient === trustedProjection.requestClient &&
-            existing.projection.sessionId === trustedProjection.sessionId;
-          if (trustedDelegatedUpgrade) return updateExisting(trustedProjection);
-          const latched = latchAuthenticatedRequest(existing.projection, projection, msg.type);
-          const continueLatched = latched.match<
-            () => ResultType<
-              AuthenticatedRequestOrigin | undefined,
-              RequestMessageCacheAdmissionError
-            >
-          >({
-            err: (error) => () => Result.err(error),
-            ok: (nextProjection) => () => updateExisting(nextProjection),
-          });
-          return continueLatched();
+    const at = now();
+    const staged = cloneEntries(entries);
+    const expired = pruneExpiredMap(staged, at);
+    const existing = staged.get(requestId);
+    let nextProjection = projection;
+    let nextMessages: readonly unknown[];
+    let intakeEventIds: Set<string>;
+    let parkedEventIds: Set<string>;
+    let owners: Set<string>;
+    if (existing) {
+      const trustedDelegatedUpgrade =
+        trustedProjection?.source === "internal-delegated" &&
+        existing.projection.source === "external" &&
+        existing.projection.requestId === trustedProjection.requestId &&
+        existing.projection.requestClient === "unknown" &&
+        existing.projection.requestClient === trustedProjection.requestClient &&
+        existing.projection.sessionId === trustedProjection.sessionId;
+      if (trustedDelegatedUpgrade) {
+        nextProjection = trustedProjection;
+      } else {
+        const latched = latchAuthenticatedRequest(existing.projection, projection, msg.type);
+        const latchError = latched.match({ err: (error) => error, ok: () => null });
+        if (latchError) return Result.err(latchError);
+        nextProjection = latched.match({
+          err: () => existing.projection,
+          ok: (value) => value,
+        });
+      }
+      intakeEventIds = new Set(existing.intakeEventIds);
+      parkedEventIds = new Set(existing.parkedEventIds);
+      owners = new Set(existing.owners);
+      const alreadyPending = intakeEventIds.has(msg.id) || parkedEventIds.has(msg.id);
+      if (alreadyPending) {
+        nextMessages = existing.messages;
+      } else {
+        const incomingBytes = estimateCachedMessagesBytes(msg.data.messages);
+        if (incomingBytes > maxBytesPerRequest) {
+          return Result.err(
+            new RequestMessageCacheRequestTooLarge({
+              requestId,
+              estimatedBytes: incomingBytes,
+              maxBytesPerRequest,
+              message: "request message lineage exceeds the per-request byte limit",
+            }),
+          );
         }
-
-        const entry: CacheEntry = {
-          messages: projectCachedRequestMessageLineage(
-            msg.data.messages,
-            [],
-            maxMessagesPerRequest,
+        nextMessages = projectCachedRequestMessageLineage(
+          existing.messages,
+          msg.data.messages,
+          maxMessagesPerRequest,
+          maxBytesPerRequest,
+        );
+      }
+      intakeEventIds.add(msg.id);
+    } else {
+      const incomingBytes = estimateCachedMessagesBytes(msg.data.messages);
+      if (incomingBytes > maxBytesPerRequest) {
+        return Result.err(
+          new RequestMessageCacheRequestTooLarge({
+            requestId,
+            estimatedBytes: incomingBytes,
             maxBytesPerRequest,
-          ),
-          projection,
-          intakeEventIds: new Set([msg.id]),
-          parkedEventIds: new Set(),
-          owners: new Set(),
-          expiresAt: at + ttlMs,
-          updatedAt: at,
-        };
-        entries.set(requestId, entry);
-        pruneMax();
-        return Result.ok(entry.projection);
-      },
+            message: "request message lineage exceeds the per-request byte limit",
+          }),
+        );
+      }
+      nextMessages = projectCachedRequestMessageLineage(
+        [],
+        msg.data.messages,
+        maxMessagesPerRequest,
+        maxBytesPerRequest,
+      );
+      intakeEventIds = new Set([msg.id]);
+      parkedEventIds = new Set();
+      owners = new Set();
+    }
+    staged.set(requestId, {
+      messages: nextMessages,
+      estimatedBytes: estimateCachedMessagesBytes(nextMessages),
+      projection: nextProjection,
+      intakeEventIds,
+      parkedEventIds,
+      owners,
+      expiresAt: at + ttlMs,
+      updatedAt: at,
     });
-    return continueProjected();
+    const protectedRequestIds = new Set([requestId]);
+    const entryEvictions = pruneMapToEntryCapacity(staged, protectedRequestIds);
+    const aggregatePlan = planAggregateCapacity({
+      target: staged,
+      protectedRequestIds,
+      requestId,
+    });
+    const aggregateError = aggregatePlan.match({ err: (error) => error, ok: () => null });
+    if (aggregateError) return Result.err(aggregateError);
+    const aggregateEvictions = aggregatePlan.match<readonly string[]>({
+      err: () => [],
+      ok: (evicted) => evicted,
+    });
+
+    replaceEntries(staged);
+    logExpired(expired);
+    logCapacityEvictions(entryEvictions, entries.size, "max_entries");
+    logCapacityEvictions(aggregateEvictions, entries.size, "max_total_bytes");
+    return Result.ok(nextProjection);
   }
 
   function cloneCacheEntry(entry: CacheEntry): CacheEntry {
     return {
       messages: entry.messages,
+      estimatedBytes: entry.estimatedBytes,
       projection: entry.projection,
       intakeEventIds: new Set(entry.intakeEventIds),
       parkedEventIds: new Set(entry.parkedEventIds),
@@ -505,6 +658,7 @@ export function createRequestMessageCache(
               }
               staged.set(requestId, {
                 messages: [],
+                estimatedBytes: 0,
                 projection: record.projection,
                 intakeEventIds: new Set(),
                 parkedEventIds: new Set(record.parkedEventIds),
@@ -520,11 +674,11 @@ export function createRequestMessageCache(
             >({
               err: (error) => () => Result.err(error),
               ok: () => () => {
-                const evicted = pruneMapToCapacity(staged);
+                const evicted = pruneMapToEntryCapacity(staged);
                 before = cloneEntries(entries);
                 replaceEntries(staged);
                 applied = true;
-                logCapacityEvictions(evicted, entries.size);
+                logCapacityEvictions(evicted, entries.size, "max_entries");
                 return Result.ok(undefined);
               },
             });
@@ -661,8 +815,11 @@ export function createRequestMessageCache(
         );
       }
       const ownerId = crypto.randomUUID();
-      entries.set(input.aliasRequestId, {
-        messages: projectCachedRequestMessageLineage(source.messages),
+      const aliasMessages = projectCachedRequestMessageLineage(source.messages);
+      const staged = cloneEntries(entries);
+      staged.set(input.aliasRequestId, {
+        messages: aliasMessages,
+        estimatedBytes: estimateCachedMessagesBytes(aliasMessages),
         projection,
         intakeEventIds: new Set(),
         parkedEventIds: new Set(),
@@ -670,6 +827,22 @@ export function createRequestMessageCache(
         expiresAt: source.expiresAt,
         updatedAt: source.updatedAt,
       });
+      const protectedRequestIds = new Set([input.sourceRequestId, input.aliasRequestId]);
+      const entryEvictions = pruneMapToEntryCapacity(staged, protectedRequestIds);
+      const aggregatePlan = planAggregateCapacity({
+        target: staged,
+        protectedRequestIds,
+        requestId: input.aliasRequestId,
+      });
+      const aggregateError = aggregatePlan.match({ err: (error) => error, ok: () => null });
+      if (aggregateError) return Result.err(aggregateError);
+      const aggregateEvictions = aggregatePlan.match<readonly string[]>({
+        err: () => [],
+        ok: (evicted) => evicted,
+      });
+      replaceEntries(staged);
+      logCapacityEvictions(entryEvictions, entries.size, "max_entries");
+      logCapacityEvictions(aggregateEvictions, entries.size, "max_total_bytes");
       return Result.ok({
         requestId: input.aliasRequestId,
         ownerId,
