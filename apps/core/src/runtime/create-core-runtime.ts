@@ -17,7 +17,6 @@ import {
   formatTaggedErrorForLog,
   getCoreConfig,
   getOpenObserveDiagnostics,
-  isTelegramSurfaceUsable,
   isPanic,
   readCoreConfigVersionResult,
   resolveDiscordDbPath,
@@ -52,9 +51,13 @@ import {
 import { DiscordAdapter } from "../surface/discord/discord-adapter";
 import { createDiscordResourceOriginAdapter } from "../surface/discord/discord-resource-origin";
 import { GithubAdapter } from "../surface/github/github-adapter";
-import { TelegramAdapter } from "../surface/telegram/telegram-adapter";
-import { isTelegramChatAllowed } from "../surface/telegram/telegram-guards";
-import { tryParseTelegramSessionId } from "../surface/telegram/telegram-ids";
+import type { TelegramAdapter } from "../surface/telegram/telegram-adapter";
+import {
+  createTelegramWorkflowTargetAuthorizer,
+  refreshTelegramCoreConfig,
+  resolveTelegramAdapterForStartup,
+  telegramSurfaceRuntimeInput,
+} from "../surface/telegram/telegram-surface-runtime";
 import { createDiscordRuntimeHealthPort } from "../surface/discord/discord-runtime-health";
 import { createDescriptorBoundSurfaceEventSource } from "../surface/produced-ref-guard";
 import {
@@ -2791,14 +2794,7 @@ export async function createCoreRuntime(
         coreConfigValidationHadError = false;
         lastCoreConfigValidationError = null;
         if (discordEnabled) await adapter.refreshCoreConfig();
-        const telegramRefresh = await telegramAdapter?.refreshCoreConfig();
-        if (telegramRefresh && telegramRefresh.restartRequiredFor.length > 0) {
-          logger.warn("telegram config change requires a core restart", {
-            configKeys: telegramRefresh.restartRequiredFor.map(
-              (field) => `surface.telegram.${field}`,
-            ),
-          });
-        }
+        await refreshTelegramCoreConfig(telegramAdapter, logger);
         await toolServer?.reload();
         conversationThreadMaterializer?.markAllDirty();
       },
@@ -2932,18 +2928,11 @@ export async function createCoreRuntime(
             };
           }
           const startupConfig = initialCoreConfig;
-          if (isTelegramSurfaceUsable(startupConfig)) {
-            telegramAdapter ??= new TelegramAdapter({
-              customCommands,
-              ...(startupConfig.surface.telegram.apiRoot
-                ? { apiRoot: startupConfig.surface.telegram.apiRoot }
-                : {}),
-            });
-          } else if (startupConfig.surface.telegram.enabled) {
-            logger.warn("telegram surface enabled but no token available; skipping", {
-              configKey: "surface.telegram.token",
-            });
-          }
+          telegramAdapter ??= resolveTelegramAdapterForStartup({
+            config: startupConfig,
+            customCommands,
+            logger,
+          });
           const activeDurableWorkflowStore = durableWorkflowStore;
           const activeTranscriptStore = transcriptStore;
           const activeDiscordSearchStore = discordSearchStore;
@@ -3211,16 +3200,11 @@ export async function createCoreRuntime(
             discordHealth: createDiscordRuntimeHealthPort(adapter),
             ...(telegramAdapter
               ? {
-                  telegram: {
+                  telegram: telegramSurfaceRuntimeInput({
                     adapter: telegramAdapter,
-                    eventSource: createDescriptorBoundSurfaceEventSource(
-                      "telegram",
-                      telegramAdapter,
-                    ),
-                    healthProvider: telegramAdapter,
                     customCommands,
                     getWorkflowStore: () => activeDurableWorkflowStore,
-                  },
+                  }),
                 }
               : {}),
             bus: durableBus,
@@ -3563,12 +3547,7 @@ export async function createCoreRuntime(
             store: activeDurableWorkflowStore,
             ports: workflowProgressPorts,
             subscriptionId: subId(subscriptionPrefix, "workflow-progress"),
-            isTargetAuthorized: async (target) => {
-              if (target.platform !== "telegram") return true;
-              const parsed = tryParseTelegramSessionId(target.channelId);
-              if (!parsed) return false;
-              return isTelegramChatAllowed({ cfg: await getCoreConfig(), chatId: parsed.chatId });
-            },
+            isTargetAuthorized: createTelegramWorkflowTargetAuthorizer(getCoreConfig),
             reportFatalPanic: reportFatalError,
           });
           await workflowProgressProjector.start();
