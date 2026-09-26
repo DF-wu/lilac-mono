@@ -52,6 +52,30 @@ jobs:
       - name: Run CI script
         run: bun run ci
 
+  fork-footprint:
+    name: Upstream footprint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Fetch upstream main
+        run: |
+          git remote add upstream https://github.com/stanley2058/lilac-mono.git
+          git fetch --no-tags upstream main
+
+      - name: Check modified upstream files against the allowlist
+        run: bun run fork:footprint
+
   docker-image:
     name: Docker image smoke (${{ matrix.variant.name }})
     runs-on: ubuntu-latest
