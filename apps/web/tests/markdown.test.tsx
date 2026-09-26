@@ -75,6 +75,12 @@ describe("markdown", () => {
       expect(rendered).not.toContain("$x");
     }
   });
+
+  test("closes emphasis after CJK punctuation followed by CJK text", () => {
+    const html = renderToStaticMarkup(<MarkdownContent text="**查核限制：**我讀到的" />);
+    expect(html).toBe("<p><strong>查核限制：</strong>我讀到的</p>");
+  });
+
   test("renders GFM and keeps embedded HTML and unsafe links inert", () => {
     const html = renderToStaticMarkup(
       <MarkdownContent
