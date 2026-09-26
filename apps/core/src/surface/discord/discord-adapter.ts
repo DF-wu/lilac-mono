@@ -4194,6 +4194,12 @@ export class DiscordAdapter implements SurfaceAdapter {
       return;
     }
 
+    // Updates feed search indexing without admitting bot output to the request router.
+    if (msg.author.bot && isDiscordChatLikeMessage(msg)) {
+      await this.onMessageUpdate(msg);
+      return;
+    }
+
     if (shouldEmitAdapterEvent) {
       beginDiscordMessageLatencyTrace({
         requestId: formatDiscordMessageRequestId({ channelId, messageId: msg.id }),
@@ -4319,7 +4325,6 @@ export class DiscordAdapter implements SurfaceAdapter {
       parentChannelId,
     });
 
-    // Trigger metadata for bus router is only needed when we emit an adapter event.
     if (!shouldEmitAdapterEvent) return;
 
     const botId = client.user?.id;

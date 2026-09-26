@@ -41,6 +41,11 @@ import type { AdapterEvent } from "../../../src/surface/events";
 import type { ContentOpts } from "../../../src/surface/types";
 import { toBusDiscordCommandInvokedData } from "../../../src/surface/discord/discord-command-projection";
 import { DiscordSurfaceStore } from "../../../src/surface/store/discord-surface-store";
+import {
+  DiscordSearchService,
+  DiscordSearchStore,
+} from "../../../src/surface/store/discord-search-store";
+import { startDiscordSearchIndexer } from "../../../src/surface/bridge/discord-search-indexer";
 import { composeRequestMessages } from "../../../src/surface/bridge/request-composition";
 import type { CustomCommandManager } from "../../../src/custom-commands/manager";
 import { buildDiscordActionCustomIdResult } from "../../../src/surface/discord/discord-actions";
@@ -142,6 +147,76 @@ function makeMessage(input: { bot: boolean; system: boolean; type: MessageType }
     type: input.type,
   } as unknown as Message;
 }
+
+describe("Discord bot output indexing", () => {
+  it.each([false, true])("indexes a new bot reply without routing it, embed=%s", async (embed) => {
+    const store = new DiscordSurfaceStore(":memory:");
+    const searchStore = new DiscordSearchStore(":memory:");
+    const adapter = createTestDiscordAdapter();
+    const cfg = testConfigWithStatusMessage();
+    const state = adapter as unknown as {
+      onMessageCreate(message: Message): Promise<void>;
+    };
+    Object.assign(adapter, {
+      cfg,
+      store,
+      client: { user: { id: "bot" } },
+      reloadCoreConfigIfNeeded: async () => {},
+    });
+    const events: AdapterEvent[] = [];
+    await adapter.subscribe((event) => {
+      events.push(event);
+    });
+    const dirties: Array<{ channelId: string; kind: string }> = [];
+    const indexed = Promise.withResolvers<void>();
+    const indexer = await startDiscordSearchIndexer({
+      eventSource: adapter,
+      search: new DiscordSearchService({ adapter, store: searchStore }),
+      getConfig: async () => cfg,
+      materializer: {
+        markDirty(input) {
+          dirties.push(input);
+          indexed.resolve();
+        },
+      },
+    });
+    const message = {
+      id: "reply",
+      channelId: "c1",
+      guildId: "g1",
+      channel: { name: "general", isThread: () => false, isDMBased: () => false },
+      author: { id: "bot", bot: true, username: "lilac" },
+      system: false,
+      type: MessageType.Reply,
+      content: embed ? "" : "Answer",
+      embeds: embed ? [{ description: "Answer", fields: [] }] : [],
+      attachments: new Collection(),
+      mentions: { users: new Collection(), roles: new Collection(), channels: new Collection() },
+      reference: { channelId: "c1", messageId: "question", type: 0 },
+      createdTimestamp: 1,
+    } as unknown as Message;
+    try {
+      await state.onMessageCreate({ ...message, channelId: "forbidden" } as Message);
+      expect(events).toEqual([]);
+      await state.onMessageCreate(message);
+      expect(events.map((event) => event.type)).toEqual(["adapter.message.updated"]);
+      await indexed.promise;
+      expect(searchStore.getIndexedMessage({ channelId: "c1", messageId: "reply" })).toMatchObject({
+        text: "Answer",
+        userId: "bot",
+        deleted: false,
+      });
+      expect(store.getMessageRelation("c1", "reply")).toMatchObject({
+        reply_to_message_id: "question",
+      });
+      expect(dirties).toEqual([{ channelId: "c1", kind: "topology" }]);
+    } finally {
+      await indexer.stop();
+      searchStore.close();
+      store.close();
+    }
+  });
+});
 
 const EMPTY_DISCORD_CONTENT_CASES: ContentOpts[] = [
   {},
