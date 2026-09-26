@@ -6,6 +6,7 @@ import { githubAlerts, MarkdownBlockquote } from "./markdown-alerts";
 import { createContext, useContext, lazy, memo, Suspense, type ComponentProps } from "react";
 import ReactMarkdown, { type Components, type ExtraProps } from "react-markdown";
 import remarkCjkFriendly from "remark-cjk-friendly/parseOnly";
+import remarkCjkFriendlyGfmStrikethrough from "remark-cjk-friendly-gfm-strikethrough/parseOnly";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { remarkChatMath } from "./remark-chat-math";
@@ -20,7 +21,13 @@ import { userMessageLineBreaks } from "./composer-line-breaks";
 const HighlightedCode = lazy(() => import("./rich-code"));
 const Diagram = lazy(() => import("./rich-diagram"));
 const MathExpression = lazy(() => import("./rich-math"));
-const plugins = [remarkGfm, remarkCjkFriendly, remarkMath, remarkChatMath];
+const plugins = [
+  remarkGfm,
+  remarkCjkFriendly,
+  remarkCjkFriendlyGfmStrikethrough,
+  remarkMath,
+  remarkChatMath,
+];
 const userPlugins = [...plugins, userMessageLineBreaks];
 const rehypePlugins = [githubAlerts];
 

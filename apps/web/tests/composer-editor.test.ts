@@ -74,6 +74,19 @@ it("round trips basic rich Markdown through draft text", () => {
   expect(editor.children.at(-1)).toMatchObject({ type: KEYS.codeBlock, lang: "ts" });
 });
 
+it("round trips CJK emphasis that closes after full-width punctuation", () => {
+  const markdown = "**注意：**粗體 ~~刪除：~~文字";
+  const editor = createComposerEditor(markdown);
+  expect(editor.children[0]?.children).toMatchObject([
+    { text: "注意：", bold: true },
+    { text: "粗體 " },
+    { text: "刪除：", strikethrough: true },
+    { text: "文字" },
+  ]);
+  expect(composerSubmissionMarkdown(editor)).toBe(markdown);
+  expect(restoreMessageAttachments(markdown, new Map())).toBe(markdown);
+});
+
 it("inserts a completion at the selected rich-text range without flattening marks or suffixes", () => {
   const editor = createComposerEditor("**Keep** $Rev later");
   editor.tf.select({ path: [0, 1], offset: 5 });

@@ -76,9 +76,12 @@ describe("markdown", () => {
     }
   });
 
-  test("closes emphasis after CJK punctuation followed by CJK text", () => {
+  test("closes emphasis and strikethrough after CJK punctuation followed by CJK text", () => {
     const html = renderToStaticMarkup(<MarkdownContent text="**查核限制：**我讀到的" />);
     expect(html).toBe("<p><strong>查核限制：</strong>我讀到的</p>");
+    expect(renderToStaticMarkup(<MarkdownContent text="~~刪除：~~文字" />)).toBe(
+      "<p><del>刪除：</del>文字</p>",
+    );
   });
 
   test("renders GFM and keeps embedded HTML and unsafe links inert", () => {
