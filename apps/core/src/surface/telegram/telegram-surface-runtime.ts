@@ -1,8 +1,15 @@
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
-import { isTelegramSurfaceUsable, type CoreConfig } from "@stanley2058/lilac-utils";
+import {
+  isTelegramSurfaceUsable,
+  resolveTelegramDbPath,
+  type CoreConfig,
+} from "@stanley2058/lilac-utils";
+import { Result, type Result as ResultType } from "better-result";
 
+import { ConversationThreadOperationFailed } from "../../conversation/thread-service";
 import type { CustomCommandManager } from "../../custom-commands/manager";
+import { toReplyChainMessage } from "../bridge/request-composition/reply-chain";
 import type { TranscriptStore } from "../../transcript/transcript-store";
 import type { DurableWorkflowStore } from "../../workflow/durable-workflow-store";
 import type { WorkflowProgressTarget } from "../../workflow/workflow-domain";
@@ -106,6 +113,85 @@ export async function refreshTelegramCoreConfig(
   if (!refresh || refresh.restartRequiredFor.length === 0) return;
   logger.warn("telegram config change requires a core restart", {
     configKeys: refresh.restartRequiredFor.map((field) => `surface.telegram.${field}`),
+  });
+}
+
+export type TelegramConversationMemoryInput = {
+  /** The Telegram history index the conversation thread store attaches as a source. */
+  readonly dbPath: string;
+  /** Author name reported for the bot's own messages in that index. */
+  readonly botName: string;
+};
+
+/**
+ * Conversation memory only sees Telegram history when the surface is running:
+ * the adapter owns `telegram-surface.db`, so without it there is nothing to
+ * attach and the store keeps its empty placeholder views.
+ */
+export function telegramConversationMemoryInput(input: {
+  readonly adapter: TelegramAdapter | null;
+  readonly config: CoreConfig;
+}): TelegramConversationMemoryInput | undefined {
+  if (!input.adapter) return undefined;
+  return {
+    dbPath: resolveTelegramDbPath(input.config),
+    botName: input.config.surface.telegram.botName,
+  };
+}
+
+/**
+ * Attachment hydration for Telegram conversation summaries. The history index
+ * projects attachment metadata only; bytes are never fetched here, so a
+ * hydrated Telegram message carries whatever the adapter's `readMsg` reports
+ * (currently nothing) and the summarizer sees metadata text instead.
+ */
+export async function hydrateTelegramConversationAttachments(input: {
+  readonly adapter: TelegramAdapter | null;
+  readonly ref: { readonly channelId: string; readonly messageId: string };
+}): Promise<
+  ResultType<
+    {
+      ref: { surface: "telegram"; channelId: string; messageId: string };
+      attachments: ReturnType<typeof toReplyChainMessage>["attachments"];
+    },
+    ConversationThreadOperationFailed
+  >
+> {
+  const ref = { surface: "telegram" as const, ...input.ref };
+  if (!input.adapter) {
+    return Result.err(
+      new ConversationThreadOperationFailed({
+        operation: "summarize-thread",
+        message: "Telegram conversation storage is unavailable",
+      }),
+    );
+  }
+  const read = await input.adapter.readMsg({ platform: "telegram", ...input.ref });
+  return read.match<
+    ResultType<
+      {
+        ref: { surface: "telegram"; channelId: string; messageId: string };
+        attachments: ReturnType<typeof toReplyChainMessage>["attachments"];
+      },
+      ConversationThreadOperationFailed
+    >
+  >({
+    err: (error) =>
+      Result.err(
+        new ConversationThreadOperationFailed({
+          operation: "summarize-thread",
+          message: error.message,
+        }),
+      ),
+    ok: (message) =>
+      message
+        ? Result.ok({ ref, attachments: toReplyChainMessage(message).attachments })
+        : Result.err(
+            new ConversationThreadOperationFailed({
+              operation: "summarize-thread",
+              message: `Surface message not found: ${input.ref.messageId}`,
+            }),
+          ),
   });
 }
 

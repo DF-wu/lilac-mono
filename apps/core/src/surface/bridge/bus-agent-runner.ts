@@ -157,6 +157,7 @@ import {
   type ConversationThreadSearchResult,
   type ConversationThreadToolService,
 } from "../../conversation/thread-service";
+import type { ConversationSurface } from "../../conversation/thread-store";
 import {
   rankAutoInjectedThreadSearchResults,
   type RankedAutoInjectThread,
@@ -1044,7 +1045,7 @@ const AUTO_INJECTED_THREAD_BRIEF_FULL_THRESHOLD = Math.floor(
 
 export type AutoInjectedThreadSearchPayload = {
   entries: Array<{
-    surface: "discord" | "native";
+    surface: ConversationSurface;
     threadId: string;
     title: string;
     brief?: string;
@@ -1200,8 +1201,18 @@ function formatInjectedThreadTimeRange(input: { start: string; end: string }): s
   return `${start} - ${end}`;
 }
 
+/**
+ * Surface label for conversation recall. Only surfaces with an indexed history
+ * are named; everything else searches as Discord, the un-prefixed default.
+ */
+export function conversationSurfaceOfRequestClient(client: AdapterPlatform): ConversationSurface {
+  if (client === "native") return "native";
+  if (client === "telegram") return "telegram";
+  return "discord";
+}
+
 export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
-  surface?: "discord" | "native";
+  surface?: ConversationSurface;
   cfg: CoreConfig;
   conversationThreads?: ConversationThreadToolService;
   requestId: string;
@@ -7764,7 +7775,7 @@ export async function startBusAgentRunner(params: {
               !control.requiresActive
                 ? await waitForPreAgent(
                     maybeBuildAutoInjectedThreadSearchMessages({
-                      surface: next.requestClient === "native" ? "native" : "discord",
+                      surface: conversationSurfaceOfRequestClient(next.requestClient),
                       cfg,
                       conversationThreads:
                         next.requestClient === "native"

@@ -17,9 +17,9 @@ import { preserveToolPanic } from "../../tools/tool-result-adapters";
 
 const searchInputSchema = z.object({
   surface: z
-    .enum(["discord", "native"])
+    .enum(["discord", "native", "telegram"])
     .optional()
-    .describe("Limit results to one surface. Defaults to both Discord and native."),
+    .describe("Limit results to one surface. Defaults to Discord, native, and Telegram."),
   query: z
     .union([z.string().min(1), z.array(z.string().min(1)).min(1).max(10)])
     .describe(
@@ -245,7 +245,7 @@ export class ConversationThread implements ServerTool {
         [CONVERSATION_THREAD_CALLABLE_IDS.search]: callable({
           name: "Conversation Thread Search",
           description:
-            "Search summarized Discord and native conversation threads. Every result identifies its source surface. Returns compact threadId, title, and brief by default; use verbose for metadata/diagnostics or conversation.thread.read to expand a result. Multi-query combines variants of one intent into one merged ranking.",
+            "Search summarized Discord, native, and Telegram conversation threads. Every result identifies its source surface. Returns compact threadId, title, and brief by default; use verbose for metadata/diagnostics or conversation.thread.read to expand a result. Multi-query combines variants of one intent into one merged ranking.",
           inputSchema: searchInputSchema,
           primaryPositional: { field: "query", variadic: true },
           run: async (input, opts) => {

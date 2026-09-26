@@ -3733,3 +3733,54 @@ describe("Discord projection parity", () => {
     });
   }
 });
+
+describe("recent agent writes from Telegram", () => {
+  it("hides writes whose chat left the Telegram allowlist", async () => {
+    const cfg = testConfig({
+      surface: {
+        discord: {
+          tokenEnv: "DISCORD_TOKEN",
+          allowedChannelIds: ["c1"],
+          allowedGuildIds: [],
+          botName: "lilac",
+        },
+      },
+    });
+    cfg.surface.telegram.allowedChatIds = ["-100123"];
+
+    const tmp = await fs.mkdtemp(join(tmpdir(), "lilac-surface-transcript-"));
+    const transcriptStore = new SqliteTranscriptStore(join(tmp, "transcripts.sqlite"));
+
+    try {
+      for (const [requestId, channelId] of [
+        ["telegram:-100123:1", "-100123"],
+        ["telegram:-100999:1", "-100999"],
+        ["telegram:-100123:7:2", "-100123:7"],
+      ] as const) {
+        transcriptStore.saveRequestTranscript({
+          requestId,
+          sessionId: channelId,
+          requestClient: "telegram",
+          messages: [],
+          finalText: `write in ${channelId}`,
+        });
+        transcriptStore.linkSurfaceMessagesToRequest({
+          requestId,
+          created: [{ platform: "telegram", channelId, messageId: "9" }],
+          last: { platform: "telegram", channelId, messageId: "9" },
+        });
+      }
+
+      const tool = new Surface({ adapter: new FakeAdapter([], {}), config: cfg, transcriptStore });
+      const out = (await tool.call("surface.activities.recentAgentWrites", {
+        limit: 5,
+      })) as Array<{ sessionId: string; client: string; preview: string }>;
+
+      expect(out.map((row) => row.sessionId).sort()).toEqual(["-100123", "-100123:7"]);
+      expect(out.every((row) => row.client === "telegram")).toBe(true);
+      expect(out.find((row) => row.sessionId === "-100123")?.preview).toBe("write in -100123");
+    } finally {
+      transcriptStore.close();
+    }
+  });
+});

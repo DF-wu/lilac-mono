@@ -6,8 +6,10 @@ import { CustomCommandManager } from "../../../src/custom-commands/manager";
 import { TelegramAdapter } from "../../../src/surface/telegram/telegram-adapter";
 import {
   createTelegramWorkflowTargetAuthorizer,
+  hydrateTelegramConversationAttachments,
   refreshTelegramCoreConfig,
   resolveTelegramAdapterForStartup,
+  telegramConversationMemoryInput,
 } from "../../../src/surface/telegram/telegram-surface-runtime";
 
 function testConfig(telegram: Record<string, unknown> = {}): CoreConfig {
@@ -107,5 +109,35 @@ describe("createTelegramWorkflowTargetAuthorizer", () => {
     await expect(
       authorize({ platform: "telegram", channelId: "not-a-chat", replyToMessageId: null }),
     ).resolves.toBe(false);
+  });
+});
+
+describe("telegram conversation memory helpers", () => {
+  it("attaches the history index only when the adapter exists", () => {
+    const config = testConfig({
+      enabled: true,
+      token: "test-token",
+      botName: "memorybot",
+      dbPath: "/tmp/lilac-telegram-memory.db",
+    });
+    expect(telegramConversationMemoryInput({ adapter: null, config })).toBeUndefined();
+    const adapter = new TelegramAdapter({
+      customCommands: new CustomCommandManager("/nonexistent"),
+    });
+    expect(telegramConversationMemoryInput({ adapter, config })).toEqual({
+      dbPath: "/tmp/lilac-telegram-memory.db",
+      botName: "memorybot",
+    });
+  });
+
+  it("reports unavailable storage instead of hydrating without an adapter", async () => {
+    const result = await hydrateTelegramConversationAttachments({
+      adapter: null,
+      ref: { channelId: "-100123", messageId: "5" },
+    });
+    expect(result.isErr()).toBe(true);
+    expect(result.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "Telegram conversation storage is unavailable",
+    );
   });
 });

@@ -3932,6 +3932,17 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               identity: { module: "src/surface/native/conversation-source.ts", exportName },
               category: "projection" as const,
             })),
+            ...[
+              "decodeTelegramThreadProjection",
+              "decodeTelegramMessageProjection",
+              "decodeTelegramAttachmentProjection",
+            ].map((exportName) => ({
+              identity: {
+                module: "src/surface/telegram/telegram-conversation-source.ts",
+                exportName,
+              },
+              category: "projection" as const,
+            })),
             ...["decodeSearchRows", "decodeSearchCount"].map((exportName) => ({
               identity: { module: "src/surface/native/store-search.ts", exportName },
               category: "projection" as const,
@@ -4660,6 +4671,17 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "readNativeConversationAttachments",
             ].map((exportName) => ({
               module: "src/surface/native/conversation-source.ts",
+              exportName,
+            })),
+            ...[
+              "decodeTelegramThreadProjection",
+              "decodeTelegramMessageProjection",
+              "decodeTelegramAttachmentProjection",
+              "readTelegramConversationThreads",
+              "readTelegramConversationMessages",
+              "readTelegramConversationAttachments",
+            ].map((exportName) => ({
+              module: "src/surface/telegram/telegram-conversation-source.ts",
               exportName,
             })),
             { module: "src/surface/native/gateway.ts", exportName: "validateNativeFrame" },

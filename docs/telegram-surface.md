@@ -383,6 +383,37 @@ commands are logged.
 
 ---
 
+### Conversation memory
+
+Telegram history joins the shared conversation memory in `apps/core/src/conversation`
+the same way native history does. When the surface is running, Core attaches
+`telegram-surface.db` to the conversation thread store as a source
+(`apps/core/src/surface/telegram/telegram-conversation-source.ts`), and the
+summarization worker receives the same path.
+
+- **What is indexed.** Every session is one thread: a DM, a group chat, or one
+  forum topic, with the thread id `telegram:<session id>`. There is no
+  segmentation of a long chat into several threads yet; a busy group is one
+  thread whose summary is rebuilt as it grows. Deleted messages leave the
+  projection immediately, and any edit or deletion changes the thread revision
+  so the next summarization pass rebuilds it from current text.
+- **Allowlist gating.** Search, read, metadata, and automatic recall admit a
+  Telegram thread only when its chat id is in the live `allowedChatIds`; a
+  topic follows its chat. The list fails closed, so an empty allowlist hides
+  every Telegram thread even though the index still exists.
+- **Attachments are metadata only.** Photos, documents, video, audio, voice,
+  and animations appear as `file_id`, name, MIME type, and size; bytes are never
+  fetched for summaries, so the summarizer sees a `[telegram_attachment …]`
+  marker instead of the media.
+- **No run-in-progress signal.** The Bot API cannot say whether the bot is
+  mid-reply, so summarization relies on the quiet period alone. The bot's own
+  messages are recognized by `from_bot` and reported under
+  `surface.telegram.botName`.
+- **Recall from Telegram requests** searches Telegram threads by the sender's
+  Telegram user id plus every native thread, mirroring Discord. Lilac
+  reference links (`/?ref=telegram:...`) are not produced yet; `t.me/c/...`
+  links are decoded through `surface.help`.
+
 ## 8. Verifying a change
 
 Automated coverage does not touch `api.telegram.org`. A Telegram bot cannot send
@@ -492,8 +523,12 @@ Discord has, stated precisely so nobody has to infer it from silence.
 ### Not implemented
 
 - **Webhook ingress.** Long polling only.
-- **A Telegram-side conversation search index.** Discord has a dedicated search
-  store; Telegram relies on the shared transcript store.
+- **Thread segmentation in conversation memory.** Telegram chats are indexed
+  as one thread per session (see §7, _Conversation memory_); Discord channels
+  are split into inferred threads.
+- **Lilac reference links for Telegram.** `/?ref=telegram:...` links are not
+  generated or parsed; Telegram `t.me/c/...` URLs are handled through
+  `surface.help` instead.
 - **Inline queries and business accounts.**
 - **Voice/video note transcription.**
 

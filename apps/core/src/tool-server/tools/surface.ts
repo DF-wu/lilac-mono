@@ -1221,6 +1221,7 @@ export class Surface implements ServerTool {
             `Lilac reference links use ${new URL(cfg.surface.native.publicUrl).origin}/?ref=<surface>:<sessionId>&message=<messageId>; relative /?ref= links use this installation.`,
             "Decode query parameters once, split ref at the first colon, and pass the prefix as client, the remainder as sessionId, and optional message as messageId. Supported prefixes: native, discord, github. Keep the remaining sessionId intact.",
             "For Discord message URLs, use client=discord, the channel ID as sessionId, and the final message ID as messageId.",
+            "For Telegram links, use client=telegram: https://t.me/c/<internal>/<messageId> means sessionId=-100<internal>; https://t.me/c/<internal>/<topicId>/<messageId> means sessionId=-100<internal>:<topicId>. Public https://t.me/<username>/... links cannot be resolved because the history index stores chat ids, not usernames.",
             "Use surface.messages.read for an anchored message, then surface.messages.list with beforeMessageId or afterMessageId for nearby context. For a thread-only link, start with surface.messages.list. Always pass the target client explicitly.",
             "Native surface tools require native request authority. From Discord or GitHub, read retained native history with conversation.thread.read using threadId=native:<threadId>; page with offset and limit to locate the referenced messageId. This requires conversation indexing and retained history.",
             "Parsed references are coordinates, not retrieved content or authorization. Report unavailable tools, denied access, missing threads, or missing messages as retrieval failures; only claim to have read content returned by retrieval.",
@@ -1479,6 +1480,15 @@ export class Surface implements ServerTool {
             ).match({ ok: (value) => value, err: () => null });
             if (!message) continue;
             nativeText = message.text;
+          }
+          if (row.client === "telegram") {
+            const telegramSession = tryParseTelegramSessionId(row.sessionId);
+            if (
+              !telegramSession ||
+              !isTelegramChatAllowed({ cfg, chatId: telegramSession.chatId })
+            ) {
+              continue;
+            }
           }
           if (row.client === "discord") {
             const discord = this.params.adapterResolver.resolve("discord");

@@ -61,6 +61,16 @@ apps/core/src/runtime/create-core-runtime.ts  # constructs and registers the Tel
 apps/core/src/runtime/compose-builtin-surface-runtimes.ts  # includes the Telegram runtime descriptor entry
 apps/core/package.json  # grammY dependency
 
+# --- Conversation memory: Telegram as a third source (projection lives in surface/telegram/telegram-conversation-source.ts)
+apps/core/src/conversation/thread-store.ts  # telegram source branch, telegram_thread kind, chat allowlist clause
+apps/core/src/conversation/thread-service.ts  # telegram surface labels and chat allowlist checks
+apps/core/src/conversation/thread-summarization-worker-protocol.ts  # telegram surface enum and source path fields
+apps/core/src/conversation/thread-summarization-worker.ts  # opens the telegram source and bot name in the worker
+apps/core/src/conversation/thread-worker.ts  # forwards the telegram source and hydrates telegram refs
+apps/core/src/surface/bridge/bus-agent-runner.ts  # labels telegram requests for conversation recall
+apps/core/src/tool-server/tools/conversation-thread.ts  # telegram in the surface filter enum
+packages/utils/prompt-templates/TOOLS.md  # mentions Telegram t.me links for conversation tools
+
 # --- Workflow engine: Telegram targets and delivery revalidation
 apps/core/src/workflow/durable-workflow-store.ts  # Telegram target revalidation
 apps/core/src/workflow/workflow-domain.ts  # Telegram workflow targets
