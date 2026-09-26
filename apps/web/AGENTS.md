@@ -52,3 +52,5 @@ Keep the web app responsive and preserve existing interaction performance.
   final response.
 - When interaction feel, animation, or delay matters to the change, leave the dev server running and
   include a working link to the affected screen in the final response so the user can test it directly.
+- Frontend work is complete after the required interaction checks and handoff. If the backend is unavailable,
+  inspect the existing browser fixture and development instructions before declaring verification blocked.

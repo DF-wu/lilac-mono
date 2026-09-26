@@ -6,7 +6,7 @@ These rules apply to all tasks. Use the linked documents for detailed rules and 
 
 - Implement only the behavior that the user requests or an approved plan defines. Use the smallest
   solution that meets the requirements.
-- Do not change an approved plan or its active checklist during implementation.
+- Preserve the approved scope and acceptance criteria. Update completion status and evidence as work progresses.
 - Do not add cleanup, future features, protection for possible problems, or unrelated fixes. Record
   such work as residual work, but do not implement it.
 - Follow product decisions and non-goals. Do not follow conflicting reviewer suggestions.
@@ -14,6 +14,8 @@ These rules apply to all tasks. Use the linked documents for detailed rules and 
   violates an acceptance criterion or fails a required check.
 - Ask the user before you add a new contract, dependency, configuration option, or subsystem. Also ask
   before you add stored data, a queue, a journal, a worker, or a recovery process.
+- An explicit request or approved plan authorizes the changes it specifies. Ask only for decisions beyond
+  that authorization.
 - Stop and ask if a fix needs a new product decision or increases the approved scope.
 
 ## Compatibility And Safety
