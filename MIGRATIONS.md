@@ -35,6 +35,21 @@ Native RPC replaces `config.readStreaming` / `config.setStreaming` with `config.
 with an additional record kind; older builds cannot manage this record. Keep a pre-upgrade database
 backup if a rollback is needed.
 
+## Conversation reference ranges and previews
+
+Reference links accept `range=<startMessageId>..<endMessageId>` instead of `message`. Endpoints are
+inclusive and may use native web display IDs, including retained external messages without a unique
+platform ID. The `references.range` RPC resolves a message anchor to its complete discussion endpoints
+without sending unloaded transcript pages to the browser. Update Core and web together for this RPC
+and the optional `range` reference field. Existing links
+and stored Markdown remain valid; no database migration or backfill is required.
+
+Native input expansion now injects visible text and attachment metadata under the starter's authority.
+Previews share a 12,000-character budget, prefer recent messages, and place omission warnings before
+the excerpt. Message links preview the selected message; session and range links page backward.
+Range endpoints fix the selection, not the contents: subsequent reads reflect retained edits and
+report unavailable or reversed endpoints. Reference previews do not retrieve attachment bytes.
+
 ## Conversation references
 
 Native web adds `references.resolve` and `references.read`, and display-message metadata accepts an
@@ -182,6 +197,8 @@ threads enter Active in creation order, newest first, and inactive threads settl
 read. The default threshold is three days. Pinned threads and running conversations do not auto-settle.
 New conversation activity re-enqueues settled threads at the top of Active; activity does not reorder
 an already active thread. Renaming and changing access do not count as conversation activity.
+Moving a thread into another section restarts its inactivity threshold; reordering within a section
+does not.
 
 The v1 RPC contract adds `sidebar.preferences`, `sidebar.configure`, `sidebar.list`, and `sidebar.move`.
 These operations always use the authenticated user and require read access to each affected thread.
