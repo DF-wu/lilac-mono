@@ -10,6 +10,7 @@ import {
   ArchiveRestore,
   Trash2,
 } from "lucide-react";
+import { cn } from "cn";
 import { Button } from "./ui/button";
 import {
   DropdownMenu,
@@ -17,6 +18,20 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from "./ui/dropdown-menu";
+
+const EDGE_INSET = 16;
+// Matches translate-x-7, the distance the resting touch target is tucked toward the edge.
+const TUCK_OFFSET = 28;
+
+function visibleViewport() {
+  const viewport = window.visualViewport;
+  return {
+    left: viewport?.offsetLeft ?? 0,
+    top: viewport?.offsetTop ?? 0,
+    width: viewport?.width ?? window.innerWidth,
+    height: viewport?.height ?? window.innerHeight,
+  };
+}
 
 export function FloatingChatMenu({
   sidebarOpen,
@@ -40,6 +55,9 @@ export function FloatingChatMenu({
   onDelete?: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [pressed, setPressed] = useState(false);
+  const [snapping, setSnapping] = useState(false);
+  const [side, setSide] = useState<"left" | "right">("right");
   const [position, setPosition] = useState<{ x: number; y: number }>();
   const anchor = useRef<HTMLDivElement>(null);
   const drag = useRef<
@@ -54,27 +72,53 @@ export function FloatingChatMenu({
     | undefined
   >(undefined);
   const suppressClick = useRef(false);
+  const expanded = open || pressed;
 
   function move(x: number, y: number) {
     const bounds = anchor.current?.getBoundingClientRect();
     if (!bounds) return;
-    const viewport = window.visualViewport;
-    const left = viewport?.offsetLeft ?? 0;
-    const top = viewport?.offsetTop ?? 0;
+    const view = visibleViewport();
     setPosition({
-      x: Math.max(left, Math.min(x, left + (viewport?.width ?? window.innerWidth) - bounds.width)),
-      y: Math.max(top, Math.min(y, top + (viewport?.height ?? window.innerHeight) - bounds.height)),
+      x: Math.max(view.left, Math.min(x, view.left + view.width - bounds.width)),
+      y: Math.max(view.top, Math.min(y, view.top + view.height - bounds.height)),
     });
+  }
+
+  function dock(next: "left" | "right", y: number) {
+    const bounds = anchor.current?.getBoundingClientRect();
+    if (!bounds) return;
+    const view = visibleViewport();
+    setSide(next);
+    move(
+      next === "left" ? view.left + EDGE_INSET : view.left + view.width - bounds.width - EDGE_INSET,
+      y,
+    );
+  }
+
+  function release() {
+    const current = drag.current;
+    drag.current = undefined;
+    setPressed(false);
+    const bounds = anchor.current?.getBoundingClientRect();
+    if (!current?.moved || !bounds) return;
+    const view = visibleViewport();
+    setSnapping(true);
+    dock(
+      bounds.left + bounds.width / 2 < view.left + view.width / 2 ? "left" : "right",
+      bounds.top,
+    );
   }
 
   useLayoutEffect(() => {
     const resize = () => {
+      // Only a drag release animates; viewport changes must track without lag.
+      setSnapping(false);
       const bounds = anchor.current?.getBoundingClientRect();
       if (!bounds?.width) {
         setOpen(false);
         return;
       }
-      move(bounds.left, bounds.top);
+      dock(side, bounds.top);
     };
     window.addEventListener("resize", resize);
     window.visualViewport?.addEventListener("resize", resize);
@@ -84,13 +128,16 @@ export function FloatingChatMenu({
       window.visualViewport?.removeEventListener("resize", resize);
       window.visualViewport?.removeEventListener("scroll", resize);
     };
-  }, []);
+  }, [side]);
 
   return createPortal(
     <div
       ref={anchor}
       data-floating-chat-menu
-      className="fixed right-4 top-1/2 z-40 workspace:hidden"
+      className={cn(
+        "pointer-events-none fixed right-4 top-1/2 z-40 workspace:hidden",
+        snapping && !pressed && "transition-[left]",
+      )}
       style={
         position ? { left: position.x, top: position.y, right: "auto", bottom: "auto" } : undefined
       }
@@ -99,9 +146,15 @@ export function FloatingChatMenu({
         <DropdownMenuTrigger
           render={
             <Button
-              variant="default"
+              variant="ghost"
               size="icon"
-              className="size-11 rounded-full shadow-md ring-1 ring-foreground/20 touch-none"
+              data-expanded={expanded || undefined}
+              className={cn(
+                // The touch target stays still and mostly off-screen; only the visual expands
+                // inward, so a press near the edge cannot slide the target out from under it.
+                "pointer-events-auto size-11 rounded-full touch-none hover:bg-transparent aria-expanded:bg-transparent focus-visible:border-transparent focus-visible:ring-0",
+                side === "left" ? "-translate-x-7" : "translate-x-7",
+              )}
             />
           }
           aria-label="Conversation menu"
@@ -120,6 +173,7 @@ export function FloatingChatMenu({
               top: bounds.top,
               moved: false,
             };
+            setPressed(true);
             event.currentTarget.setPointerCapture(event.pointerId);
           }}
           onPointerMove={(event) => {
@@ -133,27 +187,34 @@ export function FloatingChatMenu({
             setOpen(false);
             move(current.left + dx, current.top + dy);
           }}
-          onPointerUp={() => {
-            drag.current = undefined;
-          }}
+          onPointerUp={release}
           onPointerCancel={() => {
-            drag.current = undefined;
             suppressClick.current = true;
+            release();
           }}
-          onLostPointerCapture={() => {
-            drag.current = undefined;
-          }}
+          onLostPointerCapture={release}
           onClick={(event) => {
             event.preventDefault();
             if (suppressClick.current && event.detail !== 0) return;
             setOpen((value) => !value);
           }}
         >
-          <Menu />
+          <span
+            className={cn(
+              "flex size-3 shrink-0 items-center justify-center overflow-hidden rounded-full bg-primary/60 text-primary-foreground ring-1 ring-foreground/20 transition-all group-focus-visible/button:size-11 group-focus-visible/button:bg-primary group-focus-visible/button:ring-3 group-focus-visible/button:ring-ring/50 group-data-expanded/button:size-11 group-data-expanded/button:bg-primary group-data-expanded/button:shadow-md",
+              side === "left"
+                ? "group-focus-visible/button:translate-x-7 group-data-expanded/button:translate-x-7"
+                : "group-focus-visible/button:-translate-x-7 group-data-expanded/button:-translate-x-7",
+            )}
+          >
+            <Menu className="opacity-0 transition-opacity group-focus-visible/button:opacity-100 group-data-expanded/button:opacity-100" />
+          </span>
         </DropdownMenuTrigger>
         <DropdownMenuContent
-          side="top"
-          align="end"
+          side="bottom"
+          align={side === "left" ? "start" : "end"}
+          alignOffset={TUCK_OFFSET}
+          finalFocus={(type) => type === "keyboard"}
           className="min-w-52 [&_[role=menuitem]]:min-h-11"
         >
           <DropdownMenuItem onClick={onToggleSidebar}>
