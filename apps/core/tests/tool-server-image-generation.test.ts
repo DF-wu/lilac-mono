@@ -6,8 +6,11 @@ import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  buildImageGenerationPrompt,
   buildVideoGenerationPrompt,
+  videoGenerateInputSchema,
+} from "../src/tool-server/tools/generate";
+import {
+  buildImageGenerationPrompt,
   DEFAULT_IMAGE_MODEL_FALLBACK_ORDER,
   gptAspectRatioToSize,
   imageGenerateInputSchema,
@@ -15,8 +18,7 @@ import {
   resolveImageEditInputs,
   resolveImageDimensions,
   validateImageGenerationInputForModel,
-  videoGenerateInputSchema,
-} from "../src/tool-server/tools/generate";
+} from "../src/tool-server/tools/generate-image";
 import { resolveRestrictedSessionTmpDir } from "../src/shared/attachment-utils";
 
 const ONE_BY_ONE_PNG_BASE64 =

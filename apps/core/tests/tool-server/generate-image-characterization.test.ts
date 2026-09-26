@@ -4,7 +4,10 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { buildImageGenerationPrompt, Generate } from "../../src/tool-server/tools/generate";
+// generate-image is imported before generate on purpose: it proves the module
+// cycle between the two loads in this order too.
+import { buildImageGenerationPrompt } from "../../src/tool-server/tools/generate-image";
+import { Generate } from "../../src/tool-server/tools/generate";
 
 const PNG_BYTES = Uint8Array.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
