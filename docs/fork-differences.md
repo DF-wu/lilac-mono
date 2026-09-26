@@ -4,7 +4,7 @@ Language: [`English (primary / canonical)`](./fork-differences.md) · [`Traditio
 
 This document describes the current differences between [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) and [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono).
 
-The comparison baseline is the merge base with upstream `main` as of 2026-09-26: this fork includes upstream commit [`e8d6d09b`](https://github.com/stanley2058/lilac-mono/commit/e8d6d09ba112c36a163107fa0c9ac743f61d7a41) and retains the following feature and operational changes on top of it.
+The comparison baseline is the merge base with upstream `main` as of 2026-09-26 (fork PR [#68](https://github.com/DF-wu/lilac-mono/pull/68)): this fork includes upstream commit [`7f818a2e`](https://github.com/stanley2058/lilac-mono/commit/7f818a2e) and retains the following feature and operational changes on top of it.
 
 > [!IMPORTANT]
 > This is a maintenance document, not a permanent compatibility commitment. After an upstream sync, differences that have been accepted upstream or no longer exist must be removed from this table or reclassified.
@@ -30,11 +30,13 @@ Telegram is currently the largest fork-only product delta. The main implemented 
 - Mention/active routing, streamed edits, HTML rendering, and 4096-character chunking.
 - Reply context, cancellation, typing indicators, reactions, custom commands, and menu aliases.
 - Inbound photos/documents, outbound attachments, workflow progress/actions, `waitForReply`, and allowlist-bound surface tools.
+- Conversation memory: Telegram chats are indexed, summarized, searched, and auto-recalled through the shared cross-surface thread store, gated by `allowedChatIds` (see [`telegram-surface.md`](./telegram-surface.md#conversation-memory)).
 
 Items that remain unimplemented or are constrained by the platform:
 
 - Only long polling is supported; there is no webhook ingress.
-- There is no Telegram-native conversation search index, inline query support, business account support, or voice/video transcription.
+- Conversation memory indexes one thread per chat or topic (no segmentation of long chats), has no run-in-progress signal, and projects attachments as metadata only; Lilac `/?ref=telegram:` references are not recognized yet.
+- There is no inline query support, business account support, or voice/video transcription.
 - Message history includes only content the bot actually observed or sent, not Telegram's complete pre-existing history.
 
 See [`telegram-surface.md`](./telegram-surface.md#10-what-works-and-what-does-not) for the precise feature matrix and platform differences.
@@ -103,7 +105,7 @@ Rules:
 - No `backup/`, `dep/`, `pr/`, or `review-*` branches. A pre-rebase safety point is a tag or a stash, and a branch that was opened as a pull request against upstream is deleted once upstream accepts or declines it.
 - Delete a branch as soon as its PR merges; `git branch --merged origin/main` and `git cherry origin/main <branch>` decide whether anything unmerged remains.
 - Worktrees follow the same rule: one per active branch, removed with the branch.
-- Cleanup on 2026-09-26 archived 21 branches as `archive/*` tags and deleted 78 local and remote branches.
+- Cleanup on 2026-09-26 archived 22 branches (one of them an uncommitted worktree) as `archive/*` tags and deleted 79 local and remote branches; only `main` remained.
 
 ## Upstream Sync Policy
 

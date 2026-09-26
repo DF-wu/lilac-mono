@@ -35,11 +35,11 @@ Lilac 把平台訊息、路由、模型執行、工具、Skills 與可恢復工�
 
 | 領域 | 本 fork 提供的差異 | 重要限制 |
 | --- | --- | --- |
-| Telegram surface | DMs、群組、forum topics、串流 HTML 回覆、取消、reaction、command menu、inbound/outbound attachments、workflow cards 與同 surface tools | 預設停用；僅 long polling |
+| Telegram surface | DMs、群組、forum topics、串流 HTML 回覆、取消、reaction、command menu、inbound/outbound attachments、workflow cards、同 surface tools，以及納入跨 surface 對話記憶的 Telegram 歷史 | 預設停用；僅 long polling；記憶以每個聊天或 topic 為一個 thread |
 | OpenAI-compatible 圖像路由 | 將既有 `generate.image` aliases 統一路由到 operator 指定的 OpenAI-compatible endpoint | 僅 `configVersion: 2`；無自動 fallback 或自訂 alias mapping |
 | GitHub 回覆 UX | `In reply to` 可直接連到 issue/PR body 或指定 comment 的 canonical permalink | GitHub comment self-loop 防護已被上游接收，不再列為 fork-only |
 | Custom media plugin | 可部署的 Level 2 image/video plugin 範例，示範嚴格設定與檔案安全處理 | Plugin 是 trusted in-process code；restricted caller 目前不能使用 external callables |
-| 維運與交付 | 每 6 小時檢查 upstream，並發布經驗證的 GHCR `catalina`/`claudia` tags | 自動合併發生衝突時仍需人工處理 |
+| 維運與交付 | 每 6 小時檢查 upstream、發布經驗證的 GHCR `catalina`/`claudia` tags，CI 並強制執行 upstream-footprint allowlist | 自動合併發生衝突時仍需人工處理 |
 
 ## 架構概覽
 

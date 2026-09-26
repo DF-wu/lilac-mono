@@ -48,11 +48,11 @@ The table below lists only behavior that still differs from upstream. For the fu
 
 | Area                            | Difference provided by this fork                                                                                                                       | Important limitations                                                                             |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| Telegram surface                | DMs, groups, forum topics, streaming HTML replies, cancellation, reactions, command menu, inbound/outbound attachments, workflow cards, and same-surface tools | Disabled by default; long polling only                                                    |
+| Telegram surface                | DMs, groups, forum topics, streaming HTML replies, cancellation, reactions, command menu, inbound/outbound attachments, workflow cards, same-surface tools, and Telegram history in cross-surface conversation memory | Disabled by default; long polling only; memory indexes one thread per chat or topic |
 | OpenAI-compatible image routing | Routes the existing `generate.image` aliases through a single operator-specified OpenAI-compatible endpoint                                            | `configVersion: 2` only; no automatic fallback or custom alias mapping                            |
 | GitHub reply UX                 | `In reply to` can link directly to an issue/PR body or a specified comment's canonical permalink                                                       | GitHub comment self-loop protection has been accepted upstream and is no longer fork-only         |
 | Custom media plugin             | Deployable Level 2 image/video plugin example demonstrating strict configuration and file-safety handling                                              | The plugin is trusted in-process code; restricted callers currently cannot use external callables |
-| Operations and delivery         | Upstream checks every 6 hours and GHCR publishes verified `catalina`/`claudia` tags                                                                    | Automatic merges still require manual handling when conflicts occur                               |
+| Operations and delivery         | Upstream checks every 6 hours, GHCR publishes verified `catalina`/`claudia` tags, and CI enforces the upstream-footprint allowlist                     | Automatic merges still require manual handling when conflicts occur                               |
 
 ## Architecture Overview
 
