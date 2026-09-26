@@ -118,7 +118,9 @@ New v2 fields:
   `web_search` tool with `OPENAI_API_KEY` (and `OPENAI_BASE_URL` when set) and returns the answer's URL
   citations followed by uncited retrieved sources. It is search-only; `web.extract` skips it and uses the
   next configured provider. `tools.web.openai.model` (default `gpt-5-mini`) and
-  `tools.web.openai.searchContextSize` (`low` | `medium` | `high`, default `medium`) tune the call.
+  `tools.web.openai.searchContextSize` (`low` | `medium` | `high`, default `medium`) tune the call;
+  set `model` to one your endpoint serves when `OPENAI_BASE_URL` points at a gateway. Cited URLs lose
+  the `utm_source=openai` tag and snippets are the answer paragraph each citation supports.
   Frozen v1 configs cannot select this provider.
 - `models.capability.overrides.<provider/model>.attachment`: optional manual override for model attachment
   input support.

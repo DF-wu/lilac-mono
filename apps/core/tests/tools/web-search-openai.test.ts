@@ -10,6 +10,8 @@ import {
   buildOpenAIWebSearchInstructions,
   collectOpenAIWebSearchResults,
   decodeOpenAIWebSearchResponse,
+  normalizeCitedUrl,
+  stripCitationMarkers,
 } from "../../src/tool-server/tools/web-search/openai-web-search-provider";
 
 const servers: Array<{ stop(force?: boolean): void }> = [];
@@ -54,7 +56,13 @@ function json(value: unknown, init: ResponseInit = {}): Response {
   });
 }
 
-const answerText = "Bun 1.3 shipped in September. It adds a new bundler mode.";
+const firstParagraph =
+  "Bun 1.3 shipped in September. ([bun.sh](https://bun.sh/blog/bun-v1.3?utm_source=openai))";
+const secondParagraph =
+  "It adds a new bundler mode. ([github.com](https://github.com/oven-sh/bun/releases), [bun.sh](https://bun.sh/blog/bun-v1.3?utm_source=openai))";
+const answerText = `${firstParagraph}\n\n${secondParagraph}`;
+const firstMarkerStart = firstParagraph.indexOf("([");
+const secondMarkerStart = answerText.lastIndexOf("([");
 
 function completedResponse(overrides: Record<string, unknown> = {}) {
   return {
@@ -86,24 +94,24 @@ function completedResponse(overrides: Record<string, unknown> = {}) {
             annotations: [
               {
                 type: "url_citation",
-                url: "https://bun.sh/blog/bun-v1.3",
+                url: "https://bun.sh/blog/bun-v1.3?utm_source=openai",
                 title: "Bun v1.3",
-                start_index: 0,
-                end_index: 29,
+                start_index: firstMarkerStart,
+                end_index: firstParagraph.length,
               },
               {
                 type: "url_citation",
                 url: "https://github.com/oven-sh/bun/releases",
                 title: "Releases",
-                start_index: 30,
-                end_index: 57,
+                start_index: secondMarkerStart,
+                end_index: answerText.length,
               },
               {
                 type: "url_citation",
-                url: "https://bun.sh/blog/bun-v1.3",
+                url: "https://bun.sh/blog/bun-v1.3?utm_source=openai",
                 title: "Bun v1.3 (duplicate)",
-                start_index: 30,
-                end_index: 57,
+                start_index: secondMarkerStart,
+                end_index: answerText.length,
               },
             ],
           },
@@ -293,6 +301,24 @@ describe("web-search (openai)", () => {
     expect(text).toContain("use up to 3 distinct sources.");
     expect(text).toContain("Prefer financial and market sources.");
     expect(text).toContain("Only rely on sources published between 2026-01-01 and 2026-03-31.");
+  });
+
+  it("strips citation markers and the utm_source=openai tag", () => {
+    expect(
+      stripCitationMarkers(
+        "Bun 1.4.2 is out.  ([bun.sh](https://bun.sh/?utm_source=openai)) More text ([a](https://a.example), [b](https://b.example)).",
+      ),
+    ).toBe("Bun 1.4.2 is out. More text.");
+    expect(normalizeCitedUrl("https://bun.sh/blog/x?utm_source=openai")).toBe(
+      "https://bun.sh/blog/x",
+    );
+    expect(normalizeCitedUrl("https://bun.sh/blog/x?a=1&utm_source=openai&b=2")).toBe(
+      "https://bun.sh/blog/x?a=1&b=2",
+    );
+    expect(normalizeCitedUrl("https://bun.sh/blog/x?utm_source=other")).toBe(
+      "https://bun.sh/blog/x?utm_source=other",
+    );
+    expect(normalizeCitedUrl("not a url")).toBe("not a url");
   });
 
   it("ignores unknown annotation and output item types when collecting results", () => {

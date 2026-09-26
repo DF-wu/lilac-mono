@@ -207,10 +207,35 @@ export function buildOpenAIWebSearchInstructions(input: WebSearchInput): string 
   return lines.filter((line): line is string => line !== null).join("\n");
 }
 
+const CITATION_MARKER_RE = /\s*\((?:\s*\[[^\]]*\]\([^)]*\)\s*,?)+\s*\)/gu;
+const MAX_SNIPPET_CHARS = 600;
+
+/** Removes the inline `([site](url))` markers the model appends for citations. */
+export function stripCitationMarkers(text: string): string {
+  return text.replaceAll(CITATION_MARKER_RE, "").replaceAll(/\s+/gu, " ").trim();
+}
+
+/**
+ * The annotation range covers only the `([site](url))` marker, which the
+ * model places at the end of the paragraph it supports, so the snippet is
+ * that paragraph with markers removed rather than the marker itself.
+ */
 function citationSnippet(text: string, citation: UrlCitation): string {
   if (citation.start_index === undefined || citation.end_index === undefined) return "";
   if (citation.end_index <= citation.start_index || citation.end_index > text.length) return "";
-  return text.slice(citation.start_index, citation.end_index).trim();
+  const previousBreak = text.lastIndexOf("\n\n", citation.start_index);
+  const paragraphStart = previousBreak === -1 ? 0 : previousBreak + 2;
+  const nextBreak = text.indexOf("\n\n", citation.end_index);
+  const paragraphEnd = nextBreak === -1 ? text.length : nextBreak;
+  return stripCitationMarkers(text.slice(paragraphStart, paragraphEnd)).slice(0, MAX_SNIPPET_CHARS);
+}
+
+/** Drops the `utm_source=openai` tag the hosted search appends to cited URLs. */
+export function normalizeCitedUrl(url: string): string {
+  const parsed = URL.parse(url);
+  if (!parsed || parsed.searchParams.get("utm_source") !== "openai") return url;
+  parsed.searchParams.delete("utm_source");
+  return parsed.toString();
 }
 
 export function collectOpenAIWebSearchResults(
@@ -227,17 +252,18 @@ export function collectOpenAIWebSearchResults(
     }
     for (const part of item.content) {
       for (const citation of part.annotations ?? []) {
+        const url = normalizeCitedUrl(citation.url);
         const content = citationSnippet(part.text, citation);
-        const existing = byUrl.get(citation.url);
+        const existing = byUrl.get(url);
         if (existing) {
           if (existing.content.length === 0 && content.length > 0) {
-            byUrl.set(citation.url, { ...existing, content });
+            byUrl.set(url, { ...existing, content });
           }
           continue;
         }
-        byUrl.set(citation.url, {
-          url: citation.url,
-          title: citation.title?.trim() || citation.url,
+        byUrl.set(url, {
+          url,
+          title: citation.title?.trim() || url,
           content,
           score: null,
         });
@@ -245,7 +271,8 @@ export function collectOpenAIWebSearchResults(
     }
   }
 
-  for (const url of sources) {
+  for (const source of sources) {
+    const url = normalizeCitedUrl(source);
     if (byUrl.has(url)) continue;
     byUrl.set(url, { url, title: url, content: "", score: null });
   }
