@@ -311,6 +311,7 @@ See [`AGENTS.md`](./AGENTS.md) for each workspace's build, test, and typecheck c
 - Report new fork features, deployment workflows, Telegram issues, or OpenAI-compatible image-routing issues in [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues).
 - For an issue reproducible without fork modifications, first confirm the upstream state, then report it to [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono/issues).
 - Features historically contributed by this fork and accepted upstream are no longer listed as current differences. See [`docs/fork-differences.md`](./docs/fork-differences.md#accepted-upstream-contributions) for the list.
+- Fork behavior lives in fork-owned modules; upstream files are touched only at thin seams. `bun run fork:footprint` checks every modified upstream file against [`scripts/fork/upstream-footprint.txt`](./scripts/fork/upstream-footprint.txt), and [`docs/fork-differences.md`](./docs/fork-differences.md#fork-code-layout) maps each feature to its modules and seams.
 
 ## Documentation
 

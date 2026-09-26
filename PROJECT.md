@@ -181,7 +181,9 @@ findings are negative. See `PLUGIN_AUTHORING.md` for authoring details and `MIGR
 clean-break migration.
 
 `generate.image` keeps the downstream structured prompt, model-alias, dimensions, input-image, mask,
-and output-directory contract. V2 configuration can route enabled aliases exclusively through one
+and output-directory contract; upstream replaced it with a script runner, and the fork-owned
+implementation lives in `apps/core/src/tool-server/tools/generate-image/` behind a small hook in
+`tools/generate.ts`. V2 configuration can route enabled aliases exclusively through one
 OpenAI-compatible endpoint with per-alias model-ID overrides and no provider fallback. The built-in
 `image-generation` skill documents this contract. `generate.video` retains its model-based interface.
 
@@ -395,7 +397,7 @@ These invariants matter more than a fragile numbered list. Update this section o
 - Core process composition or lifecycle: `apps/core/src/runtime/create-core-runtime.ts`, `compose-builtin-surface-runtimes.ts`, and `surface-runtime-lifecycle.ts`.
 - Surface ref semantics versus executable participation: `apps/core/src/surface/builtin-surface-protocols.ts`, protocol modules, `runtime-descriptor.ts`, and the platform's runtime descriptor.
 - Discord request admission and queue selection: `apps/core/src/surface/discord/discord-request-router.ts`.
-- Telegram ingress, admission, command menus, history, and rendering: `apps/core/src/surface/telegram` and `docs/telegram-surface.md`.
+- Telegram ingress, admission, command menus, history, and rendering: `apps/core/src/surface/telegram` and `docs/telegram-surface.md`. Core wires the surface only through `telegram-surface-runtime.ts`; its configuration lives in `packages/utils/core-config/telegram-surface.ts` and `telegram-runtime.ts`. See `docs/fork-differences.md#fork-code-layout` for the fork/upstream ownership map.
 - Core resource URI, origin, cache, classification, access, and materialization behavior:
   `apps/core/src/resource`; Discord origin refresh belongs in
   `apps/core/src/surface/discord/discord-resource-origin.ts`.
@@ -411,7 +413,7 @@ These invariants matter more than a fragile numbered list. Update this section o
 - Workflow definition, runtime, persistence, scheduling, waits, or progress: the corresponding owner in `apps/core/src/workflow`; Level 2 adaptation is `apps/core/src/tool-server/tools/programmatic-workflow.ts`.
 - Core config/model/provider/prompt behavior: `packages/utils`; config version changes also require
   `docs/core-config-migrations.md`.
-- Downstream OpenAI-compatible image routing: `tools.generate.image.provider` in `packages/utils/core-config/v2.ts` and `docs/generate-image-openai-compatible.md`.
+- Downstream OpenAI-compatible image routing: `tools.generate.image.provider` in `packages/utils/core-config/generate-image.ts`, `apps/core/src/tool-server/tools/generate-image/routing.ts`, and `docs/generate-image-openai-compatible.md`.
 - Core managed opaque bytes, adapter behavior, handle/reference codecs, integrity, or expiry:
   `packages/blob-storage`; domain retention and ownership stay with the consuming Core module.
 - Architecture boundary registration or a new workspace: `scripts/architecture/manifest.ts` and its focused tests; read `scripts/architecture/README.md` first.
