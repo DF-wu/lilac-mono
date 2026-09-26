@@ -181,7 +181,7 @@ export type UniversalCoreConfig = {
     generate: GenerateToolsConfig;
     web: {
       extract: {
-        providers: Array<"tavily" | "exa" | "firecrawl">;
+        providers: Array<"tavily" | "exa" | "firecrawl" | "openai">;
       };
       fetch: {
         mode: "auto" | "fetch" | "browser" | "extract" | "provider-only";
@@ -189,6 +189,11 @@ export type UniversalCoreConfig = {
       firecrawl?: {
         maxConcurrency: number;
         queueTtlMs: number;
+      };
+      /** Only meaningful when `extract.providers` includes `openai` (web.search only). */
+      openai?: {
+        model: string;
+        searchContextSize: "low" | "medium" | "high";
       };
     };
     inspect: {

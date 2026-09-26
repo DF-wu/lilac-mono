@@ -63,6 +63,7 @@ const emptyEnvironment: WebProviderEnvironment = {
   firecrawl: {},
   exa: {},
   tavily: {},
+  openai: {},
 };
 
 const baseWebDependencies: WebDependencies = {
@@ -71,6 +72,7 @@ const baseWebDependencies: WebDependencies = {
     extractProviders: [],
     fetchMode: "auto",
     firecrawlPolicy: undefined,
+    openaiPolicy: undefined,
   }),
   getProviderEnvironment: () => emptyEnvironment,
   createSearchProviders: createDefaultWebSearchProviders,
@@ -105,6 +107,7 @@ function createTool(
         extractProviders: providers.map((provider) => provider.id),
         fetchMode: params.mode ?? "auto",
         firecrawlPolicy: params.firecrawlPolicy,
+        openaiPolicy: undefined,
       })),
     getProviderEnvironment: params.getProviderEnvironment ?? (() => emptyEnvironment),
     createSearchProviders: () => providers,
@@ -769,6 +772,38 @@ describe("web provider extraction", () => {
     ).resolves.toMatchObject({
       status: "error",
       error: { kind: "denied", message: "401 unauthorized" },
+    });
+    expect(calls).toEqual(["tavily"]);
+  });
+  it("skips search-only providers for extraction", async () => {
+    const calls: string[] = [];
+    const tool = createTool({
+      providers: [configuredProvider("openai"), configuredProvider("tavily")],
+      extract: async (providerId) => {
+        calls.push(providerId);
+        return { isError: false, content: content("Extracted by tavily.") };
+      },
+    });
+    await expect(
+      toolValue(tool.call("fetch", { url: "https://example.com", mode: "provider-only" })),
+    ).resolves.toMatchObject({ isError: false, content: "Extracted by tavily." });
+    expect(calls).toEqual(["tavily"]);
+
+    const searchOnly = createTool({
+      providers: [configuredProvider("openai")],
+      extract: async (providerId) => {
+        calls.push(providerId);
+        throw new Error("extract must not run for a search-only provider");
+      },
+    });
+    await expect(
+      searchOnly.call("fetch", { url: "https://example.com", mode: "provider-only" }),
+    ).resolves.toMatchObject({
+      status: "error",
+      error: {
+        message:
+          "web.extract is unavailable: configured providers are search-only (openai); add tavily, exa, or firecrawl.",
+      },
     });
     expect(calls).toEqual(["tavily"]);
   });

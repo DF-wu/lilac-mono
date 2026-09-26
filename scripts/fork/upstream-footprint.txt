@@ -23,6 +23,16 @@ docker/verify-image.sh  # verifies the container identity variants
 __tests__/docker-build-script.test.ts  # covers the container identity variants
 bun.lock  # grammY (Telegram Bot API) dependency
 
+# --- OpenAI web.search provider (staged for an upstream contribution; remove once accepted)
+apps/core/src/tool-server/tools/web-search.ts  # exports OpenAIWebSearchProvider
+apps/core/src/tool-server/tools/web-search/default-web-search-providers.ts  # registers the openai provider
+apps/core/src/tool-server/tools/web-search/resolve-provider.ts  # OPENAI_API_KEY missing-config message
+apps/core/src/tool-server/tools/web-search/types.ts  # "openai" provider id
+apps/core/src/tool-server/tools/web.ts  # openai environment/policy plumbing; web.extract skips search-only providers
+apps/core/src/tool-server/tools/web/provider-page-extraction.ts  # openai environment and supportsPageExtraction
+apps/core/tests/tools/web.test.ts  # covers search-only provider skipping
+packages/utils/tests/core-config.web-search-provider.test.ts  # covers the openai provider config
+
 # --- Documentation
 README.md  # fork entry point; describes fork features and maintenance
 PROJECT.md  # documents the Telegram surface and structured generate.image

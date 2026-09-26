@@ -114,6 +114,12 @@ New v2 fields:
 - `tools.web.firecrawl`: optional process-local concurrency policy applied independently to Firecrawl
   fetch and search calls. When present, `maxConcurrency` defaults to `2` and `queueTtl` defaults to `3s`;
   when absent, Firecrawl calls remain unlimited.
+- `tools.web.extract.providers` accepts `openai` in v2: `web.search` then runs the OpenAI Responses
+  `web_search` tool with `OPENAI_API_KEY` (and `OPENAI_BASE_URL` when set) and returns the answer's URL
+  citations followed by uncited retrieved sources. It is search-only; `web.extract` skips it and uses the
+  next configured provider. `tools.web.openai.model` (default `gpt-5-mini`) and
+  `tools.web.openai.searchContextSize` (`low` | `medium` | `high`, default `medium`) tune the call.
+  Frozen v1 configs cannot select this provider.
 - `models.capability.overrides.<provider/model>.attachment`: optional manual override for model attachment
   input support.
 - `conversation.thread.summarization.enabled`: default-false gate for background conversation thread
