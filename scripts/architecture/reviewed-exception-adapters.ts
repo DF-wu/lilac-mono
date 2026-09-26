@@ -21,6 +21,14 @@ export const REVIEWED_EXCEPTION_ADAPTERS: Readonly<Record<string, readonly Excep
   ],
   "apps/web": [
     {
+      identity: { module: "src/queries.ts", exportName: "queryNativeRPC" },
+      category: "compatibility",
+      externalApi: { package: "@orpc/client", exportName: "ORPCError" },
+      direction: "signal-host",
+      reason:
+        "Reports a disconnected native client through TanStack Query's rejected Promise contract while resolving the current RPC at execution time.",
+    },
+    {
       identity: { module: "src/cache.ts", exportName: "signalWebCacheFailure" },
       category: "result-to-framework",
       externalApi: { package: "@stanley2058/lilac-client", exportName: "NativeCache" },

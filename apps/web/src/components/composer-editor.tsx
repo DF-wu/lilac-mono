@@ -1,3 +1,6 @@
+import { Kbd } from "./ui/kbd";
+import { shortcutOverlayOpen } from "../shortcuts";
+import { formatBinding, ariaBinding } from "../keybindings";
 import { parseReferenceHref, referenceHref } from "@stanley2058/lilac-client-protocol";
 import { ConversationBadge } from "./ConversationReference";
 import { FileIcon } from "./FileIcon";
@@ -64,6 +67,7 @@ import { IndentPlugin } from "@platejs/indent/react";
 import { MarkdownPlugin, defaultRules } from "@platejs/markdown";
 import remarkGfm from "remark-gfm";
 import { editableComposerLinks, protectComposerLinks } from "./composer-links";
+import { composerParagraphSpacing } from "./composer-line-breaks";
 import {
   Bold,
   Italic,
@@ -368,7 +372,14 @@ export const composerPlugins = [
     ],
     render: { belowNodes: BlockList },
   }),
-  MarkdownPlugin.configure({ options: { remarkPlugins: [remarkGfm, editableComposerLinks] } }),
+  MarkdownPlugin.configure({
+    options: {
+      remarkPlugins: [remarkGfm, editableComposerLinks, composerParagraphSpacing],
+      rules: {
+        text: { deserialize: (node, decoration) => ({ ...decoration, text: node.value }) },
+      },
+    },
+  }),
 ];
 
 function deserializeComposer(editor: PlateEditor, text: string) {
@@ -449,8 +460,26 @@ function serializeComposer(editor: PlateEditor, references: boolean): string {
   if (!value.some((node) => NodeApi.string(node))) return "";
   for (const block of value) block.children = trimEmptyInlineText(block.children);
   const restoreLinks = protectComposerLinks(editor, value);
-  return restoreLinks(editor.getApi(MarkdownPlugin).markdown.serialize({ value }))
-    .replace(/\n$/, "")
+  const last: (TElement & Partial<TListProps>) | undefined = value.at(-1);
+  const endsWithEmptyParagraph =
+    last?.type === KEYS.p && !last.listStyleType && !NodeApi.string(last);
+  return restoreLinks(
+    editor.getApi(MarkdownPlugin).markdown.serialize({
+      value,
+      preserveEmptyParagraphs: false,
+      remarkStringifyOptions: {
+        handlers: { break: () => "\n" },
+        // Composer paragraphs are adjacent lines; an empty block supplies the blank line.
+        join: [
+          (left, right, parent) =>
+            parent.type === "root" && left.type === "paragraph" && right.type === "paragraph"
+              ? 0
+              : undefined,
+        ],
+      },
+    }),
+  )
+    .replace(/\n$/, endsWithEmptyParagraph ? "\n" : "")
     .replace(/(?:&#x20;)+(?=\n|$)/g, (spaces) => " ".repeat(spaces.length / 6));
 }
 
@@ -493,8 +522,13 @@ export function restoreMessageAttachments(
     ]),
   );
   const value = editor.getApi(MarkdownPlugin).markdown.deserialize(text, {
-    remarkPlugins: [remarkGfm, () => editableComposerLinks(new Set(byUrl.keys()))],
+    remarkPlugins: [
+      remarkGfm,
+      () => editableComposerLinks(new Set(byUrl.keys())),
+      composerParagraphSpacing,
+    ],
     rules: {
+      ...editor.getOptions(MarkdownPlugin).rules,
       img: {
         deserialize: (node, decoration, options) => {
           const attachment = byUrl.get(node.url);
@@ -593,6 +627,7 @@ export type ComposerEditorProps = {
   text: string;
   documentKey?: string;
   loadingDraft?: boolean;
+  autoFocus?: boolean;
   attachments?: readonly Attachment[];
   onRemoveAttachment?: (key: string) => void;
   onRetryAttachment?: (key: string) => void;
@@ -668,6 +703,24 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
     }),
     [editor, attachments],
   );
+  const focusedDocument = useRef<string>(undefined);
+  useEffect(() => {
+    if (
+      !props.documentKey ||
+      props.loadingDraft ||
+      props.disabled ||
+      focusedDocument.current === props.documentKey
+    )
+      return;
+    focusedDocument.current = props.documentKey;
+    if (!props.autoFocus || window.matchMedia("(pointer: coarse)").matches || shortcutOverlayOpen())
+      return;
+    const focused = document.activeElement;
+    if (focused instanceof Element && focused.closest('input, textarea, [contenteditable="true"]'))
+      return;
+    editor.tf.select(editor.api.end([]));
+    editor.tf.focus();
+  }, [editor, props.documentKey, props.loadingDraft, props.disabled, props.autoFocus]);
   function change() {
     if (props.loadingDraft) return;
     const references = attachmentKeys(editor);
@@ -695,6 +748,7 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
         <ComposerFormatting editor={editor} disabled={props.disabled} />
         <PlateContent
           className="composer-editor"
+          data-ui="composer-input"
           style={{
             minHeight: "calc(1lh + calc(var(--ui-space-unit) * 3) * 2)",
             overflowWrap: "anywhere",
@@ -770,10 +824,30 @@ const ComposerFormatting = memo(function ComposerFormatting({
       aria-label="Text formatting"
       onMouseDown={(event) => event.preventDefault()}
     >
-      <IconButton label="Bold" disabled={disabled} onClick={() => mark(KEYS.bold)}>
+      <IconButton
+        tooltip={
+          <>
+            Bold <Kbd>{formatBinding({ code: "KeyB", mod: true, alt: false, shift: false })}</Kbd>
+          </>
+        }
+        aria-keyshortcuts={ariaBinding({ code: "KeyB", mod: true, alt: false, shift: false })}
+        label="Bold"
+        disabled={disabled}
+        onClick={() => mark(KEYS.bold)}
+      >
         <Bold />
       </IconButton>
-      <IconButton label="Italic" disabled={disabled} onClick={() => mark(KEYS.italic)}>
+      <IconButton
+        tooltip={
+          <>
+            Italic <Kbd>{formatBinding({ code: "KeyI", mod: true, alt: false, shift: false })}</Kbd>
+          </>
+        }
+        aria-keyshortcuts={ariaBinding({ code: "KeyI", mod: true, alt: false, shift: false })}
+        label="Italic"
+        disabled={disabled}
+        onClick={() => mark(KEYS.italic)}
+      >
         <Italic />
       </IconButton>
       <IconButton

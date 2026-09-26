@@ -1,11 +1,5 @@
-import { CONVERSATION_FACET_WEIGHTS as weights } from "../../conversation/thread-search-weights";
 import { Result } from "better-result";
-import type {
-  ConversationThreadToolService,
-  ConversationThreadSearchResult,
-  ConversationThreadReadOutput,
-  ConversationThreadMetadataOutput,
-} from "../../conversation/thread-service";
+import type { ConversationThreadToolService } from "../../conversation/thread-service";
 import {
   resolveTimeWindow,
   compareGroups,
@@ -17,7 +11,6 @@ import {
 import type { RequestContext } from "../../tool-server/types";
 import { NativeStore, type NativeStoreResult, type NativeStoreError } from "./store";
 import { NativeSearchStore, type NativeSearchMessage } from "./store-search";
-import type { NativeSummaryStore } from "./store-search-summary";
 import { nativeThreadId } from "./native-protocol";
 import { nativeFailure } from "./errors";
 
@@ -28,7 +21,6 @@ type SearchHit = {
   excerpt: string;
   surface: "native";
 };
-type ThreadSearchInput = Parameters<ConversationThreadToolService["search"]>[0];
 
 function discoveryGroupKey(
   groupBy: "none" | "source" | "origin",
@@ -53,27 +45,6 @@ function offsetCursor(cursor?: string): NativeStoreResult<number> {
   return Result.ok(offset);
 }
 
-function metadata(page: {
-  thread: { id: string; title: string; createdAt: number; updatedAt: number };
-  messages: NativeSearchMessage[];
-  total: number;
-  startMessageId: string | null;
-  endMessageId: string | null;
-}): ConversationThreadReadOutput["thread"] {
-  return {
-    threadId: page.thread.id,
-    title: page.thread.title,
-    brief: excerpt(page.messages[0]?.text ?? ""),
-    session: { platform: "native", channelId: page.thread.id },
-    anchors: { startMessageId: page.startMessageId ?? "", endMessageId: page.endMessageId ?? "" },
-    timeRange: {
-      start: new Date(page.thread.createdAt).toISOString(),
-      end: new Date(page.thread.updatedAt).toISOString(),
-    },
-    messageCount: page.total,
-  };
-}
-
 export function nativeSearchFailureToHost(error: NativeStoreError): never {
   throw error;
 }
@@ -91,9 +62,7 @@ export class NativeSearchService {
     private readonly params: {
       store: NativeStore;
       searchStore: NativeSearchStore;
-      planner?: Pick<ConversationThreadToolService, "planAutoInjectSearch">;
-      summaries?: NativeSummaryStore;
-      externalThreads?: ConversationThreadToolService;
+      conversationThreads?: ConversationThreadToolService;
     },
   ) {}
 
@@ -105,97 +74,23 @@ export class NativeSearchService {
       read: (input) => service().read(input),
       runSummarization: (input) => service().runSummarization(input),
       planAutoInjectSearch: (input) => service().planAutoInjectSearch(input),
+      getAutoInjectRankingCorpusDocuments: () =>
+        service().getAutoInjectRankingCorpusDocuments?.() ?? [],
     };
   }
 
   forUser(userId: string): ConversationThreadToolService {
-    const isOwner = () =>
-      resolveNativeSearchToHost(this.params.store.getUser(userId)).role === "owner";
-    const local = (threadId: string) =>
-      resolveNativeSearchToHost(
-        this.params.store
-          .getThreadRecord(threadId)
-          .map(() => true)
-          .tryRecover((error) =>
-            error._tag === "NativeStoreFailure" && error.code === "not-found"
-              ? Result.ok(false)
-              : Result.err(error),
-          ),
+    const user = resolveNativeSearchToHost(this.params.store.getUser(userId));
+    if (user.role === "service")
+      return resolveNativeSearchToHost(
+        Result.err(nativeFailure("forbidden", "Service users cannot browse conversations")),
       );
-    return {
-      search: async (input) => {
-        const aggregateExternal = isOwner() && this.params.externalThreads !== undefined;
-        const native = resolveNativeSearchToHost(
-          this.conversationSearch(userId, {
-            ...input,
-            verbose: aggregateExternal || input.verbose,
-          }),
-        );
-        if (!aggregateExternal || !this.params.externalThreads) return native;
-        const external = await this.params.externalThreads.search({
-          ...input,
-          mode: "lexical",
-          verbose: true,
-        });
-        const results = [...native.results, ...external.results]
-          .sort(
-            (left, right) =>
-              (right.score ?? 0) - (left.score ?? 0) || left.threadId.localeCompare(right.threadId),
-          )
-          .slice(0, native.meta.limit)
-          .map((hit) =>
-            input.verbose ? hit : { threadId: hit.threadId, title: hit.title, brief: hit.brief },
-          );
-        return { meta: { ...native.meta, count: results.length }, results };
-      },
-      read: async (input) => {
-        if (isOwner() && this.params.externalThreads && !local(input.threadId))
-          return this.params.externalThreads.read(input);
-        return resolveNativeSearchToHost(this.conversationRead(userId, input));
-      },
-      metadata: async (input) => {
-        if (!isOwner() || !this.params.externalThreads)
-          return resolveNativeSearchToHost(this.conversationMetadata(userId, input));
-        const nativeIds: string[] = [];
-        const externalIds: string[] = [];
-        for (const id of input.threadIds) (local(id) ? nativeIds : externalIds).push(id);
-        const native = resolveNativeSearchToHost(
-          this.conversationMetadata(userId, { threadIds: nativeIds }),
-        );
-        if (externalIds.length === 0) return native;
-        const external = await this.params.externalThreads.metadata({ threadIds: externalIds });
-        return { threads: [...native.threads, ...external.threads], missing: external.missing };
-      },
-      runSummarization: async () =>
-        resolveNativeSearchToHost(
-          Result.err(
-            nativeFailure(
-              "forbidden",
-              "Native summary maintenance requires the owner maintenance service",
-            ),
-          ),
-        ),
-      planAutoInjectSearch: async (input) => {
-        resolveNativeSearchToHost(this.params.store.getUser(userId));
-        const planner = this.params.planner ?? this.params.externalThreads;
-        if (planner) return planner.planAutoInjectSearch(input);
-        return {
-          searches: [
-            {
-              queries: [input.text],
-              aboutness: {
-                domains: [],
-                situations: [],
-                targets: [],
-                entities: [],
-                userWouldAskForThisAs: [],
-                intentSummary: input.text,
-              },
-            },
-          ],
-        };
-      },
-    };
+    return (
+      this.params.conversationThreads ??
+      resolveNativeSearchToHost(
+        Result.err(nativeFailure("invalid", "Conversation memory is unavailable")),
+      )
+    );
   }
 
   query(
@@ -392,217 +287,6 @@ export class NativeSearchService {
         .slice(0, input.limit ?? 10)
         .map((group) => stripVerboseGroup(group, input.verbose ?? false));
       return Result.ok({ meta: { ...external.meta, verbose: input.verbose ?? false }, groups });
-    }, this);
-  }
-
-  conversationSearch(
-    userId: string,
-    input: ThreadSearchInput,
-  ): NativeStoreResult<ConversationThreadSearchResult> {
-    return Result.gen(function* () {
-      if (input.mode === "semantic")
-        return Result.err(
-          nativeFailure(
-            "invalid",
-            "Native conversation search supports lexical search only; use lexical or hybrid for lexical fallback.",
-          ),
-        );
-      const queries = typeof input.query === "string" ? [input.query] : [...input.query];
-      const limit = Math.min(50, Math.max(1, input.limit ?? 5));
-      const unique = new Map<string, ConversationThreadSearchResult["results"][number]>();
-      const scores = new Map<string, number>();
-      const score = (id: string, query: string, fields: readonly [string, number][]) => {
-        const terms = query.toLowerCase().trim().split(/\s+/u).filter(Boolean);
-        const combined = fields
-          .map(([text]) => text)
-          .join(" ")
-          .toLowerCase();
-        const value = Math.max(
-          terms.length && terms.every((term) => combined.includes(term)) ? weights.combined : 0,
-          ...fields.map(([text, weight]) =>
-            terms.length && terms.every((term) => text.toLowerCase().includes(term)) ? weight : 0,
-          ),
-        );
-        scores.set(id, Math.max(scores.get(id) ?? 0, value));
-      };
-      for (const query of queries) {
-        for (let offset = 0; ; offset += 100) {
-          const summaries = this.params.summaries
-            ? yield* this.params.summaries.search(userId, {
-                query,
-                threadId: input.sessionId ? nativeThreadId(input.sessionId) : undefined,
-                participantId: input.participantId,
-                participantIdsAny: input.participantIdsAny,
-                beforeTs: input.beforeTs,
-                afterTs: input.afterTs,
-                limit: 100,
-                offset,
-              })
-            : [];
-          for (const summary of summaries) {
-            const thread = yield* this.params.store.authorizeThread(userId, summary.threadId);
-            score(summary.threadId, query, [
-              [summary.summary.title, weights.title],
-              [summary.summary.brief, weights.brief],
-              [summary.summary.retrievalHints.join(" "), weights.retrievalHints],
-              [summary.summary.topics.join(" "), weights.topics],
-              [summary.summary.importance, weights.combined],
-              [summary.summary.importanceReasons.join(" "), weights.combined],
-              [summary.summary.aboutness.domains.join(" "), weights.aboutnessDomains],
-              [summary.summary.aboutness.situations.join(" "), weights.aboutnessSituations],
-              [
-                summary.summary.aboutness.complaintTargets.join(" "),
-                weights.aboutnessComplaintTargets,
-              ],
-              [summary.summary.aboutness.entities.join(" "), weights.aboutnessEntities],
-              [
-                summary.summary.aboutness.userWouldAskForThisAs.join(" "),
-                weights.userWouldAskForThisAs,
-              ],
-            ]);
-            unique.set(summary.threadId, {
-              threadId: summary.threadId,
-              title: summary.summary.title,
-              brief: summary.summary.brief,
-              ...(input.verbose
-                ? {
-                    ...summary.summary,
-                    messageCount: summary.messageCount,
-                    session: { platform: "native" as const, channelId: summary.threadId },
-                    derivedState: {
-                      summarized: true,
-                      stale: summary.contentRevision < thread.revision,
-                    },
-                  }
-                : {}),
-            });
-          }
-          if (summaries.length < 100) break;
-        }
-        for (let offset = 0; ; offset += 500) {
-          const rows = yield* this.params.searchStore.searchMessages(userId, {
-            query,
-            threadId: input.sessionId ? nativeThreadId(input.sessionId) : undefined,
-            authorId: input.participantId,
-            beforeTs: input.beforeTs,
-            afterTs: input.afterTs,
-            limit: 500,
-            offset,
-          });
-          for (const row of rows) {
-            if (input.participantIdsAny?.length && !input.participantIdsAny.includes(row.authorId))
-              continue;
-            score(row.threadId, query, [
-              [row.title, weights.title],
-              [row.text, weights.combined],
-            ]);
-            if (unique.has(row.threadId)) continue;
-            const summary = this.params.summaries
-              ? yield* this.params.summaries.get(row.threadId)
-              : null;
-            unique.set(row.threadId, {
-              threadId: row.threadId,
-              title: summary?.summary.title ?? row.title,
-              brief: summary?.summary.brief ?? excerpt(row.text),
-              ...(input.verbose
-                ? {
-                    session: { platform: "native" as const, channelId: row.threadId },
-                    derivedState: { summarized: summary !== null, stale: true },
-                  }
-                : {}),
-            });
-          }
-          if (rows.length < 500) break;
-        }
-      }
-      const minScore = input.minScore ?? 0.1;
-      const results = [...unique.values()]
-        .filter((hit) => (scores.get(hit.threadId) ?? 0) >= minScore)
-        .sort(
-          (a, b) =>
-            (scores.get(b.threadId) ?? 0) - (scores.get(a.threadId) ?? 0) ||
-            a.threadId.localeCompare(b.threadId),
-        )
-        .slice(0, limit)
-        .map((hit) =>
-          input.verbose
-            ? { ...hit, score: scores.get(hit.threadId), lexicalScore: scores.get(hit.threadId) }
-            : hit,
-        );
-      return Result.ok({
-        meta: {
-          query: queries[0] ?? "",
-          ...(queries.length > 1 ? { queries } : {}),
-          mode: "lexical" as const,
-          limit,
-          minScore,
-          count: results.length,
-          vectorAvailable: false,
-        },
-        results,
-      });
-    }, this);
-  }
-
-  conversationRead(
-    userId: string,
-    input: { threadId: string; offset?: number; limit?: number },
-  ): NativeStoreResult<ConversationThreadReadOutput> {
-    return Result.gen(function* () {
-      const page = yield* this.params.searchStore.readThread(userId, input.threadId, input);
-      const summary = this.params.summaries
-        ? yield* this.params.summaries.get(input.threadId)
-        : null;
-      const offset = Math.max(0, input.offset ?? 0);
-      const limit = Math.min(200, Math.max(1, input.limit ?? 50));
-      const nextOffset = offset + page.messages.length;
-      return Result.ok({
-        thread: { ...metadata(page), ...summary?.summary },
-        page: {
-          offset,
-          limit,
-          total: page.total,
-          hasMore: nextOffset < page.total,
-          ...(nextOffset < page.total ? { nextOffset } : {}),
-        },
-        messages: page.messages.map((message) => ({
-          ordinal: message.ordinal,
-          messageId: message.messageId,
-          userId: message.authorId,
-          userName: this.params.store.getUser(message.authorId).match({
-            ok: (user) => user.displayName || `user_${user.id}`,
-            err: () => message.authorId,
-          }),
-          time: new Date(message.createdAt).toISOString(),
-          content: message.text,
-        })),
-      });
-    }, this);
-  }
-
-  conversationMetadata(
-    userId: string,
-    input: { threadIds: readonly string[] },
-  ): NativeStoreResult<ConversationThreadMetadataOutput> {
-    return Result.gen(function* () {
-      const threads: ConversationThreadMetadataOutput["threads"] = [];
-      const missing: string[] = [];
-      for (const threadId of input.threadIds) {
-        const page = yield* this.params.searchStore
-          .readThread(userId, threadId, { limit: 1 })
-          .tryRecover((error) =>
-            error._tag === "NativeStoreFailure" && error.code === "not-found"
-              ? Result.ok(null)
-              : Result.err(error),
-          );
-        if (!page) {
-          missing.push(threadId);
-          continue;
-        }
-        const summary = this.params.summaries ? yield* this.params.summaries.get(threadId) : null;
-        threads.push({ ...metadata(page), ...summary?.summary });
-      }
-      return Result.ok({ threads, missing });
     }, this);
   }
 }

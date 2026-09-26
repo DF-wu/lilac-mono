@@ -2137,7 +2137,8 @@ describe("WorkflowEngine", () => {
   );
   it("recovers an older expired claim behind a full page of newer live owners", async () => {
     const dbPath = join(tmpdir(), `workflow-recovery-page-${crypto.randomUUID()}.sqlite`);
-    const store = new DurableWorkflowStore(dbPath);
+    // This exercises lease pagination, not reopening a database. Avoid 1,000 disk commits.
+    const store = new DurableWorkflowStore(":memory:");
     const bus = createLilacBus(new CapturingRawBus());
     createApprovedRun(store);
     const expired = store.tryClaimRun({ runId: "run-1", claimerId: "dead-owner", now: 100 });

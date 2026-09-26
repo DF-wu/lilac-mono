@@ -20,13 +20,9 @@ import {
   webFetchModeSchema,
 } from "./v1";
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
-import {
-  cloneDefaultTelegramSurface,
-  defaultNativeSurfaceConfig,
-  IMAGE_GENERATION_MODEL_ALIASES,
-  MODEL_REASONING_EFFORTS,
-  TELEGRAM_SURFACE_DEFAULTS,
-} from "./types";
+import { defaultGenerateToolsConfig, generateToolsSchema } from "./generate-image";
+import { cloneDefaultTelegramSurface, telegramSurfaceSchema } from "./telegram-surface";
+import { defaultNativeSurfaceConfig, MODEL_REASONING_EFFORTS } from "./types";
 
 import type {
   ConfigParser,
@@ -321,20 +317,6 @@ const discordMarkdownTableRenderSchema = z
     fallbackMode: "list",
   });
 
-const telegramMarkdownTableRenderSchema = z
-  .object({
-    enabled: z.boolean().default(true),
-    style: z.enum(["unicode", "ascii"]).default("unicode"),
-    maxWidth: z.number().int().min(40).max(240).default(50),
-    fallbackMode: z.enum(["list", "passthrough"]).default("list"),
-  })
-  .default({
-    enabled: true,
-    style: "unicode",
-    maxWidth: 50,
-    fallbackMode: "list",
-  });
-
 const discordMarkdownMathRenderSchema = z
   .object({
     enabled: z.boolean().default(false),
@@ -420,63 +402,6 @@ const discordSurfaceSchema = z
 const byteSizeSchema = z.preprocess(parseFriendlyByteSize, z.number().int().positive());
 const durationMsSchema = z.preprocess(parseFriendlyDurationMs, z.number().int().positive());
 
-const telegramSurfaceSchema = z
-  .object({
-    enabled: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.enabled),
-    token: z.string().trim().min(1).optional(),
-    tokenEnv: z
-      .never({
-        error:
-          "surface.telegram.tokenEnv was removed; copy the token to surface.telegram.token and remove tokenEnv",
-      })
-      .optional(),
-    botName: z
-      .string()
-      .min(1)
-      .refine((s) => !/\s/u.test(s), "botName must not contain spaces")
-      .default(TELEGRAM_SURFACE_DEFAULTS.botName),
-    botUsername: z
-      .string()
-      .min(1)
-      .refine((s) => !s.startsWith("@"), "botUsername must not include a leading '@'")
-      .optional(),
-    // Lazy defaults: a literal default is evaluated once at schema construction
-    // and would then be shared (and mutable) across every parsed config.
-    allowedChatIds: z.array(z.string().min(1)).default(() => []),
-    allowedUserIds: z.array(z.string().min(1)).default(() => []),
-    dbPath: z.string().min(1).optional(),
-    apiRoot: z.url().optional(),
-    outputMode: z.enum(["inline", "preview"]).default(TELEGRAM_SURFACE_DEFAULTS.outputMode),
-    parseMode: z.enum(["html", "plain"]).default(TELEGRAM_SURFACE_DEFAULTS.parseMode),
-    // Telegram throttles edits at roughly one per second per chat; going below
-    // this reliably trips 429 retry_after responses during streaming.
-    streamEditIntervalMs: z
-      .number()
-      .int()
-      .min(500)
-      .max(60_000)
-      .default(TELEGRAM_SURFACE_DEFAULTS.streamEditIntervalMs),
-    outputNotification: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.outputNotification),
-    workingIndicators: z
-      .array(z.string().trim().min(1))
-      .min(1)
-      .default(() => cloneDefaultWorkingIndicators()),
-    commandMenu: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.commandMenu),
-    markdownTableRender: telegramMarkdownTableRenderSchema,
-    inboundMedia: z
-      .object({
-        enabled: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.inboundMedia.enabled),
-        maxBytesPerAttachment: byteSizeSchema.default(
-          TELEGRAM_SURFACE_DEFAULTS.inboundMedia.maxBytesPerAttachment,
-        ),
-        maxBytesPerRequest: byteSizeSchema.default(
-          TELEGRAM_SURFACE_DEFAULTS.inboundMedia.maxBytesPerRequest,
-        ),
-      })
-      .default(() => ({ ...TELEGRAM_SURFACE_DEFAULTS.inboundMedia })),
-  })
-  .default(() => cloneDefaultTelegramSurface());
-
 const webConfigSchemaV2 = z
   .preprocess(
     migrateWebConfigValue,
@@ -508,37 +433,10 @@ const webConfigSchemaV2 = z
     },
   });
 
-const imageGenerationAliasSchema = z.enum(IMAGE_GENERATION_MODEL_ALIASES, {
-  error: `Unknown generate.image alias. Valid aliases: ${IMAGE_GENERATION_MODEL_ALIASES.join(", ")}.`,
-});
-
-const generateImageOpenAICompatibleSchema = z
-  .object({
-    models: z.array(imageGenerationAliasSchema).min(1).optional(),
-    modelIds: z
-      .partialRecord(imageGenerationAliasSchema, z.string().trim().min(1), {
-        error: (issue) =>
-          issue.code === "invalid_key"
-            ? `Unknown generate.image alias in modelIds. Valid aliases: ${IMAGE_GENERATION_MODEL_ALIASES.join(", ")}.`
-            : undefined,
-      })
-      .default({}),
-  })
-  .default({ modelIds: {} });
-
 const toolsSchema = z
   .object({
     fsBackend: z.enum(["fff", "node-rg"]).default("fff"),
-    generate: z
-      .object({
-        image: z
-          .object({
-            provider: z.enum(["default", "openai-compatible"]).default("default"),
-            openaiCompatible: generateImageOpenAICompatibleSchema,
-          })
-          .default({ provider: "default", openaiCompatible: { modelIds: {} } }),
-      })
-      .default({ image: { provider: "default", openaiCompatible: { modelIds: {} } } }),
+    generate: generateToolsSchema,
     web: webConfigSchemaV2,
     inspect: z
       .object({
@@ -593,12 +491,7 @@ const toolsSchema = z
   })
   .default({
     fsBackend: "fff",
-    generate: {
-      image: {
-        provider: "default",
-        openaiCompatible: { modelIds: {} },
-      },
-    },
+    generate: defaultGenerateToolsConfig(),
     web: {
       extract: {
         providers: ["tavily"],
@@ -844,6 +737,7 @@ const nativeSurfaceSchema = z
         clerkOAuthClientId: z.string().trim().min(1).optional(),
       })
       .default({ provider: "local", ownerId: "owner" }),
+    // Legacy values seed native deployment settings only when the database has no record.
     titleModel: z.string().trim().min(1).default("fast"),
     outputStreaming: z.enum(["paragraph", "complete"]).default("paragraph"),
     oldMessageSelectionMaxAgeMs: positiveDurationMsSchema.nullable().default(null),

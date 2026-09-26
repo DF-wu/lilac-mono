@@ -17,7 +17,11 @@ import {
   type ThreadSummarizationHydrationResponse,
   type ThreadSummarizationWorkerRequest,
 } from "./thread-summarization-worker-protocol";
-import type { ConversationThreadRunSummarizationInput } from "./thread-service";
+import {
+  ConversationThreadOperationFailed,
+  type ConversationThreadAttachmentHydrator,
+  type ConversationThreadRunSummarizationInput,
+} from "./thread-service";
 import type { SurfaceAdapter } from "../surface/adapter";
 import { toReplyChainMessage } from "../surface/bridge/request-composition/reply-chain";
 
@@ -166,7 +170,11 @@ function queuedResult(jobId: string): ThreadSummarizationResult {
 export function startConversationThreadSummarizationWorker(params: {
   searchDbPath: string;
   surfaceDbPath?: string;
+  nativeDbPath?: string;
+  telegramDbPath?: string;
+  telegramBotName?: string;
   adapter?: Pick<SurfaceAdapter, "readMsg">;
+  attachmentHydrator?: ConversationThreadAttachmentHydrator;
   createWorker?: () => ConversationThreadSummarizationWorkerTransport;
   reportFatalPanic?: ConversationThreadWorkerFatalReporter;
 }): ConversationThreadSummarizationRunner & { stop(): Promise<void> } {
@@ -246,44 +254,84 @@ export function startConversationThreadSummarizationWorker(params: {
     }
   };
 
-  const handleHydrationRequest = async (request: ThreadSummarizationHydrationRequest) => {
-    const results: ThreadSummarizationHydrationResponse["results"] = [];
-    for (const ref of request.refs) {
-      if (!params.adapter) {
-        results.push({ ref, ok: false, error: "surface adapter unavailable" });
-        continue;
+  const hydrateRequest: ConversationThreadAttachmentHydrator = async (input) => {
+    if (params.attachmentHydrator) return params.attachmentHydrator(input);
+    const adapter = params.adapter;
+    if (!adapter)
+      return Result.err(
+        new ConversationThreadOperationFailed({
+          operation: "summarize-thread",
+          message: "surface adapter unavailable",
+        }),
+      );
+    return Result.gen(async function* () {
+      const results: Array<{
+        ref: (typeof input.refs)[number];
+        attachments: ReturnType<typeof toReplyChainMessage>["attachments"];
+      }> = [];
+      for (const ref of input.refs) {
+        if (ref.surface === "native")
+          return Result.err(
+            new ConversationThreadOperationFailed({
+              operation: "summarize-thread",
+              message: "native attachment hydrator unavailable",
+            }),
+          );
+        const platform = ref.surface === "telegram" ? ("telegram" as const) : ("discord" as const);
+        const message = yield* Result.await(
+          adapter
+            .readMsg({ platform, channelId: ref.channelId, messageId: ref.messageId })
+            .then((result) =>
+              result.mapError(
+                (error) =>
+                  new ConversationThreadOperationFailed({
+                    operation: "summarize-thread",
+                    message: error.message,
+                  }),
+              ),
+            ),
+        );
+        if (!message)
+          return Result.err(
+            new ConversationThreadOperationFailed({
+              operation: "summarize-thread",
+              message: "surface message not found",
+            }),
+          );
+        results.push({ ref, attachments: toReplyChainMessage(message).attachments });
       }
-      const [settled] = await Promise.allSettled([
-        params.adapter.readMsg({ platform: "discord", ...ref }),
-      ]);
-      if (settled.status === "rejected") {
-        const panic = Panic.is(settled.reason)
+      return Result.ok(results);
+    });
+  };
+  const handleHydrationRequest = async (request: ThreadSummarizationHydrationRequest) => {
+    const [settled] = await Promise.allSettled([hydrateRequest({ refs: request.refs })]);
+    if (settled.status === "rejected") {
+      handleWorkerPanic(
+        Panic.is(settled.reason)
           ? settled.reason
           : new Panic({
               message: "Conversation thread attachment hydration defect",
               cause: settled.reason,
-            });
-        handleWorkerPanic(panic);
-        return;
-      }
-      const read = settled.value;
-      read.match({
-        err: (error) => {
-          results.push({ ref, ok: false, error: error.message });
-        },
-        ok: (message) => {
-          if (!message) {
-            results.push({ ref, ok: false, error: "surface message not found" });
-            return;
-          }
-          results.push({
-            ref,
-            ok: true,
-            attachments: toReplyChainMessage(message).attachments,
-          });
-        },
-      });
+            }),
+      );
+      return;
     }
+    const results = settled.value.match<ThreadSummarizationHydrationResponse["results"]>({
+      ok: (items) =>
+        items.map((item) => ({
+          ref: item.ref,
+          ok: true,
+          attachments: item.attachments.map((attachment) => ({
+            id: attachment.id,
+            url: attachment.url,
+            filename: attachment.filename,
+            mimeType: attachment.mimeType,
+            size: attachment.size,
+            ...(attachment.data ? { data: new Uint8Array(attachment.data) } : {}),
+          })),
+        })),
+      err: (error) => request.refs.map((ref) => ({ ref, ok: false, error: error.message })),
+    });
     if (stopped || terminalFailure || terminalPanic) return;
     const response: ThreadSummarizationParentMessage = {
       type: "hydrate-discord-attachments-result",
@@ -428,6 +476,9 @@ export function startConversationThreadSummarizationWorker(params: {
         input,
         searchDbPath: params.searchDbPath,
         surfaceDbPath: params.surfaceDbPath,
+        nativeDbPath: params.nativeDbPath,
+        telegramDbPath: params.telegramDbPath,
+        telegramBotName: params.telegramBotName,
       } satisfies ThreadSummarizationWorkerRequest;
       if (wait) {
         return await new Promise<

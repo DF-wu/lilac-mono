@@ -290,6 +290,7 @@ bun run fmt:check
 - 本 fork 新功能、部署 workflow、Telegram 或相容式圖像路由問題：請在 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues) 回報。
 - 可在未修改 upstream 重現的問題：先確認 upstream 狀態，再向 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono/issues) 回報。
 - 歷史上由本 fork 回饋並已被 upstream 接收的功能，不再列為當前差異。清單見 [`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md#已被上游接收的貢獻)。
+- Fork 的行為放在 fork 自有模組；upstream 檔案只保留很薄的接縫。`bun run fork:footprint` 會把每個被修改的 upstream 檔案對照 [`scripts/fork/upstream-footprint.txt`](./scripts/fork/upstream-footprint.txt)，[`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md#fork-程式碼配置) 則列出每項功能對應的模組與接縫。
 
 ## 文件
 

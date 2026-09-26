@@ -14,11 +14,13 @@ import { AttachmentReference } from "./AttachmentReference";
 import { MessageResourcesContext } from "./message-resources";
 import { CodeBlock } from "./CodeBlock";
 import { markdownUrl } from "./markdown-policy";
+import { userMessageLineBreaks } from "./composer-line-breaks";
 
 const HighlightedCode = lazy(() => import("./rich-code"));
 const Diagram = lazy(() => import("./rich-diagram"));
 const MathExpression = lazy(() => import("./rich-math"));
 const plugins = [remarkGfm, remarkMath, remarkChatMath];
+const userPlugins = [...plugins, userMessageLineBreaks];
 const rehypePlugins = [githubAlerts];
 
 function RichBlock({ source, language }: { source: string; language: string }) {
@@ -123,10 +125,16 @@ const components: Components = {
   ),
 };
 
-export default memo(function MarkdownContent({ text }: { text: string }) {
+export default memo(function MarkdownContent({
+  text,
+  preserveLineBreaks = false,
+}: {
+  text: string;
+  preserveLineBreaks?: boolean;
+}) {
   return (
     <ReactMarkdown
-      remarkPlugins={plugins}
+      remarkPlugins={preserveLineBreaks ? userPlugins : plugins}
       rehypePlugins={rehypePlugins}
       components={components}
       urlTransform={markdownUrl}

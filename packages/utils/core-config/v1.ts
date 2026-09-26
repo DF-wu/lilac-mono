@@ -4,7 +4,8 @@ import { z } from "zod";
 import { cloneDefaultWorkingIndicators } from "../working-indicators";
 
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
-import { cloneDefaultTelegramSurface } from "./types";
+import { defaultGenerateToolsConfig } from "./generate-image";
+import { cloneDefaultTelegramSurface } from "./telegram-surface";
 
 import type {
   ConfigParser,
@@ -705,12 +706,7 @@ function coreConfigV1ToUniversal(
     tools: {
       ...toolsRest,
       fsBackend: parsed.tools.fsBackend,
-      generate: {
-        image: {
-          provider: "default",
-          openaiCompatible: { modelIds: {} },
-        },
-      },
+      generate: defaultGenerateToolsConfig(),
       inspect: {
         model: "google/gemini-3-flash",
       },

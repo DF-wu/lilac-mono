@@ -1,8 +1,6 @@
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 
-import type { CustomCommandManager } from "../custom-commands/manager";
-import { startGithubWebhookServer } from "../github/webhook/github-webhook-server";
 import type { TranscriptStore } from "../transcript/transcript-store";
 import type { SurfaceAdapter, SurfaceAdapterEventSource } from "../surface/adapter";
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
@@ -21,15 +19,11 @@ import {
   type SurfaceRuntimeHealthPort,
   type SurfaceRuntimeDescriptor,
 } from "../surface/runtime-descriptor";
+import { startGithubWebhookServer } from "../github/webhook/github-webhook-server";
 import {
-  createTelegramRelayPolicy,
-  createTelegramSurfaceRuntimeDescriptor,
-} from "../surface/telegram/telegram-runtime-descriptor";
-import type { TelegramRuntimeHealthProvider } from "../surface/telegram/telegram-runtime-health";
-import { createTelegramRuntimeHealthPort } from "../surface/telegram/telegram-runtime-health";
-import { startTelegramRequestRouter } from "../surface/telegram/telegram-request-router";
-import type { DurableWorkflowStore } from "../workflow/durable-workflow-store";
-import { shouldSuppressRouterForWorkflowReply } from "../workflow/workflow-router-suppression";
+  createTelegramSurfaceRuntimeEntry,
+  type TelegramSurfaceRuntimeInput,
+} from "../surface/telegram/telegram-surface-runtime";
 
 type BuiltinSurfaceRuntimeLogger = {
   debug(message: string, context: Readonly<Record<string, unknown>>): void;
@@ -45,14 +39,7 @@ export type ComposeBuiltinSurfaceRuntimesInput = {
   readonly githubAdapter: SurfaceAdapter;
   readonly descriptorBoundDiscordEventSource: SurfaceAdapterEventSource;
   readonly discordHealth?: SurfaceRuntimeHealthPort;
-  readonly telegram?: {
-    readonly adapter: SurfaceAdapter & { stopIngress(): Promise<void> };
-    readonly eventSource: SurfaceAdapterEventSource;
-    readonly healthProvider: TelegramRuntimeHealthProvider;
-    readonly customCommands?: CustomCommandManager;
-    readonly getWorkflowStore?: () => DurableWorkflowStore;
-    readonly config?: Record<string, unknown>;
-  };
+  readonly telegram?: TelegramSurfaceRuntimeInput;
   readonly bus: LilacBus;
   readonly blobStore: BlobStore;
   readonly subscriptionPrefix: string;
@@ -65,7 +52,6 @@ export type ComposeBuiltinSurfaceRuntimesInput = {
 
 export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntimesInput) {
   const subscriptionId = (name: string) => `${input.subscriptionPrefix}:${name}`;
-  const telegram = input.telegram;
 
   return SurfaceRuntimeRegistry.create([
     ...(input.discordEnabled === false
@@ -160,80 +146,14 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
         };
       },
     }),
-    ...(telegram
+    ...(input.telegram
       ? [
-          createTelegramSurfaceRuntimeDescriptor({
-            adapter: telegram.adapter,
-            health: createTelegramRuntimeHealthPort(telegram.healthProvider),
-            requestIngress: {
-              start: async () => {
-                const id = subscriptionId("telegram-request-router");
-                const getWorkflowStore = telegram.getWorkflowStore;
-                const router = await startTelegramRequestRouter({
-                  adapter: telegram.adapter,
-                  bus: input.bus,
-                  blobStore: input.blobStore,
-                  subscriptionId: id,
-                  ...(telegram.customCommands ? { customCommands: telegram.customCommands } : {}),
-                  ...(telegram.config ? { config: telegram.config } : {}),
-                  ...(getWorkflowStore
-                    ? {
-                        shouldSuppressAdapterEvent: async ({ evt }) =>
-                          shouldSuppressRouterForWorkflowReply({
-                            store: getWorkflowStore(),
-                            event: evt,
-                          }),
-                      }
-                    : {}),
-                });
-                input.logger.debug("Telegram request router started", { subscriptionId: id });
-                return router;
-              },
-            },
-            adapterIngress: {
-              start: async () => {
-                const id = subscriptionId("telegram-adapter-to-bus");
-                const handle = await bridgeAdapterToBus({
-                  eventSource: telegram.eventSource,
-                  platform: "telegram",
-                  bus: input.bus,
-                  subscriptionId: id,
-                  transcriptStore: input.getTranscriptStore(),
-                });
-                await telegram.adapter.connect();
-                input.logger.debug("Telegram adapter ingress started", { subscriptionId: id });
-                return {
-                  platform: "telegram" as const,
-                  stop: async () => {
-                    await telegram.adapter.stopIngress();
-                    await handle.stop();
-                  },
-                };
-              },
-            },
-            createRelay: (guardedAdapter) => {
-              const policy = createTelegramRelayPolicy();
-              return {
-                ...policy,
-                lifecycle: {
-                  platform: "telegram" as const,
-                  start: async () => {
-                    const id = subscriptionId("bus-to-telegram");
-                    const relay = await bridgeBusToAdapter({
-                      adapter: guardedAdapter,
-                      blobStore: input.blobStore,
-                      bus: input.bus,
-                      platform: "telegram",
-                      policy,
-                      subscriptionId: id,
-                      transcriptStore: input.getTranscriptStore(),
-                    });
-                    input.logger.debug("Telegram output relay started", { subscriptionId: id });
-                    return relay;
-                  },
-                },
-              };
-            },
+          createTelegramSurfaceRuntimeEntry(input.telegram, {
+            bus: input.bus,
+            blobStore: input.blobStore,
+            subscriptionId,
+            getTranscriptStore: input.getTranscriptStore,
+            logger: input.logger,
           }),
         ]
       : []),

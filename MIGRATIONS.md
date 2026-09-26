@@ -1,14 +1,39 @@
 # MIGRATIONS.md
 
-## Native response streaming settings
+## Native web keybindings
 
-Native RPC adds owner-only `config.readStreaming` and `config.setStreaming` for the existing
-version 2 `surface.native.outputStreaming` option. Values remain `paragraph` and `complete`;
-the web UI labels them Paragraph and Full. Writes require the Core document revision and use
-the existing atomic configuration save. Updating this option reserializes the YAML document,
-preserving configuration values but not comments or formatting. No stored-data migration is required.
-Update Core and web together to use the new control. New responses pick up the setting through
-the existing Core configuration reload path; active responses retain their original mode.
+Keyboard shortcuts are stored only in the browser under `lilac-keybindings-v1`, scoped to the
+installation and principal. The version 1 payload contains physical key codes and modifiers for
+each action; null disables an action. Missing, invalid, duplicate, or unsupported payloads use
+default bindings without rewriting storage. No Core configuration or server-data migration is needed.
+
+
+## Native reaction names
+
+Reaction responses add optional `userNames` (at most five display names) and `overflowCount`.
+Core projects these fields from current users when personalizing messages; stored messages need no
+backfill. Update Core and web together because older strict response validators reject these fields.
+
+
+## Native deployment settings
+
+Native settings `titleModel`, `outputStreaming`, `oldMessageSelectionMaxAgeMs`,
+`storageRetentionMaxAgeMs`, and `crossThreadSend.triggerRun` now live in a singleton
+`deployment` record in the native database. Startup creates the record once from the existing
+parsed `surface.native` values, including version-owned defaults. Existing database values always
+win on later starts. The migration does not rewrite `core-config.yaml`; the old keys remain readable
+for initial import only and can be removed after successful startup. Changing those YAML keys no
+longer changes a migrated installation's runtime behavior.
+
+Settings > Deployment replaces the response streaming control in Options. All five settings are
+instance-wide and owner-only. Saves use an atomic database transaction with a revision check.
+New output attempts and title jobs use the latest settings; active output attempts keep their mode.
+Message selection and retention maintenance read the current settings when they run.
+
+Native RPC replaces `config.readStreaming` / `config.setStreaming` with `config.readDeployment` /
+`config.setDeployment`. Update Core and web together. The native database format remains version 1
+with an additional record kind; older builds cannot manage this record. Keep a pre-upgrade database
+backup if a rollback is needed.
 
 ## Conversation references
 
@@ -127,6 +152,13 @@ returns the resolved path, filename, media type, and existing authenticated prev
 requires thread edit access and uses the thread's filesystem permissions and deny paths. Existing
 published-path records and file-serving routes are reused; no database migration is required.
 Update clients and servers together to enable inline-path previews.
+
+## Native web theme selection
+
+The web app stores the selected built-in theme for each color scheme under `lilac-theme-palette-v1`.
+The value is browser-wide, like the existing `lilac-theme-v1` scheme preference. The JSON value holds
+`light` and `dark` theme IDs. Missing, invalid, unknown, or unavailable values use Lilac for both.
+Older clients ignore the key. No backend data or existing browser preferences require migration.
 
 ## Native web local panel layouts
 
@@ -798,3 +830,22 @@ workflow and transcript stores; there is no stored-data migration. Update client
 Transcript responses contain bounded pages of display text and activity labels. They omit system
 prompts, raw reasoning, tool arguments, and provider state. Older runs without retained transcripts
 show an unavailable state. Panel visibility and pixel width are local to the current workspace session.
+
+## Shared cross-surface conversation memory
+
+Conversation memory now indexes Discord and native threads in the shared conversation-thread tables
+in the Discord search database. The first open without the `conversation_index_v2` marker drops and
+recreates only those derived thread, summary, facet, FTS, and embedding tables. Retained Discord
+messages, native records, conversation IDs, grants, resources, and canonical transcripts are unchanged.
+Native runtime startup drops the obsolete `native_thread_summaries` table. No old summaries are copied.
+The materializer rebuilds Discord groups, and native entries are projected from current retained turns.
+The existing summarization worker regenerates quiet eligible threads and their embeddings. Recall is
+incomplete until that refresh finishes; manual `conversation.thread.runSummarization` can trigger it.
+
+Every conversation-memory result now includes `surface`, and native thread references are
+`native:<threadId>`. Deploy Core and its tools together. Both agent origins can search and read all
+retained native conversations, independent of native ownership and grants; Discord allowlists still
+apply. Native UI read and write permissions remain unchanged. Derived native state is discarded when
+its retained message content or history generation changes, including edits, rewinds, and deletion.
+Model selection, titles, archiving, and grant changes preserve existing summaries. Downgrading requires
+rebuilding the derived index for the older runtime; do not reuse cross-surface derived rows with an older binary.

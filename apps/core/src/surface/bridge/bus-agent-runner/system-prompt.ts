@@ -18,6 +18,7 @@ import {
   buildRestrictedSessionOverlay,
   buildSurfaceMetadataOverlay,
   buildDiscordOutputOverlay,
+  buildNativeOutputOverlay,
   maybeAppendResponseCommentaryPrompt,
 } from "./prompt-overlays";
 import { buildSystemPromptForProfile, selectWorkspaceSystemPrompt } from "./subagent-prompt";
@@ -83,6 +84,7 @@ export function buildAgentRunSystemPrompt(params: {
     autoInjectedThreadSearchOverlay,
     surfaceMetadataOverlay,
     params.requestClient === "discord" ? buildDiscordOutputOverlay() : null,
+    params.requestClient === "native" ? buildNativeOutputOverlay() : null,
     restrictedSessionOverlay,
   ]) {
     if (overlay?.trim()) prompt = `${prompt}\n\n${overlay}`;

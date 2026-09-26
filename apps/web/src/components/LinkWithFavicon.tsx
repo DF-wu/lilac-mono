@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Globe } from "lucide-react";
-import { skipToken, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import type { NativeClient } from "@stanley2058/lilac-client";
 import type { NativeRpcOutputs } from "@stanley2058/lilac-client-protocol";
-import { useNativeOnline } from "../queries";
+import { queryNativeRPC, useNativeOnline } from "../queries";
 import { useOptionalWorkspace } from "../workspace-context";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "./ui/hover-card";
 
@@ -149,7 +149,6 @@ function ResolvedLink({
   client: NativeClient;
 }) {
   const online = useNativeOnline(client);
-  const rpc = client.rpc;
   const anchor = useRef<HTMLAnchorElement>(null);
   const [visible, setVisible] = useState(false);
   const local = localPreview(url);
@@ -165,7 +164,8 @@ function ResolvedLink({
   }, [url]);
   const preview = useQuery({
     queryKey: ["link-preview", url],
-    queryFn: rpc ? ({ signal }) => rpc.links.preview({ url }, { signal }) : skipToken,
+    queryFn: ({ signal }) =>
+      queryNativeRPC(client, (rpc) => rpc.links.preview({ url }, { signal })),
     enabled: visible && !local && online,
     staleTime: 30 * 60 * 1000,
     gcTime: 30 * 60 * 1000,

@@ -1,3 +1,16 @@
+import { FloatingChatMenu } from "./components/FloatingChatMenu";
+import { useWorkspaceViewport } from "./use-workspace-viewport";
+import { Kbd } from "./components/ui/kbd";
+import {
+  useAppShortcuts,
+  useThreadShortcut,
+  useShortcut,
+  ThreadShortcutTargets,
+  focusMainComposer,
+  blurForThreadNavigation,
+} from "./shortcuts";
+import { watchNotifications, holdNotificationLock, notificationScope } from "./notifications";
+import { useConnectionNotice } from "./use-connection-notice";
 import { parseReferenceHref } from "@stanley2058/lilac-client-protocol";
 import { ThreadReferenceView } from "./components/ThreadReferenceView";
 import { SidebarEmptyState } from "./components/SidebarEmptyState";
@@ -94,6 +107,7 @@ export function App(props: AppProps) {
   );
 }
 function Workspace(props: AppProps) {
+  const viewport = useWorkspaceViewport();
   const navigate = useNavigate();
   const router = useRouter();
   const active = useMatch({ from: "/chat", shouldThrow: false, select: () => true }) ?? false;
@@ -104,7 +118,7 @@ function Workspace(props: AppProps) {
   });
   const routePathname = useLocation({ select: (location) => location.pathname });
   const routeDraftId = useLocation({ select: (location) => location.state.draftThreadId });
-  const { pool, drafts: draftStore, panels } = useWorkspace();
+  const { pool, drafts: draftStore, panels, notifications } = useWorkspace();
   const draftIds = useStore(draftStore, (state) => state.ids);
   const setLocalDrafts = draftStore.getState().setLocalDrafts;
   const { client, initial } = props;
@@ -148,7 +162,6 @@ function Workspace(props: AppProps) {
   const [catalog, setCatalog] = useState<DisplayCatalog | undefined>(() =>
     initial.catalog.kind === "catalog" ? initial.catalog.catalog : client.catalogs.get(props.scope),
   );
-  const [connection, setConnection] = useState("online");
   const [error, setError] = useState<string>();
   const search: WorkspaceSearch =
     useMatch({
@@ -162,6 +175,50 @@ function Workspace(props: AppProps) {
       )
     : undefined;
   const settings = search.settings;
+  const viewedNotificationThread = search.view === "others" ? search.otherThread : routeThreadId;
+  const openNotificationThread = useEventCallback((threadId: string) => {
+    void navigate({ to: "/threads/$threadId", params: { threadId }, search: {} });
+  });
+  useEffect(
+    () =>
+      watchNotifications({
+        client,
+        initial: initial.threads.items,
+        scope: props.scope,
+        preferences: notifications,
+        openThread: openNotificationThread,
+      }),
+    [client, notifications],
+  );
+  useEffect(() => {
+    let release: (() => void) | undefined;
+    const update = () => {
+      release?.();
+      release = undefined;
+      if (
+        active &&
+        !settings &&
+        viewedNotificationThread &&
+        document.visibilityState === "visible" &&
+        document.hasFocus() &&
+        navigator.locks
+      )
+        release = holdNotificationLock(
+          `${notificationScope(props.scope)}:view:${viewedNotificationThread}`,
+        );
+    };
+    update();
+    window.addEventListener("focus", update);
+    window.addEventListener("blur", update);
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      release?.();
+      window.removeEventListener("focus", update);
+      window.removeEventListener("blur", update);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [active, settings, viewedNotificationThread, notifications]);
+
   const archived = search.view === "archived";
   const external = search.view === "others" && viewer.role === "owner";
   const externalId = search.otherThread;
@@ -353,7 +410,6 @@ function Workspace(props: AppProps) {
             setCatalog(client.catalogs.get(props.scope));
             return;
           case "connection":
-            setConnection(event.state);
             return;
           case "error":
             setError(event.error.message);
@@ -367,8 +423,7 @@ function Workspace(props: AppProps) {
     [client, props.scope, upsert],
   );
   useEffect(() => {
-    if (!selectedId || selectedId.startsWith("draft:")) return;
-    void client.selectThread(selectedId);
+    void client.selectThread(selectedId?.startsWith("draft:") ? undefined : selectedId);
   }, [client, selectedId]);
   const selectedMetadata = useQuery({
     ...threadOptions(client, selectedId ?? ""),
@@ -431,6 +486,8 @@ function Workspace(props: AppProps) {
       void attempt(() => props.draftCache!.saveDraft(props.scope, id, empty), setError);
   });
   const select = useEventCallback(function select(id: string) {
+    blurForThreadNavigation();
+    if (id === selectedRef.current) focusMainComposer();
     const search = { view: archived ? ("archived" as const) : undefined };
     if (id.startsWith("draft:")) {
       void navigate({ to: "/", state: { draftThreadId: id }, search });
@@ -440,6 +497,7 @@ function Workspace(props: AppProps) {
   });
 
   const createThread = useEventCallback(function createThread() {
+    blurForThreadNavigation();
     const draft = newDraftThread();
     const changed = new Map(draftStore.getState().localDrafts);
     for (const [id, existing] of changed) if (!hasDraftContent(existing)) changed.delete(id);
@@ -621,7 +679,13 @@ function Workspace(props: AppProps) {
     setThreadListError(false);
     if (!cursor) setNextCursor(undefined);
     const page = await attempt(
-      () => client.rpc!.threads.list({ archived: showArchived, limit: 100, cursor }),
+      () =>
+        client.rpc!.threads.list({
+          archived: showArchived,
+          excludeSettled: !showArchived,
+          limit: 100,
+          cursor,
+        }),
       (message) => {
         if (threadListRequest.current === request) setError(message);
       },
@@ -711,32 +775,14 @@ function Workspace(props: AppProps) {
     if (!error) return;
     toast.add({ id: "app-error", title: error, type: "error", onClose: () => setError(undefined) });
   }, [error]);
-  useEffect(() => {
-    if (connection === "online") {
-      toast.close("connection");
-      return;
-    }
-    toast.add({
-      id: "connection",
-      title: connection === "connecting" ? "Connecting…" : "You're offline",
-      description: "Cached conversations remain available.",
-      type: "info",
-      timeout: 0,
-    });
-    return () => toast.close("connection");
-  }, [connection]);
+  useConnectionNotice(online, () => client.reconnect());
+
   const renameSidebarThread = useEventCallback((id: string, title: string) =>
     setRename({ id, title }),
   );
   const archiveSidebarThread = useEventCallback(
     (id: string, archived: boolean) => void update(id, { archived }),
   );
-  const searchSidebar = useEventCallback((query: string) => {
-    const next = query.trim();
-    if (next && next === searchQuery) void searchResults.refetch();
-    setSearchQuery(next);
-  });
-  const clearSidebarSearch = useCallback(() => setSearchQuery(""), []);
   const toggleArchived = useEventCallback(() => {
     changeView({ view: archived ? undefined : "archived", otherThread: undefined });
   });
@@ -757,10 +803,28 @@ function Workspace(props: AppProps) {
       }),
   );
   const logout = useEventCallback(() => void attempt(props.onLogout, setError));
+  const newThreadKeys = useShortcut("newThread");
+  const settingsKeys = useShortcut("settings");
+  useAppShortcuts({
+    enabled: active,
+    blocked: !!settings,
+    newThread: createThread,
+    settings: openSettings,
+    sidebar: () => {
+      const focused = document.activeElement?.closest("#sidebar");
+      panels.getState().toggleSidebar();
+      if (focused) focusMainComposer();
+    },
+    rightPanel: () => {
+      const focused = document.activeElement?.closest("#right-panel");
+      panels.getState().toggle(selectedId);
+      if (focused) focusMainComposer();
+    },
+  });
   const sidebarToolbar = useMemo(
     () => (
       <div className="sidebar-search-row flex items-center gap-1 min-w-0 mb-2">
-        <SidebarSearch onSearch={searchSidebar} onClear={clearSidebarSearch} />
+        <SidebarSearch onSearch={setSearchQuery} />
         <nav
           className="sidebar-tabs flex items-center py-2 px-0"
           aria-label="Conversation filters and actions"
@@ -783,22 +847,18 @@ function Workspace(props: AppProps) {
               <Globe />
             </IconButton>
           ) : null}
-          <IconButton label="New conversation" tooltip="New" onClick={createThread}>
+          <IconButton
+            label="New conversation"
+            tooltip="New thread"
+            shortcut="newThread"
+            onClick={createThread}
+          >
             <MessageCirclePlus />
           </IconButton>
         </nav>
       </div>
     ),
-    [
-      archived,
-      external,
-      owner,
-      searchSidebar,
-      clearSidebarSearch,
-      toggleArchived,
-      toggleExternal,
-      createThread,
-    ],
+    [archived, external, owner, toggleArchived, toggleExternal, createThread],
   );
   const sidebarFooter = useMemo(
     () => (
@@ -812,14 +872,15 @@ function Workspace(props: AppProps) {
         <ContextMenu>
           <ContextMenuTrigger
             render={
-              <IconButton label="Settings" onClick={openSettings}>
+              <IconButton label="Settings" shortcut="settings" onClick={openSettings}>
                 <SettingsIcon />
               </IconButton>
             }
           />
           <ContextMenuContent side="top" align="end">
             <ContextMenuItem onClick={openSettings}>
-              <SettingsIcon /> Settings
+              <SettingsIcon /> Settings{" "}
+              <span className="ml-auto text-xs text-muted-foreground">{settingsKeys.label}</span>
             </ContextMenuItem>
             <ContextMenuItem onClick={openDesign}>
               <Palette /> Design
@@ -831,8 +892,9 @@ function Workspace(props: AppProps) {
         </ContextMenu>
       </footer>
     ),
-    [viewer, props.sessionControl, openSettings, openDesign, logout],
+    [viewer, props.sessionControl, openSettings, openDesign, logout, settingsKeys.label],
   );
+  const actionThread = !external && !reference ? (selected ?? selectedMetadata.data) : undefined;
   return (
     <MessageIdentityContext.Provider value={identities}>
       <FileViewerProvider threadId={selectedId}>
@@ -843,12 +905,14 @@ function Workspace(props: AppProps) {
         >
           <Tooltip.Provider delay={350}>
             <main
+              ref={viewport}
               className={`app-shell group/workspace relative flex h-dvh overflow-hidden ${sidebar ? "" : "sidebar-hidden"} ${rightOpen ? "" : "right-panel-hidden"}`}
               aria-label="Chat workspace"
             >
               <div className="sidebar-toggle fixed top-0 left-3 h-8 flex items-center z-40 [&_.icon-button]:size-[var(--ui-control-compact)]">
                 <PanelToggleButton
                   label={sidebar ? "Hide sidebar" : "Show sidebar"}
+                  shortcut="sidebar"
                   open={sidebar}
                   onToggle={panels.getState().toggleSidebar}
                 >
@@ -858,6 +922,29 @@ function Workspace(props: AppProps) {
               <RightPanelToggle
                 open={rightOpen}
                 onToggle={() => panels.getState().toggle(selectedId)}
+              />
+              <FloatingChatMenu
+                sidebarOpen={sidebar}
+                rightOpen={rightOpen}
+                onToggleSidebar={panels.getState().toggleSidebar}
+                onToggleRight={() => panels.getState().toggle(selectedId)}
+                archived={actionThread?.archived}
+                onShare={owner && actionThread ? () => setSharing(true) : undefined}
+                onRename={
+                  actionThread?.capabilities.edit
+                    ? () => setRename({ id: actionThread.id, title: actionThread.title })
+                    : undefined
+                }
+                onArchive={
+                  actionThread?.capabilities.edit
+                    ? () => void update(actionThread.id, { archived: !actionThread.archived })
+                    : undefined
+                }
+                onDelete={
+                  actionThread?.capabilities.edit
+                    ? () => setConfirmDelete(actionThread.id)
+                    : undefined
+                }
               />
               <WorkspacePanels
                 leftOpen={sidebar}
@@ -889,6 +976,22 @@ function Workspace(props: AppProps) {
                       </span>
                     </header>
                     {sidebarToolbar}
+                    {archived && !results && !external ? (
+                      <ThreadShortcutTargets
+                        ids={sidebarThreads.map((thread) => thread.id)}
+                        select={select}
+                      />
+                    ) : null}
+                    {results ? (
+                      <ThreadShortcutTargets
+                        ids={results.items.map((hit) => hit.threadId)}
+                        select={(id) => {
+                          const hit = results.items.find((hit) => hit.threadId === id);
+                          if (hit?.surface === "native") select(id);
+                          else selectExternal(id);
+                        }}
+                      />
+                    ) : null}
                     {external && owner && !results ? (
                       <ExternalSidebar selectedId={externalId} onSelect={selectExternal} />
                     ) : null}
@@ -902,20 +1005,17 @@ function Workspace(props: AppProps) {
                             className="thread-list flex-1"
                             estimate={92}
                             render={(hit) => (
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                className="search-result flex w-full gap-1 p-3 text-left rounded-sm h-auto flex-col items-start whitespace-normal"
-                                onClick={() => {
+                              <SearchThreadButton
+                                id={hit.threadId}
+                                title={hit.title}
+                                excerpt={hit.excerpt}
+                                onSelect={() => {
                                   if (hit.surface === "native") select(hit.threadId);
                                   else {
                                     selectExternal(hit.threadId);
                                   }
                                 }}
-                              >
-                                <strong>{hit.title}</strong>
-                                <span>{hit.excerpt}</span>
-                              </Button>
+                              />
                             )}
                           />
                           {results.items.length === 0 && !searching ? (
@@ -1017,11 +1117,61 @@ function Workspace(props: AppProps) {
                     {!reference && !external && selectedId && routeDraftExists
                       ? (() => {
                           const thread = selected ?? selectedMetadata.data;
+                          const conversationActions = thread ? (
+                            <>
+                              {owner ? (
+                                <IconButton
+                                  label="Share conversation"
+                                  tooltip="Share"
+                                  onClick={() => setSharing(true)}
+                                >
+                                  <Users />
+                                </IconButton>
+                              ) : null}
+                              {thread.capabilities.edit ? (
+                                <DropdownMenu>
+                                  <DropdownMenuTrigger
+                                    render={
+                                      <IconButton label="Conversation actions" tooltip="Options">
+                                        <MoreHorizontal />
+                                      </IconButton>
+                                    }
+                                  />
+                                  <DropdownMenuContent align="end">
+                                    <DropdownMenuItem
+                                      onClick={() =>
+                                        setRename({ id: thread.id, title: thread.title })
+                                      }
+                                    >
+                                      <Pencil />
+                                      Rename
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      onClick={() =>
+                                        void update(thread.id, { archived: !thread.archived })
+                                      }
+                                    >
+                                      {thread.archived ? <ArchiveRestore /> : <Archive />}
+                                      {thread.archived ? "Unarchive" : "Archive"}
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      variant="destructive"
+                                      onClick={() => setConfirmDelete(thread.id)}
+                                    >
+                                      <Trash2 />
+                                      Delete
+                                    </DropdownMenuItem>
+                                  </DropdownMenuContent>
+                                </DropdownMenu>
+                              ) : null}
+                            </>
+                          ) : null;
                           return (
                             <Chat
                               threadId={selectedId}
                               thread={thread}
                               foreground={active}
+                              autoFocus={active && !settings && !search.ref && !search.message}
                               catalog={catalog}
                               onError={setError}
                               readTurns={readTurns.current}
@@ -1051,54 +1201,9 @@ function Workspace(props: AppProps) {
                                       </span>
                                     ) : null}
                                     <span className="toolbar-spacer flex-1" />
-                                    {owner ? (
-                                      <IconButton
-                                        label="Share conversation"
-                                        tooltip="Share"
-                                        onClick={() => setSharing(true)}
-                                      >
-                                        <Users />
-                                      </IconButton>
-                                    ) : null}
-                                    {thread.capabilities.edit ? (
-                                      <DropdownMenu>
-                                        <DropdownMenuTrigger
-                                          render={
-                                            <IconButton
-                                              label="Conversation actions"
-                                              tooltip="Options"
-                                            >
-                                              <MoreHorizontal />
-                                            </IconButton>
-                                          }
-                                        />
-                                        <DropdownMenuContent align="end">
-                                          <DropdownMenuItem
-                                            onClick={() =>
-                                              setRename({ id: thread.id, title: thread.title })
-                                            }
-                                          >
-                                            <Pencil />
-                                            Rename
-                                          </DropdownMenuItem>
-                                          <DropdownMenuItem
-                                            onClick={() =>
-                                              void update(thread.id, { archived: !thread.archived })
-                                            }
-                                          >
-                                            {thread.archived ? <ArchiveRestore /> : <Archive />}
-                                            {thread.archived ? "Unarchive" : "Archive"}
-                                          </DropdownMenuItem>
-                                          <DropdownMenuItem
-                                            variant="destructive"
-                                            onClick={() => setConfirmDelete(thread.id)}
-                                          >
-                                            <Trash2 />
-                                            Delete
-                                          </DropdownMenuItem>
-                                        </DropdownMenuContent>
-                                      </DropdownMenu>
-                                    ) : null}
+                                    <div className="hidden workspace:flex items-center gap-2">
+                                      {conversationActions}
+                                    </div>
                                   </header>
                                 ) : undefined
                               }
@@ -1108,7 +1213,15 @@ function Workspace(props: AppProps) {
                       : null}
                     {!reference && !external && !selectedId ? (
                       <div className="welcome">
-                        <Button onClick={createThread}>
+                        <Button
+                          title={
+                            newThreadKeys.label
+                              ? `New thread (${newThreadKeys.label})`
+                              : "New thread"
+                          }
+                          aria-keyshortcuts={newThreadKeys.aria}
+                          onClick={createThread}
+                        >
                           <Plus />
                           New conversation
                         </Button>
@@ -1207,3 +1320,34 @@ function Workspace(props: AppProps) {
   );
 }
 export default App;
+
+function SearchThreadButton({
+  id,
+  title,
+  excerpt,
+  onSelect,
+}: {
+  id: string;
+  title: string;
+  excerpt: string;
+  onSelect: () => void;
+}) {
+  const shortcut = useThreadShortcut(id);
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      className="search-result relative flex w-full gap-1 p-3 text-left rounded-sm h-auto flex-col items-start whitespace-normal"
+      aria-keyshortcuts={shortcut.aria}
+      onClick={onSelect}
+    >
+      <strong>{title}</strong>
+      <span>{excerpt}</span>
+      {shortcut.held && shortcut.label ? (
+        <Kbd className="absolute bottom-2 right-2 bg-popover px-2 text-popover-foreground shadow-sm">
+          {shortcut.label}
+        </Kbd>
+      ) : null}
+    </Button>
+  );
+}

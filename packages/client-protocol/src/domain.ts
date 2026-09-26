@@ -235,3 +235,16 @@ export const subagentSummarySchema = z.strictObject({
   startedAt: revisionSchema,
 });
 export type SubagentSummary = z.infer<typeof subagentSummarySchema>;
+
+export const nativeDeploymentSettingsSchema = z.strictObject({
+  titleModel: z.string().trim().min(1),
+  outputStreaming: z.enum(["paragraph", "complete"]),
+  oldMessageSelectionMaxAgeMs: z.number().int().positive().nullable(),
+  storageRetentionMaxAgeMs: z.number().int().positive().nullable(),
+  crossThreadSend: z.strictObject({ triggerRun: z.boolean() }),
+});
+export type NativeDeploymentSettings = z.infer<typeof nativeDeploymentSettingsSchema>;
+export const nativeDeploymentDocumentSchema = z.strictObject({
+  settings: nativeDeploymentSettingsSchema,
+  revision: z.number().int().nonnegative(),
+});

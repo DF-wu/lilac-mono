@@ -37,6 +37,8 @@ export const clerkAppearance = {
     headerTitle: "text-lg font-semibold",
     headerSubtitle: "text-sm text-muted-foreground",
     formFieldInput: inputClassName,
+    otpCodeFieldInput:
+      "border border-muted-foreground bg-input-background text-input-foreground shadow-none data-[focus-within=true]:border-ring data-[focus-within=true]:ring-3 data-[focus-within=true]:ring-ring/50 data-[feedback=success]:border-success data-[feedback=success]:data-[focus-within=true]:border-success aria-invalid:border-destructive aria-invalid:data-[focus-within=true]:border-destructive aria-invalid:ring-destructive/20",
     formFieldInput__password: "pr-10",
     formButtonPrimary: buttonVariants({ className: "w-full" }),
     socialButtonsBlockButton: buttonVariants({ variant: "outline", className: "w-full" }),

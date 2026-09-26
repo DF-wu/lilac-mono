@@ -1,12 +1,15 @@
+import { KeybindingsSettings } from "./KeybindingsSettings";
+import { NotificationSettings } from "./NotificationSettings";
 import type { SettingsTab } from "../router";
 import { useWorkspace } from "../workspace-context";
 import { useStore } from "zustand";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { configOptions, userOptions, useNativeOnline } from "../queries";
-import { StreamingSettings } from "./StreamingSettings";
+import { DeploymentSettings } from "./DeploymentSettings";
 import { SidebarPreferences } from "./SidebarPreferences";
 import { AccountProfile } from "./AccountProfile";
 import { AgentIdentity } from "./AgentIdentity";
+import { AppearanceSettings } from "./AppearanceSettings";
 import type { ActorIdentity } from "./ActorAvatar";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { RefreshCw, Save, UserPlus } from "lucide-react";
@@ -52,7 +55,7 @@ export function Settings({
 }) {
   const [open, setOpen] = useState(true);
   const narrow = useSyncExternalStore(subscribeToSettingsWidth, isNarrowSettings);
-  const { client, preferences, accountProfile } = useWorkspace();
+  const { client, preferences, keybindings, notifications, accountProfile } = useWorkspace();
   const animation = useStore(preferences, (state) => state.animation);
   const [editors, setEditors] = useState<ConfigEditors>({});
   const [error, setError] = useState<string>();
@@ -110,8 +113,6 @@ export function Settings({
     setSaving((current) => ({ ...current, [request.kind]: false }));
     if (!saved) return;
     void queries.invalidateQueries({ queryKey: ["config", request.kind] });
-    if (request.kind === "core")
-      void queries.invalidateQueries({ queryKey: ["config", "streaming"] });
     setEditors((current) => completeConfigSave(current, request, saved));
   }
   async function reload() {
@@ -139,7 +140,8 @@ export function Settings({
             if (
               value === "account" ||
               value === "options" ||
-              value === "theme" ||
+              value === "keybindings" ||
+              value === "deployment" ||
               value === "core" ||
               value === "mcp" ||
               value === "agent" ||
@@ -151,6 +153,7 @@ export function Settings({
           }}
         >
           <TabsList
+            activateOnFocus
             variant="navigation"
             className="settings-navigation w-40 flex-none items-stretch justify-start self-stretch h-auto overflow-y-auto overflow-x-hidden min-w-0 py-4 px-0 gap-6 bg-transparent"
             aria-label="Settings sections"
@@ -162,9 +165,15 @@ export function Settings({
               >
                 Preferences
               </span>
-              <TabsTrigger value="account">Account</TabsTrigger>
-              <TabsTrigger value="theme">Appearance</TabsTrigger>
-              <TabsTrigger value="options">Options</TabsTrigger>
+              <TabsTrigger tabIndex={0} value="account">
+                Account
+              </TabsTrigger>
+              <TabsTrigger tabIndex={0} value="options">
+                Settings
+              </TabsTrigger>
+              <TabsTrigger tabIndex={0} value="keybindings">
+                Keybindings
+              </TabsTrigger>
             </div>
             {viewer.role === "owner" ? (
               <div className="settings-navigation-group flex flex-col gap-1">
@@ -174,10 +183,21 @@ export function Settings({
                 >
                   Runtime
                 </span>
-                <TabsTrigger value="core">Core</TabsTrigger>
-                <TabsTrigger value="mcp">MCP</TabsTrigger>
-                <TabsTrigger value="agent">Agent</TabsTrigger>
-                <TabsTrigger value="users">User</TabsTrigger>
+                <TabsTrigger tabIndex={0} value="deployment">
+                  Deployment
+                </TabsTrigger>
+                <TabsTrigger tabIndex={0} value="core">
+                  Core
+                </TabsTrigger>
+                <TabsTrigger tabIndex={0} value="mcp">
+                  MCP
+                </TabsTrigger>
+                <TabsTrigger tabIndex={0} value="agent">
+                  Agent
+                </TabsTrigger>
+                <TabsTrigger tabIndex={0} value="users">
+                  User
+                </TabsTrigger>
               </div>
             ) : null}
           </TabsList>
@@ -196,62 +216,12 @@ export function Settings({
                 </>
               )}
             </TabsContent>
+            <TabsContent value="keybindings" className="settings-section">
+              <KeybindingsSettings store={keybindings} />
+            </TabsContent>
             <TabsContent value="options" className="settings-section">
-              <h2>Thread</h2>
-              <SidebarPreferences />
-              {viewer.role === "owner" ? (
-                <StreamingSettings
-                  disabled={!!saving.core}
-                  onSaved={() =>
-                    setEditors((current) => {
-                      const core = current.core;
-                      if (!core || core.text !== core.document.text) return current;
-                      return { ...current, core: undefined };
-                    })
-                  }
-                />
-              ) : null}
-              <h2>Access</h2>
-              <dl className="settings-account grid gap-4 mb-6">
-                <div>
-                  <dt>Role</dt>
-                  <dd>{viewer.role}</dd>
-                </div>
-                <div>
-                  <dt>Tool access</dt>
-                  <dd>{viewer.toolMode === "full" ? "Full access" : "Restricted"}</dd>
-                </div>
-              </dl>
-            </TabsContent>
-            <TabsContent value="agent" className="settings-section">
-              <h2>Agent</h2>
-              <AgentIdentity client={client} identity={agent} />
-            </TabsContent>
-            <TabsContent value="theme" className="settings-section">
               <h2>Appearance</h2>
-              <div className="settings-row flex items-start justify-between gap-6 mb-8">
-                <span>Theme</span>
-                <Select
-                  items={[
-                    { value: "system", label: "System" },
-                    { value: "dark", label: "Dark" },
-                    { value: "light", label: "Light" },
-                  ]}
-                  value={theme}
-                  onValueChange={(value) => {
-                    if (value) onTheme(value);
-                  }}
-                >
-                  <SelectTrigger aria-label="Theme">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="system">System</SelectItem>
-                    <SelectItem value="dark">Dark</SelectItem>
-                    <SelectItem value="light">Light</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
+              <AppearanceSettings theme={theme} onTheme={onTheme} />
               <div className="settings-row flex items-start justify-between gap-6 mb-8">
                 <div className="settings-row-description min-w-0">
                   <span>Animation speed</span>
@@ -282,6 +252,30 @@ export function Settings({
                   </SelectContent>
                 </Select>
               </div>
+              <h2>Thread</h2>
+              <SidebarPreferences />
+              <NotificationSettings preferences={notifications} />
+              <h2>Access</h2>
+              <dl className="settings-account grid gap-4 mb-6">
+                <div>
+                  <dt>Role</dt>
+                  <dd>{viewer.role}</dd>
+                </div>
+                <div>
+                  <dt>Tool access</dt>
+                  <dd>{viewer.toolMode === "full" ? "Full access" : "Restricted"}</dd>
+                </div>
+              </dl>
+            </TabsContent>
+            {viewer.role === "owner" ? (
+              <TabsContent value="deployment" className="settings-section">
+                <h2>Deployment</h2>
+                <DeploymentSettings />
+              </TabsContent>
+            ) : null}
+            <TabsContent value="agent" className="settings-section">
+              <h2>Agent</h2>
+              <AgentIdentity client={client} identity={agent} />
             </TabsContent>
             <TabsContent value="users" className="settings-section">
               <h2>User</h2>

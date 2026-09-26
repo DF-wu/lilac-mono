@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import { parseCoreConfig } from "../core-config";
-import { IMAGE_GENERATION_MODEL_ALIASES } from "../core-config/types";
+import { IMAGE_GENERATION_MODEL_ALIASES } from "../core-config/generate-image";
 
 const DEFAULT_IMAGE_CONFIG = {
   provider: "default",

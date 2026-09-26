@@ -1,0 +1,141 @@
+# Upstream footprint allowlist.
+#
+# Every upstream-owned file this fork modifies, with the reason it cannot live
+# in a fork-owned module. `bun run fork:footprint` fails when a file outside
+# this list differs from the merge base with upstream, and reports entries that
+# no longer differ so they can be removed. Format: `<path>  # <reason>`.
+#
+# Keep entries to thin seams: imports, one-line registrations, closed-union
+# members, and re-exports. Behavior belongs in fork-owned modules
+# (`apps/core/src/surface/telegram/`, `apps/core/src/tool-server/tools/generate-image/`,
+# `packages/utils/core-config/{telegram-surface,generate-image}.ts`, ...).
+
+# --- Repository, CI, and container delivery
+.env.example  # documents fork-only environment variables
+package.json  # fork:footprint script and scripts/fork lint, format, and typecheck coverage
+.github/workflows/ci.yml  # container variant matrix and the upstream-footprint job
+.gitignore  # ignores local agent state directories
+.oxfmtrc.json  # ignores local agent state directories
+Dockerfile  # container identity variants (CONTAINER_USER/UID build args)
+compose.yaml  # container identity variants and the native surface port
+docker/direct-entrypoint.sh  # container identity variants and legacy blob migration
+docker/verify-image.sh  # verifies the container identity variants
+__tests__/docker-build-script.test.ts  # covers the container identity variants
+bun.lock  # grammY (Telegram Bot API) dependency
+
+# --- Documentation
+README.md  # fork entry point; describes fork features and maintenance
+PROJECT.md  # documents the Telegram surface and structured generate.image
+MIGRATIONS.md  # documents fork v2 config keys (surface.telegram, tools.generate)
+docs/core-config-migrations.md  # documents fork v2 config keys
+docs/docker-deployment.md  # documents the container identity variants
+packages/utils/config-templates/core-config.example.yaml  # example keys for surface.telegram and tools.generate
+packages/utils/builtin-skills/image-generation/SKILL.md  # skill describes the structured generate.image contract
+packages/utils/builtin-skills/image-generation/references/openai.md  # superseded script recipe removed
+packages/utils/builtin-skills/image-generation/references/openrouter.md  # superseded script recipe removed
+packages/utils/builtin-skills/image-generation/references/xai.md  # superseded script recipe removed
+packages/utils/builtin-skills/workflow-authoring/SKILL.md  # documents Telegram workflow targets
+packages/utils/builtin-skills/workflow-authoring/REFERENCE.md  # documents Telegram workflow targets
+packages/utils/builtin-skills/workflow-authoring/RUNTIME.md  # documents Telegram workflow targets
+
+# --- Architecture gate registrations for fork modules
+scripts/architecture/manifest.ts  # registers fork module boundaries, codecs, and exception adapters
+scripts/architecture/precise-exception-identities.ts  # registers fork module exception identities
+scripts/architecture/core-final-boundary-identities.ts  # registers the attachment-resolver capability predicate
+scripts/architecture/architecture.test.ts  # expects the Telegram request router event consumer
+
+# --- Closed platform unions and shared surface contracts (Telegram membership)
+apps/core/src/surface/types.ts  # adds "telegram" to the closed SessionRef/MsgRef unions
+apps/core/src/surface/adapter.ts  # adds the optional attachment-resolver capability and resolve-attachment operation
+apps/core/src/surface/builtin-surface-protocols.ts  # registers telegramSurfaceProtocol in the closed catalog
+apps/core/src/surface/bridge/request-ids.ts  # telegram:<session>:<message> request-id form
+apps/core/src/surface/bridge/request-composition/attachments.ts  # resolves Telegram attachment refs during composition
+apps/core/src/surface/bridge/request-composition/normalization.ts  # platform-aware routed-surface normalization
+apps/core/src/surface/bridge/subscribe-from-bus.ts  # platform-generic relay refs
+apps/core/src/transcript/transcript-store.ts  # Telegram platform filters
+apps/core/src/migration/frozen-graceful-restart-store.ts  # frozen restart snapshot accepts Telegram refs
+apps/core/scripts/legacy-graceful-restart-blob-migration.ts  # legacy snapshot decoder accepts Telegram refs
+apps/core/scripts/legacy-transcript-blob-migration.ts  # startup legacy blob migration
+apps/core/src/runtime/main.ts  # startup legacy blob migration via startCoreRuntime
+apps/core/src/runtime/create-core-runtime.ts  # constructs and registers the Telegram surface module
+apps/core/src/runtime/compose-builtin-surface-runtimes.ts  # includes the Telegram runtime descriptor entry
+apps/core/package.json  # grammY dependency
+
+# --- Conversation memory: Telegram as a third source (projection lives in surface/telegram/telegram-conversation-source.ts)
+apps/core/src/conversation/thread-store.ts  # telegram source branch, telegram_thread kind, chat allowlist clause
+apps/core/src/conversation/thread-service.ts  # telegram surface labels and chat allowlist checks
+apps/core/src/conversation/thread-summarization-worker-protocol.ts  # telegram surface enum and source path fields
+apps/core/src/conversation/thread-summarization-worker.ts  # opens the telegram source and bot name in the worker
+apps/core/src/conversation/thread-worker.ts  # forwards the telegram source and hydrates telegram refs
+apps/core/src/surface/bridge/bus-agent-runner.ts  # labels telegram requests for conversation recall
+apps/core/src/tool-server/tools/conversation-thread.ts  # telegram in the surface filter enum
+packages/utils/prompt-templates/TOOLS.md  # mentions Telegram t.me links for conversation tools
+
+# --- Workflow engine: Telegram targets and delivery revalidation
+apps/core/src/workflow/durable-workflow-store.ts  # Telegram target revalidation
+apps/core/src/workflow/workflow-domain.ts  # Telegram workflow targets
+apps/core/src/workflow/workflow-engine.ts  # Telegram waitForReply and targets
+apps/core/src/workflow/workflow-operation-policy.ts  # Telegram waitForReply policy
+apps/core/src/workflow/workflow-progress-projector.ts  # target authorization hook and Telegram ports
+apps/core/src/workflow/workflow-progress-view.ts  # Telegram progress card rendering
+apps/core/src/workflow/workflow-trigger-scheduler.ts  # rechecks Telegram target authorization before fire
+apps/core/src/workflow/workflow-waits.ts  # Telegram reply waits
+
+# --- Tool server: origin-session authority and structured generate.image
+apps/core/src/tool-server/create-tool-server.ts  # x-lilac-origin-session-id header and initiator-scoped restricted calls
+apps/core/src/tool-server/request-control-authority.ts  # origin session authority
+apps/core/src/tool-server/tools/surface.ts  # Telegram allowlist filtering for list-sessions and initiator session defaults
+apps/core/src/tool-server/tools/generate.ts  # hooks the structured generate.image callable; exports shared helpers
+apps/core/src/tool-server/tools/image-script.ts  # upstream script runner replaced by the structured tool (deleted)
+apps/core/src/tool-server/tools/image-script-preload.ts  # upstream script runner replaced by the structured tool (deleted)
+apps/core/src/tools/bash-impl.ts  # forwards LILAC_ORIGIN_SESSION_ID to tool processes
+apps/core/src/plugins/builtin/server-tools.ts  # passes core config into the Generate tool
+apps/core/src/custom-commands/manager.ts  # menu alias index and @target-aware command parsing
+apps/tool-bridge/client.ts  # forwards the origin session header
+apps/tool-bridge/index.ts  # tool-bridge plugin manager wiring
+packages/plugin-runtime/types.ts  # originSessionId / requestInitiator in RequestContext
+
+# --- GitHub reply permalinks and trigger-loop hardening
+apps/core/src/github/github-api.ts  # issue vs comment permalink resolution
+apps/core/src/github/github-ids.ts  # issue vs comment permalink identifiers
+apps/core/src/github/webhook/github-webhook-server.ts  # duplicate final publication and self-trigger guards
+apps/core/src/surface/github/github-adapter.ts  # single publisher for replies
+apps/core/src/surface/github/output/github-output-stream.ts  # reply permalinks
+
+# --- Config layer seams
+packages/utils/core-config.ts  # re-exports fork config modules
+packages/utils/core-config/types.ts  # UniversalCoreConfig gains surface.telegram and tools.generate
+packages/utils/core-config/v1.ts  # v1 fallbacks for fork config keys
+packages/utils/core-config/v2.ts  # v2 schema includes fork config modules
+packages/utils/index.ts  # re-exports the custom-command menu module
+
+# --- Agent and event bus fixes carried by the fork
+packages/agent/adapters/ai-sdk/adapter.ts  # executes parsed local tool calls on nonstandard finish reasons
+packages/agent/agent-run-idle-watchdog.ts  # idle watchdog restart gap fix
+packages/event-bus/redis-streams-bus.ts  # single-flight subscription cleanup
+
+# --- Upstream tests extended for fork behavior
+apps/core/tests/heartbeat/heartbeat-service.test.ts  # machine-independent quiet-hours timezone test
+apps/core/tests/runtime/compose-builtin-surface-runtimes.test.ts  # covers the Telegram runtime entry
+apps/core/tests/surface/authenticated-request.test.ts  # Telegram principals
+apps/core/tests/surface/bridge/adapter-event-projection.test.ts  # Telegram adapter events
+apps/core/tests/surface/bridge/bus-agent-runner.test.ts  # Telegram authority
+apps/core/tests/surface/bridge/subscribe-from-bus.test.ts  # platform-generic relay refs
+apps/core/tests/surface/github/github-adapter.test.ts  # single publisher replies
+apps/core/tests/surface/github/github-output-stream.test.ts  # reply permalinks
+apps/core/tests/surface/operation-contract.test.ts  # resolve-attachment operation
+apps/core/tests/surface/reference-adapter-contract.test.ts  # attachment-resolver capability
+apps/core/tests/surface/runtime-descriptor.test.ts  # Telegram descriptor
+apps/core/tests/tool-server-create-tool-server.test.ts  # origin-session authority
+apps/core/tests/tool-server-image-generation.test.ts  # structured generate.image
+apps/core/tests/tool-server-surface.test.ts  # Telegram session listing
+apps/core/tests/tools/subagent.test.ts  # origin session context
+apps/core/tests/transcript/transcript-store.test.ts  # Telegram platform filters
+apps/core/tests/workflow/workflow-engine.test.ts  # Telegram workflow targets
+apps/core/tests/workflow/workflow-progress-projector.test.ts  # target authorization
+apps/core/tests/workflow/workflow-trigger-scheduler.test.ts  # target rechecks
+apps/core/tests/workflow/workflow-wait-resolver.test.ts  # Telegram reply waits
+apps/tool-bridge/client.test.ts  # origin session header
+packages/agent/tests/ai-sdk-pi-agent.test.ts  # nonstandard finish reason tool calls
+packages/event-bus/tests/redis-streams-bus.test.ts  # single-flight cleanup
+packages/utils/tests/core-config.versioning.test.ts  # v1/v2 drift test for fork keys

@@ -1,4 +1,4 @@
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { MessageSquare, Link2, ExternalLink } from "lucide-react";
 import { referenceHref, type ConversationReference } from "@stanley2058/lilac-client-protocol";
@@ -11,7 +11,7 @@ import {
   ContextMenuTrigger,
 } from "./ui/context-menu";
 import { Button } from "./ui/button";
-import { attempt } from "./ui";
+import { attempt, IconButton } from "./ui";
 import { toast } from "./ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
@@ -30,6 +30,39 @@ export function ConversationIcon({ surface }: { surface: ConversationReference["
       aria-label={surface === "native" ? "Native" : "GitHub"}
       className="size-4 shrink-0"
     />
+  );
+}
+
+export function CopyReferenceButton({
+  target,
+  disabled = false,
+}: {
+  target?: ConversationReference;
+  disabled?: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <IconButton
+      label="Copy link"
+      tooltip={copied ? "Link copied" : "Copy link"}
+      disabled={disabled || !target}
+      onPointerLeave={() => setCopied(false)}
+      onBlur={() => setCopied(false)}
+      onClick={() => {
+        if (!target) return;
+        void attempt(
+          async () => {
+            await navigator.clipboard.writeText(
+              new URL(referenceHref(target), location.origin).href,
+            );
+            setCopied(true);
+          },
+          () => toast.add({ title: "Copy unavailable", type: "error" }),
+        );
+      }}
+    >
+      <Link2 />
+    </IconButton>
   );
 }
 

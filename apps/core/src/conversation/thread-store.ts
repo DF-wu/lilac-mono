@@ -1,3 +1,15 @@
+import {
+  installNativeConversationSource,
+  readNativeConversationThreads,
+  readNativeConversationMessages,
+  readNativeConversationAttachments,
+} from "../surface/native/conversation-source";
+import {
+  installTelegramConversationSource,
+  readTelegramConversationAttachments,
+  readTelegramConversationMessages,
+  readTelegramConversationThreads,
+} from "../surface/telegram/telegram-conversation-source";
 import { SUMMARY_QUIET_MS } from "./thread-summary-policy";
 import { CONVERSATION_FACET_WEIGHTS as FACET_WEIGHTS } from "./thread-search-weights";
 import { Database } from "bun:sqlite";
@@ -57,7 +69,38 @@ function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
 export const CONVERSATION_THREAD_SUMMARY_VERSION = 5;
 export const CONVERSATION_THREAD_EMBEDDING_VERSION = 1;
 
-export type ConversationThreadKind = "discord_thread" | "inferred_channel_thread";
+export type ConversationThreadKind =
+  | "discord_thread"
+  | "inferred_channel_thread"
+  | "native_thread"
+  | "telegram_thread";
+
+/** Surfaces whose history the thread store can index. */
+export type ConversationSurface = "discord" | "native" | "telegram";
+
+/**
+ * Threads materialized from an attached surface source carry their surface as
+ * a thread-id prefix; Discord threads are the un-prefixed default. This is the
+ * single mapping shared by the SQL joins and the TypeScript projections.
+ */
+export function conversationSurfaceOfThreadId(threadId: string): ConversationSurface {
+  if (threadId.startsWith("native:")) return "native";
+  if (threadId.startsWith("telegram:")) return "telegram";
+  return "discord";
+}
+
+export function conversationSurfaceOfThreadKind(kind: ConversationThreadKind): ConversationSurface {
+  if (kind === "native_thread") return "native";
+  if (kind === "telegram_thread") return "telegram";
+  return "discord";
+}
+
+const SOURCE_SURFACE_SQL =
+  "CASE WHEN tm.thread_id LIKE 'native:%' THEN 'native' WHEN tm.thread_id LIKE 'telegram:%' THEN 'telegram' ELSE 'discord' END";
+
+/** Chat id of a Telegram session id (`<chat_id>` or `<chat_id>:<topic_id>`), in SQL. */
+const TELEGRAM_CHAT_ID_SQL =
+  "CASE WHEN instr(t.channel_id,':')>0 THEN substr(t.channel_id,1,instr(t.channel_id,':')-1) ELSE t.channel_id END";
 
 export type ConversationThreadRepairKind = "content" | "topology";
 
@@ -117,6 +160,7 @@ export type ConversationThreadSummarizationEligibility = {
 export type ConversationThreadSummaryRow = PersistedConversationThreadSummaryRow;
 
 export type ConversationThreadMessage = {
+  surface?: ConversationSurface;
   channelId: string;
   messageId: string;
   ordinal: number;
@@ -163,6 +207,7 @@ export type ConversationThreadSearchHit = {
   guildId?: string;
   parentChannelId?: string;
   kind: ConversationThreadKind;
+  sourceRevision?: string;
   title: string;
   brief: string;
   topics: string[];
@@ -183,6 +228,8 @@ export type ConversationThreadSearchHit = {
 };
 
 export type ConversationThreadSearchFilters = {
+  surface?: ConversationSurface;
+  participantSurface?: ConversationSurface;
   sessionId?: string;
   participantId?: string;
   participantIdsAny?: readonly string[];
@@ -193,6 +240,11 @@ export type ConversationThreadSearchFilters = {
 export type ConversationThreadSearchAllowlist = {
   channelIds: readonly string[];
   guildIds: readonly string[];
+  /**
+   * Telegram chat ids whose threads may be read. Absent or empty denies every
+   * Telegram thread, matching the fail-closed `surface.telegram.allowedChatIds`.
+   */
+  telegramChatIds?: readonly string[];
 };
 
 export type ConversationThreadReadResult = {
@@ -239,6 +291,10 @@ const SEMANTIC_SIMILARITY_FLOOR = 0.15;
 
 export type ConversationThreadStoreOptions = {
   surfaceDbPath?: string;
+  nativeDbPath?: string;
+  telegramDbPath?: string;
+  /** Reported as the author of the bot's own Telegram messages; see the Telegram source. */
+  telegramBotName?: string;
   mainAgentUserNames?: readonly string[];
   onPersistenceDiagnostic?: (diagnostic: ConversationThreadPersistenceDiagnostic) => void;
 };
@@ -368,7 +424,12 @@ function computeSummaryHash(summary: ConversationThreadSummary): string {
 }
 
 function computeFacetHash(facets: readonly ConversationThreadFacetInput[]): string {
-  return stableHash(facets.map((facet) => [facet.facet, facet.text].join("\u001f")).join("\u001e"));
+  return stableHash(
+    [...facets]
+      .sort((a, b) => a.facet.localeCompare(b.facet))
+      .map((facet) => [facet.facet, facet.text].join("\u001f"))
+      .join("\u001e"),
+  );
 }
 
 function facetWeightSql(alias: string): string {
@@ -638,6 +699,8 @@ export class ConversationThreadStore {
   private readonly searchDbPath: string;
   private readonly surfaceDbPath?: string;
   private readonly mainAgentUserNames: ReadonlySet<string>;
+  private hasNativeSource = false;
+  private hasTelegramSource = false;
   private readonly onPersistenceDiagnostic: (
     diagnostic: ConversationThreadPersistenceDiagnostic,
   ) => void;
@@ -663,6 +726,133 @@ export class ConversationThreadStore {
     this.hasSurfaceDb = this.attachSurfaceDb();
     this.loadVectorExtension();
     this.migrate();
+    installNativeConversationSource(this.db, options.nativeDbPath);
+    this.hasNativeSource = options.nativeDbPath !== undefined;
+    installTelegramConversationSource(this.db, {
+      databasePath: options.telegramDbPath,
+      botName: options.telegramBotName,
+    });
+    this.hasTelegramSource = options.telegramDbPath !== undefined;
+    this.installMessageSource();
+  }
+
+  attachNativeSource(databasePath: string): void {
+    installNativeConversationSource(this.db, databasePath);
+    this.hasNativeSource = true;
+  }
+
+  attachTelegramSource(databasePath: string, botName?: string): void {
+    installTelegramConversationSource(this.db, { databasePath, botName });
+    this.hasTelegramSource = true;
+  }
+
+  private installMessageSource(): void {
+    this.db.run(`CREATE TEMP VIEW conversation_source_messages AS
+      SELECT 'discord' AS surface, channel_id,message_id,user_id,user_name,text,ts,deleted
+      FROM discord_search_messages
+      UNION ALL SELECT 'native',channel_id,message_id,user_id,user_name,text,ts,0
+      FROM native_conversation_messages
+      UNION ALL SELECT 'telegram',channel_id,message_id,user_id,user_name,text,ts,deleted
+      FROM telegram_conversation_messages`);
+  }
+
+  /** Re-project every attached surface source into the thread index. */
+  refreshSourceThreads(): void {
+    this.refreshNativeThreads();
+    this.refreshTelegramThreads();
+  }
+
+  refreshNativeThreads(): void {
+    if (!this.hasNativeSource) return;
+    this.db.transaction(() => this.materializeNativeThreads())();
+  }
+
+  refreshTelegramThreads(): void {
+    if (!this.hasTelegramSource) return;
+    this.db.transaction(() => this.materializeTelegramThreads())();
+  }
+
+  /**
+   * One indexed thread per Telegram session. Like native threads, a changed
+   * revision rebuilds the thread so edited or deleted text cannot survive in
+   * an earlier summary.
+   */
+  private materializeTelegramThreads(): void {
+    const threads = selectResultValue(readTelegramConversationThreads(this.db));
+    const activeIds = new Set(threads.map((thread) => `telegram:${thread.id}`));
+    for (const row of this.db
+      .query<{ thread_id: string }, []>(
+        "SELECT thread_id FROM conversation_threads WHERE kind='telegram_thread'",
+      )
+      .all()) {
+      if (!activeIds.has(row.thread_id)) this.deleteThread(row.thread_id);
+    }
+    for (const thread of threads) {
+      const threadId = `telegram:${thread.id}`;
+      const existing = this.getThread(threadId);
+      const hash = `telegram:${stableHash(thread.revision)}`;
+      if (existing?.summary_input_hash === hash) continue;
+      const sourceMessages = selectResultValue(
+        readTelegramConversationMessages(this.db, thread.id),
+      );
+      const messages: IndexedMessageRow[] = sourceMessages.map((message) => ({
+        ...message,
+        guild_id: null,
+        parent_channel_id: null,
+        session_type: "thread",
+        edited_ts: null,
+        updated_ts: thread.updated_at,
+        attachments_hash: null,
+        is_chat: 1,
+        reply_to_channel_id: null,
+        reply_to_message_id: null,
+      }));
+      this.deleteThread(threadId);
+      if (messages.length === 0) continue;
+      this.upsertThread({ threadId, kind: "telegram_thread", parentChannelId: null, messages });
+      this.db.run(
+        "UPDATE conversation_threads SET summary_input_hash=?,updated_at=?,end_ts=? WHERE thread_id=?",
+        [hash, thread.updated_at, thread.updated_at, threadId],
+      );
+    }
+  }
+
+  private materializeNativeThreads(): void {
+    const threads = selectResultValue(readNativeConversationThreads(this.db));
+    const activeIds = new Set(threads.map((thread) => `native:${thread.id}`));
+    for (const row of this.db
+      .query<{ thread_id: string }, []>(
+        "SELECT thread_id FROM conversation_threads WHERE kind='native_thread'",
+      )
+      .all()) {
+      if (!activeIds.has(row.thread_id)) this.deleteThread(row.thread_id);
+    }
+    for (const thread of threads) {
+      const threadId = `native:${thread.id}`;
+      const existing = this.getThread(threadId);
+      const hash = `native:${stableHash(thread.revision)}`;
+      const sourceMessages = selectResultValue(readNativeConversationMessages(this.db, thread.id));
+      if (existing?.summary_input_hash === hash) continue;
+      const messages: IndexedMessageRow[] = sourceMessages.map((message) => ({
+        ...message,
+        guild_id: null,
+        parent_channel_id: null,
+        session_type: "thread",
+        edited_ts: null,
+        updated_ts: thread.updated_at,
+        attachments_hash: null,
+        is_chat: 1,
+        reply_to_channel_id: null,
+        reply_to_message_id: null,
+      }));
+      // Rebuild changed native entries so removed text cannot survive in a previous summary.
+      this.deleteThread(threadId);
+      this.upsertThread({ threadId, kind: "native_thread", parentChannelId: null, messages });
+      this.db.run(
+        "UPDATE conversation_threads SET summary_input_hash=?,updated_at=?,end_ts=? WHERE thread_id=?",
+        [hash, thread.updated_at, thread.updated_at, threadId],
+      );
+    }
   }
 
   close(): void {
@@ -783,6 +973,25 @@ export class ConversationThreadStore {
   }
 
   private migrate(): void {
+    const reset = this.db.transaction(() => {
+      const current = this.db
+        .query("SELECT name FROM sqlite_master WHERE name='conversation_index_v2'")
+        .get();
+      if (current) return;
+      for (const table of [
+        "conversation_thread_facets_fts",
+        "conversation_thread_embeddings",
+        "conversation_thread_facets",
+        "conversation_thread_summaries",
+        "conversation_thread_messages",
+        "conversation_threads",
+      ])
+        this.db.run(`DROP TABLE IF EXISTS ${table}`);
+      this.db.run("CREATE TABLE conversation_index_v2 (version INTEGER NOT NULL)");
+      this.db.run("INSERT INTO conversation_index_v2 VALUES (2)");
+    });
+    reset();
+
     this.db.run(`
       CREATE TABLE IF NOT EXISTS conversation_threads (
         thread_id TEXT PRIMARY KEY,
@@ -1304,6 +1513,8 @@ export class ConversationThreadStore {
   }
 
   getThread(threadId: string): ConversationThreadRow | null {
+    if (threadId.startsWith("native:") && !this.hasNativeSource) return null;
+    if (threadId.startsWith("telegram:") && !this.hasTelegramSource) return null;
     return this.db
       .query<ConversationThreadRow, [string]>(
         "SELECT * FROM conversation_threads WHERE thread_id = ?",
@@ -1339,8 +1550,8 @@ export class ConversationThreadStore {
       .query<{ threadId: string; ordinal: number; authorId: string }, [string, string]>(`
       SELECT tm.thread_id AS threadId, tm.ordinal, m.user_id AS authorId
       FROM conversation_thread_messages tm
-      JOIN discord_search_messages m ON m.channel_id = tm.channel_id AND m.message_id = tm.message_id
-      WHERE tm.channel_id = ? AND tm.message_id = ? AND m.deleted = 0
+      JOIN conversation_source_messages m ON m.channel_id = tm.channel_id AND m.message_id = tm.message_id AND m.surface = ${SOURCE_SURFACE_SQL}
+      WHERE tm.channel_id = ? AND tm.message_id = ? AND m.deleted = 0 AND m.surface = 'discord'
       ORDER BY tm.thread_id LIMIT 1
     `)
       .get(channelId, messageId);
@@ -1354,7 +1565,7 @@ export class ConversationThreadStore {
       .query<{ messageId: string; ordinal: number; authorId: string }, [string, number]>(`
       SELECT tm.message_id AS messageId, tm.ordinal, m.user_id AS authorId
       FROM conversation_thread_messages tm
-      JOIN discord_search_messages m ON m.channel_id = tm.channel_id AND m.message_id = tm.message_id
+      JOIN conversation_source_messages m ON m.channel_id = tm.channel_id AND m.message_id = tm.message_id AND m.surface = ${SOURCE_SURFACE_SQL}
       WHERE tm.thread_id = ? AND tm.ordinal < ? AND m.deleted = 0
       ORDER BY tm.ordinal DESC LIMIT 200
     `)
@@ -1376,9 +1587,9 @@ export class ConversationThreadStore {
           m.text,
           m.ts
         FROM conversation_thread_messages tm
-        JOIN discord_search_messages m
+        JOIN conversation_source_messages m
           ON m.channel_id = tm.channel_id
-         AND m.message_id = tm.message_id
+         AND m.message_id = tm.message_id AND m.surface = ${SOURCE_SURFACE_SQL}
         WHERE tm.thread_id = ?
           AND m.deleted = 0
         ORDER BY tm.ordinal ASC
@@ -1395,7 +1606,9 @@ export class ConversationThreadStore {
       ts: number;
     }>;
 
+    const surface = conversationSurfaceOfThreadId(threadId);
     return rows.map((row) => ({
+      surface,
       channelId: row.channel_id,
       messageId: row.message_id,
       ordinal: row.ordinal,
@@ -1403,8 +1616,25 @@ export class ConversationThreadStore {
       userName: row.user_name ?? undefined,
       text: row.text,
       ts: row.ts,
-      attachments: this.listMessageAttachments(row.channel_id, row.message_id),
+      attachments: this.listSourceMessageAttachments(surface, row.channel_id, row.message_id),
     }));
+  }
+
+  private listSourceMessageAttachments(
+    surface: ConversationSurface,
+    channelId: string,
+    messageId: string,
+  ): DiscordIndexedAttachmentMeta[] {
+    switch (surface) {
+      case "native":
+        return selectResultValue(readNativeConversationAttachments(this.db, channelId, messageId));
+      case "telegram":
+        return selectResultValue(
+          readTelegramConversationAttachments(this.db, channelId, messageId),
+        );
+      case "discord":
+        return this.listMessageAttachments(channelId, messageId);
+    }
   }
 
   private listMessageAttachments(
@@ -1443,9 +1673,9 @@ export class ConversationThreadStore {
         `
         SELECT COUNT(1) AS c
         FROM conversation_thread_messages tm
-        JOIN discord_search_messages m
+        JOIN conversation_source_messages m
           ON m.channel_id = tm.channel_id
-         AND m.message_id = tm.message_id
+         AND m.message_id = tm.message_id AND m.surface = ${SOURCE_SURFACE_SQL}
         WHERE tm.thread_id = ?
           AND m.deleted = 0
         `,
@@ -1560,6 +1790,7 @@ export class ConversationThreadStore {
     embeddingModelId?: string;
     force?: boolean;
   }): ConversationThreadSummarizationEligibility[] {
+    this.refreshSourceThreads();
     const now = input?.now ?? Date.now();
     const quietMs = input?.quietMs ?? SUMMARY_QUIET_MS;
     const embeddingModelId =
@@ -1580,6 +1811,8 @@ export class ConversationThreadStore {
     const clauses = [
       "(CASE WHEN t.last_summarized_at IS NULL THEN t.end_ts ELSE t.updated_at END) <= ?",
       "t.message_count > 1",
+      "(t.kind!='native_thread' OR EXISTS(SELECT 1 FROM native_conversation_threads n WHERE n.id=t.channel_id AND n.active=0))",
+      "(t.kind!='telegram_thread' OR EXISTS(SELECT 1 FROM telegram_conversation_threads n WHERE n.id=t.channel_id))",
     ];
     if (input?.force !== true) {
       clauses.push("(t.maintenance_retry_after IS NULL OR t.maintenance_retry_after <= ?)");
@@ -1757,6 +1990,7 @@ export class ConversationThreadStore {
     ConversationThreadSummaryWriteResult | null,
     ConversationThreadSqliteDriverFailure
   > {
+    this.refreshSourceThreads();
     const normalized = normalizeSummary(summary);
     const now = Date.now();
     const topicsJson = JSON.stringify(normalized.topics);
@@ -1904,17 +2138,19 @@ export class ConversationThreadStore {
     }));
   }
 
-  listAutoInjectRankingDocuments(): string[] {
+  listAutoInjectRankingDocuments(allowlist?: ConversationThreadSearchAllowlist): string[] {
+    this.refreshSourceThreads();
+    const filter = buildSearchFilterClause(undefined, allowlist);
     const rows = this.db
       .query(
         `
-        SELECT text
-        FROM conversation_thread_facets
-        WHERE facet = 'combined'
-        ORDER BY thread_id ASC
+        SELECT f.text
+        FROM conversation_thread_facets f JOIN conversation_threads t ON t.thread_id=f.thread_id
+        WHERE f.facet = 'combined' AND ${filter.sql}
+        ORDER BY f.thread_id ASC
         `,
       )
-      .all() as Array<{ text: string }>;
+      .all(...filter.values) as Array<{ text: string }>;
     return rows.map((row) => row.text);
   }
 
@@ -1933,6 +2169,12 @@ export class ConversationThreadStore {
       embedding: Float32Array;
     }>;
   }): void {
+    this.refreshSourceThreads();
+    if (
+      conversationSurfaceOfThreadId(input.threadId) !== "discord" &&
+      this.computeEmbeddingInputHash(input.threadId) !== input.embeddingInputHash
+    )
+      return;
     const now = Date.now();
     const tx = this.db.transaction(() => {
       this.db.run("DELETE FROM conversation_thread_embeddings WHERE thread_id = ?", [
@@ -1970,6 +2212,7 @@ export class ConversationThreadStore {
     filters?: ConversationThreadSearchFilters;
     allowlist?: ConversationThreadSearchAllowlist;
   }): ResultType<ConversationThreadSearchHit[], PersistedDataError> {
+    this.refreshSourceThreads();
     const ftsQuery = normalizeFtsQuery(input.query);
     if (!ftsQuery) return Result.ok([]);
 
@@ -2029,6 +2272,7 @@ export class ConversationThreadStore {
         guildId: row.guild_id ?? undefined,
         parentChannelId: row.parent_channel_id ?? undefined,
         kind: row.kind,
+        sourceRevision: row.summary_input_hash ?? undefined,
         title: summary.title,
         brief: summary.brief,
         topics: summary.topics,
@@ -2059,6 +2303,7 @@ export class ConversationThreadStore {
     filters?: ConversationThreadSearchFilters;
     allowlist?: ConversationThreadSearchAllowlist;
   }): ResultType<ConversationThreadSearchHit[], PersistedDataError> {
+    this.refreshSourceThreads();
     if (!this.vectorLoaded) return Result.ok([]);
 
     const limit = Math.min(SEARCH_LIMIT_MAX, Math.max(1, Math.floor(input.limit ?? 5)));
@@ -2127,6 +2372,7 @@ export class ConversationThreadStore {
         guildId: row.guild_id ?? undefined,
         parentChannelId: row.parent_channel_id ?? undefined,
         kind: row.kind,
+        sourceRevision: row.summary_input_hash ?? undefined,
         title: summary.title,
         brief: summary.brief,
         topics: summary.topics,
@@ -2150,6 +2396,17 @@ export class ConversationThreadStore {
   }
 }
 
+function surfaceKindClause(surface: ConversationSurface): string {
+  switch (surface) {
+    case "native":
+      return "t.kind='native_thread'";
+    case "telegram":
+      return "t.kind='telegram_thread'";
+    case "discord":
+      return "t.kind NOT IN ('native_thread','telegram_thread')";
+  }
+}
+
 function buildSearchFilterClause(
   filters?: ConversationThreadSearchFilters,
   allowlist?: ConversationThreadSearchAllowlist,
@@ -2157,11 +2414,15 @@ function buildSearchFilterClause(
   sql: string;
   values: Array<string | number>;
 } {
-  const clauses: string[] = [];
+  const clauses: string[] = [
+    "(t.kind!='native_thread' OR EXISTS(SELECT 1 FROM native_conversation_threads n WHERE n.id=t.channel_id))",
+    "(t.kind!='telegram_thread' OR EXISTS(SELECT 1 FROM telegram_conversation_threads n WHERE n.id=t.channel_id))",
+  ];
   const values: Array<string | number> = [];
 
   const channelIds = allowlist?.channelIds.filter((id) => id.trim().length > 0) ?? [];
   const guildIds = allowlist?.guildIds.filter((id) => id.trim().length > 0) ?? [];
+  const telegramChatIds = allowlist?.telegramChatIds?.filter((id) => id.trim().length > 0) ?? [];
   if (allowlist) {
     const allowClauses: string[] = [];
     if (channelIds.length > 0) {
@@ -2176,12 +2437,24 @@ function buildSearchFilterClause(
       values.push(...guildIds);
     }
 
-    clauses.push(allowClauses.length > 0 ? `(${allowClauses.join(" OR ")})` : "0 = 1");
+    let telegramClause = "0=1";
+    if (telegramChatIds.length > 0) {
+      const placeholders = telegramChatIds.map(() => "?").join(", ");
+      telegramClause = `${TELEGRAM_CHAT_ID_SQL} IN (${placeholders})`;
+      values.push(...telegramChatIds);
+    }
+
+    clauses.push(
+      `(t.kind='native_thread' OR (t.kind NOT IN ('native_thread','telegram_thread') AND (${allowClauses.join(" OR ") || "0=1"})) OR (t.kind='telegram_thread' AND ${telegramClause}))`,
+    );
   }
 
+  if (filters?.surface) {
+    clauses.push(surfaceKindClause(filters.surface));
+  }
   if (filters?.sessionId) {
     clauses.push("t.channel_id = ?");
-    values.push(filters.sessionId);
+    values.push(filters.sessionId.replace(/^(native|discord|telegram):/u, ""));
   }
 
   if (filters?.participantId) {
@@ -2189,9 +2462,9 @@ function buildSearchFilterClause(
       EXISTS (
         SELECT 1
         FROM conversation_thread_messages tm
-        JOIN discord_search_messages m
+        JOIN conversation_source_messages m
           ON m.channel_id = tm.channel_id
-         AND m.message_id = tm.message_id
+         AND m.message_id = tm.message_id AND m.surface = ${SOURCE_SURFACE_SQL}
         WHERE tm.thread_id = t.thread_id
           AND m.deleted = 0
           AND m.user_id = ?
@@ -2206,18 +2479,28 @@ function buildSearchFilterClause(
     ),
   ];
   if (participantIdsAny.length > 0) {
+    // Native threads carry no participant filter, so every surface sees them;
+    // participant ids only ever match threads from the requester's own surface,
+    // since user ids are not comparable across surfaces.
+    let crossSurface = "";
+    let sameSurface = "";
+    if (filters?.participantSurface === "native") crossSurface = "1=1 OR ";
+    if (filters?.participantSurface === "discord" || filters?.participantSurface === "telegram") {
+      crossSurface = "t.kind='native_thread' OR ";
+      sameSurface = `${surfaceKindClause(filters.participantSurface)} AND `;
+    }
     const placeholders = participantIdsAny.map(() => "?").join(", ");
     clauses.push(`
-      EXISTS (
+      (${crossSurface}(${sameSurface}EXISTS (
         SELECT 1
         FROM conversation_thread_messages tm
-        JOIN discord_search_messages m
+        JOIN conversation_source_messages m
           ON m.channel_id = tm.channel_id
-         AND m.message_id = tm.message_id
+         AND m.message_id = tm.message_id AND m.surface = ${SOURCE_SURFACE_SQL}
         WHERE tm.thread_id = t.thread_id
           AND m.deleted = 0
           AND m.user_id IN (${placeholders})
-      )
+      )))
     `);
     values.push(...participantIdsAny);
   }

@@ -403,3 +403,34 @@ describe("conversation thread summarization worker client", () => {
     await client.stop();
   });
 });
+
+it("hydrates native resources through the shared worker bridge without losing bytes", async () => {
+  const worker = new FakeWorker();
+  const bytes = new Uint8Array([1, 2, 3]);
+  const response = Promise.withResolvers<ThreadSummarizationParentMessage>();
+  worker.onPost = (message) => {
+    if ("type" in message) response.resolve(message);
+  };
+  const client = startConversationThreadSummarizationWorker({
+    searchDbPath: "/data/search.db",
+    nativeDbPath: "/data/native.db",
+    createWorker: () => worker,
+    attachmentHydrator: async ({ refs }) =>
+      Result.ok(
+        refs.map((ref) => ({ ref, attachments: [{ url: "resource://r1_test", data: bytes }] })),
+      ),
+  });
+  const pending = client.runSummarization({ wait: true });
+  expect(worker.lastRequest().nativeDbPath).toBe("/data/native.db");
+  worker.emitMessage({
+    type: "hydrate-discord-attachments",
+    id: "hydrate-native",
+    refs: [{ surface: "native", channelId: "thread", messageId: "message" }],
+  });
+  expect(await response.promise).toMatchObject({
+    results: [{ ok: true, ref: { surface: "native" }, attachments: [{ data: bytes }] }],
+  });
+  worker.emitMessage({ id: worker.lastRequest().id, ok: true, result: resultFixture() });
+  await pending;
+  client.stop();
+});

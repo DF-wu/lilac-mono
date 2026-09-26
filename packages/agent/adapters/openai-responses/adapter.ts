@@ -132,6 +132,7 @@ class OpenAIResponsesExecution implements AgentExecution {
     { callId?: string; toolName?: string; phase?: "commentary" | "final_answer" }
   >();
   private readonly startedOutput = new Set<string>();
+  private readonly activeReasoningOutput = new Set<string>();
   private readonly accounted = new Set<string>();
   private current: ParentResponse | undefined;
   private pendingRequest:
@@ -610,6 +611,10 @@ class OpenAIResponsesExecution implements AgentExecution {
           this.startedOutput.add(output.id);
           this.emit({ type: "output", output: { ...output, phase: "start", delta: undefined } });
         }
+        if (output.kind === "reasoning") {
+          if (output.phase === "end") this.activeReasoningOutput.delete(output.id);
+          else this.activeReasoningOutput.add(output.id);
+        }
         if (output.phase !== "start") this.emit({ type: "output", output });
         return Result.ok("continue");
       }
@@ -627,6 +632,7 @@ class OpenAIResponsesExecution implements AgentExecution {
         return Result.ok("continue");
       }
       case "item-complete":
+        if (event.item.type === "reasoning") this.completeReasoningOutput(event.item.id);
         return this.checkpointItem(event.item);
       case "block-complete": {
         const existing = this.current?.completedItems.find((item) => item.id === event.item.id);
@@ -707,6 +713,15 @@ class OpenAIResponsesExecution implements AgentExecution {
       }
     }
   }
+  private completeReasoningOutput(itemId: string): void {
+    // Codex summary completion events can become deltas when recovering missing text.
+    for (const id of this.activeReasoningOutput) {
+      if (!id.startsWith(`${itemId}:`)) continue;
+      this.activeReasoningOutput.delete(id);
+      this.emit({ type: "output", output: { kind: "reasoning", phase: "end", id } });
+    }
+  }
+
   private checkpointItem(item: ResponseOutputItem): ResultType<"continue", AgentAdapterFailure> {
     const parent = this.current;
     if (!parent) return Result.err(failure("OpenAI output item preceded response creation"));

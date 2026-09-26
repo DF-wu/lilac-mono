@@ -6,6 +6,29 @@ import { highlightCode } from "../src/components/rich-code";
 import { diagramSourceAllowed, markdownUrl } from "../src/components/markdown-policy";
 
 describe("markdown", () => {
+  test("retains extra blank lines between user paragraphs", () => {
+    for (const count of [2, 3, 4]) {
+      const text = `First${"\n".repeat(count)}Last`;
+      const html = renderToStaticMarkup(<MarkdownContent text={text} preserveLineBreaks />);
+      expect(html).toBe(`<p>First</p>\n<p>${"<br/>\n".repeat(count - 2)}Last</p>`);
+    }
+  });
+
+  test("shows user line breaks without changing code or doubling Markdown hard breaks", () => {
+    const text = "First paragraph\n\n**Next** line\nhttps://example.com\n\nHard\\\nbreak";
+    const html = renderToStaticMarkup(<MarkdownContent text={text} preserveLineBreaks />);
+    expect(html).toContain("<p>First paragraph</p>");
+    expect(html).toContain("<strong>Next</strong> line<br/>");
+    expect(html).toContain("<p>Hard<br/>\nbreak</p>");
+    expect(html).not.toContain("\u200b");
+    expect(renderToStaticMarkup(<MarkdownContent text={"one\ntwo"} />)).toContain(
+      "<p>one\ntwo</p>",
+    );
+    expect(
+      renderToStaticMarkup(<MarkdownContent text={"`one\ntwo`"} preserveLineBreaks />),
+    ).not.toContain("<br");
+  });
+
   test("keeps currency as prose while preserving Markdown and real math", () => {
     const text =
       "your $10 suggestion makes sense: your colleague shouldn’t have to assemble a miniature insurance claim over $7 just to **get paid**.";
@@ -142,6 +165,36 @@ describe("markdown", () => {
     );
     expect(html).toContain("const value");
     expect(html).toContain("&lt;script&gt;");
+  });
+  test("retained resource links and images use the authenticated resource endpoint", () => {
+    const id = `r1_${"ab".repeat(16)}`;
+    const uri = `resource://${id}`;
+    expect(markdownUrl(uri)).toBe(`/api/resources/${id}`);
+    const html = renderToStaticMarkup(
+      <MarkdownContent text={`[report.txt](${uri})\n\n![Chart](${uri})`} />,
+    );
+    expect(html).toContain(`href="/api/resources/${id}"`);
+    expect(html).toContain(`src="/api/resources/${id}"`);
+    expect(html).toContain('aria-label="Preview Chart"');
+    expect(html).not.toContain("resource://");
+  });
+  test("resource URLs reject transient IDs and noncanonical forms", () => {
+    const id = `r1_${"ab".repeat(16)}`;
+    for (const uri of [
+      `resource://t1_${"ab".repeat(16)}`,
+      `resource://${id}/file`,
+      `resource://${id}?download=1`,
+      `resource://${id}#fragment`,
+      `resource://user@${id}`,
+      `resource://${id}:443`,
+      `resource://${id.toUpperCase()}`,
+      `RESOURCE://${id}`,
+      `resource://${id.slice(0, -1)}`,
+      `resource://${id}a`,
+      `resource://${id.replace("ab", "%61b")}`,
+      "ssh://host/path.png",
+    ])
+      expect(markdownUrl(uri)).toBe("");
   });
   test("link protocols reject executable and ambiguous URLs", () => {
     for (const url of [

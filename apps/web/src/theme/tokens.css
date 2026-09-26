@@ -14,10 +14,15 @@
   --ui-text-2xl: 1.5rem;
   --ui-text-hero: 3rem;
   --ui-control-compact: 1.75rem;
+  --ui-swatch-size: 2rem;
+  --ui-swatch-step: 0.625rem;
+  --ui-swatch-fan: 1.75rem;
+  --ui-swatch-lift: 0.5rem;
   --ui-line-tight: 1.3;
   --ui-line-normal: 1.6;
   --ui-sidebar-width: 18rem;
   --ui-chat-width: calc(54rem + calc(var(--ui-space-unit) * 4) * 2);
+  --ui-table-cell-max-width: 36ch;
   --ui-icon-size: 1.125rem;
   --ui-control-size: 2.25rem;
   --ui-radius-xl: 0.75rem;
@@ -37,4 +42,25 @@
   --ui-motion-spin-duration: 2s;
   --ui-motion-shine-duration: 4s;
   --ui-motion-pulse-duration: 4s;
+}
+
+/* Agent artwork colors stay stable across application themes. */
+[data-agent-profile] {
+  --ui-agent-eyes: #101010;
+  --ui-agent-highlight: #b5d6f9;
+  --ui-agent-light: #62a9f3;
+  --ui-agent-base: #3b93f0;
+  --ui-agent-shadow: #275c95;
+}
+[data-agent-profile="explore"] {
+  --ui-agent-highlight: #c1f3da;
+  --ui-agent-light: #72d5a8;
+  --ui-agent-base: #39b583;
+  --ui-agent-shadow: #24735a;
+}
+[data-agent-profile="self"] {
+  --ui-agent-highlight: #e3ceff;
+  --ui-agent-light: #bc94ef;
+  --ui-agent-base: #9c72d4;
+  --ui-agent-shadow: #65468f;
 }

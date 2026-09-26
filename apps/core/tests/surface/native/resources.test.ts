@@ -1,3 +1,6 @@
+import { buildThreadSummaryModelMessages } from "../../../src/conversation/thread-service";
+import { hydrateNativeConversationAttachments } from "../../../src/surface/native/conversation-attachments";
+import { NativeSurfaceStore } from "../../../src/surface/native/store-surface";
 import { nativeUserDisplay } from "../../../src/surface/native/identity";
 import { authFailure } from "../../../src/surface/native/auth";
 import { nativeFailure } from "../../../src/surface/native/errors";
@@ -24,7 +27,8 @@ function value<T, E>(result: ResultType<T, E>): T {
 }
 
 async function fixture() {
-  const native = new NativeStore(new Database(":memory:"));
+  const db = new Database(":memory:");
+  const native = new NativeStore(db);
   value(native.initialize());
   for (const [id, role] of [
     ["owner", "owner"],
@@ -81,6 +85,7 @@ async function fixture() {
       }),
     );
   return {
+    db,
     native,
     thread,
     resources,
@@ -669,4 +674,64 @@ test("retained transcript files support previews and ranges without exposing blo
   expect(
     (await service.handle(new Request("http://local/api/resources/xo_test"), "owner"))?.status,
   ).toBe(404);
+});
+
+test("conversation summary hydration reads verified native upload bytes", async () => {
+  const f = await fixture();
+  const upload = (await f.service.upload("alice", f.reserve().id, f.source())).unwrap();
+  f.publish(upload.id);
+  const surface = new NativeSurfaceStore(f.db, f.native);
+  surface.initialize().unwrap();
+  const message = surface.listMessages("alice", f.thread.id, { limit: 10 }).unwrap()[0]!;
+  const ref = { surface: "native" as const, channelId: f.thread.id, messageId: message.message.id };
+  const result = await hydrateNativeConversationAttachments(
+    { store: f.native, surface, resources: f.service },
+    ref,
+    1024,
+  );
+  expect(result.unwrap().attachments[0]).toMatchObject({ filename: "notes.txt", data: f.bytes });
+  const open = spyOn(f.service, "scopedAccess");
+  const oversized = (
+    await hydrateNativeConversationAttachments(
+      { store: f.native, surface, resources: f.service },
+      ref,
+      1,
+    )
+  ).unwrap();
+  expect(oversized.attachments[0]?.data).toBeUndefined();
+  expect(oversized.attachments[0]?.filename).toBe("notes.txt");
+  expect(open).not.toHaveBeenCalled();
+  open.mockRestore();
+  value(f.resources.releaseNativeResource(upload.id));
+  value(await f.access.maintain({ limit: 10 }));
+  const unavailable = (
+    await hydrateNativeConversationAttachments(
+      { store: f.native, surface, resources: f.service },
+      ref,
+      1024,
+    )
+  ).unwrap();
+  expect(unavailable.attachments[0]?.data).toBeUndefined();
+  expect(unavailable.attachments[0]?.filename).toBe("notes.txt");
+  const modelMessages = await buildThreadSummaryModelMessages({
+    previous: "",
+    promptContextSection: null,
+    omittedMessages: 0,
+    messages: [
+      {
+        surface: "native",
+        channelId: f.thread.id,
+        messageId: ref.messageId,
+        ordinal: 0,
+        userId: "alice",
+        text: "Keep this useful conversation text",
+        ts: Date.now(),
+        attachments: unavailable.attachments,
+      },
+    ],
+  });
+  const content = JSON.stringify(modelMessages);
+  expect(content).toContain("Keep this useful conversation text");
+  expect(content).toContain("native_attachment");
+  expect(content).toContain("content unavailable");
 });

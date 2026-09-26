@@ -1,7 +1,10 @@
+import { Kbd } from "./ui/kbd";
+import { useThreadShortcut } from "../shortcuts";
+import { LoadingSpinner } from "./ui/loading-spinner";
 import { useWorkspace } from "../workspace-context";
 import { useQuery } from "@tanstack/react-query";
 import { participantOptions, useNativeOnline } from "../queries";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type ComponentType, type ReactNode } from "react";
 import {
   SquarePen,
   Clock3,
@@ -11,10 +14,8 @@ import {
   Users,
   CircleCheck,
   Pin,
-  LoaderCircle,
   CircleAlert,
   MessageCircleQuestion,
-  type LucideIcon,
 } from "lucide-react";
 import type { NativeThread, NativeUser } from "@stanley2058/lilac-client-protocol";
 import { relativeThreadTime } from "../thread-metadata";
@@ -27,13 +28,14 @@ export type ThreadDisplayState = "idle" | "completed" | "working" | "error" | "i
 const states = {
   idle: { label: "Idle", icon: MessageSquare },
   completed: { label: "Completed, unread", icon: CircleCheck },
-  working: { label: "Working", icon: LoaderCircle },
+  working: { label: "Working", icon: LoadingSpinner },
   error: { label: "Run failed", icon: CircleAlert },
   input: { label: "Needs your input", icon: MessageCircleQuestion },
-} satisfies Record<ThreadDisplayState, { label: string; icon: LucideIcon }>;
+} satisfies Record<ThreadDisplayState, { label: string; icon: ComponentType }>;
 
 export function ThreadCard({
   title,
+  shortcutId,
   starterName,
   starterAvatarUrl,
   updatedAt,
@@ -46,6 +48,7 @@ export function ThreadCard({
   onSelect,
 }: {
   title: string;
+  shortcutId?: string;
   starterName: string;
   starterAvatarUrl?: string;
   updatedAt?: number;
@@ -57,6 +60,7 @@ export function ThreadCard({
   actions?: ReactNode;
   onSelect: () => void;
 }) {
+  const shortcut = useThreadShortcut(shortcutId);
   const StatusIcon = states[state].icon;
   return (
     <div
@@ -68,6 +72,7 @@ export function ThreadCard({
         variant="ghost"
         className="thread-card-select absolute inset-0 w-full h-full rounded-[inherit]"
         onClick={onSelect}
+        aria-keyshortcuts={shortcut.aria}
         aria-label={`${title || "Untitled"}, ${states[state].label}${draft && !selected ? ", Draft" : ""}`}
       />
       <span className="thread-card-copy relative pointer-events-none flex min-w-0 flex-col gap-0 pt-[calc(var(--ui-space-unit)*1.5)] px-3 pb-3">
@@ -117,6 +122,14 @@ export function ThreadCard({
           {title || "Untitled"}
         </span>
       </span>
+      {shortcut.held && shortcut.label ? (
+        <Kbd
+          data-ui="thread-shortcut"
+          className="absolute bottom-2 right-2 bg-popover px-2 text-popover-foreground shadow-sm"
+        >
+          {shortcut.label}
+        </Kbd>
+      ) : null}
     </div>
   );
 }
@@ -175,6 +188,7 @@ export function ThreadSelect({
     <Tooltip onOpenChange={setOpen}>
       <TooltipTrigger render={<div className="thread-card-trigger block min-w-0 w-full" />}>
         <ThreadCard
+          shortcutId={thread.id}
           title={thread.title}
           starterName={starter}
           starterAvatarUrl={

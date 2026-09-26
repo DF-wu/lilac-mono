@@ -197,6 +197,17 @@ export function isTextExtractableMimeType(mimeType: string): boolean {
   );
 }
 
+export function canInlineConversationAttachment(mimeType: string, size: number): boolean {
+  const normalized = normalizeMimeType(mimeType);
+  if (size > DEFAULT_INBOUND_MAX_FILE_BYTES) return false;
+  if (!normalized) return true;
+  return (
+    isTextExtractableMimeType(normalized) ||
+    isPdfMimeType(normalized) ||
+    isImageMimeType(normalized)
+  );
+}
+
 function isPdfMimeType(mimeType: string): boolean {
   return mimeType === "application/pdf";
 }

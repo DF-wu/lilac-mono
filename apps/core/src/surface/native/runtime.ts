@@ -1,5 +1,5 @@
 import { NativeReferences } from "./references";
-import type { NativeStoreError } from "./store";
+import { nativeStoreTransaction, type NativeStoreError } from "./store";
 import { serverToolFailure } from "@stanley2058/lilac-plugin-runtime";
 import type { NativeAttachmentOutput } from "../../tool-server/tools/attachment";
 import type { NativeOutputPublisher } from "./output";
@@ -22,10 +22,7 @@ import {
 import { discoverSkills, type DiscoveredSkill } from "@stanley2058/lilac-utils/skills";
 import { toDurableResolvedModelPlan, type CoreConfig } from "@stanley2058/lilac-utils";
 import type { CustomCommandManager } from "../../custom-commands/manager";
-import type {
-  ConversationThreadRunSummarizationInput,
-  ConversationThreadToolService,
-} from "../../conversation/thread-service";
+import type { ConversationThreadToolService } from "../../conversation/thread-service";
 import type { McpRegistryApi } from "../../mcp/registry-types";
 import type { CoreResourceService } from "../../resource";
 import type { SqliteTranscriptStore } from "../../transcript/transcript-store";
@@ -58,9 +55,8 @@ import {
   type ExternalHistory,
   type ExternalOutputs,
 } from "./search-external";
-import { NativeSummaryRefresher, emptyNativeSummaryResult } from "./search-summary";
+import { hydrateNativeConversationAttachments } from "./conversation-attachments";
 import { NativeSearchStore } from "./store-search";
-import { NativeSummaryStore } from "./store-search-summary";
 import { NativeSurfaceStore } from "./store-surface";
 
 export function nativeRuntimeFailureToHost(error: Error): never {
@@ -111,6 +107,20 @@ export type NativeRuntimeOptions = {
 
 export async function createNativeRuntime(options: NativeRuntimeOptions) {
   const { store, database, auth: publicAuth, clerk, login } = options.installation;
+  const legacy = options.getConfig().surface.native;
+  const deploymentInitialized = store.initializeDeployment({
+    titleModel: legacy.titleModel,
+    outputStreaming: legacy.outputStreaming,
+    oldMessageSelectionMaxAgeMs: legacy.oldMessageSelectionMaxAgeMs,
+    storageRetentionMaxAgeMs: legacy.storageRetentionMaxAgeMs,
+    crossThreadSend: legacy.crossThreadSend,
+  });
+  const deploymentInitializationError = deploymentInitialized.match({
+    ok: () => null,
+    err: (error) => error,
+  });
+  if (deploymentInitializationError) return Result.err(deploymentInitializationError);
+  const deployment = () => nativeRuntimeResultToHost(store.getDeployment()).settings;
   const metrics = createNativeMetrics();
   let skills: readonly DiscoveredSkill[] = (
     await discoverSkills({ workspaceRoot: options.workspaceRoot, dataDir: options.dataDir })
@@ -154,17 +164,18 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     remoteDenyPaths: options.denyPaths,
   });
   const execution = createNativeExecution({
-    expandReferences: (userId, text) => references.expand(userId, text),
+    expandReferences: (userId, text) =>
+      references.expand(userId, text, new URL(options.getConfig().surface.native.publicUrl).origin),
     metrics,
     store,
     bus: options.bus,
     transcriptStore: options.transcript,
+    blobStore: options.blobs,
     runner: options.runner,
     customCommands: options.customCommands,
     validateSkill: (id) => skills.some((skill) => skill.name === id),
     deliveryState: options.deliveryState,
-    getOldMessageSelectionMaxAgeMs: () =>
-      options.getConfig().surface.native.oldMessageSelectionMaxAgeMs ?? undefined,
+    getOldMessageSelectionMaxAgeMs: () => deployment().oldMessageSelectionMaxAgeMs ?? undefined,
   });
   const operator = options.operatorTokenSha256
     ? createNativeOperator({
@@ -232,8 +243,8 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     surface,
     resources,
     resolveModel,
-    shouldTriggerRun: () => options.getConfig().surface.native.crossThreadSend.triggerRun,
-    streamingMode: () => options.getConfig().surface.native.outputStreaming,
+    shouldTriggerRun: () => deployment().crossThreadSend.triggerRun,
+    streamingMode: () => deployment().outputStreaming,
     kick,
   });
   const descriptor = createNativeSurfaceRuntimeDescriptor({
@@ -254,28 +265,19 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     reportFatalError: options.reportFatalError,
   });
   const searchStore = new NativeSearchStore({ db: database, store });
-  const summaries = new NativeSummaryStore({ db: database, store });
-  const summaryInitialization = summaries.initialize();
-  const summaryError = summaryInitialization.match({ ok: () => null, err: (error) => error });
-  if (summaryError) return Result.err(summaryError);
+  const retiredSummaries = nativeStoreTransaction(database, () => {
+    database.run("DROP TABLE IF EXISTS native_thread_summaries");
+    return Result.ok(undefined);
+  });
+  const retirementError = retiredSummaries.match({ ok: () => null, err: (error) => error });
+  if (retirementError) return Result.err(retirementError);
   const search = new NativeSearchService({
     store,
     searchStore,
-    summaries,
-    get planner() {
-      return options.conversationThreads();
-    },
-    get externalThreads() {
+    get conversationThreads() {
       return options.conversationThreads();
     },
   });
-  const summaryRefresher = new NativeSummaryRefresher({
-    store,
-    search: searchStore,
-    summaries,
-    getConfig: options.getConfig,
-  });
-  const summaryAbort = new AbortController();
   const config = new NativeConfigService({
     dataDir: options.dataDir,
     ownerId: options.getConfig().surface.native.auth.ownerId,
@@ -620,7 +622,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     const publisher = createNativeOutputPublisher({
       ...attempt,
       requestId: input.requestId,
-      mode: options.getConfig().surface.native.outputStreaming,
+      mode: deployment().outputStreaming,
       publish: publishDurableOutput,
       recoveryFrontier: input.recoveryOutputFrontier,
     });
@@ -655,7 +657,6 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   }
 
   async function stopIngress() {
-    summaryAbort.abort();
     await titles.stop();
     stopAgentIdentity();
     unsubscribe?.();
@@ -687,7 +688,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   async function maintain() {
     return Result.gen(async function* () {
       const config = options.getConfig();
-      const maxAge = config.surface.native.storageRetentionMaxAgeMs;
+      const maxAge = (yield* store.getDeployment()).settings.storageRetentionMaxAgeMs;
       if (maxAge !== null) {
         const expired = yield* store.listExpiredThreadIds(Date.now() - maxAge, 10);
         for (const threadId of expired)
@@ -700,20 +701,10 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       }
       yield* resources.reconcileReferences();
       yield* surface.pruneDeleted();
-      yield* summaries.pruneDeleted();
       yield* store.pruneReplay();
 
       return Result.ok(undefined);
     });
-  }
-  async function refreshSummaries(input: ConversationThreadRunSummarizationInput = {}) {
-    if (
-      summaryAbort.signal.aborted ||
-      (input.trigger === "periodic" &&
-        !options.getConfig().conversation.thread.summarization.enabled)
-    )
-      return Result.ok(emptyNativeSummaryResult(input.dryRun));
-    return summaryRefresher.refresh({ ...input, abortSignal: summaryAbort.signal });
   }
   function scopedResources(request: NativeRunnerRequest) {
     return resources.scopedAccess(parseNativeRequestEnvelope(request)?.starterUserId ?? "");
@@ -733,6 +724,10 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     createOutput,
     scopedResources,
     scopedThreads,
+    hydrateConversationAttachments: (
+      ref: Parameters<typeof hydrateNativeConversationAttachments>[1],
+      remainingBytes: number,
+    ) => hydrateNativeConversationAttachments({ store, surface, resources }, ref, remainingBytes),
     startOutput,
     startIngress,
     stopIngress,
@@ -740,7 +735,6 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     recover,
     recoverOperator,
     maintain,
-    refreshSummaries,
     updateCatalog,
   });
 }

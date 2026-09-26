@@ -4,7 +4,14 @@ import type { FileTarget } from "../file-target";
 import { useFileViewer } from "./file-viewer-context";
 import { FileSource } from "./FileSource";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useRef, useState, type ReactNode, type PointerEvent } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+  type PointerEvent,
+} from "react";
 import type { DisplayPart } from "@stanley2058/lilac-client-protocol";
 import {
   PanelRight,
@@ -297,6 +304,8 @@ export function AttachmentPreviewBody({
   const [copyState, setCopyState] = useState<"idle" | "copying" | "copied">("idle");
   const [copyError, setCopyError] = useState<string>();
   const viewport = useRef<HTMLDivElement>(null);
+  const content = useRef<HTMLDivElement>(null);
+  const zoomAnchor = useRef<{ x: number; y: number } | null>(null);
   const pan = useRef<{ id: number; x: number; y: number; left: number; top: number } | null>(null);
   const [dragging, setDragging] = useState(false);
   function startPan(event: PointerEvent<HTMLDivElement>) {
@@ -339,13 +348,44 @@ export function AttachmentPreviewBody({
     if (!element || kind !== "image") return;
     const wheel = (event: WheelEvent) => {
       event.preventDefault();
-      setZoom((current) => Math.min(4, Math.max(0.25, current + (event.deltaY < 0 ? 0.1 : -0.1))));
+      changeZoom(event.deltaY < 0 ? 0.1 : -0.1);
     };
     element.addEventListener("wheel", wheel, { passive: false });
     return () => element.removeEventListener("wheel", wheel);
   }, [kind, failed]);
-  const changeZoom = (amount: number) =>
+  useLayoutEffect(() => {
+    const anchor = zoomAnchor.current;
+    zoomAnchor.current = null;
+    const center = measureViewportCenter();
+    if (!anchor || !center) return;
+    center.viewport.scrollLeft += (anchor.x - center.x) * center.width;
+    center.viewport.scrollTop += (anchor.y - center.y) * center.height;
+  }, [zoom]);
+  function changeZoom(amount: number) {
+    // The content box resizes from its top-left corner, so remember which point sits at the
+    // viewport center before the resize and scroll it back to the center afterward.
+    zoomAnchor.current = measureViewportCenter();
     setZoom((current) => Math.min(4, Math.max(0.25, current + amount)));
+  }
+  function measureViewportCenter() {
+    const viewportElement = viewport.current;
+    const contentElement = content.current;
+    if (!viewportElement || !contentElement) return null;
+    const viewportRect = viewportElement.getBoundingClientRect();
+    const contentRect = contentElement.getBoundingClientRect();
+    if (contentRect.width <= 0 || contentRect.height <= 0) return null;
+    return {
+      viewport: viewportElement,
+      x:
+        (viewportRect.left + viewportElement.clientWidth / 2 - contentRect.left) /
+        contentRect.width,
+      y:
+        (viewportRect.top + viewportElement.clientHeight / 2 - contentRect.top) /
+        contentRect.height,
+      width: contentRect.width,
+      height: contentRect.height,
+    };
+  }
   async function copyImage() {
     const image = previewImage.current;
     if (!image) return;
@@ -495,6 +535,7 @@ export function AttachmentPreviewBody({
         onLostPointerCapture={stopPan}
       >
         <div
+          ref={content}
           className="media-preview-content min-w-0 [flex:0_0_auto] flex items-center justify-center m-auto"
           style={{ width: `${zoom * 100}%`, height: `${zoom * 100}%` }}
         >

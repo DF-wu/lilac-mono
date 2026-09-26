@@ -337,6 +337,52 @@ describe("native surface adapter", () => {
     expect(scopedCalls).toBe(1);
   });
 
+  test("reaction names are bounded, refreshed on read, and keep viewer state beyond the cap", async () => {
+    const f = fixture();
+    const ref = (await f.scoped.sendMsg(f.ref, { text: "Reactions" })).unwrap();
+    for (let index = 0; index < 7; index++) {
+      const id = `person-${index}`;
+      f.store
+        .upsertUser({
+          id,
+          providerId: id,
+          displayName: `Person ${index}`,
+          role: "participant",
+          toolMode: "full",
+        })
+        .unwrap();
+      f.surface.setReaction("owner", f.source.id, ref.messageId, "👍", true, id).unwrap();
+    }
+    f.store
+      .shareThread("owner", { threadId: f.source.id, userId: "person-6", grant: "read" })
+      .unwrap();
+    const stored = f.surface.readMessage("owner", f.source.id, ref.messageId).unwrap()!.message;
+    expect(
+      stored.parts.find((part) => part.type === "data-reactions")?.data.items[0]?.userNames,
+    ).toBeUndefined();
+    const message = f.surface.personalizeMessage("person-6", f.source.id, stored).unwrap();
+    expect(message.parts.find((part) => part.type === "data-reactions")?.data.items[0]).toEqual({
+      emoji: "👍",
+      count: 7,
+      reacted: true,
+      userNames: ["Person 0", "Person 1", "Person 2", "Person 3", "Person 4"],
+      overflowCount: 2,
+    });
+    f.store
+      .upsertUser({
+        id: "person-0",
+        providerId: "person-0",
+        displayName: "Renamed",
+        role: "participant",
+        toolMode: "full",
+      })
+      .unwrap();
+    const renamed = f.surface.personalizeMessage("owner", f.source.id, stored).unwrap();
+    expect(
+      renamed.parts.find((part) => part.type === "data-reactions")?.data.items[0]?.userNames?.[0],
+    ).toBe("Renamed");
+  });
+
   test("reaction projections contain each viewer's state and read-only actions are denied", async () => {
     const f = fixture();
     const ref = (

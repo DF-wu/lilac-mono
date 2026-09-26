@@ -19,7 +19,7 @@ import {
   ConversationThreadService,
   type ConversationThreadAttachmentHydrator,
 } from "./thread-service";
-import { ConversationThreadStore } from "./thread-store";
+import { ConversationThreadStore, type ConversationSurface } from "./thread-store";
 import { createDiscordEntityMapper } from "../entity/entity-mapper";
 import { DiscordSurfaceStore } from "../surface/store/discord-surface-store";
 
@@ -112,7 +112,7 @@ function respond(response: ThreadSummarizationWorkerMessage): void {
 const pendingHydrations = new Map<
   string,
   {
-    refs: readonly { channelId: string; messageId: string }[];
+    refs: Parameters<ConversationThreadAttachmentHydrator>[0]["refs"];
     resolve: (response: ThreadSummarizationHydrationResponse) => void;
   }
 >();
@@ -133,9 +133,10 @@ const hydrateAttachments: ConversationThreadAttachmentHydrator = async ({ refs }
     );
   }
   const hydrated: Array<{
-    ref: { channelId: string; messageId: string };
+    ref: { surface?: ConversationSurface; channelId: string; messageId: string };
     attachments: Array<{
       id?: string;
+      data?: Uint8Array;
       url: string;
       filename?: string;
       mimeType?: string;
@@ -146,6 +147,7 @@ const hydrateAttachments: ConversationThreadAttachmentHydrator = async ({ refs }
     const result = response.results[index]!;
     const expected = pendingRefs[index]!;
     if (
+      (result.ref.surface ?? "discord") !== (expected.surface ?? "discord") ||
       result.ref.channelId !== expected.channelId ||
       result.ref.messageId !== expected.messageId
     ) {
@@ -192,7 +194,10 @@ async function runJob(request: ThreadSummarizationWorkerRequest): Promise<void> 
 
       store = new ConversationThreadStore(request.searchDbPath, {
         surfaceDbPath: request.surfaceDbPath,
-        mainAgentUserNames: [cfg.surface.discord.botName],
+        nativeDbPath: request.nativeDbPath,
+        telegramDbPath: request.telegramDbPath,
+        telegramBotName: request.telegramBotName,
+        mainAgentUserNames: [cfg.surface.discord.botName, cfg.surface.telegram.botName],
       });
       const entityMapper = request.surfaceDbPath
         ? (() => {

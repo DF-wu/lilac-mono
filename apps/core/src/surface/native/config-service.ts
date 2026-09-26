@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { z } from "zod";
 import { Result, TaggedError } from "better-result";
 import { decodeCoreConfigYaml, parseCoreConfigResult } from "@stanley2058/lilac-utils/core-config";
 import { errorCode } from "@stanley2058/lilac-utils/runtime-utils";
@@ -58,37 +57,6 @@ function validateDocument(
       );
     });
     return Result.ok();
-  });
-}
-
-type StreamingMode = "paragraph" | "complete";
-type StreamingSettings = { mode: StreamingMode; revision: string };
-const streamingDocumentSchema = z
-  .object({
-    configVersion: z.literal(2),
-    surface: z
-      .object({
-        native: z
-          .object({ outputStreaming: z.enum(["paragraph", "complete"]).optional() })
-          .catchall(z.json())
-          .optional(),
-      })
-      .catchall(z.json())
-      .optional(),
-  })
-  .catchall(z.json());
-
-function streamingDocument(text: string) {
-  return Result.gen(function* () {
-    const raw = yield* decodeCoreConfigYaml(text).mapError((error) =>
-      failure("invalid", error.message),
-    );
-    const parsed = streamingDocumentSchema.safeParse(raw);
-    if (!parsed.success)
-      return Result.err(
-        failure("invalid", "Streaming settings require a valid version 2 Core configuration"),
-      );
-    return Result.ok(parsed.data);
   });
 }
 
@@ -161,48 +129,6 @@ export class NativeConfigService {
       const file = path.join(this.options.dataDir, `${input.kind}-config.yaml`);
       yield* Result.await(writeAtomic(file, input.text));
       return Result.ok({ kind: input.kind, text: input.text, revision: revisionOf(input.text) });
-    }, this);
-  }
-
-  async readStreaming(userId: string): Promise<Result<StreamingSettings, NativeConfigError>> {
-    return Result.gen(async function* () {
-      const document = yield* Result.await(this.read(userId, "core"));
-      const source = yield* streamingDocument(document.text);
-      return Result.ok({
-        mode: source.surface?.native?.outputStreaming ?? "paragraph",
-        revision: document.revision,
-      });
-    }, this);
-  }
-
-  async setStreaming(
-    userId: string,
-    input: { mode: StreamingMode; expectedRevision: string },
-  ): Promise<Result<StreamingSettings, NativeConfigError>> {
-    return Result.gen(async function* () {
-      const document = yield* Result.await(this.read(userId, "core"));
-      if (document.revision !== input.expectedRevision)
-        return Result.err(
-          failure("conflict", "Configuration changed since it was loaded", document.revision),
-        );
-      const source = yield* streamingDocument(document.text);
-      if ((source.surface?.native?.outputStreaming ?? "paragraph") === input.mode)
-        return Result.ok({ mode: input.mode, revision: document.revision });
-      const updated = {
-        ...source,
-        surface: {
-          ...source.surface,
-          native: { ...source.surface?.native, outputStreaming: input.mode },
-        },
-      };
-      const text = yield* Result.try({
-        try: () => `${Bun.YAML.stringify(updated, null, 2)}\n`,
-        catch: () => failure("invalid", "Cannot serialize Core configuration"),
-      });
-      const saved = yield* Result.await(
-        this.save(userId, { kind: "core", expectedRevision: input.expectedRevision, text }),
-      );
-      return Result.ok({ mode: input.mode, revision: saved.revision });
     }, this);
   }
 

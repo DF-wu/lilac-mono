@@ -213,7 +213,7 @@ function createSurfaceMessageRef<P extends RegisteredSurfacePlatform>(
 const surfaceClientSchema = z
   .enum(["discord", "github", "native", "whatsapp", "slack", "telegram", "web"])
   .describe(
-    "Recognized surface wire client/platform. Execution requires a registered adapter and is selected from request context unless --client is needed.",
+    "Recognized surface wire client/platform. Execution requires a registered adapter. Explicit --client selects the target surface; otherwise the request context supplies the default.",
   );
 
 type SurfaceClient = z.infer<typeof surfaceClientSchema>;
@@ -237,18 +237,6 @@ function resolveSurfaceAdapter(params: {
   const ctxClient = requestClient && requestClient !== "unknown" ? requestClient : initiatorClient;
   const contextAdapter = ctxClient ? params.resolver.resolve(ctxClient) : null;
 
-  if (contextAdapter) {
-    if (params.inputClient && params.inputClient !== contextAdapter.platform) {
-      return Result.err(
-        surfaceFailure(
-          "conflict",
-          `Client mismatch: context requestClient is '${contextAdapter.platform}' but input client is '${params.inputClient}'`,
-        ),
-      );
-    }
-    return Result.ok(contextAdapter);
-  }
-
   if (params.inputClient) {
     const inputAdapter = params.resolver.resolve(params.inputClient);
     if (inputAdapter) return Result.ok(inputAdapter);
@@ -259,6 +247,8 @@ function resolveSurfaceAdapter(params: {
       ),
     );
   }
+
+  if (contextAdapter) return Result.ok(contextAdapter);
 
   if (ctxClient) {
     return Result.err(
@@ -1043,7 +1033,7 @@ export class Surface implements ServerTool {
         "surface.help": callable({
           name: "Surface Help",
           description:
-            "Explain surface terminology (client/platform/sessionId/messageId) and common sessionId formats.",
+            "Explain conversation link parsing, cross-surface retrieval, surface terminology, and sessionId formats.",
           inputSchema: helpInputSchema,
           validation: "zod",
           run: (input, opts) => this.callHelp(input, opts?.context),
@@ -1216,7 +1206,7 @@ export class Surface implements ServerTool {
         },
         terminology: {
           client:
-            "Surface client/platform. A registered request-context adapter is authoritative; an explicit conflicting --client fails closed. Otherwise pass --client to select a registered adapter.",
+            "Surface client/platform. Pass --client to select a registered adapter, including a different surface from the request origin. If omitted, the request context supplies the default.",
           adapterResolution:
             "supportedClients lists registered executable adapters only. It does not predict support for individual operations; each operation returns its declared runtime result.",
           session:
@@ -1227,6 +1217,15 @@ export class Surface implements ServerTool {
             "Human-friendly Discord session alias from cfg.entity.sessions.discord. Prefer aliases over raw channel ids when available.",
           messageId:
             "A platform-specific message identifier inside a session/channel. Many surface tools can default this to the origin message when requestId is 'discord:<sessionId>:<messageId>' or 'github:<OWNER/REPO#N>:<triggerId>'.",
+          conversationLinks: [
+            `Lilac reference links use ${new URL(cfg.surface.native.publicUrl).origin}/?ref=<surface>:<sessionId>&message=<messageId>; relative /?ref= links use this installation.`,
+            "Decode query parameters once, split ref at the first colon, and pass the prefix as client, the remainder as sessionId, and optional message as messageId. Supported prefixes: native, discord, github. Keep the remaining sessionId intact.",
+            "For Discord message URLs, use client=discord, the channel ID as sessionId, and the final message ID as messageId.",
+            "For Telegram links, use client=telegram: https://t.me/c/<internal>/<messageId> means sessionId=-100<internal>; https://t.me/c/<internal>/<topicId>/<messageId> means sessionId=-100<internal>:<topicId>. Public https://t.me/<username>/... links cannot be resolved because the history index stores chat ids, not usernames.",
+            "Use surface.messages.read for an anchored message, then surface.messages.list with beforeMessageId or afterMessageId for nearby context. For a thread-only link, start with surface.messages.list. Always pass the target client explicitly.",
+            "Native surface tools require native request authority. From Discord or GitHub, read retained native history with conversation.thread.read using threadId=native:<threadId>; page with offset and limit to locate the referenced messageId. This requires conversation indexing and retained history.",
+            "Parsed references are coordinates, not retrieved content or authorization. Report unavailable tools, denied access, missing threads, or missing messages as retrieval failures; only claim to have read content returned by retrieval.",
+          ],
           replyToMessageId: "When sending a message, optionally reply to an existing messageId.",
           silent: "When true, suppress all notifications for this send (mentions + reply ping).",
           attachments:
@@ -1464,7 +1463,6 @@ export class Surface implements ServerTool {
         offset += rows.length;
 
         for (const row of rows) {
-          if (ctx?.requestClient === "native" && row.client !== "native") continue;
           let nativeText: string | undefined;
           if (row.client === "native") {
             const native = this.resolveAdapter("native", ctx).match({
@@ -1482,6 +1480,15 @@ export class Surface implements ServerTool {
             ).match({ ok: (value) => value, err: () => null });
             if (!message) continue;
             nativeText = message.text;
+          }
+          if (row.client === "telegram") {
+            const telegramSession = tryParseTelegramSessionId(row.sessionId);
+            if (
+              !telegramSession ||
+              !isTelegramChatAllowed({ cfg, chatId: telegramSession.chatId })
+            ) {
+              continue;
+            }
           }
           if (row.client === "discord") {
             const discord = this.params.adapterResolver.resolve("discord");

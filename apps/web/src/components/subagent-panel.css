@@ -31,7 +31,7 @@
   white-space: nowrap;
 }
 
-.subagent-card > span {
+.subagent-card > span:not([data-slot="avatar"]) {
   display: grid;
   gap: calc(var(--ui-space-unit) * 2);
   min-width: 0;
@@ -56,14 +56,11 @@
   max-width: 100%;
 }
 
-.subagent-activity > span {
+.subagent-activity > span:not([data-slot="avatar"]) {
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-:root[data-animation] .subagent-status .animate-spin {
-  animation-duration: var(--ui-motion-spin-duration) !important;
 }
 
 .right-panel-toggle {
@@ -78,4 +75,11 @@
 .right-panel-toggle .icon-button {
   width: var(--ui-control-compact);
   height: var(--ui-control-compact);
+}
+
+.subagent-transcript .turn {
+  padding: 0;
+}
+.subagent-transcript .user-turn {
+  margin-left: 0;
 }

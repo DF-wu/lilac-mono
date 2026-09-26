@@ -57,6 +57,7 @@ export type RequestDeliveryCoordinatorOptions<TEnvelope, TWork, TOutputMetadata>
   readonly isResolveTimeout?: (error: BlobResolveError) => boolean;
   readonly logger?: RequestDeliveryLogger;
   readonly activity?: RequestDeliveryActivity;
+  readonly inputBlobRetained?: (objectId: string) => ResultType<boolean, Error>;
 };
 
 export type RequestDeliveryLogger = {
@@ -84,6 +85,7 @@ export class RequestDeliveryCoordinator<
   readonly #isResolveTimeout: (error: BlobResolveError) => boolean;
   readonly #logger?: RequestDeliveryLogger;
   readonly #activity?: RequestDeliveryActivity;
+  readonly #inputBlobRetained?: (objectId: string) => ResultType<boolean, Error>;
 
   constructor(options: RequestDeliveryCoordinatorOptions<TEnvelope, TWork, TOutputMetadata>) {
     this.#store = options.store;
@@ -93,6 +95,7 @@ export class RequestDeliveryCoordinator<
     this.#isResolveTimeout = options.isResolveTimeout ?? defaultIsResolveTimeout;
     this.#logger = options.logger;
     this.#activity = options.activity;
+    this.#inputBlobRetained = options.inputBlobRetained;
   }
 
   async prepareAndPublish(
@@ -779,6 +782,18 @@ export class RequestDeliveryCoordinator<
     })();
   }
 
+  async #deleteInputBlob(
+    blob: BlobHandleV1 | BlobRefV1,
+  ): Promise<ResultType<"deleted" | "absent" | "retained", Error>> {
+    return Result.gen(async function* (
+      this: RequestDeliveryCoordinator<TEnvelope, TWork, TOutputMetadata>,
+    ) {
+      const retained = yield* this.#inputBlobRetained?.(blob.objectId) ?? Result.ok(false);
+      if (retained) return Result.ok("retained" as const);
+      return await this.#blobStore.delete(blob);
+    }, this);
+  }
+
   async #deleteInputTargets(record: {
     readonly requestDeliveryId: string;
     readonly inputCleanupPending: readonly {
@@ -791,7 +806,7 @@ export class RequestDeliveryCoordinator<
     let deleted = 0;
     const failures: RequestDeliveryDeleteFailed[] = [];
     for (const target of record.inputCleanupPending) {
-      const result = await this.#blobStore.delete(target.blob);
+      const result = await this.#deleteInputBlob(target.blob);
       const continueResult = result.match<() => void>({
         err: (error) => () => {
           failures.push(
@@ -802,7 +817,7 @@ export class RequestDeliveryCoordinator<
             }),
           );
         },
-        ok: () => () => {
+        ok: (outcome) => () => {
           const marked = this.#store.markInputObjectDeleted({
             requestDeliveryId: record.requestDeliveryId,
             objectId: target.blob.objectId,
@@ -817,7 +832,7 @@ export class RequestDeliveryCoordinator<
                 }),
               ),
             ok: () => {
-              deleted += 1;
+              if (outcome !== "retained") deleted += 1;
             },
           });
         },

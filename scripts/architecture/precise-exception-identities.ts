@@ -686,7 +686,7 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ["core-config.ts", "parseCoreConfig", "signal"],
     ["core-config.ts", "readCoreConfigVersion", "signal"],
     ["core-config.ts", "resolveDiscordToken", "signal"],
-    ["core-config.ts", "adaptTelegramTokenResultToHost", "signal"],
+    ["core-config/telegram-runtime.ts", "adaptTelegramTokenResultToHost", "signal"],
     ["core-config/v1.ts", "parseCoreConfigV1ToUniversal", "signal"],
     ["core-config/v2.ts", "parseCoreConfigV2ToUniversal", "signal"],
     ["custom-commands.ts", "decodeCustomCommandResult", "signal"],

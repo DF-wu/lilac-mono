@@ -4,6 +4,8 @@ import githubLight from "shiki/themes/github-light.mjs";
 import githubDark from "shiki/themes/github-dark.mjs";
 import { resolveTheme } from "../src/theme/resolve-theme";
 import { builtinThemes } from "../src/theme/builtin";
+import { loadThemePair, themeCatalog } from "../src/theme/catalog";
+import { decodeThemeSelection } from "../src/theme/theme";
 import { highlightCode } from "../src/components/rich-code";
 
 test("VS Code roles preserve distinct control pairs, alpha and explicit transparency", () => {
@@ -114,4 +116,39 @@ test("menu highlights derive from the menu pair without colliding with its surfa
   });
   expect(variables["menu-selection"]).toBe("#fedcba");
   expect(variables["menu-selection-foreground"]).toBe("#000000");
+});
+
+test("built-in theme pairs resolve each kind with a distinct raised surface", async () => {
+  for (const entry of themeCatalog) {
+    const pair = (await loadThemePair(entry.id)).unwrap();
+    expect(pair.light.kind).toBe("light");
+    expect(pair.dark.kind).toBe("dark");
+    for (const theme of [pair.light, pair.dark])
+      expect(theme.variables["surface-raised"]).not.toBe(theme.variables.surface);
+  }
+});
+
+test("raised surfaces derive a tint when a theme reuses the sidebar color", () => {
+  const { variables } = resolveTheme({
+    type: "dark",
+    colors: {
+      "editor.foreground": "#ffffff",
+      "sideBar.background": "#181825",
+      "editorWidget.background": "#181825",
+    },
+  });
+  expect(variables["surface-raised"]).toBe("color-mix(in srgb, #ffffff 6%, #181825)");
+});
+
+test("stored theme selections fall back to Lilac when missing or unknown", () => {
+  expect(decodeThemeSelection(null)).toEqual({ light: "lilac", dark: "lilac" });
+  expect(decodeThemeSelection('{"light":"github","dark":"catppuccin"}')).toEqual({
+    light: "github",
+    dark: "catppuccin",
+  });
+  expect(decodeThemeSelection('{"light":"missing","dark":"github"}')).toEqual({
+    light: "lilac",
+    dark: "lilac",
+  });
+  expect(decodeThemeSelection("not json")).toEqual({ light: "lilac", dark: "lilac" });
 });

@@ -112,7 +112,7 @@
   vertical-align: middle;
   align-items: center;
   gap: calc(var(--ui-space-unit) * 1);
-  padding: calc(var(--ui-space-unit) * 1);
+  padding: calc(var(--ui-space-unit) * 0.5) var(--ui-space-unit);
   max-width: 100%;
   height: auto;
   font-family: var(--ui-font-mono);

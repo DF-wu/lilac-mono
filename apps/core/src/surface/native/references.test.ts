@@ -88,7 +88,7 @@ test("reference titles and model expansion respect the executing principal", asy
   expect((await f.references.resolve("reader", target)).isErr()).toBe(true);
   expect((await f.references.read("reader", { target })).isErr()).toBe(true);
   const expanded = f.references.expand("owner", text).unwrap();
-  expect(expanded).toContain(`"conversationThreadId":"${f.thread.id}"`);
+  expect(expanded).toContain(`"conversationThreadId":"native:${f.thread.id}"`);
   expect(expanded).toContain('"messageId":"message"');
   expect(expanded).not.toContain("Secret");
   const denied = f.references.expand("reader", text).unwrap();
@@ -121,4 +121,19 @@ test("exact native preview page boundaries do not advertise an empty newer page"
   ).unwrap();
   expect(refetched.messages.at(-1)?.id).toBe("message-40");
   expect(fullPage.messages.some((message) => message.id === target.messageId)).toBe(true);
+});
+
+test("absolute native references retain principal checks and missing-message failures", () => {
+  using f = fixture();
+  const url = `https://chat.example${referenceHref({ surface: "native", sessionId: f.thread.id })}`;
+  const expanded = f.references.expand("owner", url, "https://chat.example").unwrap();
+  expect(expanded).toContain('"client":"native"');
+  expect(expanded).not.toContain('"unavailable":true');
+  expect(f.references.expand("reader", url, "https://chat.example").unwrap()).toContain(
+    '"unavailable":true',
+  );
+  expect(
+    f.references.expand("owner", `${url}&message=missing`, "https://chat.example").unwrap(),
+  ).toContain('"unavailable":true');
+  expect(f.references.expand("owner", url, "https://other.example").unwrap()).toBe(url);
 });

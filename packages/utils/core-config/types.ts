@@ -1,4 +1,5 @@
-import { cloneDefaultWorkingIndicators } from "../working-indicators";
+import type { GenerateToolsConfig } from "./generate-image";
+import type { TelegramSurfaceConfig } from "./telegram-surface";
 
 export type JSONValue = null | string | number | boolean | JSONObject | JSONArray;
 export type JSONArray = JSONValue[];
@@ -133,61 +134,6 @@ export type BlobStorageConfig =
       forcePathStyle: boolean;
     };
 
-export const TELEGRAM_SURFACE_DEFAULTS = {
-  enabled: false,
-  botName: "lilac",
-  outputMode: "preview",
-  parseMode: "html",
-  streamEditIntervalMs: 1500,
-  outputNotification: true,
-  commandMenu: true,
-  markdownTableRender: {
-    enabled: true,
-    style: "unicode",
-    maxWidth: 50,
-    fallbackMode: "list",
-  },
-  inboundMedia: {
-    enabled: true,
-    maxBytesPerAttachment: 5 * 1024 * 1024,
-    maxBytesPerRequest: 10 * 1024 * 1024,
-  },
-} as const;
-
-/**
- * Shared by the v2 schema and by the v1 fallback so both config versions
- * produce an identical `surface.telegram` shape. The core-config drift test
- * asserts this equivalence.
- */
-export function cloneDefaultTelegramSurface(): UniversalCoreConfig["surface"]["telegram"] {
-  return {
-    ...TELEGRAM_SURFACE_DEFAULTS,
-    allowedChatIds: [],
-    allowedUserIds: [],
-    workingIndicators: cloneDefaultWorkingIndicators(),
-    markdownTableRender: { ...TELEGRAM_SURFACE_DEFAULTS.markdownTableRender },
-    inboundMedia: { ...TELEGRAM_SURFACE_DEFAULTS.inboundMedia },
-  };
-}
-
-/**
- * Canonical list of Lilac `generate.image` model aliases. A drift test in
- * apps/core pins this list to the generate tool's fallback order so the two
- * cannot diverge silently.
- */
-export const IMAGE_GENERATION_MODEL_ALIASES = [
-  "gpt-image-2",
-  "gpt-5-image",
-  "nanobanana",
-  "nanobanana-2",
-  "nanobanana-2-lite",
-  "nanobanana-pro",
-  "grok-imagine-image",
-  "grok-imagine-image-pro",
-] as const;
-
-export type ImageGenerationModelAlias = (typeof IMAGE_GENERATION_MODEL_ALIASES)[number];
-
 export type NativeSurfaceConfig = {
   enabled: boolean;
   host: string;
@@ -232,18 +178,7 @@ export type UniversalCoreConfig = {
 
   tools: {
     fsBackend: "fff" | "node-rg";
-    generate: {
-      image: {
-        provider: "default" | "openai-compatible";
-        /** Only meaningful when provider is "openai-compatible". */
-        openaiCompatible: {
-          /** Optional allowlist of aliases the endpoint serves; omitted = all aliases. */
-          models?: readonly ImageGenerationModelAlias[];
-          /** Per-alias upstream model-ID overrides; unlisted aliases keep canonical IDs. */
-          modelIds: Partial<Record<ImageGenerationModelAlias, string>>;
-        };
-      };
-    };
+    generate: GenerateToolsConfig;
     web: {
       extract: {
         providers: Array<"tavily" | "exa" | "firecrawl">;
@@ -368,61 +303,7 @@ export type UniversalCoreConfig = {
       };
     };
 
-    telegram: {
-      /** Telegram surface is opt-in; when false the adapter is never constructed. */
-      enabled: boolean;
-      /** Bot API token. Keep core-config.yaml private because this is a secret. */
-      token?: string;
-      /** Identity used for mention detection and prompt attribution. */
-      botName: string;
-      /** Resolved from getMe at connect time when omitted. */
-      botUsername?: string;
-      /** Empty means "deny all": the surface fails closed. */
-      allowedChatIds: string[];
-      /** Empty means "no user-level restriction" (chat allowlist still applies). */
-      allowedUserIds: string[];
-      dbPath?: string;
-      /**
-       * Bot API endpoint. Telegram supports self-hosted Bot API servers, which
-       * raise the file-size limits; this also lets a verification run point at
-       * a local endpoint. Defaults to https://api.telegram.org.
-       */
-      apiRoot?: string;
-      /**
-       * Telegram edits the streamed message in place, so on a successful run
-       * both modes produce the same result. The mode only changes what happens
-       * on cancellation: `preview` removes the streamed messages, `inline`
-       * leaves the partial answer visible.
-       */
-      outputMode: "inline" | "preview";
-      parseMode: "html" | "plain";
-      /** Minimum gap between streaming editMessageText calls, per Bot API rate limits. */
-      streamEditIntervalMs: number;
-      outputNotification: boolean;
-      workingIndicators: string[];
-      /** Register the bot command menu via setMyCommands on connect. */
-      commandMenu: boolean;
-      markdownTableRender: {
-        enabled: boolean;
-        style: "unicode" | "ascii";
-        maxWidth: number;
-        fallbackMode: "list" | "passthrough";
-      };
-      /**
-       * Inbound photo/document delivery to the model. Media is resolved from
-       * Telegram at composition time via the stable `file_id` (never a URL, so
-       * the bot token cannot leak into composed content or transcripts) and is
-       * bounded by decoded-byte budgets before anything is published.
-       */
-      inboundMedia: {
-        /** When false, media messages route on caption text only (media dropped). */
-        enabled: boolean;
-        /** Decoded-byte cap per attachment; larger media degrade to a metadata marker. */
-        maxBytesPerAttachment: number;
-        /** Decoded-byte budget across every attachment in one composed request. */
-        maxBytesPerRequest: number;
-      };
-    };
+    telegram: TelegramSurfaceConfig;
 
     heartbeat: {
       enabled: boolean;

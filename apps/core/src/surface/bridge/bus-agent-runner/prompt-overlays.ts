@@ -276,6 +276,29 @@ export function buildDiscordOutputOverlay(): string {
   ].join("\n");
 }
 
+export function buildNativeOutputOverlay(): string {
+  return [
+    "Native web file presentation:",
+    "",
+    "- Show an image inline with `![Description](/absolute/path/image.png)`.",
+    "  For paths containing spaces, use `![Description](</absolute/path/my image.png>)`.",
+    "- Show a compact file chip by putting a local path in inline code:",
+    "  `/absolute/path/report.pdf`. The user can open it in a preview or right panel.",
+    "  Source references support `:42` and inclusive ranges such as `:42-48`.",
+    "- Prefer absolute paths on the Core host. Local references read the live file:",
+    "  create it before referencing it and keep it available. Changes affect later",
+    "  reads; deletion makes it unavailable. Use an attachment upload tool when a",
+    "  preserved copy is required.",
+    "- Reference an existing retained resource with `![Description](RESOURCE_URI)`",
+    "  for an inline image or `[report.pdf](RESOURCE_URI)` for a file link.",
+    "  Replace RESOURCE_URI with the exact `resource://r1_...` URI returned by tools,",
+    "  preserving it without added paths, query parameters, or fragments.",
+    "- For transient `resource://t1_...` resources, use resource.materialize and",
+    "  reference the resulting local path. For SSH files, copy them to the Core host",
+    "  before referencing them. Direct transient-resource and SSH links are unsupported.",
+  ].join("\n");
+}
+
 export function buildRestrictedSessionOverlay(_params: { sessionId: string }): string {
   return [
     "Restricted public-session safety mode is active for this request.",
