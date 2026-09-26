@@ -849,3 +849,12 @@ apply. Native UI read and write permissions remain unchanged. Derived native sta
 its retained message content or history generation changes, including edits, rewinds, and deletion.
 Model selection, titles, archiving, and grant changes preserve existing summaries. Downgrading requires
 rebuilding the derived index for the older runtime; do not reuse cross-surface derived rows with an older binary.
+
+This fork additionally attaches `telegram-surface.db` as a conversation source when the Telegram
+surface is usable. Telegram sessions are projected into the same derived tables as `telegram_thread`
+rows with thread references `telegram:<sessionId>`, one thread per chat or forum topic, and are
+subject to `surface.telegram.allowedChatIds` on every read. Retained Telegram messages are unchanged;
+derived Telegram rows are rebuilt whenever a session's message count, latest timestamp, latest edit, or
+deletion count changes. Removing the Telegram surface leaves stale `telegram_thread` rows that the
+next materialization pass deletes. Downgrading to a runtime without the Telegram source requires the
+same derived-index rebuild as above.

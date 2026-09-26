@@ -4,7 +4,7 @@
 
 本文件描述 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) 相對於 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的現行差異。
 
-比較基準為 2026-09-26 時與 upstream `main` 的 merge base：本 fork 已包含 upstream commit [`e8d6d09b`](https://github.com/stanley2058/lilac-mono/commit/e8d6d09ba112c36a163107fa0c9ac743f61d7a41)，並在其上保留下列功能與維運修改。
+比較基準為 2026-09-26 時與 upstream `main` 的 merge base：（fork PR [#68](https://github.com/DF-wu/lilac-mono/pull/68)）本 fork 已包含 upstream commit [`7f818a2e`](https://github.com/stanley2058/lilac-mono/commit/7f818a2e)，並在其上保留下列功能與維運修改。
 
 > [!IMPORTANT]
 > 這是維護文件，不是永久相容性承諾。Upstream sync 後，已被上游接收或不再存在的差異必須從本表移除或重新分類。
@@ -30,11 +30,13 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 - Mention/active routing、streamed edits、HTML rendering 與 4096-character chunking。
 - Reply context、cancel、typing indicators、reactions、custom commands 與 menu aliases。
 - Inbound photos/documents、outbound attachments、workflow progress/actions、`waitForReply` 與 allowlist-bound surface tools。
+- 對話記憶：Telegram 聊天透過共用的跨 surface thread store 被索引、摘要、搜尋與自動召回，並以 `allowedChatIds` 把關（見 [`telegram-surface.md`](./telegram-surface.md#conversation-memory)）。
 
 仍未實作或受平台限制的項目：
 
 - 只有 long polling，沒有 webhook ingress。
-- 沒有 Telegram-native conversation search index、inline queries、business accounts 或 voice/video transcription。
+- 對話記憶以每個聊天或 topic 為一個 thread（長聊天室不分段）、沒有 run-in-progress 訊號、附件只保留 metadata；尚未辨識 Lilac 的 `/?ref=telegram:` 參照。
+- 沒有 inline queries、business accounts 或 voice/video transcription。
 - Message history 只包含 bot 實際觀察或送出的內容，不是 Telegram 既有完整歷史。
 
 精確 feature matrix 與平台差異以 [`telegram-surface.md`](./telegram-surface.md#10-what-works-and-what-does-not) 為準。
@@ -103,7 +105,7 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 - 不再使用 `backup/`、`dep/`、`pr/`、`review-*` 分支。rebase 前的安全點用 tag 或 stash；對 upstream 開 PR 的分支，在 upstream 接受或拒絕後即刪除。
 - PR 合併後立即刪除分支；用 `git branch --merged origin/main` 與 `git cherry origin/main <branch>` 判斷是否還有未合入的內容。
 - Worktree 比照辦理：一個進行中的分支對應一個 worktree，分支刪除時一併移除。
-- 2026-09-26 的整理將 21 個分支封存為 `archive/*` tags，並刪除了 78 個本地與遠端分支。
+- 2026-09-26 的整理將 22 個分支（其中一個是未 commit 的 worktree）封存為 `archive/*` tags，並刪除了 79 個本地與遠端分支；最後只留下 `main`。
 
 ## Upstream Sync Policy
 

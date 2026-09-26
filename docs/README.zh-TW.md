@@ -17,7 +17,7 @@
 | 文件 | 內容 |
 | --- | --- |
 | [`docker-deployment.md`](./docker-deployment.md) | Docker/Compose、operator token、持久化、UID、安全邊界與診斷 |
-| [`telegram-surface.md`](./telegram-surface.md) | BotFather、allowlists、群組、forum topics、workflow、驗證與限制 |
+| [`telegram-surface.md`](./telegram-surface.md) | BotFather、allowlists、群組、forum topics、workflow、對話記憶、驗證與限制 |
 | [`github-reply-permalinks.md`](./github-reply-permalinks.md) | GitHub issue/PR body 與 comment reply permalink contract |
 
 ## Generation 與 Extensions

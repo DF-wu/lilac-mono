@@ -17,7 +17,7 @@ Language: [`English (primary / canonical)`](../README.md) · [`Traditional Chine
 | Document | Contents |
 | --- | --- |
 | [`docker-deployment.md`](./docker-deployment.md) | Docker/Compose, operator tokens, persistence, UID, security boundaries, and diagnostics |
-| [`telegram-surface.md`](./telegram-surface.md) | BotFather, allowlists, groups, forum topics, workflows, verification, and limitations |
+| [`telegram-surface.md`](./telegram-surface.md) | BotFather, allowlists, groups, forum topics, workflows, conversation memory, verification, and limitations |
 | [`github-reply-permalinks.md`](./github-reply-permalinks.md) | GitHub issue/PR body and comment reply permalink contract |
 
 ## Generation and Extensions
