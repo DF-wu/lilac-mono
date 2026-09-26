@@ -6,6 +6,7 @@ import { Panic } from "better-result";
 import { Web, type WebDependencies } from "../../src/tool-server/tools/web";
 import {
   createDefaultWebSearchProviders,
+  OpenAIWebSearchProvider,
   type WebSearchProvider,
 } from "../../src/tool-server/tools/web-search";
 import { FirecrawlPermitPool } from "../../src/tool-server/tools/web-search/firecrawl-permit-pool";
@@ -904,6 +905,61 @@ describe("web search and permits", () => {
       error: { kind: "denied", message: "401 unauthorized" },
     });
     expect(calls).toEqual(["tavily"]);
+  });
+
+  it("falls back after retriable OpenAI HTTP errors even without retry keywords", async () => {
+    const recovered = [
+      { url: "https://example.com", title: "Fallback", content: "Recovered", score: null },
+    ];
+    for (const status of [409, 425, 429, 503]) {
+      const server = startServer(
+        () =>
+          new Response(JSON.stringify({ error: { message: "request failed" } }), {
+            status,
+            headers: { "content-type": "application/json" },
+          }),
+      );
+      const fallback = jest.fn(async () => recovered);
+      const tool = createTool({
+        providers: [
+          new OpenAIWebSearchProvider({
+            apiKey: "sk-test",
+            baseUrl: `http://127.0.0.1:${server.port}/v1`,
+          }),
+          configuredProvider("exa", fallback),
+        ],
+      });
+
+      await expect(toolValue(tool.call("search", { query: "fallback test" }))).resolves.toEqual(
+        recovered,
+      );
+      expect(fallback).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("falls back after a non-JSON OpenAI 500 but not after a 400", async () => {
+    for (const status of [500, 400]) {
+      const server = startServer(() => new Response("gateway error", { status }));
+      const fallback = jest.fn(async () => []);
+      const tool = createTool({
+        providers: [
+          new OpenAIWebSearchProvider({
+            apiKey: "sk-test",
+            baseUrl: `http://127.0.0.1:${server.port}/v1`,
+          }),
+          configuredProvider("exa", fallback),
+        ],
+      });
+
+      const result = await tool.call("search", { query: "fallback test" });
+      if (status === 500) {
+        expect(result.status).toBe("ok");
+        expect(fallback).toHaveBeenCalledTimes(1);
+        continue;
+      }
+      expect(result.status).toBe("error");
+      expect(fallback).not.toHaveBeenCalled();
+    }
   });
 
   it("queues Firecrawl searches and falls back when queue TTL expires", async () => {

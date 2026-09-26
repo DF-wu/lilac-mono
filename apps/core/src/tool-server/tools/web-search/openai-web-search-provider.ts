@@ -128,6 +128,7 @@ export class OpenAIWebSearchResponseInvalid extends TaggedError("OpenAIWebSearch
 
 class OpenAIWebSearchFailure extends TaggedError("OpenAIWebSearchFailure")<{
   readonly message: string;
+  readonly status?: number;
 }> {}
 
 export function decodeOpenAIWebSearchResponse(
@@ -146,7 +147,7 @@ function adaptOpenAIWebSearchResultToHost<TValue>(
   return result.match({
     ok: (value) => () => value,
     err: (error) => () => {
-      throw new Error(error.message);
+      throw Object.assign(new Error(error.message), { status: error.status });
     },
   })();
 }
@@ -166,6 +167,7 @@ async function captureOpenAIResponseJson(
     catch: () =>
       new OpenAIWebSearchFailure({
         message: `OpenAI web search failed (${response.status}): invalid JSON response.`,
+        status: response.status,
       }),
   });
 }
@@ -302,6 +304,7 @@ function decodeOpenAIWebSearchOutcome(
     return Result.err(
       new OpenAIWebSearchFailure({
         message: `OpenAI web search failed (${response.status}): ${envelope.kind === "api_error" ? envelope.message : response.statusText || "request failed"}`,
+        status: response.status,
       }),
     );
   }
@@ -309,6 +312,7 @@ function decodeOpenAIWebSearchOutcome(
     return Result.err(
       new OpenAIWebSearchFailure({
         message: `OpenAI web search failed (${response.status}): ${envelope.message}`,
+        status: response.status,
       }),
     );
   }
@@ -316,6 +320,7 @@ function decodeOpenAIWebSearchOutcome(
     return Result.err(
       new OpenAIWebSearchFailure({
         message: `OpenAI web search failed (${response.status}): response status '${envelope.kind}'.`,
+        status: response.status,
       }),
     );
   }
@@ -323,6 +328,7 @@ function decodeOpenAIWebSearchOutcome(
     return Result.err(
       new OpenAIWebSearchFailure({
         message: `OpenAI web search failed (${response.status}): response incomplete (${envelope.reason ?? "unknown reason"}).`,
+        status: response.status,
       }),
     );
   }
@@ -332,6 +338,7 @@ function decodeOpenAIWebSearchOutcome(
   return Result.err(
     new OpenAIWebSearchFailure({
       message: `OpenAI web search failed (${response.status}): invalid response contract.`,
+      status: response.status,
     }),
   );
 }
@@ -401,6 +408,7 @@ export class OpenAIWebSearchProvider implements WebSearchProvider {
           () =>
             new OpenAIWebSearchFailure({
               message: `OpenAI web search failed (${response.status}): invalid response contract.`,
+              status: response.status,
             }),
         )
         .andThen((value) => decodeOpenAIWebSearchOutcome(response, value, input.maxResults)),
