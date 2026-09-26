@@ -120,7 +120,9 @@ New v2 fields:
   next configured provider. `tools.web.openai.model` (default `gpt-5-mini`) and
   `tools.web.openai.searchContextSize` (`low` | `medium` | `high`, default `medium`) tune the call;
   set `model` to one your endpoint serves when `OPENAI_BASE_URL` points at a gateway. Cited URLs lose
-  the `utm_source=openai` tag and snippets are the answer paragraph each citation supports.
+  the `utm_source=openai` tag; cited `content` is explicitly labeled as an OpenAI-generated summary,
+  not a page excerpt, and may combine cited sources. Date constraints are model instructions, not
+  enforced publication-date filters.
   Frozen v1 configs cannot select this provider.
 - `models.capability.overrides.<provider/model>.attachment`: optional manual override for model attachment
   input support.

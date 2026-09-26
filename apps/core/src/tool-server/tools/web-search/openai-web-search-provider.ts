@@ -94,22 +94,33 @@ function decodeOutputItems(values: readonly unknown[]): OutputItem[] {
   });
 }
 
-const responseErrorSchema = z
-  .object({
-    message: z.string(),
-    code: z.string().nullable().optional(),
-  })
-  .nullable()
-  .optional();
+const responseErrorSchema = z.object({ error: z.object({ message: z.string() }) });
+const responseStatusSchema = z.object({
+  status: z.enum(["failed", "cancelled", "incomplete"]),
+  incomplete_details: z.object({ reason: z.string().optional() }).nullable().optional(),
+});
 
 const openaiResponseSchema = z.object({
-  status: z.string().optional(),
-  error: responseErrorSchema,
-  incomplete_details: z.object({ reason: z.string().optional() }).nullable().optional(),
-  output: z.array(z.unknown()).transform(decodeOutputItems).optional(),
+  status: z.literal("completed"),
+  output: z
+    .array(z.unknown())
+    .transform(decodeOutputItems)
+    .refine((items) => items.some((item) => item.type === "web_search_call")),
 });
 
 type OpenAIResponse = z.output<typeof openaiResponseSchema>;
+const responseEnvelopeSchema = z.union([
+  responseErrorSchema.transform(({ error }) => ({
+    kind: "api_error" as const,
+    message: error.message,
+  })),
+  responseStatusSchema.transform(({ status, incomplete_details }) => ({
+    kind: status,
+    reason: incomplete_details?.reason,
+  })),
+  openaiResponseSchema.transform((payload) => ({ kind: "completed" as const, payload })),
+]);
+type OpenAIResponseEnvelope = z.output<typeof responseEnvelopeSchema>;
 
 export class OpenAIWebSearchResponseInvalid extends TaggedError("OpenAIWebSearchResponseInvalid")<{
   readonly message: string;
@@ -121,8 +132,8 @@ class OpenAIWebSearchFailure extends TaggedError("OpenAIWebSearchFailure")<{
 
 export function decodeOpenAIWebSearchResponse(
   value: unknown,
-): ResultType<OpenAIResponse, OpenAIWebSearchResponseInvalid> {
-  const decoded = openaiResponseSchema.safeParse(value);
+): ResultType<OpenAIResponseEnvelope, OpenAIWebSearchResponseInvalid> {
+  const decoded = responseEnvelopeSchema.safeParse(value);
   if (decoded.success) return Result.ok(decoded.data);
   return Result.err(
     new OpenAIWebSearchResponseInvalid({ message: "OpenAI returned an invalid response" }),
@@ -209,6 +220,7 @@ export function buildOpenAIWebSearchInstructions(input: WebSearchInput): string 
 
 const CITATION_MARKER_RE = /\s*\((?:\s*\[[^\]]*\]\([^)]*\)\s*,?)+\s*\)/gu;
 const MAX_SNIPPET_CHARS = 600;
+const GENERATED_SUMMARY_LABEL = "OpenAI-generated summary (may combine cited sources): ";
 
 /** Removes the inline `([site](url))` markers the model appends for citations. */
 export function stripCitationMarkers(text: string): string {
@@ -245,7 +257,7 @@ export function collectOpenAIWebSearchResults(
   const byUrl = new Map<string, WebSearchResult>();
   const sources: string[] = [];
 
-  for (const item of payload.output ?? []) {
+  for (const item of payload.output) {
     if (item.type === "web_search_call") {
       sources.push(...(item.action?.sources ?? []));
       continue;
@@ -253,7 +265,8 @@ export function collectOpenAIWebSearchResults(
     for (const part of item.content) {
       for (const citation of part.annotations ?? []) {
         const url = normalizeCitedUrl(citation.url);
-        const content = citationSnippet(part.text, citation);
+        const snippet = citationSnippet(part.text, citation);
+        const content = snippet ? `${GENERATED_SUMMARY_LABEL}${snippet}` : "";
         const existing = byUrl.get(url);
         if (existing) {
           if (existing.content.length === 0 && content.length > 0) {
@@ -282,38 +295,45 @@ export function collectOpenAIWebSearchResults(
 
 function decodeOpenAIWebSearchOutcome(
   response: Response,
-  payload: OpenAIResponse,
+  envelope: OpenAIResponseEnvelope,
   maxResults: number,
 ): ResultType<readonly WebSearchResult[], OpenAIWebSearchFailure> {
   if (!response.ok) {
     return Result.err(
       new OpenAIWebSearchFailure({
-        message: `OpenAI web search failed (${response.status}): ${payload.error?.message ?? (response.statusText || "request failed")}`,
+        message: `OpenAI web search failed (${response.status}): ${envelope.kind === "api_error" ? envelope.message : response.statusText || "request failed"}`,
       }),
     );
   }
-  if (payload.error) {
+  if (envelope.kind === "api_error") {
     return Result.err(
       new OpenAIWebSearchFailure({
-        message: `OpenAI web search failed (${response.status}): ${payload.error.message}`,
+        message: `OpenAI web search failed (${response.status}): ${envelope.message}`,
       }),
     );
   }
-  if (payload.status === "failed" || payload.status === "cancelled") {
+  if (envelope.kind === "failed" || envelope.kind === "cancelled") {
     return Result.err(
       new OpenAIWebSearchFailure({
-        message: `OpenAI web search failed (${response.status}): response status '${payload.status}'.`,
+        message: `OpenAI web search failed (${response.status}): response status '${envelope.kind}'.`,
       }),
     );
   }
-  if (payload.status === "incomplete") {
+  if (envelope.kind === "incomplete") {
     return Result.err(
       new OpenAIWebSearchFailure({
-        message: `OpenAI web search failed (${response.status}): response incomplete (${payload.incomplete_details?.reason ?? "unknown reason"}).`,
+        message: `OpenAI web search failed (${response.status}): response incomplete (${envelope.reason ?? "unknown reason"}).`,
       }),
     );
   }
-  return Result.ok(collectOpenAIWebSearchResults(payload, maxResults));
+  if (envelope.kind === "completed") {
+    return Result.ok(collectOpenAIWebSearchResults(envelope.payload, maxResults));
+  }
+  return Result.err(
+    new OpenAIWebSearchFailure({
+      message: `OpenAI web search failed (${response.status}): invalid response contract.`,
+    }),
+  );
 }
 
 export class OpenAIWebSearchProvider implements WebSearchProvider {
@@ -374,9 +394,9 @@ export class OpenAIWebSearchProvider implements WebSearchProvider {
     });
 
     const rawPayload = adaptOpenAIWebSearchResultToHost(await captureOpenAIResponseJson(response));
-    const payload = decodeOpenAIWebSearchResponse(rawPayload);
+    const envelope = decodeOpenAIWebSearchResponse(rawPayload);
     return adaptOpenAIWebSearchResultToHost(
-      payload
+      envelope
         .mapError(
           () =>
             new OpenAIWebSearchFailure({

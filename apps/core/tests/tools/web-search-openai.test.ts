@@ -182,13 +182,15 @@ describe("web-search (openai)", () => {
       {
         url: "https://bun.sh/blog/bun-v1.3",
         title: "Bun v1.3",
-        content: "Bun 1.3 shipped in September.",
+        content:
+          "OpenAI-generated summary (may combine cited sources): Bun 1.3 shipped in September.",
         score: null,
       },
       {
         url: "https://github.com/oven-sh/bun/releases",
         title: "Releases",
-        content: "It adds a new bundler mode.",
+        content:
+          "OpenAI-generated summary (may combine cited sources): It adds a new bundler mode.",
         score: null,
       },
       {
@@ -197,6 +199,51 @@ describe("web-search (openai)", () => {
         content: "",
         score: null,
       },
+    ]);
+  });
+
+  it("labels a paragraph citing multiple URLs as generated synthesis for each result", async () => {
+    const text =
+      "Source A reports a release; source B reports the rollout. ([a](https://a.example), [b](https://b.example))";
+    const markerStart = text.indexOf("([a]");
+    const server = startResponsesServer(() =>
+      json({
+        status: "completed",
+        output: [
+          { type: "web_search_call", status: "completed", action: { sources: [] } },
+          {
+            type: "message",
+            content: [
+              {
+                type: "output_text",
+                text,
+                annotations: [
+                  {
+                    type: "url_citation",
+                    url: "https://a.example",
+                    start_index: markerStart,
+                    end_index: text.length,
+                  },
+                  {
+                    type: "url_citation",
+                    url: "https://b.example",
+                    start_index: markerStart,
+                    end_index: text.length,
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    const provider = new OpenAIWebSearchProvider({ apiKey: "sk-test", baseUrl: server.url });
+
+    const results = await provider.search(webSearchInputSchema.parse({ query: "release" }));
+    expect(results.map((result) => result.url)).toEqual(["https://a.example", "https://b.example"]);
+    expect(results.map((result) => result.content)).toEqual([
+      "OpenAI-generated summary (may combine cited sources): Source A reports a release; source B reports the rollout.",
+      "OpenAI-generated summary (may combine cited sources): Source A reports a release; source B reports the rollout.",
     ]);
   });
 
@@ -220,6 +267,7 @@ describe("web-search (openai)", () => {
       json({
         status: "completed",
         output: [
+          { type: "web_search_call", status: "completed", action: { sources: [] } },
           {
             type: "message",
             content: [{ type: "output_text", text: "No idea.", annotations: [] }],
@@ -251,6 +299,10 @@ describe("web-search (openai)", () => {
       { status: "failed", error: { message: "server_error: boom", code: "server_error" } },
       { status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, output: [] },
       { output: "not-an-array" },
+      {},
+      { status: "queued", output: [{ type: "web_search_call", action: { sources: [] } }] },
+      { status: "completed", output: [{ type: "reasoning", summary: [] }] },
+      { status: "completed", output: [] },
     ];
     const server = startResponsesServer(() => json(payloads.shift()));
     const provider = new OpenAIWebSearchProvider({ apiKey: "sk-test", baseUrl: server.url });
@@ -265,6 +317,11 @@ describe("web-search (openai)", () => {
     await expect(provider.search(input)).rejects.toThrow(
       "OpenAI web search failed (200): invalid response contract.",
     );
+    for (let i = 0; i < 4; i++) {
+      await expect(provider.search(input)).rejects.toThrow(
+        "OpenAI web search failed (200): invalid response contract.",
+      );
+    }
   });
 
   it("rejects when no API key is configured", async () => {
@@ -323,8 +380,10 @@ describe("web-search (openai)", () => {
 
   it("ignores unknown annotation and output item types when collecting results", () => {
     const decoded = decodeOpenAIWebSearchResponse({
+      status: "completed",
       output: [
         { type: "file_search_call", id: "fs" },
+        { type: "web_search_call", action: { sources: [] } },
         {
           type: "message",
           content: [
@@ -342,7 +401,10 @@ describe("web-search (openai)", () => {
       ],
     });
     const payload = decoded.match({
-      ok: (value) => value,
+      ok: (value) => {
+        if (value.kind !== "completed") throw new Error("expected completed response");
+        return value.payload;
+      },
       err: (error) => {
         throw new Error(error.message);
       },
