@@ -13,7 +13,7 @@
 
 | 領域 | 差異 | 使用入口 | 限制或注意事項 |
 | --- | --- | --- | --- |
-| Telegram surface | 新增 DM、group、forum topic ingress；streamed HTML output；cancel、reaction、command menu、inbound/outbound attachments、workflow cards/actions 與 same-surface tools | [`telegram-surface.md`](./telegram-surface.md)、fork PR [#45](https://github.com/DF-wu/lilac-mono/pull/45) | 預設停用；僅 long polling；history 來自 local SQLite index |
+| Telegram surface | 新增 DM、group、forum topic ingress；streamed HTML output；cancel、reaction、command menu、inbound/outbound attachments、workflow cards/actions、same-surface tools，並參與跨 surface 的 conversation memory（每個 chat 或 topic 一個 indexed thread，受 `allowedChatIds` 管制） | [`telegram-surface.md`](./telegram-surface.md)、fork PR [#45](https://github.com/DF-wu/lilac-mono/pull/45) | 預設停用；僅 long polling；history 來自 local SQLite index |
 | 結構化 `generate.image` | Upstream commit [`05115838`](https://github.com/stanley2058/lilac-mono/commit/05115838) 將 `generate.image` 改成 JavaScript script runner（`image-script.ts`、`providers` global 與 `image-generation` skill 內的 per-provider recipes）。本 fork 保留結構化的 prompt / model alias / size / mask / `outputDir` 工具、其測試，以及描述該 contract 的 skill | [`apps/core/src/tool-server/tools/generate-image/`](../apps/core/src/tool-server/tools/generate-image/)、[`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md) | 無法使用 upstream 的 script recipes；agent 不能透過 `generate.image` 執行任意 image script。這是最大的 tool contract 分歧，每次 sync 碰到 `tools/generate.ts` 時都要重新評估 |
 | OpenAI-compatible image routing | 以 v2 config 將所有既有 `generate.image` aliases 路由到單一 operator endpoint，支援 alias allowlist 與 per-alias upstream model-ID overrides；ratio-driven aliases 會把 `aspectRatio` 以 colon-form `size` 轉送 | [`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md)、fork PR [#47](https://github.com/DF-wu/lilac-mono/pull/47) | 無 official-provider fallback 或 cross-provider retry |
 | GitHub reply permalinks | `In reply to` 連結會指向指定 issue/PR body 或 comment anchor | [`github-reply-permalinks.md`](./github-reply-permalinks.md)、fork PR [#49](https://github.com/DF-wu/lilac-mono/pull/49) | Body target 需要 issue database ID；取不到時退回 thread URL |
@@ -78,6 +78,7 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 | 功能 | Fork 自有模組 | Upstream 接縫 |
 | --- | --- | --- |
 | Telegram surface | `apps/core/src/surface/telegram/`（adapter、ingress、router、output、store、protocol）。`telegram-surface-runtime.ts` 是 Core 唯一呼叫的接線入口：啟動時的 adapter 解析、runtime descriptor entry、config hot-reload 與 workflow target 授權 | `runtime/create-core-runtime.ts`（四個單行呼叫點）、`runtime/compose-builtin-surface-runtimes.ts`（一個 descriptor entry）、`surface/types.ts` 的 closed platform unions、`builtin-surface-protocols.ts`、`bridge/request-ids.ts` 與 workflow target 型別 |
+| Telegram conversation memory | `apps/core/src/surface/telegram/telegram-conversation-source.ts`（覆蓋 `telegram-surface.db` 的 SQL views、projection decoders、attachment metadata）以及 `telegram-surface-runtime.ts` 裡的 `telegramConversationMemoryInput` / `hydrateTelegramConversationAttachments` | `conversation/thread-store.ts`（第三個 source 分支、`telegram_thread` kind、allowlist 子句）、`thread-service.ts`（surface 標籤與 allowlist 檢查）、summarization worker protocol、`bus-agent-runner.ts`（recall 的 surface 標籤）、`tool-server/tools/conversation-thread.ts`（enum） |
 | Telegram 設定 | `packages/utils/core-config/telegram-surface.ts`（型別、預設值、v2 schema）與 `telegram-runtime.ts`（token 與 database path helpers） | `core-config/types.ts`、`v1.ts`、`v2.ts`（各一個欄位）與 `core-config.ts` 的 re-export |
 | 結構化 `generate.image` | `apps/core/src/tool-server/tools/generate-image/`（`input`、`models`、`prompt`、`routing`、`callable`） | `tool-server/tools/generate.ts`（callable hook 與 export 出來的共用 helpers）與 `plugins/builtin/server-tools.ts`（傳入 core config） |
 | Image routing 設定 | `packages/utils/core-config/generate-image.ts` | 同上的 config 接縫 |
@@ -86,6 +87,23 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 | Architecture gate | 無 | `scripts/architecture/manifest.ts`、`precise-exception-identities.ts` 與 `core-final-boundary-identities.ts` 註冊 fork 模組 |
 
 `bun run fork:footprint` 會列出所有相對於 `upstream/main` merge base 有差異的 upstream 檔案，遇到不在 [`scripts/fork/upstream-footprint.txt`](../scripts/fork/upstream-footprint.txt) 裡的檔案就失敗；清單中每一筆都記錄該接縫存在的理由。它也會回報檔案已不再有差異的過期項目，讓清單隨著 upstream 接收改動而縮小。CI 在每次 push 與 pull request 都會執行。
+
+## Branch 政策
+
+`main` 是唯一的長期分支：upstream `main` 加上本 fork 的功能，且永遠保持綠燈。其他分支都是短命的，一律透過 pull request 合入 `main`，讓 CI（含 upstream-footprint job）先跑過。
+
+| 前綴 | 用途 | 生命週期 |
+| --- | --- | --- |
+| `chore/sync-upstream-YYYYMMDD` | 合併 upstream `main`、解衝突，以及讓 fork 功能配合新 upstream 所需的後續修正 | PR 合併後刪除 |
+| `feat/`、`fix/`、`refactor/`、`docs/`、`test/` | 一個分支一件事，以改動內容命名（`feat/telegram-forum-topics`） | PR 合併後刪除 |
+| `archive/<舊分支名>`（tag，不是 branch） | 已退役、commits 不在 `main` 但日後可能要查閱的工作 | 永久保留；不再從它開新工作 |
+
+規則：
+
+- 不再使用 `backup/`、`dep/`、`pr/`、`review-*` 分支。rebase 前的安全點用 tag 或 stash；對 upstream 開 PR 的分支，在 upstream 接受或拒絕後即刪除。
+- PR 合併後立即刪除分支；用 `git branch --merged origin/main` 與 `git cherry origin/main <branch>` 判斷是否還有未合入的內容。
+- Worktree 比照辦理：一個進行中的分支對應一個 worktree，分支刪除時一併移除。
+- 2026-09-26 的整理將 21 個分支封存為 `archive/*` tags，並刪除了 78 個本地與遠端分支。
 
 ## Upstream Sync Policy
 
