@@ -2282,6 +2282,40 @@ describe("tool-server surface", () => {
     expect(adapter.sendCalls[0]?.opts?.silent).toBe(true);
   });
 
+  it("forwards the Discord message style for send", async () => {
+    const cfg = testConfig({
+      surface: {
+        discord: {
+          tokenEnv: "DISCORD_TOKEN",
+          allowedChannelIds: ["c1"],
+          allowedGuildIds: [],
+          botName: "lilac",
+        },
+      },
+      entity: { sessions: { discord: { ops: "c1" } } },
+    });
+
+    const adapter = new FakeAdapter([], {});
+    const tool = new Surface({ adapter, config: cfg });
+
+    await tool.call("surface.messages.send", {
+      sessionId: "ops",
+      text: "hi",
+      style: "plain",
+      client: "discord",
+    });
+    await expect(
+      tool.call("surface.messages.send", {
+        sessionId: "ops",
+        text: "hi",
+        style: "card",
+        client: "discord",
+      }),
+    ).rejects.toThrow("style");
+
+    expect(adapter.sendCalls.map((call) => call.content.style)).toEqual(["plain"]);
+  });
+
   it("links sent messages back to the request transcript", async () => {
     const cfg = testConfig({
       surface: {
