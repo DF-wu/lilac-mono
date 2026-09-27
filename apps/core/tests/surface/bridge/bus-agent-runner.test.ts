@@ -10403,6 +10403,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     const finishedUsage: Parameters<ConversationThreadAutoInjectUsageAccumulator["finish"]>[0][] =
       [];
     const autoInjectUsage: ConversationThreadAutoInjectUsageAccumulator = {
+      recordTiming: () => {},
       recordPlannerUsage: () => {},
       recordEmbeddingUsage: () => {},
       finish: (usage) => finishedUsage.push(usage),

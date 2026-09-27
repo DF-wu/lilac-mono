@@ -481,7 +481,17 @@ type ThreadLanguageModelUsageOperation = "summary" | "query_aboutness" | "auto_i
 type ThreadEmbeddingUsageOperation = "thread_facets" | "search_query";
 type ThreadEmbeddingUsageStatus = "completed" | "failed";
 
+type AutoInjectTimingStage =
+  | "planning"
+  | "plannerModel"
+  | "search"
+  | "embedding"
+  | "corpus"
+  | "ranking";
+type AutoInjectTiming = { calls: number; totalMs: number; maxMs: number };
+
 export type ConversationThreadAutoInjectUsageAccumulator = {
+  recordTiming(stage: AutoInjectTimingStage, elapsedMs: number): void;
   recordPlannerUsage(usage: {
     model: string;
     inputTokens?: number;
@@ -509,6 +519,7 @@ type AutoInjectUsageLogRecord = {
   elapsedMs: number;
   searches: number;
   queries: number;
+  timings: Partial<Record<AutoInjectTimingStage, AutoInjectTiming>>;
   planner?: {
     model: string;
     calls: number;
@@ -552,6 +563,7 @@ function createThreadLanguageModelUsageLogger(input: {
 }) {
   return (event: ThreadLanguageModelCallEndEvent) => {
     if (input.autoInjectUsage) {
+      input.autoInjectUsage.recordTiming("plannerModel", event.performance.responseTimeMs);
       input.autoInjectUsage.recordPlannerUsage({
         model: input.modelSpec,
         inputTokens: event.usage.inputTokens,
@@ -604,6 +616,8 @@ function createThreadEmbeddingUsageAccumulator(
 
   return {
     record(event: ConversationThreadEmbeddingUsageEvent) {
+      if (event.elapsedMs !== undefined)
+        autoInjectUsage?.recordTiming("embedding", event.elapsedMs);
       calls += 1;
       inputChars += event.inputChars;
       tokens += event.tokens;
@@ -681,8 +695,22 @@ export function createConversationThreadAutoInjectUsageAccumulator(input: {
   let embeddingInputChars = 0;
   let embeddingTokens = 0;
   let embeddingWarnings = 0;
+  const timings: Record<AutoInjectTimingStage, AutoInjectTiming> = {
+    planning: { calls: 0, totalMs: 0, maxMs: 0 },
+    plannerModel: { calls: 0, totalMs: 0, maxMs: 0 },
+    search: { calls: 0, totalMs: 0, maxMs: 0 },
+    embedding: { calls: 0, totalMs: 0, maxMs: 0 },
+    corpus: { calls: 0, totalMs: 0, maxMs: 0 },
+    ranking: { calls: 0, totalMs: 0, maxMs: 0 },
+  };
 
   return {
+    recordTiming(stage, elapsedMs) {
+      const timing = timings[stage];
+      timing.calls += 1;
+      timing.totalMs += elapsedMs;
+      timing.maxMs = Math.max(timing.maxMs, elapsedMs);
+    },
     recordPlannerUsage(usage) {
       plannerModel ??= usage.model;
       plannerCalls += 1;
@@ -707,6 +735,18 @@ export function createConversationThreadAutoInjectUsageAccumulator(input: {
         elapsedMs: Math.round(now() - startedAt),
         searches: finishInput.searchCount ?? 0,
         queries: finishInput.queryCount ?? 0,
+        timings: Object.fromEntries(
+          Object.entries(timings)
+            .filter(([, timing]) => timing.calls > 0)
+            .map(([stage, timing]) => [
+              stage,
+              {
+                calls: timing.calls,
+                totalMs: Math.round(timing.totalMs),
+                maxMs: Math.round(timing.maxMs),
+              },
+            ]),
+        ),
         ...(plannerCalls > 0 && plannerModel
           ? {
               planner: {

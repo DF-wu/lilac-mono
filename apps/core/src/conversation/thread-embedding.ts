@@ -40,6 +40,7 @@ export type ConversationThreadEmbeddingUsageEvent = {
   inputChars: number;
   tokens: number;
   warnings: number;
+  elapsedMs?: number;
 };
 
 export type ConversationThreadEmbeddingAdapter = {
@@ -100,6 +101,7 @@ function createConversationThreadEmbeddingAdapterFromResolved(
   return {
     modelId: resolved.spec,
     async embed(input) {
+      const startedAt = performance.now();
       const result = await embed({
         model,
         value: input.text,
@@ -113,6 +115,7 @@ function createConversationThreadEmbeddingAdapterFromResolved(
         inputChars: input.text.length,
         tokens: result.usage.tokens,
         warnings: result.warnings.length,
+        elapsedMs: performance.now() - startedAt,
       });
       return Float32Array.from(result.embedding);
     },

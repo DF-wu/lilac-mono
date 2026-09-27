@@ -655,6 +655,7 @@ export class ConversationThreadStore {
   private readonly surfaceDbPath?: string;
   private readonly mainAgentUserNames: ReadonlySet<string>;
   private hasNativeSource = false;
+  private nativeDataVersion: number | undefined;
   private readonly onPersistenceDiagnostic: (
     diagnostic: ConversationThreadPersistenceDiagnostic,
   ) => void;
@@ -688,6 +689,7 @@ export class ConversationThreadStore {
   attachNativeSource(databasePath: string): void {
     installNativeConversationSource(this.db, databasePath);
     this.hasNativeSource = true;
+    this.nativeDataVersion = undefined;
   }
 
   private installMessageSource(): void {
@@ -700,7 +702,17 @@ export class ConversationThreadStore {
 
   refreshNativeThreads(): void {
     if (!this.hasNativeSource) return;
+    const version = this.db
+      .query<{ data_version: number }, []>("PRAGMA native_conversation.data_version")
+      .get()?.data_version;
+    if (version !== undefined && version === this.nativeDataVersion) return;
+    const startedAt = performance.now();
     this.db.transaction(() => this.materializeNativeThreads())();
+    // Remember the version from before the scan so a concurrent commit cannot be skipped.
+    this.nativeDataVersion = version;
+    threadStoreLogger.debug("conversation.thread.native_refresh", {
+      elapsedMs: performance.now() - startedAt,
+    });
   }
 
   private materializeNativeThreads(): void {
@@ -717,8 +729,8 @@ export class ConversationThreadStore {
       const threadId = `native:${thread.id}`;
       const existing = this.getThread(threadId);
       const hash = `native:${stableHash(thread.revision)}`;
-      const sourceMessages = selectResultValue(readNativeConversationMessages(this.db, thread.id));
       if (existing?.summary_input_hash === hash) continue;
+      const sourceMessages = selectResultValue(readNativeConversationMessages(this.db, thread.id));
       const messages: IndexedMessageRow[] = sourceMessages.map((message) => ({
         ...message,
         guild_id: null,

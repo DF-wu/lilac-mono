@@ -31,6 +31,10 @@ describe("conversation thread auto-inject usage", () => {
     } satisfies PlannerUsage);
     usage.recordEmbeddingUsage(embeddingUsage({ calls: 3, inputChars: 158, tokens: 30 }));
     usage.recordEmbeddingUsage(embeddingUsage({ calls: 3, inputChars: 130, tokens: 29 }));
+    usage.recordTiming("planning", 12.3);
+    usage.recordTiming("embedding", 20.4);
+    usage.recordTiming("embedding", 30.2);
+    usage.recordTiming("search", 32.1);
 
     usage.finish({ status: "completed", searchCount: 2, queryCount: 6 });
     usage.finish({ status: "failed" });
@@ -44,6 +48,11 @@ describe("conversation thread auto-inject usage", () => {
           elapsedMs: 56,
           searches: 2,
           queries: 6,
+          timings: {
+            planning: { calls: 1, totalMs: 12, maxMs: 12 },
+            embedding: { calls: 2, totalMs: 51, maxMs: 30 },
+            search: { calls: 1, totalMs: 32, maxMs: 32 },
+          },
           planner: {
             model: "codex/gpt-5.3-codex-spark",
             calls: 1,

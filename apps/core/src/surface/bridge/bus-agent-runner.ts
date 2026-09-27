@@ -1285,11 +1285,13 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
   {
     const attempt = await Result.tryPromise({
       try: async () => {
+        const planningStartedAt = performance.now();
         const plan = await conversationThreads.planAutoInjectSearch({
           text,
           content: latestInput.content,
           autoInjectUsage,
         });
+        autoInjectUsage.recordTiming("planning", performance.now() - planningStartedAt);
         usageSearchCount = plan.searches.length;
         usageQueryCount = plan.searches.reduce(
           (sum, searchPlan) => sum + searchPlan.queries.length,
@@ -1306,6 +1308,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
           return [];
         }
         const searchRecallLimit = Math.min(50, Math.max(autoInject.limit * 5, 10));
+        const searchStartedAt = performance.now();
         const settledSearches = await Promise.allSettled(
           plan.searches.map((searchPlan) =>
             conversationThreads.search({
@@ -1322,6 +1325,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
             }),
           ),
         );
+        autoInjectUsage.recordTiming("search", performance.now() - searchStartedAt);
         let fulfilledSearches = 0;
         const successfulSearches: Array<{
           searchIndex: number;
@@ -1357,8 +1361,11 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
           return [];
         }
         usageStatus = fulfilledSearches === plan.searches.length ? "completed" : "partial";
+        const corpusStartedAt = performance.now();
         const corpusDocuments =
           (await conversationThreads.getAutoInjectRankingCorpusDocuments?.()) ?? [];
+        autoInjectUsage.recordTiming("corpus", performance.now() - corpusStartedAt);
+        const rankingStartedAt = performance.now();
         const rankingResult = rankAutoInjectedThreadSearchResults({
           plan,
           searches: successfulSearches,
@@ -1367,6 +1374,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
           limit: autoInject.limit,
           expansionMinConfidence: autoInject.expansionMinConfidence,
         });
+        autoInjectUsage.recordTiming("ranking", performance.now() - rankingStartedAt);
         const rankedEntries = rankingResult.selected;
         const entries = rankedEntries.map(formatRankedAutoInjectedThread);
 
