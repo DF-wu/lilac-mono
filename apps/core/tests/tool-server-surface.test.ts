@@ -2282,7 +2282,7 @@ describe("tool-server surface", () => {
     expect(adapter.sendCalls[0]?.opts?.silent).toBe(true);
   });
 
-  it("forwards the Discord message style for send", async () => {
+  it("defaults Discord sends to plain and forwards an explicit style", async () => {
     const cfg = testConfig({
       surface: {
         discord: {
@@ -2301,7 +2301,12 @@ describe("tool-server surface", () => {
     await tool.call("surface.messages.send", {
       sessionId: "ops",
       text: "hi",
-      style: "plain",
+      client: "discord",
+    });
+    await tool.call("surface.messages.send", {
+      sessionId: "ops",
+      text: "hi",
+      style: "embed",
       client: "discord",
     });
     await expect(
@@ -2313,7 +2318,7 @@ describe("tool-server surface", () => {
       }),
     ).rejects.toThrow("style");
 
-    expect(adapter.sendCalls.map((call) => call.content.style)).toEqual(["plain"]);
+    expect(adapter.sendCalls.map((call) => call.content.style)).toEqual(["plain", "embed"]);
   });
 
   it("links sent messages back to the request transcript", async () => {
