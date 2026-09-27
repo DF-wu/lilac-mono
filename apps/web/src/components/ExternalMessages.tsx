@@ -75,6 +75,7 @@ export function ExternalMessages({
   loading,
   onLoadMore,
   targetMessageId,
+  padded = true,
 }: {
   messages: readonly DisplayMessage[];
   resourceUrl: (id: string) => string;
@@ -83,6 +84,7 @@ export function ExternalMessages({
   loading: boolean;
   onLoadMore: () => void;
   targetMessageId?: string;
+  padded?: boolean;
 }) {
   const navigated = useRef<string>(undefined);
   const parent = useRef<HTMLDivElement>(null);
@@ -161,13 +163,17 @@ export function ExternalMessages({
                 messages[row.index - 1]!.metadata?.externalRunId ? (
                 <ConversationDivider messages={messages} index={row.index} />
               ) : null}
-              <Message
-                message={messages[row.index]!}
-                canEdit={false}
-                resourceUrl={resourceUrl}
-                onAction={noop}
-                onReaction={noop}
-              />
+              <div
+                className={`mx-auto max-w-[var(--ui-chat-width)] ${padded ? "px-6 max-workspace:px-4" : ""}`}
+              >
+                <Message
+                  message={messages[row.index]!}
+                  canEdit={false}
+                  resourceUrl={resourceUrl}
+                  onAction={noop}
+                  onReaction={noop}
+                />
+              </div>
             </div>
           ))}
         </div>

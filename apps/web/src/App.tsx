@@ -71,6 +71,7 @@ import { MessageIdentityContext } from "./components/message-identity";
 import { toast } from "./components/ui/toast";
 import { refreshSidebar } from "./sidebar-queries";
 import { ExternalSidebar, ExternalSkeleton } from "./components/ExternalSidebar";
+import { ExternalMenuItems } from "./components/ExternalActions";
 import { SidebarQueue } from "./components/SidebarQueue";
 import { SidebarThread } from "./components/SidebarThread";
 import {
@@ -945,7 +946,11 @@ function Workspace(props: AppProps) {
                     ? () => setConfirmDelete(actionThread.id)
                     : undefined
                 }
-              />
+              >
+                {!reference && external && owner && externalId ? (
+                  <ExternalMenuItems threadId={externalId} />
+                ) : null}
+              </FloatingChatMenu>
               <WorkspacePanels
                 leftOpen={sidebar}
                 rightOpen={rightOpen}
