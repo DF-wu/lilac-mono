@@ -33,19 +33,65 @@ function localPreview(url: string): LinkPreview | undefined {
   };
 }
 
+// github.com declares only its black favicon, which disappears on dark themes.
+const githubFaviconSources = new Set([
+  "https://github.com/favicon.ico",
+  "https://github.githubassets.com/favicons/favicon.png",
+  "https://github.githubassets.com/favicons/favicon.svg",
+]);
+const githubThemedFavicons = {
+  light: "https://github.githubassets.com/favicons/favicon.png",
+  dark: "https://github.githubassets.com/favicons/favicon-dark.png",
+};
+const themeVisibility = { light: "dark:hidden", dark: "hidden dark:block" };
+
+function FaviconImage({
+  src,
+  theme,
+  onError,
+}: {
+  src: string;
+  theme?: "light" | "dark";
+  onError: () => void;
+}) {
+  return (
+    <img
+      src={src}
+      alt=""
+      className={theme && themeVisibility[theme]}
+      data-favicon-theme={theme}
+      loading="lazy"
+      decoding="async"
+      referrerPolicy="no-referrer"
+      onError={onError}
+    />
+  );
+}
+
+function SiteFavicon({ src, onError }: { src: string; onError: () => void }) {
+  if (!githubFaviconSources.has(src)) return <FaviconImage src={src} onError={onError} />;
+  return (
+    <>
+      <FaviconImage src={githubThemedFavicons.light} theme="light" onError={onError} />
+      <FaviconImage src={githubThemedFavicons.dark} theme="dark" onError={onError} />
+    </>
+  );
+}
+
+// Every GitHub source renders the same themed images, so a failure must skip all of them.
+function failedSources(src: string) {
+  return githubFaviconSources.has(src) ? [...githubFaviconSources] : [src];
+}
+
 function LinkIcon({ icon, fallback }: { icon?: string; fallback?: string }) {
   const [failed, setFailed] = useState<string[]>([]);
   const src = [icon, fallback].find((candidate) => candidate && !failed.includes(candidate));
   return (
     <span className="link-favicon" aria-hidden="true">
       {src ? (
-        <img
+        <SiteFavicon
           src={src}
-          alt=""
-          loading="lazy"
-          decoding="async"
-          referrerPolicy="no-referrer"
-          onError={() => setFailed((previous) => [...previous, src])}
+          onError={() => setFailed((previous) => [...previous, ...failedSources(src)])}
         />
       ) : (
         <Globe />
