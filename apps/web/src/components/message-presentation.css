@@ -107,7 +107,7 @@
 }
 .markdown-link .link-favicon {
   display: inline-flex;
-  vertical-align: text-bottom;
+  vertical-align: -0.125em;
   width: 1em;
   height: 1em;
   margin-right: calc(var(--ui-space-unit) * 1);

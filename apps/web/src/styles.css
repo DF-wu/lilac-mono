@@ -367,11 +367,6 @@
   .external-thread:hover {
     background: var(--ui-surface);
   }
-  .external-messages .message {
-    max-width: var(--ui-chat-width);
-    margin: auto;
-    padding: calc(var(--ui-space-unit) * 4) calc(var(--ui-space-unit) * 6);
-  }
   .markdown {
     line-height: var(--ui-line-normal);
   }

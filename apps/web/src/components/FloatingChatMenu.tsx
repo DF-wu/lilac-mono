@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   Menu,
@@ -42,6 +42,7 @@ export function FloatingChatMenu({
   onRename,
   onArchive,
   onDelete,
+  children,
 }: {
   sidebarOpen: boolean;
   rightOpen: boolean;
@@ -52,6 +53,7 @@ export function FloatingChatMenu({
   onRename?: () => void;
   onArchive?: () => void;
   onDelete?: () => void;
+  children?: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
   const [pressed, setPressed] = useState(false);
@@ -196,6 +198,7 @@ export function FloatingChatMenu({
             <PanelRight />
             {rightOpen ? "Hide Right panel" : "Show Right panel"}
           </DropdownMenuItem>
+          {children}
           {onShare ? (
             <DropdownMenuItem onClick={onShare}>
               <Users />

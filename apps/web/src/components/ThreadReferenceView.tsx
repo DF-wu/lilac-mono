@@ -191,6 +191,7 @@ export function ThreadReferenceView({
             messages={messages}
             resourceUrl={resourceUrl}
             loadDirection="start"
+            padded={!panel}
             targetMessageId={
               read.data?.pages.find((page) => page.anchorMessageId)?.anchorMessageId ??
               target.messageId

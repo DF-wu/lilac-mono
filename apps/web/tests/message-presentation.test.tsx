@@ -4,7 +4,12 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { AttachmentPreviewBody } from "../src/components/ResourcePreview";
 import { MarkdownWrapContext } from "../src/components/markdown-layout";
 import { CodeBlock } from "../src/components/CodeBlock";
-import { faviconUrl, previewUrl, LinkPreviewBody } from "../src/components/LinkWithFavicon";
+import {
+  faviconUrl,
+  previewUrl,
+  LinkPreviewBody,
+  LinkWithFavicon,
+} from "../src/components/LinkWithFavicon";
 import { initials } from "../src/components/ActorAvatar";
 import { Message } from "../src/components/Timeline";
 import { MessageIdentityContext } from "../src/components/message-identity";
@@ -345,6 +350,20 @@ describe("message presentation", () => {
       undefined,
     ])
       expect(faviconUrl(href)).toBeUndefined();
+  });
+  test("GitHub links use the black favicon on light themes and the white one on dark themes", () => {
+    const html = renderToStaticMarkup(
+      <LinkWithFavicon href="https://github.com/octocat">GitHub</LinkWithFavicon>,
+    );
+    const themed = [...html.matchAll(/<img [^>]*>/g)].map(([image]) => [
+      image.match(/data-favicon-theme="([^"]*)"/)?.[1],
+      image.match(/src="([^"]*)"/)?.[1],
+    ]);
+    expect(themed).toEqual([
+      ["light", "https://github.githubassets.com/favicons/favicon.png"],
+      ["dark", "https://github.githubassets.com/favicons/favicon-dark.png"],
+    ]);
+    expect(html).not.toContain("github.com/favicon.ico");
   });
   test("file preview fallback escapes text and both loading states retain truncation and download", async () => {
     // A fresh process keeps the lazy FileCode module cold regardless of test order.

@@ -10,6 +10,7 @@ import { Result } from "better-result";
 
 export { signOutActiveClerk } from "./clerk-signout";
 import { registerClerkSignOut } from "./clerk-signout";
+import { registerConnectionCredentials } from "./connection-credentials";
 
 function RegisterClerk({ children }: { children: ReactNode }) {
   const clerk = useClerk();
@@ -125,6 +126,9 @@ function SessionStatus({
       void endSession();
       return () => controller.abort();
     }
+    const stopCredentials = registerConnectionCredentials(async () => {
+      await getToken();
+    });
     const refresh = createClerkSessionRefresh({
       client,
       getToken: () => getToken({ skipCache: true }),
@@ -146,6 +150,7 @@ function SessionStatus({
     window.addEventListener("online", retry);
     return () => {
       controller.abort();
+      stopCredentials();
       clearInterval(timer);
       stop();
       window.removeEventListener("focus", retry);

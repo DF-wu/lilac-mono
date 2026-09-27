@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { implement } from "@orpc/server";
 import { ORPCError } from "@orpc/client";
 import { RPCHandler } from "@orpc/server/bun-ws";
@@ -54,6 +54,8 @@ afterEach(async () => {
 function harness(
   options: {
     delayedSubmit?: Promise<void>;
+    prepareConnection?: () => Promise<void>;
+    reauthenticate?: (signal?: AbortSignal) => Promise<BootstrapReply["viewer"]>;
     beforeOpen?: () => void;
     delayedCatalog?: Promise<void>;
     bootstrap?: () => Promise<BootstrapReply>;
@@ -99,7 +101,11 @@ function harness(
       catalog: { revision: "new", models: [], skills: [], commands: [] },
     };
   });
+  const reauthenticate = implement(nativeContract.connection.reauthenticate).handler(
+    ({ signal }) => options.reauthenticate?.(signal) ?? Promise.resolve(bootstrap.viewer),
+  );
   const handler = new RPCHandler({
+    connection: { reauthenticate },
     threads: { watch },
     bootstrap: { watch: catalog },
     inputs: { submit },
@@ -124,6 +130,7 @@ function harness(
   const client = new NativeClient({
     scope,
     cache,
+    prepareConnection: options.prepareConnection,
     openSocket: () => {
       socketCount++;
       options.beforeOpen?.();
@@ -532,4 +539,138 @@ test("a socket constructor failure during resume remains retryable", async () =>
   await recovered.promise;
   expect(test.socketCount()).toBe(3);
   expect(test.client.thread("thread").get("slot")).toBeDefined();
+});
+
+test("reconnect waits for fresh credentials before opening either transport", async () => {
+  const credentials = Promise.withResolvers<void>();
+  let prepare = () => Promise.resolve();
+  const state = harness({ prepareConnection: () => prepare() });
+  await state.client.start("thread");
+  await state.watching;
+  prepare = () => credentials.promise;
+  const recovered = Promise.withResolvers<void>();
+  state.client.subscribe((event) => {
+    if (event.kind === "connection" && event.state === "online") recovered.resolve();
+  });
+  state.client.reconnect();
+  expect(state.socketCount()).toBe(1);
+  expect(state.client.connectionState).toBe("connecting");
+  credentials.resolve();
+  await recovered.promise;
+  expect(state.socketCount()).toBe(2);
+  expect(state.client.thread("thread").get("slot")).toBeDefined();
+});
+
+test("Retry supersedes a stalled credential refresh", async () => {
+  const credentials = Promise.withResolvers<void>();
+  let calls = 0;
+  const state = harness({
+    prepareConnection: () => (calls++ === 0 ? credentials.promise : Promise.resolve()),
+  });
+  const starting = state.client.start();
+  expect(state.socketCount()).toBe(0);
+  const recovered = Promise.withResolvers<void>();
+  state.client.subscribe((event) => {
+    if (event.kind === "connection" && event.state === "online") recovered.resolve();
+  });
+  state.client.reconnect();
+  await recovered.promise;
+  credentials.resolve();
+  await starting;
+  expect(state.socketCount()).toBe(1);
+  expect(state.client.connectionState).toBe("online");
+});
+
+test("a stalled bootstrap is replaced at the connection deadline", async () => {
+  const originalTimeout = globalThis.setTimeout;
+  let expire: (() => void) | undefined;
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(
+    Object.assign((...args: Parameters<typeof setTimeout>) => {
+      const [callback, delay, ...values] = args;
+      if (delay === 10_000) expire = () => callback(...values);
+      return originalTimeout(...args);
+    }, originalTimeout),
+  );
+  disposers.push(() => timer.mockRestore());
+  const stalled = Promise.withResolvers<BootstrapReply>();
+  const requested = Promise.withResolvers<void>();
+  let calls = 0;
+  const state = harness({
+    bootstrap: () => {
+      if (calls++ > 0) return Promise.resolve(bootstrap);
+      requested.resolve();
+      return stalled.promise;
+    },
+  });
+  const starting = state.client.start();
+  await requested.promise;
+  const recovered = Promise.withResolvers<void>();
+  state.client.subscribe((event) => {
+    if (event.kind === "connection" && event.state === "online") recovered.resolve();
+  });
+  expect(expire).toBeDefined();
+  expire!();
+  await recovered.promise;
+  stalled.reject(new ORPCError("UNAUTHENTICATED"));
+  await starting;
+  expect(state.client.connectionState).toBe("online");
+  expect(state.socketCount()).toBe(2);
+});
+
+test("an old authentication error cannot log out a reconnect waiting for credentials", async () => {
+  const old = Promise.withResolvers<BootstrapReply>();
+  const requested = Promise.withResolvers<void>();
+  const credentials = Promise.withResolvers<void>();
+  let preparations = 0;
+  let bootstraps = 0;
+  const state = harness({
+    prepareConnection: () => (preparations++ === 0 ? Promise.resolve() : credentials.promise),
+    bootstrap: () => {
+      if (bootstraps++ > 0) return Promise.resolve(bootstrap);
+      requested.resolve();
+      return old.promise;
+    },
+  });
+  const starting = state.client.start("thread");
+  await requested.promise;
+  state.client.reconnect();
+  old.reject(new ORPCError("UNAUTHENTICATED"));
+  await starting;
+  expect(state.client.connectionState).toBe("connecting");
+  const recovered = Promise.withResolvers<void>();
+  state.client.subscribe((event) => {
+    if (event.kind === "connection" && event.state === "online") recovered.resolve();
+  });
+  credentials.resolve();
+  await recovered.promise;
+  expect(state.client.connectionState).toBe("online");
+});
+
+test("reauthentication timeout replaces an unresponsive socket even when HTTP remains healthy", async () => {
+  const deadline = new AbortController();
+  const timer = spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+  disposers.push(() => timer.mockRestore());
+  const requested = Promise.withResolvers<void>();
+  const state = harness({
+    reauthenticate: (signal) =>
+      new Promise((resolve) => {
+        requested.resolve();
+        if (signal?.aborted) return resolve(bootstrap.viewer);
+        signal?.addEventListener("abort", () => resolve(bootstrap.viewer), { once: true });
+      }),
+  });
+  await state.client.start("thread");
+  await state.watching;
+  const recovered = Promise.withResolvers<void>();
+  state.client.subscribe((event) => {
+    if (event.kind === "connection" && event.state === "online") recovered.resolve();
+  });
+  const refreshing = state.client.reauthenticate("test-token");
+  await requested.promise;
+  deadline.abort(new DOMException("Timed out", "TimeoutError"));
+  expect(await refreshing).toBe(false);
+  await recovered.promise;
+  expect(state.socketCount()).toBe(2);
+  expect(state.client.connectionState).toBe("online");
+  expect(state.client.thread("thread").get("slot")).toBeDefined();
 });

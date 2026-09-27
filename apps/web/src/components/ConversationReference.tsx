@@ -83,6 +83,16 @@ export function CopyReferenceButton({
   );
 }
 
+export function copyReferenceLink(target: ConversationReference) {
+  void attempt(
+    async () => {
+      await navigator.clipboard.writeText(new URL(referenceHref(target), location.origin).href);
+      toast.add({ title: "Link copied" });
+    },
+    () => toast.add({ title: "Copy unavailable", type: "error" }),
+  );
+}
+
 export function CopyReferenceItem({
   target,
   label,
@@ -91,19 +101,7 @@ export function CopyReferenceItem({
   label?: string;
 }) {
   return (
-    <ContextMenuItem
-      onClick={() =>
-        void attempt(
-          async () => {
-            await navigator.clipboard.writeText(
-              new URL(referenceHref(target), location.origin).href,
-            );
-            toast.add({ title: "Link copied" });
-          },
-          () => toast.add({ title: "Copy unavailable", type: "error" }),
-        )
-      }
-    >
+    <ContextMenuItem onClick={() => copyReferenceLink(target)}>
       <Link2 />
       {label ?? (target.messageId ? "Copy link" : "Copy conversation link")}
     </ContextMenuItem>
