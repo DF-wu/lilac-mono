@@ -36,6 +36,7 @@ export type NativeClientOptions = {
   scope: CacheScope;
   openSocket: () => WebSocket;
   bootstrap: (input: BootstrapInput, signal: AbortSignal) => Promise<BootstrapReply>;
+  prepareConnection?: () => Promise<void>;
   cache?: NativeCache;
   catalogs?: DisplayCatalogCache;
   onEvent?: (event: ClientEvent) => void;
@@ -94,6 +95,9 @@ export class NativeClient {
   private bootstrapSequence = 0;
   private bootstrapPending = true;
   private bootstrapRequest: AbortController | undefined;
+  private connectionAttempt = 0;
+  private connectionLifetime = new AbortController();
+  private connectionDeadline: ReturnType<typeof setTimeout> | undefined;
   private state: Extract<ClientEvent, { kind: "connection" }>["state"] = "connecting";
 
   constructor(private readonly options: NativeClientOptions) {
@@ -194,10 +198,7 @@ export class NativeClient {
     this.bootstrapPending = true;
     this.stopped = false;
     this.lifetime = new AbortController();
-    this.open();
-    if (this.selectedThreadId && !this.thread(this.selectedThreadId).checkpoint)
-      await this.loadCached(this.selectedThreadId);
-    await this.bootstrap();
+    await this.connect();
   }
   reconnect(): void {
     if (this.stopped) return;
@@ -209,14 +210,53 @@ export class NativeClient {
     this.abortHistory();
     const socket = this.socket;
     this.socket = undefined;
+    this.connection = undefined;
     // Stream cancellation sends an RPC abort before the socket can close.
     void Promise.all(streams).then(() => socket?.close());
     this.bootstrapPending = true;
+    void this.connect();
+  }
+  private async connect(): Promise<void> {
+    const attempt = ++this.connectionAttempt;
+    clearTimeout(this.bootstrapTimer);
+    this.connectionLifetime.abort();
+    this.connectionLifetime = new AbortController();
+    ++this.bootstrapSequence;
+    this.bootstrapRequest?.abort();
+    this.emit({ kind: "connection", state: "connecting" });
+    this.armConnectionDeadline();
+    const prepare = this.options.prepareConnection;
+    if (prepare && !(await this.prepareConnection(prepare, attempt))) return;
     this.open();
-    void this.bootstrap();
+    if (this.selectedThreadId && !this.thread(this.selectedThreadId).checkpoint)
+      await this.loadCached(this.selectedThreadId);
+    if (this.stopped || attempt !== this.connectionAttempt) return;
+    await this.bootstrap();
+  }
+  private async prepareConnection(
+    operation: () => Promise<void>,
+    attempt: number,
+  ): Promise<boolean> {
+    const prepared = await Result.tryPromise({ try: operation, catch: captureFailure });
+    if (this.stopped || attempt !== this.connectionAttempt) return false;
+    const error = prepared.match({ ok: () => undefined, err: (error) => error });
+    if (error) {
+      this.disconnected();
+      return false;
+    }
+    return true;
+  }
+  private armConnectionDeadline(): void {
+    const attempt = this.connectionAttempt;
+    clearTimeout(this.connectionDeadline);
+    this.connectionDeadline = setTimeout(() => {
+      if (this.stopped || attempt !== this.connectionAttempt) return;
+      this.reconnect();
+    }, 10_000);
   }
   private connected(): void {
     if (this.bootstrapPending || this.socket?.readyState !== WebSocket.OPEN) return;
+    clearTimeout(this.connectionDeadline);
     this.attempt = 0;
     this.emit({ kind: "connection", state: "online" });
   }
@@ -251,8 +291,7 @@ export class NativeClient {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(
       () => {
-        this.open();
-        void this.bootstrap();
+        void this.connect();
       },
       reconnectDelay(this.attempt++),
     );
@@ -260,6 +299,7 @@ export class NativeClient {
 
   private async bootstrap(): Promise<void> {
     clearTimeout(this.bootstrapTimer);
+    this.armConnectionDeadline();
     this.bootstrapTimer = undefined;
     this.bootstrapPending = true;
     this.bootstrapRequest?.abort();
@@ -584,7 +624,13 @@ export class NativeClient {
     const rpc = this.connection;
     if (!rpc) return false;
     const captured = await Result.tryPromise({
-      try: () => rpc.connection.reauthenticate({ token }),
+      try: () =>
+        rpc.connection.reauthenticate(
+          { token },
+          {
+            signal: AbortSignal.any([this.connectionLifetime.signal, AbortSignal.timeout(10_000)]),
+          },
+        ),
       catch: captureFailure,
     });
     if (rpc !== this.connection || this.stopped) return false;
@@ -593,6 +639,10 @@ export class NativeClient {
       err: (error) => ({ error }),
     });
     if ("error" in outcome) {
+      if (outcome.error.kind === "network") {
+        this.reconnect();
+        return false;
+      }
       await this.failure(outcome.error);
       return false;
     }
@@ -710,6 +760,8 @@ export class NativeClient {
     this.stopped = true;
     this.generation++;
     this.lifetime.abort();
+    this.connectionLifetime.abort();
+    clearTimeout(this.connectionDeadline);
     this.abortStreams();
     this.abortHistory();
     clearTimeout(this.reconnectTimer);

@@ -6,6 +6,7 @@ import { Result } from "better-result";
 import { z } from "zod";
 import { createWebNativeCache, type WebNativeCache } from "./cache";
 import { logoutHttp, openNativeSocket, readBootstrap } from "./http";
+import { prepareWebConnection } from "./connection-credentials";
 
 export type WebSession = {
   client: NativeClient;
@@ -217,7 +218,13 @@ export class WebSessionController {
     openSocket: () => WebSocket,
     bootstrap: typeof readBootstrap,
   ): WebSession {
-    const client = new NativeClient({ scope, cache: this.cache, openSocket, bootstrap });
+    const client = new NativeClient({
+      scope,
+      cache: this.cache,
+      openSocket,
+      bootstrap,
+      prepareConnection: prepareWebConnection,
+    });
     if (initial.catalog.kind === "catalog") client.catalogs.put(scope, initial.catalog.catalog);
     if (initialThreadId && initial.selectedThread)
       client.thread(initialThreadId).replay(initial.selectedThread);
