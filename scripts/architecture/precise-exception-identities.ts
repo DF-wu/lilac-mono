@@ -446,6 +446,11 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
       "signal",
     ],
     [
+      "src/tool-server/tools/web-search/openai-web-search-provider.ts",
+      "adaptOpenAIWebSearchResultToHost.err.<callback>",
+      "signal",
+    ],
+    [
       "src/tool-server/health-state.ts",
       "createToolServerHealthState.signalWatchdogDefect.queueMicrotask.<callback@1>",
       "signal",

@@ -20,6 +20,7 @@ import {
   createDefaultWebSearchProviders,
   resolveWebSearchProvider,
   webSearchInputSchema,
+  type OpenAIWebSearchContextSize,
   type WebSearchProvider,
   type WebSearchProviderId,
 } from "./web-search";
@@ -53,6 +54,7 @@ import {
 import {
   createProviderPageExtractor,
   type ProviderPageExtractor,
+  supportsPageExtraction,
   type WebProviderEnvironment,
 } from "./web/provider-page-extraction";
 import { preserveToolPanic } from "../../tools/tool-result-adapters";
@@ -108,6 +110,12 @@ type WebToolConfig = {
   extractProviders: readonly WebSearchProviderId[];
   fetchMode: GetPageMode;
   firecrawlPolicy: FirecrawlPermitPolicy | undefined;
+  openaiPolicy: OpenAIWebSearchPolicy | undefined;
+};
+
+type OpenAIWebSearchPolicy = {
+  readonly model: string;
+  readonly searchContextSize: OpenAIWebSearchContextSize;
 };
 
 const RETRIABLE_WEB_PROVIDER_ERROR_PATTERNS = [
@@ -138,6 +146,7 @@ async function loadDefaultWebToolConfig(): Promise<WebToolConfig> {
     extractProviders: config.tools.web.extract.providers,
     fetchMode: config.tools.web.fetch.mode,
     firecrawlPolicy: config.tools.web.firecrawl,
+    openaiPolicy: config.tools.web.openai,
   };
 }
 
@@ -154,6 +163,10 @@ function getDefaultWebProviderEnvironment(): WebProviderEnvironment {
     tavily: {
       apiKey: env.tools.web.tavilyApiKey,
       apiBaseUrl: env.tools.web.tavilyApiBaseUrl,
+    },
+    openai: {
+      apiKey: env.providers.openai.apiKey,
+      baseUrl: env.providers.openai.baseUrl,
     },
   };
 }
@@ -412,7 +425,12 @@ export class Web implements ServerTool {
     });
     const config = loaded.match<WebToolConfig>({
       ok: (value) => value,
-      err: () => ({ extractProviders: [], fetchMode: "auto", firecrawlPolicy: undefined }),
+      err: () => ({
+        extractProviders: [],
+        fetchMode: "auto",
+        firecrawlPolicy: undefined,
+        openaiPolicy: undefined,
+      }),
     });
     const loadFailure = loaded.match<Error | Panic | null>({
       ok: () => null,
@@ -444,6 +462,9 @@ export class Web implements ServerTool {
       hasExaApiKey: Boolean(environment.exa.apiKey),
       hasTavilyApiKey: Boolean(environment.tavily.apiKey),
       tavilyApiBaseUrl: environment.tavily.apiBaseUrl ?? null,
+      hasOpenAIApiKey: Boolean(environment.openai.apiKey),
+      openaiBaseUrl: environment.openai.baseUrl ?? null,
+      openaiPolicy: config.openaiPolicy ?? null,
     });
     if (nextKey === this.webSearchProviderKey) return;
     this.webSearchProviderKey = nextKey;
@@ -462,6 +483,12 @@ export class Web implements ServerTool {
       exa: { baseUrl: environment.exa.baseUrl, apiKey: environment.exa.apiKey },
       tavilyApiKey: environment.tavily.apiKey,
       tavilyApiBaseUrl: environment.tavily.apiBaseUrl,
+      openai: {
+        apiKey: environment.openai.apiKey,
+        baseUrl: environment.openai.baseUrl,
+        model: config.openaiPolicy?.model,
+        searchContextSize: config.openaiPolicy?.searchContextSize,
+      },
     });
     const resolved = resolveWebSearchProvider({
       requested: config.extractProviders,
@@ -622,15 +649,22 @@ export class Web implements ServerTool {
     opts?: { signal?: AbortSignal },
   ): Promise<WebPageContentResult> {
     const { format = "markdown" } = input;
-    if (this.webSearchProviders.length === 0) {
+    const extractProviders = this.webSearchProviders.filter((provider) =>
+      supportsPageExtraction(provider.id),
+    );
+    if (extractProviders.length === 0) {
       return {
         isError: true,
-        error: this.webSearchProviderError ?? "web.extract is unavailable: no provider configured.",
+        error:
+          this.webSearchProviderError ??
+          (this.webSearchProviders.length > 0
+            ? "web.extract is unavailable: configured providers are search-only (openai); add tavily, exa, or firecrawl."
+            : "web.extract is unavailable: no provider configured."),
       };
     }
 
     const failures: WebProviderFailure[] = [];
-    for (const [index, provider] of this.webSearchProviders.entries()) {
+    for (const [index, provider] of extractProviders.entries()) {
       if (index > 0) {
         this.logger.logInfo(`web.extract retrying with fallback provider '${provider.id}'.`);
       }
@@ -660,7 +694,7 @@ export class Web implements ServerTool {
       if (outcome.kind === "panic") preserveToolPanic(outcome.panic);
       if (outcome.kind === "failure") {
         failures.push({ providerId: provider.id, failure: outcome.failure });
-        if (outcome.retryable && index < this.webSearchProviders.length - 1) {
+        if (outcome.retryable && index < extractProviders.length - 1) {
           this.logger.logInfo(
             `web.extract retryable failure (${provider.id}); falling back to next provider.`,
             formatTaggedErrorForLog(
@@ -700,7 +734,7 @@ export class Web implements ServerTool {
         format === "html" && !supportsHtmlExtractFormat(provider.id);
       if (
         (isRetriableWebProviderError(result.error) || canTryNextProviderForFormat) &&
-        index < this.webSearchProviders.length - 1
+        index < extractProviders.length - 1
       ) {
         this.logger.logInfo(
           `web.extract fallback failure (${provider.id}); falling back to next provider.`,
