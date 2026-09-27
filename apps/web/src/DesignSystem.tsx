@@ -12,7 +12,7 @@ import { SPINNERS } from "loading-dev";
 import { LoadingSpinner } from "./components/ui/loading-spinner";
 import { ConnectionLoading } from "./components/ui/connection-loading";
 import { ReconnectionDemo } from "./components/ReconnectionDemo";
-import { ConversationBadge } from "./components/ConversationReference";
+import { ConversationBadge, ConversationIcon } from "./components/ConversationReference";
 import lilacLogo from "./assets/logo.svg";
 import { LinkPreviewAnchor } from "./components/LinkWithFavicon";
 import { SidebarEmptyState } from "./components/SidebarEmptyState";
@@ -515,10 +515,20 @@ function Threads() {
           <ThreadCard
             title="Calendar Enums"
             starterName="Discord"
+            starterIcon={<ConversationIcon surface="discord" />}
             updatedAt={now}
             now={now}
             state="idle"
             selected
+            onSelect={() => {}}
+          />
+          <ThreadCard
+            title="Fix search pagination"
+            starterName="GitHub"
+            starterIcon={<ConversationIcon surface="github" />}
+            updatedAt={now - 3 * 86_400_000}
+            now={now}
+            state="idle"
             onSelect={() => {}}
           />
           <ExternalSkeleton />
