@@ -2,6 +2,7 @@ import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   Menu,
+  MessageCirclePlus,
   PanelLeft,
   PanelRight,
   Users,
@@ -37,6 +38,7 @@ export function FloatingChatMenu({
   rightOpen,
   onToggleSidebar,
   onToggleRight,
+  onNewThread,
   archived,
   onShare,
   onRename,
@@ -48,6 +50,7 @@ export function FloatingChatMenu({
   rightOpen: boolean;
   onToggleSidebar: () => void;
   onToggleRight: () => void;
+  onNewThread: () => void;
   archived?: boolean;
   onShare?: () => void;
   onRename?: () => void;
@@ -190,6 +193,10 @@ export function FloatingChatMenu({
           finalFocus={(type) => type === "keyboard"}
           className="min-w-52 [&_[role=menuitem]]:min-h-11"
         >
+          <DropdownMenuItem onClick={onNewThread}>
+            <MessageCirclePlus />
+            New thread
+          </DropdownMenuItem>
           <DropdownMenuItem onClick={onToggleSidebar}>
             <PanelLeft />
             {sidebarOpen ? "Hide Sidebar" : "Show Sidebar"}

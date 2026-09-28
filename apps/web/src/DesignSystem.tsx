@@ -927,6 +927,7 @@ function ComposerSpecimen() {
           rightOpen={rightOpen}
           onToggleSidebar={() => setSidebarOpen((open) => !open)}
           onToggleRight={() => setRightOpen((open) => !open)}
+          onNewThread={() => toast.add({ title: "New thread selected", type: "info" })}
           onShare={() => toast.add({ title: "Share selected", type: "info" })}
           onRename={() => toast.add({ title: "Rename selected", type: "info" })}
           onArchive={() => toast.add({ title: "Archive selected", type: "info" })}

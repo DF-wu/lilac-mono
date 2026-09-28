@@ -929,6 +929,7 @@ function Workspace(props: AppProps) {
                 rightOpen={rightOpen}
                 onToggleSidebar={panels.getState().toggleSidebar}
                 onToggleRight={() => panels.getState().toggle(selectedId)}
+                onNewThread={createThread}
                 archived={actionThread?.archived}
                 onShare={owner && actionThread ? () => setSharing(true) : undefined}
                 onRename={
