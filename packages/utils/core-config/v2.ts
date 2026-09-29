@@ -519,6 +519,17 @@ const toolsSchema = z
     },
   });
 
+const jevAutoInjectDefaultsV2 = {
+  model: "jev-1.13.0",
+  limit: 3,
+  candidateLimit: 30,
+  semanticFallback: true,
+  recallMinProbability: 0.7,
+  durableSubjectMinProbability: 0.6,
+  casualMaxProbability: 0.6,
+  relevanceMinProbability: 0.6,
+};
+
 const conversationSchemaV2 = z
   .object({
     thread: z
@@ -567,6 +578,40 @@ const conversationSchemaV2 = z
             mode: "hybrid",
             filterCurrentParticipants: false,
           }),
+        autoInjectMode: z.enum(["llm", "jev"]).default("llm"),
+        jevAutoInject: z
+          .object({
+            model: z.string().trim().min(1).default(jevAutoInjectDefaultsV2.model),
+            limit: z.number().int().positive().max(10).default(jevAutoInjectDefaultsV2.limit),
+            candidateLimit: z
+              .number()
+              .int()
+              .positive()
+              .max(50)
+              .default(jevAutoInjectDefaultsV2.candidateLimit),
+            semanticFallback: z.boolean().default(jevAutoInjectDefaultsV2.semanticFallback),
+            recallMinProbability: z
+              .number()
+              .min(0)
+              .max(1)
+              .default(jevAutoInjectDefaultsV2.recallMinProbability),
+            durableSubjectMinProbability: z
+              .number()
+              .min(0)
+              .max(1)
+              .default(jevAutoInjectDefaultsV2.durableSubjectMinProbability),
+            casualMaxProbability: z
+              .number()
+              .min(0)
+              .max(1)
+              .default(jevAutoInjectDefaultsV2.casualMaxProbability),
+            relevanceMinProbability: z
+              .number()
+              .min(0)
+              .max(1)
+              .default(jevAutoInjectDefaultsV2.relevanceMinProbability),
+          })
+          .default(jevAutoInjectDefaultsV2),
       })
       .default({
         summarization: {
@@ -587,6 +632,8 @@ const conversationSchemaV2 = z
           mode: "hybrid",
           filterCurrentParticipants: false,
         },
+        autoInjectMode: "llm",
+        jevAutoInject: jevAutoInjectDefaultsV2,
       }),
   })
   .default({
@@ -609,6 +656,8 @@ const conversationSchemaV2 = z
         mode: "hybrid",
         filterCurrentParticipants: false,
       },
+      autoInjectMode: "llm",
+      jevAutoInject: jevAutoInjectDefaultsV2,
     },
   });
 

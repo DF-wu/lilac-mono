@@ -2929,6 +2929,7 @@ const CORE_THREAD_PERSISTED_CODECS = [
 const CORE_THREAD_PERSISTED_CONSUMERS = [
   "ConversationThreadStore.getSummary",
   "ConversationThreadStore.search",
+  "ConversationThreadStore.searchAnyTerm",
   "ConversationThreadStore.searchSemantic",
 ].map(
   (exportName): PersistedStoreConsumerRegistration => ({

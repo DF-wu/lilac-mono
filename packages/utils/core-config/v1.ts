@@ -751,6 +751,17 @@ function coreConfigV1ToUniversal(
           mode: "hybrid",
           filterCurrentParticipants: false,
         },
+        autoInjectMode: "llm",
+        jevAutoInject: {
+          model: "jev-1.13.0",
+          limit: 3,
+          candidateLimit: 30,
+          semanticFallback: true,
+          recallMinProbability: 0.7,
+          durableSubjectMinProbability: 0.6,
+          casualMaxProbability: 0.6,
+          relevanceMinProbability: 0.6,
+        },
       },
     },
     workflows: {

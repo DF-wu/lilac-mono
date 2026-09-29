@@ -243,6 +243,14 @@ export type ConversationThreadToolService = {
     input: Parameters<ConversationThreadService["planAutoInjectSearch"]>[0],
   ): Promise<ConversationThreadAutoInjectQueryPlan>;
   getAutoInjectRankingCorpusDocuments?(): readonly string[] | Promise<readonly string[]>;
+  shortlistAutoInjectCandidates?(
+    input: Parameters<ConversationThreadService["shortlistAutoInjectCandidates"]>[0],
+  ): Promise<ConversationThreadAutoInjectShortlist>;
+};
+
+export type ConversationThreadAutoInjectShortlist = {
+  source: "lexical" | "semantic" | "none";
+  results: ConversationThreadSearchResult["results"];
 };
 
 export type ConversationThreadSearchResult = {
@@ -487,7 +495,9 @@ type AutoInjectTimingStage =
   | "search"
   | "embedding"
   | "corpus"
-  | "ranking";
+  | "ranking"
+  | "shortlist"
+  | "jev";
 type AutoInjectTiming = { calls: number; totalMs: number; maxMs: number };
 
 export type ConversationThreadAutoInjectUsageAccumulator = {
@@ -506,6 +516,7 @@ export type ConversationThreadAutoInjectUsageAccumulator = {
     tokens: number;
     warnings: number;
   }): void;
+  recordJevUsage(usage: { model: string; inputTokens?: number; outputTokens?: number }): void;
   finish(input: {
     status: "completed" | "abstained" | "partial" | "failed";
     searchCount?: number;
@@ -534,6 +545,12 @@ type AutoInjectUsageLogRecord = {
     inputChars: number;
     tokens: number;
     warnings: number;
+  };
+  jev?: {
+    model: string;
+    calls: number;
+    inputTokens: number;
+    outputTokens: number;
   };
 };
 
@@ -695,6 +712,10 @@ export function createConversationThreadAutoInjectUsageAccumulator(input: {
   let embeddingInputChars = 0;
   let embeddingTokens = 0;
   let embeddingWarnings = 0;
+  let jevModel: string | undefined;
+  let jevCalls = 0;
+  let jevInputTokens = 0;
+  let jevOutputTokens = 0;
   const timings: Record<AutoInjectTimingStage, AutoInjectTiming> = {
     planning: { calls: 0, totalMs: 0, maxMs: 0 },
     plannerModel: { calls: 0, totalMs: 0, maxMs: 0 },
@@ -702,6 +723,8 @@ export function createConversationThreadAutoInjectUsageAccumulator(input: {
     embedding: { calls: 0, totalMs: 0, maxMs: 0 },
     corpus: { calls: 0, totalMs: 0, maxMs: 0 },
     ranking: { calls: 0, totalMs: 0, maxMs: 0 },
+    shortlist: { calls: 0, totalMs: 0, maxMs: 0 },
+    jev: { calls: 0, totalMs: 0, maxMs: 0 },
   };
 
   return {
@@ -725,6 +748,12 @@ export function createConversationThreadAutoInjectUsageAccumulator(input: {
       embeddingInputChars += usage.inputChars;
       embeddingTokens += usage.tokens;
       embeddingWarnings += usage.warnings;
+    },
+    recordJevUsage(usage) {
+      jevModel ??= usage.model;
+      jevCalls += 1;
+      jevInputTokens += usage.inputTokens ?? 0;
+      jevOutputTokens += usage.outputTokens ?? 0;
     },
     finish(finishInput) {
       if (finished) return;
@@ -767,6 +796,16 @@ export function createConversationThreadAutoInjectUsageAccumulator(input: {
                 inputChars: embeddingInputChars,
                 tokens: embeddingTokens,
                 warnings: embeddingWarnings,
+              },
+            }
+          : {}),
+        ...(jevCalls > 0 && jevModel
+          ? {
+              jev: {
+                model: jevModel,
+                calls: jevCalls,
+                inputTokens: jevInputTokens,
+                outputTokens: jevOutputTokens,
               },
             }
           : {}),
@@ -2045,6 +2084,108 @@ export class ConversationThreadService {
     return planned.map(normalizeAutoInjectQueryPlan);
   }
 
+  async shortlistAutoInjectCandidates(input: {
+    text: string;
+    limit: number;
+    semanticFallback: boolean;
+    participantSurface?: "discord" | "native";
+    participantIdsAny?: readonly string[];
+    excludeThreadIds?: readonly string[];
+    autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
+  }): Promise<ResultType<ConversationThreadAutoInjectShortlist, PersistedDataError>> {
+    const cfg = await this.params.getConfig();
+    const filters = buildSearchFilters(input);
+    const allowlist = buildSearchAllowlist(cfg);
+    // Over-fetch so stale native summaries dropped by the filter do not take candidate slots.
+    const lexical = this.params.store
+      .searchAnyTerm({
+        text: input.text,
+        limit: input.limit * 2,
+        filters,
+        allowlist,
+        excludeThreadIds: input.excludeThreadIds,
+      })
+      .map((hits) => this.filterCurrentAutoInjectHits(cfg, hits).slice(0, input.limit));
+    const lexicalError = resultErrorOrNull(lexical);
+    if (lexicalError) return Result.err(lexicalError);
+    const lexicalHits = selectResultValue(lexical);
+    if (lexicalHits.length > 0) return Result.ok(this.formatShortlist("lexical", lexicalHits));
+    if (!input.semanticFallback) return Result.ok({ source: "none", results: [] });
+
+    const semantic = await this.searchAutoInjectSemanticFallback({ ...input, filters, allowlist });
+    const semanticError = resultErrorOrNull(semantic);
+    if (semanticError) return Result.err(semanticError);
+    const semanticHits = this.filterCurrentAutoInjectHits(cfg, selectResultValue(semantic));
+    if (semanticHits.length === 0) return Result.ok({ source: "none", results: [] });
+    return Result.ok(this.formatShortlist("semantic", semanticHits));
+  }
+
+  private async searchAutoInjectSemanticFallback(input: {
+    text: string;
+    limit: number;
+    excludeThreadIds?: readonly string[];
+    filters: ConversationThreadSearchFilters;
+    allowlist: ConversationThreadSearchAllowlist;
+    autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
+  }): Promise<ResultType<ConversationThreadSearchHit[], PersistedDataError>> {
+    const adapter = this.params.getEmbeddingAdapter
+      ? await this.params.getEmbeddingAdapter()
+      : null;
+    if (!adapter || !this.params.store.isVectorSearchAvailable()) return Result.ok([]);
+
+    const usage = createThreadEmbeddingUsageAccumulator("search_query", input.autoInjectUsage);
+    const embedded = await captureConversationThreadGeneration(
+      () => adapter.embed({ text: input.text, facet: "query", onUsage: usage.record }),
+      "search-embedding",
+      "Search embedding failed",
+    );
+    const embeddingError = resultErrorOrNull(embedded);
+    if (embeddingError) {
+      usage.log({ status: "failed", mode: "semantic", queryCount: 1 });
+      this.logger.warn("auto-inject semantic shortlist failed; continuing without candidates", {
+        ...formatTaggedErrorForLog(embeddingError),
+      });
+      return Result.ok([]);
+    }
+    usage.log({ status: "completed", mode: "semantic", queryCount: 1 });
+
+    const excluded = new Set(input.excludeThreadIds ?? []);
+    const queryEmbedding = selectResultValue(embedded);
+    return this.params.store
+      .searchSemantic({
+        embedding: queryEmbedding,
+        modelId: adapter.modelId,
+        dimensions: queryEmbedding.length,
+        limit: input.limit + excluded.size,
+        filters: input.filters,
+        allowlist: input.allowlist,
+      })
+      .map((hits) => hits.filter((hit) => !excluded.has(hit.threadId)).slice(0, input.limit));
+  }
+
+  private filterCurrentAutoInjectHits(
+    cfg: CoreConfig,
+    hits: readonly ConversationThreadSearchHit[],
+  ): ConversationThreadSearchHit[] {
+    return hits.filter((hit) => {
+      if (hit.kind === "native_thread") {
+        return this.params.store.getThread(hit.threadId)?.summary_input_hash === hit.sourceRevision;
+      }
+      return shouldAllowDiscordThread(cfg, {
+        channelId: hit.channelId,
+        parentChannelId: hit.parentChannelId,
+        guildId: hit.guildId,
+      });
+    });
+  }
+
+  private formatShortlist(
+    source: "lexical" | "semantic",
+    hits: readonly ConversationThreadSearchHit[],
+  ): ConversationThreadAutoInjectShortlist {
+    return { source, results: hits.map((hit) => this.formatSearchHit(hit, true)) };
+  }
+
   async getAutoInjectRankingCorpusDocuments(): Promise<readonly string[]> {
     const cfg = await this.params.getConfig();
     return this.params.store.listAutoInjectRankingDocuments(buildSearchAllowlist(cfg));
@@ -3235,6 +3376,8 @@ export function createConversationThreadToolService(
     planAutoInjectSearch: (input) =>
       resolvePersistenceOperation(service.planAutoInjectSearch(input)),
     getAutoInjectRankingCorpusDocuments: () => service.getAutoInjectRankingCorpusDocuments(),
+    shortlistAutoInjectCandidates: (input) =>
+      resolvePersistenceOperation(service.shortlistAutoInjectCandidates(input)),
   };
 }
 

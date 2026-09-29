@@ -76,6 +76,11 @@ export class NativeSearchService {
       planAutoInjectSearch: (input) => service().planAutoInjectSearch(input),
       getAutoInjectRankingCorpusDocuments: () =>
         service().getAutoInjectRankingCorpusDocuments?.() ?? [],
+      shortlistAutoInjectCandidates: async (input) =>
+        (await service().shortlistAutoInjectCandidates?.(input)) ?? {
+          source: "none",
+          results: [],
+        },
     };
   }
 

@@ -58,6 +58,11 @@ import type {
   ConversationThreadAutoInjectUsageAccumulator,
   ConversationThreadToolService,
 } from "../../../src/conversation/thread-service";
+import {
+  createJevAutoInjectEvaluator,
+  createJevAutoInjectEvaluatorForModel,
+  type JevAutoInjectEvaluator,
+} from "../../../src/conversation/thread-auto-inject-jev";
 
 import {
   AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH,
@@ -10406,6 +10411,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       recordTiming: () => {},
       recordPlannerUsage: () => {},
       recordEmbeddingUsage: () => {},
+      recordJevUsage: () => {},
       finish: (usage) => finishedUsage.push(usage),
     };
 
@@ -11857,6 +11863,322 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(errors).toEqual([
       "auto-injected thread search status publish failed; continuing",
       "auto-injected thread search status publish failed; continuing",
+    ]);
+  });
+});
+
+describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
+  type ShortlistInput = Parameters<
+    NonNullable<ConversationThreadToolService["shortlistAutoInjectCandidates"]>
+  >[0];
+  type ShortlistResult = Awaited<
+    ReturnType<NonNullable<ConversationThreadToolService["shortlistAutoInjectCandidates"]>>
+  >;
+
+  function jevCfg(): CoreConfig {
+    const cfg = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      surface: { discord: { botName: "lilac", allowedChannelIds: ["c1"] } },
+      conversation: {
+        thread: { autoInject: { enabled: true }, autoInjectMode: "jev" },
+      },
+    });
+    return cfg;
+  }
+
+  function shortlistResult(
+    ...threads: Array<{ threadId: string; title: string }>
+  ): ShortlistResult {
+    return {
+      source: "lexical",
+      results: threads.map((thread) => ({
+        surface: "native" as const,
+        threadId: thread.threadId,
+        title: thread.title,
+        brief: `${thread.title} brief.`,
+      })),
+    };
+  }
+
+  function jevModel(probabilities: Record<string, number>) {
+    const calls: Array<{ state: unknown; questionIds: string[] }> = [];
+    const evaluator: JevAutoInjectEvaluator = createJevAutoInjectEvaluatorForModel({
+      modelId: "jev-test",
+      doEvaluate: async (options) => {
+        calls.push({ state: options.state, questionIds: Object.keys(options.questions) });
+        return {
+          answers: Object.fromEntries(
+            Object.keys(options.questions).map((id) => [
+              id,
+              { type: "boolean" as const, probability: probabilities[id] ?? 0 },
+            ]),
+          ),
+          usage: { inputTokens: 700 },
+          warnings: [],
+        };
+      },
+    });
+    return { evaluator, calls };
+  }
+
+  function threadService(
+    shortlist: (input: ShortlistInput) => Promise<ShortlistResult>,
+  ): ConversationThreadToolService {
+    return {
+      planAutoInjectSearch: async () => {
+        throw new Error("the Jev lane must not call the planner");
+      },
+      search: async () => {
+        throw new Error("the Jev lane must not call planned search");
+      },
+      metadata: async () => ({ threads: [], missing: [] }),
+      read: async () => {
+        throw new Error("not used");
+      },
+      runSummarization: async () => {
+        throw new Error("not used");
+      },
+      shortlistAutoInjectCandidates: shortlist,
+    };
+  }
+
+  function usageRecorder() {
+    const finished: Parameters<ConversationThreadAutoInjectUsageAccumulator["finish"]>[0][] = [];
+    const jev: Parameters<ConversationThreadAutoInjectUsageAccumulator["recordJevUsage"]>[0][] = [];
+    const usage: ConversationThreadAutoInjectUsageAccumulator = {
+      recordTiming: () => {},
+      recordPlannerUsage: () => {},
+      recordEmbeddingUsage: () => {},
+      recordJevUsage: (input) => jev.push(input),
+      finish: (input) => finished.push(input),
+    };
+    return { usage, finished, jev };
+  }
+
+  it("injects Jev-selected candidates without the length gate or planner", async () => {
+    const shortlistInputs: ShortlistInput[] = [];
+    const { evaluator, calls } = jevModel({
+      asks_to_recall: 0.92,
+      candidate_0: 0.3,
+      candidate_1: 0.81,
+    });
+    const { usage, finished, jev } = usageRecorder();
+    const statuses: Array<{ status: "start" | "end"; ok?: boolean }> = [];
+    const events: unknown[] = [];
+
+    const messages = await maybeBuildAutoInjectedThreadSearchMessages({
+      surface: "native",
+      cfg: jevCfg(),
+      requestId: "native:current:m2",
+      sessionId: "native:current",
+      previousMessages: buildAutoInjectedThreadSearchMessages({
+        toolCallId: "earlier",
+        entries: [{ surface: "native", threadId: "native:earlier", title: "Earlier" }],
+      }),
+      userMessages: [{ role: "user", content: "what did we pick for retries?" }],
+      conversationThreads: threadService(async (input) => {
+        shortlistInputs.push(input);
+        return shortlistResult(
+          { threadId: "native:garden", title: "Garden plan" },
+          { threadId: "native:retries", title: "Router retries" },
+        );
+      }),
+      createJevEvaluator: () => Result.ok(evaluator),
+      autoInjectUsage: usage,
+      publishToolStatus: async (update) => {
+        statuses.push({ status: update.status, ok: update.ok });
+      },
+      onJevEvaluated: (event) => events.push(event),
+      onError: (message) => {
+        throw new Error(message);
+      },
+    });
+
+    expect(shortlistInputs).toEqual([
+      expect.objectContaining({
+        text: "what did we pick for retries?",
+        limit: 30,
+        semanticFallback: true,
+        excludeThreadIds: ["native:earlier", "native:current"],
+      }),
+    ]);
+    expect(calls).toEqual([
+      {
+        state: { message: "what did we pick for retries?" },
+        questionIds: ["asks_to_recall", "durable_subject", "casual", "candidate_0", "candidate_1"],
+      },
+    ]);
+    expect(messages[0]).toMatchObject({
+      role: "assistant",
+      content: [{ input: { note: "auto-injected for the latest user input" } }],
+    });
+    expect(messages[1]).toMatchObject({
+      role: "tool",
+      content: [
+        {
+          output: {
+            type: "json",
+            value: {
+              entries: [
+                {
+                  surface: "native",
+                  threadId: "native:retries",
+                  title: "Router retries",
+                  brief: "Router retries brief.",
+                },
+              ],
+            },
+          },
+        },
+      ],
+    });
+    expect(statuses).toEqual([{ status: "start" }, { status: "end", ok: true }]);
+    expect(events).toEqual([
+      expect.objectContaining({
+        model: "jev-test",
+        source: "lexical",
+        candidateCount: 2,
+        gate: "recall",
+        selected: [{ index: 1, threadId: "native:retries", probability: 0.81 }],
+        highestRejected: { index: 0, threadId: "native:garden", probability: 0.3 },
+      }),
+    ]);
+    expect(jev).toEqual([{ model: "jev-test", inputTokens: 700 }]);
+    expect(finished).toEqual([{ status: "completed" }]);
+  });
+
+  it("shortlists authored text only and abstains quietly without candidates", async () => {
+    const { evaluator, calls } = jevModel({ asks_to_recall: 1 });
+    const { usage, finished } = usageRecorder();
+    const shortlistTexts: string[] = [];
+    let statusCount = 0;
+
+    const messages = await maybeBuildAutoInjectedThreadSearchMessages({
+      cfg: jevCfg(),
+      requestId: "empty-shortlist",
+      userMessages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "remember the thing?" },
+            {
+              type: "text",
+              text: '[discord_attachment filename="shot.png" mime="image/png" size=12 url="https://cdn.example/shot.png"]',
+            },
+          ],
+        },
+      ],
+      conversationThreads: threadService(async (input) => {
+        shortlistTexts.push(input.text);
+        return { source: "none", results: [] };
+      }),
+      createJevEvaluator: () => Result.ok(evaluator),
+      autoInjectUsage: usage,
+      publishToolStatus: async () => {
+        statusCount += 1;
+      },
+      onError: (message) => {
+        throw new Error(message);
+      },
+    });
+
+    expect(messages).toEqual([]);
+    expect(shortlistTexts).toEqual(["remember the thing?"]);
+    expect(calls).toEqual([]);
+    expect(statusCount).toBe(0);
+    expect(finished).toEqual([{ status: "abstained" }]);
+  });
+
+  it("abstains when the Jev gate stays closed", async () => {
+    const { evaluator } = jevModel({ casual: 0.95, durable_subject: 0.9, candidate_0: 0.99 });
+    const { usage, finished } = usageRecorder();
+    const events: Array<{ gate: string | null; entries: readonly unknown[] }> = [];
+
+    const messages = await maybeBuildAutoInjectedThreadSearchMessages({
+      cfg: jevCfg(),
+      requestId: "casual",
+      userMessages: [{ role: "user", content: "lol nice, thanks" }],
+      conversationThreads: threadService(async () =>
+        shortlistResult({ threadId: "native:garden", title: "Garden plan" }),
+      ),
+      createJevEvaluator: () => Result.ok(evaluator),
+      autoInjectUsage: usage,
+      publishToolStatus: async () => {},
+      onJevEvaluated: (event) => events.push({ gate: event.gate, entries: event.entries }),
+      onError: (message) => {
+        throw new Error(message);
+      },
+    });
+
+    expect(messages).toEqual([]);
+    expect(events).toEqual([{ gate: null, entries: [] }]);
+    expect(finished).toEqual([{ status: "abstained" }]);
+  });
+
+  it("reports Jev failures and continues without metadata", async () => {
+    const evaluator = createJevAutoInjectEvaluatorForModel({
+      modelId: "jev-test",
+      doEvaluate: async () => {
+        throw new Error("503 Service Unavailable");
+      },
+    });
+    const { usage, finished } = usageRecorder();
+    const statuses: Array<{ status: "start" | "end"; ok?: boolean; error?: string }> = [];
+    const errors: Array<{ message: string; error: string }> = [];
+
+    const messages = await maybeBuildAutoInjectedThreadSearchMessages({
+      cfg: jevCfg(),
+      requestId: "jev-down",
+      userMessages: [{ role: "user", content: "what did we decide about the router?" }],
+      conversationThreads: threadService(async () =>
+        shortlistResult({ threadId: "native:retries", title: "Router retries" }),
+      ),
+      createJevEvaluator: () => Result.ok(evaluator),
+      autoInjectUsage: usage,
+      publishToolStatus: async (update) => {
+        statuses.push({ status: update.status, ok: update.ok, error: update.error });
+      },
+      onError: (message, error) => errors.push({ message, error: error.message }),
+    });
+
+    expect(messages).toEqual([]);
+    expect(statuses.at(-1)).toEqual({
+      status: "end",
+      ok: false,
+      error: "503 Service Unavailable",
+    });
+    expect(errors).toEqual([
+      {
+        message: "Jev auto-inject evaluation failed; continuing without metadata",
+        error: "503 Service Unavailable",
+      },
+    ]);
+    expect(finished).toEqual([{ status: "failed" }]);
+  });
+
+  it("skips with an error when the TypeSafe API key is missing", async () => {
+    const errors: string[] = [];
+    let shortlistCalls = 0;
+
+    const messages = await maybeBuildAutoInjectedThreadSearchMessages({
+      cfg: jevCfg(),
+      requestId: "no-key",
+      userMessages: [{ role: "user", content: "what did we decide about the router?" }],
+      conversationThreads: threadService(async () => {
+        shortlistCalls += 1;
+        return { source: "none", results: [] };
+      }),
+      publishToolStatus: async () => {
+        throw new Error("status must not be published");
+      },
+      onError: (message, error) => errors.push(`${message}: ${error.message}`),
+      createJevEvaluator: (model) => createJevAutoInjectEvaluator({ model }),
+    });
+
+    expect(messages).toEqual([]);
+    expect(shortlistCalls).toBe(0);
+    expect(errors).toEqual([
+      "Jev auto-inject is unavailable; continuing without metadata: TYPESAFE_AI_API_KEY is required when conversation.thread.autoInjectMode is jev",
     ]);
   });
 });
