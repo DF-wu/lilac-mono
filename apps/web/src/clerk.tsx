@@ -126,9 +126,7 @@ function SessionStatus({
       void endSession();
       return () => controller.abort();
     }
-    const stopCredentials = registerConnectionCredentials(async () => {
-      await getToken();
-    });
+    const stopCredentials = registerConnectionCredentials(() => getToken());
     const refresh = createClerkSessionRefresh({
       client,
       getToken: () => getToken({ skipCache: true }),

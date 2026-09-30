@@ -6,6 +6,7 @@ import {
 } from "@stanley2058/lilac-client-protocol";
 import { Result, TaggedError } from "better-result";
 import { z } from "zod";
+import { readConnectionToken } from "./connection-credentials";
 
 export class WebRequestFailed extends TaggedError("WebRequestFailed")<{
   code: "unauthenticated" | "forbidden" | "unavailable" | "incompatible" | "canceled";
@@ -85,7 +86,19 @@ async function bootstrapResult(
   if (input.checkpoint) url.searchParams.set("checkpoint", JSON.stringify(input.checkpoint));
   if (input.catalogRevision) url.searchParams.set("catalogRevision", input.catalogRevision);
   return Result.gen(async function* () {
-    const response = yield* Result.await(request(url, { signal }));
+    const token = yield* Result.await(
+      Result.tryPromise({
+        try: readConnectionToken,
+        catch: () => failed("unavailable", "Could not refresh your session. Retry connection."),
+      }),
+    );
+    if (signal?.aborted) return Result.err(failed("canceled", "Request canceled"));
+    if (token === null) return Result.err(failed("unauthenticated", "Sign in to continue"));
+    // Clerk may update its session cookie after getToken resolves. Use the returned token so a
+    // foreground bootstrap cannot mistake that stale cookie for an ended session.
+    const response = yield* Result.await(
+      request(url, { signal, ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}) }),
+    );
     yield* responseStatus(response);
     const body = yield* Result.await(
       Result.tryPromise({

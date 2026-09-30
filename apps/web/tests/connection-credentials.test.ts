@@ -1,11 +1,15 @@
 import { expect, test } from "bun:test";
-import { prepareWebConnection, registerConnectionCredentials } from "../src/connection-credentials";
+import {
+  prepareWebConnection,
+  readConnectionToken,
+  registerConnectionCredentials,
+} from "../src/connection-credentials";
 
 test("connection preparation awaits the active credentials and ignores stale cleanup", async () => {
   const old = registerConnectionCredentials(async () => {
     throw new Error("Stale provider");
   });
-  const token = Promise.withResolvers<void>();
+  const token = Promise.withResolvers<string>();
   const stop = registerConnectionCredentials(() => token.promise);
   old();
   let ready = false;
@@ -14,10 +18,12 @@ test("connection preparation awaits the active credentials and ignores stale cle
   });
   await Promise.resolve();
   expect(ready).toBe(false);
-  token.resolve();
+  token.resolve("fresh-token");
   await preparing;
   expect(ready).toBe(true);
+  expect(await readConnectionToken()).toBe("fresh-token");
   stop();
+  expect(await readConnectionToken()).toBeUndefined();
   await prepareWebConnection();
 });
 
