@@ -684,7 +684,8 @@
   width: var(--ui-control-compact);
   height: var(--ui-control-compact);
 }
-.sidebar-search-row:has(.search-box:focus-within) .sidebar-tabs {
+.sidebar-search-row:has(.search-box:focus-within) .sidebar-tabs,
+.sidebar-search-row:has(.search-box > .icon-button) .sidebar-tabs {
   display: none;
 }
 
