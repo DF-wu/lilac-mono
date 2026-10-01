@@ -673,6 +673,7 @@ export function formatStoredResourceMarkerV1(part: StoredResourcePartV1): string
 
 const RESOURCE_INLINE_GUIDANCE =
   "Use resource.materialize to write this resource into the working directory, transform it to a supported size or format, and then consume the transformed file.";
+const RESOURCE_IMAGE_INLINE_MAX_BYTES = 1024 * 1024;
 
 function resourceInlineErrorCode(error: ResourceAccessError): string {
   switch (error._tag) {
@@ -703,6 +704,7 @@ function resourceInlineGuidance(input: {
   readonly part: StoredResourcePartV1;
   readonly code: string;
   readonly limit?: number;
+  readonly guidance?: string;
 }): object[] {
   const fields = [
     `uri="${markerValue(input.part.uri)}"`,
@@ -711,7 +713,20 @@ function resourceInlineGuidance(input: {
   ].filter((field): field is string => field !== null);
   return [
     { type: "text", text: `[resource_inline_error ${fields.join(" ")}]` },
-    { type: "text", text: RESOURCE_INLINE_GUIDANCE },
+    { type: "text", text: input.guidance ?? RESOURCE_INLINE_GUIDANCE },
+  ];
+}
+
+function omittedImageParts(part: StoredResourcePartV1): object[] {
+  return [
+    { type: "text", text: formatStoredResourceMarkerV1(part) },
+    ...resourceInlineGuidance({
+      part,
+      code: "too_large",
+      limit: RESOURCE_IMAGE_INLINE_MAX_BYTES,
+      guidance:
+        "Image exceeds the 1 MiB automatic inline limit. Use resource.materialize to save the original, resize a copy to at most 1 MiB, and read the resized copy. Keep the original for editing or generation; do not read the full-size original into model context.",
+    }),
   ];
 }
 
@@ -795,13 +810,28 @@ async function materializeStoredResource(input: {
   if (descriptor.detectedMediaType && detectedKind === null) return [marker];
   if (!descriptor.detectedMediaType && hasResourceTextFilenameHint(filename)) return [marker];
 
+  const knownKind = resourceKindFromMediaType(
+    descriptor.detectedMediaType ?? descriptor.declaredMediaType ?? input.part.mediaType,
+  );
+  const knownBytes =
+    descriptor.cachedByteLength ?? descriptor.reportedByteLength ?? input.part.size;
+  if (
+    knownKind === "image" &&
+    knownBytes !== undefined &&
+    knownBytes > RESOURCE_IMAGE_INLINE_MAX_BYTES
+  )
+    return omittedImageParts(input.part);
+
   const opened = resourceAccessDecision(
     await input.resourceAccess.open(input.part.uri, {
-      maxBytes: RESOURCE_MODEL_INLINE_MAX_BYTES,
+      maxBytes:
+        knownKind === "image" ? RESOURCE_IMAGE_INLINE_MAX_BYTES : RESOURCE_MODEL_INLINE_MAX_BYTES,
       expected: "any",
     }),
   );
   if (opened.kind === "error") {
+    if (knownKind === "image" && opened.error._tag === "ResourceTooLarge")
+      return omittedImageParts(input.part);
     return expectedResourceErrorParts({
       marker,
       part: input.part,
@@ -826,6 +856,10 @@ async function materializeStoredResource(input: {
         code: "unsupported_provider",
       }),
     ];
+  }
+  if (verifiedKind === "image" && read.blob.byteLength > RESOURCE_IMAGE_INLINE_MAX_BYTES) {
+    await cancelVerifiedResourceRead(read);
+    return omittedImageParts(input.part);
   }
 
   const consumed = resourceAccessDecision(await consumeVerifiedResourceRead(read));

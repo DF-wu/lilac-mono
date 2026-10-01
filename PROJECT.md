@@ -259,8 +259,11 @@ Core's transcript database also owns resource metadata and retained transcript o
 references. A structured resource part contains only the opaque URI and display metadata. Discord
 attachment IDs, signed CDN URLs, and blob object IDs do not enter messages or model markers. The
 resource module refreshes an origin URL in memory, streams at most 512 MiB into BlobStore, verifies the
-result, and attaches the cache reference with compare-and-swap semantics. Images and PDFs no larger
-than 25 MiB may become verified byte-backed provider parts. Claude Code receives images only.
+result, and attaches the cache reference with compare-and-swap semantics. Automatic image viewing
+includes verified images up to 1 MiB each. Larger images
+remain resource references with instructions to materialize the original, resize a copy, and read
+that copy. PDFs up to 25 MiB may become verified byte-backed provider parts. Claude Code receives
+images only.
 
 Legacy resource resolution treats an exact retained resource URI as a capability. Native resource
 access also requires current visibility of the origin thread, including cross-thread references.
