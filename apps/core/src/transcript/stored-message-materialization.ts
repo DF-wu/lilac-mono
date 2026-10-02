@@ -20,6 +20,7 @@ import {
   consumeVerifiedResourceRead,
   hasResourceTextFilenameHint,
   RESOURCE_MODEL_INLINE_MAX_BYTES,
+  RESOURCE_IMAGE_INLINE_MAX_BYTES,
   type ResourceAccess,
   type ResourceAccessError,
 } from "../resource";
@@ -673,7 +674,6 @@ export function formatStoredResourceMarkerV1(part: StoredResourcePartV1): string
 
 const RESOURCE_INLINE_GUIDANCE =
   "Use resource.materialize to write this resource into the working directory, transform it to a supported size or format, and then consume the transformed file.";
-const RESOURCE_IMAGE_INLINE_MAX_BYTES = 1024 * 1024;
 
 function resourceInlineErrorCode(error: ResourceAccessError): string {
   switch (error._tag) {
@@ -813,19 +813,14 @@ async function materializeStoredResource(input: {
   const knownKind = resourceKindFromMediaType(
     descriptor.detectedMediaType ?? descriptor.declaredMediaType ?? input.part.mediaType,
   );
-  const knownBytes =
-    descriptor.cachedByteLength ?? descriptor.reportedByteLength ?? input.part.size;
-  if (
-    knownKind === "image" &&
-    knownBytes !== undefined &&
-    knownBytes > RESOURCE_IMAGE_INLINE_MAX_BYTES
-  )
-    return omittedImageParts(input.part);
+  if (detectedKind && !providerSupportsResourceKind(input.target, detectedKind)) {
+    return [marker, ...resourceInlineGuidance({ part: input.part, code: "unsupported_provider" })];
+  }
 
   const opened = resourceAccessDecision(
     await input.resourceAccess.open(input.part.uri, {
-      maxBytes:
-        knownKind === "image" ? RESOURCE_IMAGE_INLINE_MAX_BYTES : RESOURCE_MODEL_INLINE_MAX_BYTES,
+      maxBytes: RESOURCE_MODEL_INLINE_MAX_BYTES,
+      modelImage: input.target.supportsImage,
       expected: "any",
     }),
   );
@@ -884,7 +879,16 @@ async function materializeStoredResource(input: {
     mediaType: verifiedMediaType,
     ...(input.part.filename === undefined ? {} : { filename: input.part.filename }),
   };
-  return [marker, file];
+  if (!read.imagePreview) return [marker, file];
+  const preview = read.imagePreview;
+  return [
+    marker,
+    {
+      type: "text",
+      text: `Resized preview (${preview.originalWidth}×${preview.originalHeight} → ${preview.width}×${preview.height}). Small text and fine details may be lost. Use resource.materialize with ${input.part.uri} to access the original if needed.`,
+    },
+    file,
+  ];
 }
 
 async function materializeStoredFile(input: {

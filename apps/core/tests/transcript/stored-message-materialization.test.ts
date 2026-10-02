@@ -792,7 +792,7 @@ describe("stored message materialization", () => {
       }),
     );
 
-    expect(openedWith).toBe(1024 * 1024);
+    expect(openedWith).toBe(RESOURCE_MODEL_INLINE_MAX_BYTES);
     expect(materialized[0]?.content).toEqual([
       {
         type: "text",
@@ -1066,7 +1066,7 @@ describe("stored message materialization", () => {
   });
 
   for (const sizeSource of ["reportedByteLength", "cachedByteLength", "size"] as const) {
-    it(`keeps a large image reference and resize guidance without opening it (${sizeSource})`, async () => {
+    it(`checks actual bytes when image metadata overstates size (${sizeSource})`, async () => {
       const blobStore = resultValue(await createMemoryBlobStore());
       const original = [
         {
@@ -1098,17 +1098,13 @@ describe("stored message materialization", () => {
           resourceTarget: { family: "ai-sdk", supportsImage: true, supportsPdf: true },
         }),
       );
-      expect(opened).toBe(false);
-      expect(materialized[0]?.content).toEqual([
-        { type: "text", text: expect.stringContaining(original[0]!.content[0]!.uri) },
-        { type: "text", text: expect.stringContaining('code="too_large"') },
-        {
-          type: "text",
-          text: expect.stringContaining(
-            "resize a copy to at most 1 MiB, and read the resized copy",
-          ),
-        },
-      ]);
+      expect(opened).toBe(true);
+      expect(materialized[0]?.content).toContainEqual({
+        type: "file",
+        data: new Uint8Array(),
+        mediaType: "image/png",
+        filename: "image.png",
+      });
       expect(resultValue(identityProjection.project(materialized))).toEqual(original);
       const pastedMarker = [
         { role: "user", content: [{ type: "text", text: original[0]!.content[0]!.uri }] },
@@ -1286,9 +1282,9 @@ describe("stored message materialization", () => {
         blobStore,
         resourceAccess: observedAccess,
         resourceTarget: {
-          family: "ai-sdk",
+          family: "claude-code",
           supportsImage: true,
-          supportsPdf: true,
+          supportsPdf: false,
         },
       }),
     );

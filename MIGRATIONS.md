@@ -851,3 +851,13 @@ apply. Native UI read and write permissions remain unchanged. Derived native sta
 its retained message content or history generation changes, including edits, rewinds, and deletion.
 Model selection, titles, archiving, and grant changes preserve existing summaries. Downgrading requires
 rebuilding the derived index for the older runtime; do not reuse cross-surface derived rows with an older binary.
+
+## Transcript schema 14: model image previews
+
+Schema 14 adds nullable `image_preview_json` to `core_resources`. Existing originals and resource
+references are unchanged. Core lazily generates previews for model input above 1 MiB, with a 25 MiB
+source-read limit and a 40-million-pixel decode limit. Preview metadata records the source hash,
+resize policy version, dimensions, media type, and a separate expiring blob reference. Preview blobs
+expire after 24 hours through existing blob maintenance, including abandoned or replaced previews.
+Missing or expired previews regenerate on demand. Original downloads remain unchanged.
+Older binaries reject schema 14; rollback requires a pre-upgrade backup.

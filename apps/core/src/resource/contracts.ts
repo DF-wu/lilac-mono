@@ -74,6 +74,20 @@ export const resourceCacheV1Schema = z.strictObject({
 });
 export type ResourceCacheV1 = z.infer<typeof resourceCacheV1Schema>;
 
+export const RESOURCE_IMAGE_INLINE_MAX_BYTES = 1024 * 1024;
+
+export const resourceImagePreviewSchema = z.strictObject({
+  policyVersion: z.literal(1),
+  sourceSha256: blobRefV1Schema.shape.sha256,
+  blob: blobRefV1Schema.extend({ expiresAt: z.number().int().nonnegative() }),
+  mediaType: z.enum(["image/png", "image/jpeg"]),
+  originalWidth: z.number().int().positive(),
+  originalHeight: z.number().int().positive(),
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+});
+export type ResourceImagePreview = z.infer<typeof resourceImagePreviewSchema>;
+
 export const resourceRecordV1Schema = z.strictObject({
   version: z.literal(1),
   resourceId: resourceIdSchema,
@@ -84,6 +98,7 @@ export const resourceRecordV1Schema = z.strictObject({
   reportedByteLength: nonNegativeSafeIntegerSchema.optional(),
   createdAt: nonNegativeSafeIntegerSchema,
   cache: resourceCacheV1Schema.optional(),
+  imagePreview: resourceImagePreviewSchema.optional(),
 });
 export type ResourceRecordV1 = z.infer<typeof resourceRecordV1Schema>;
 

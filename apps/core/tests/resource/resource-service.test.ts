@@ -120,6 +120,18 @@ class MemoryResourceStore implements ResourceStore {
     return Result.ok({ kind: "attached", record });
   }
 
+  setImagePreview(input: Parameters<ResourceStore["setImagePreview"]>[0]) {
+    const current = this.records.get(input.resourceId);
+    if (
+      !current ||
+      !this.retained.has(input.resourceId) ||
+      JSON.stringify(current.cache) !== JSON.stringify(input.source)
+    )
+      return Result.ok(false);
+    this.records.set(input.resourceId, { ...current, imagePreview: input.preview });
+    return Result.ok(true);
+  }
+
   clearCache(
     input: Parameters<ResourceStore["clearCache"]>[0],
   ): ResultType<boolean, ResourceStoreFailure> {
@@ -1162,4 +1174,211 @@ describe("CoreResourceService", () => {
     await rm(directory, { recursive: true, force: true });
     await closeFixture(resources.service, resources.blobStore);
   });
+});
+
+function previewBitmap(): Uint8Array {
+  const width = 4000;
+  const height = 400;
+  const offset = 54;
+  const image = new Uint8Array(offset + width * height * 3);
+  const header = new DataView(image.buffer);
+  image.set([0x42, 0x4d]);
+  header.setUint32(2, image.byteLength, true);
+  header.setUint32(10, offset, true);
+  header.setUint32(14, 40, true);
+  header.setInt32(18, width, true);
+  header.setInt32(22, height, true);
+  header.setUint16(26, 1, true);
+  header.setUint16(28, 24, true);
+  header.setUint32(34, width * height * 3, true);
+  let state = 12345;
+  for (let i = offset; i < image.length; i++) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    image[i] = state >>> 24;
+  }
+  return image;
+}
+
+describe("model image previews", () => {
+  test("fits an image, shares concurrent conversion, reuses the blob, and preserves original reads", async () => {
+    const bytes = previewBitmap();
+    const f = await fixture({ bytes, filename: "wide.bmp", declaredMediaType: "image/bmp" });
+    const options = { maxBytes: 25 * 1024 * 1024, modelImage: true };
+    const [first, second] = await Promise.all([
+      f.service.open(f.descriptor.uri, options),
+      f.service.open(f.descriptor.uri, options),
+    ]);
+    const read = success(first);
+    const other = success(second);
+    const preview = success(await consumeVerifiedResourceRead(read));
+    success(await consumeVerifiedResourceRead(other));
+    expect(preview.byteLength).toBeLessThanOrEqual(1024 * 1024);
+    expect(read.imagePreview).toMatchObject({
+      originalWidth: 4000,
+      originalHeight: 400,
+      width: 3072,
+    });
+    expect(other.blob.objectId).toBe(read.blob.objectId);
+    const metadata = await new Bun.Image(preview).metadata();
+    expect(metadata.width).toBe(read.imagePreview!.width);
+    expect(metadata.height).toBe(read.imagePreview!.height);
+    expect(metadata.width / metadata.height).toBeCloseTo(10, 1);
+    expect(f.uploadCount()).toBe(2);
+    const again = success(await f.service.open(f.descriptor.uri, options));
+    success(await consumeVerifiedResourceRead(again));
+    expect(again.blob.objectId).toBe(read.blob.objectId);
+    expect(f.uploadCount()).toBe(2);
+    const restarted = new CoreResourceService({
+      store: f.store,
+      blobStore: f.blobStore,
+      originAdapters: new ResourceOriginAdapterRegistry([]),
+    });
+    const afterRestart = success(await restarted.open(f.descriptor.uri, options));
+    success(await consumeVerifiedResourceRead(afterRestart));
+    expect(afterRestart.blob.objectId).toBe(read.blob.objectId);
+    expect(f.uploadCount()).toBe(2);
+    await restarted.close();
+    const original = success(
+      await f.service.open(f.descriptor.uri, { maxBytes: bytes.byteLength }),
+    );
+    expect(original.imagePreview).toBeUndefined();
+    expect(success(await consumeVerifiedResourceRead(original))).toEqual(bytes);
+    expect(f.store.records.get(f.resourceId)?.cache?.blob.objectId).not.toBe(read.blob.objectId);
+    success(await f.deleteStoredBlob(read.blob));
+    const repaired = success(await f.service.open(f.descriptor.uri, options));
+    success(await consumeVerifiedResourceRead(repaired));
+    expect(repaired.blob.objectId).not.toBe(read.blob.objectId);
+    expect(f.fetchCount()).toBe(1);
+    await closeFixture(f.service, f.blobStore);
+  });
+
+  test("includes a concise preview note for every model family and preserves canonical resource identity", async () => {
+    const { materializeStoredMessagesV1, createStoredMessageIdentityProjectionV1 } =
+      await import("../../src/transcript/stored-message-materialization");
+    const f = await fixture({
+      bytes: previewBitmap(),
+      filename: "wide.bmp",
+      declaredMediaType: "image/bmp",
+    });
+    const messages = [
+      {
+        role: "user" as const,
+        content: [{ type: "resource" as const, uri: f.descriptor.uri, mediaType: "image/bmp" }],
+      },
+    ];
+    for (const family of ["ai-sdk", "claude-code"] as const) {
+      const identityProjection = createStoredMessageIdentityProjectionV1();
+      const materialized = success(
+        await materializeStoredMessagesV1({
+          messages,
+          blobStore: f.blobStore,
+          resourceAccess: f.service,
+          resourceTarget: { family, supportsImage: true, supportsPdf: false },
+          identityProjection,
+        }),
+      );
+      expect(materialized[0]?.content).toContainEqual({
+        type: "text",
+        text: expect.stringContaining("Small text and fine details may be lost."),
+      });
+      expect(materialized[0]?.content).toContainEqual({
+        type: "file",
+        mediaType: expect.stringMatching(/^image\/(jpeg|png)$/),
+        data: expect.any(Uint8Array),
+      });
+      expect(success(identityProjection.project(materialized))).toEqual(messages);
+    }
+    const unsupported = success(
+      await materializeStoredMessagesV1({
+        messages,
+        blobStore: f.blobStore,
+        resourceAccess: f.service,
+        resourceTarget: { family: "ai-sdk", supportsImage: false, supportsPdf: false },
+      }),
+    );
+    expect(JSON.stringify(unsupported)).not.toContain("Resized preview");
+    expect(JSON.stringify(unsupported)).toContain("unsupported_provider");
+    await closeFixture(f.service, f.blobStore);
+  });
+
+  test("returns resize guidance when decoding fails and leaves small images unchanged", async () => {
+    const { materializeStoredMessagesV1 } =
+      await import("../../src/transcript/stored-message-materialization");
+    const invalid = new Uint8Array(1024 * 1024 + 1);
+    invalid.set([137, 80, 78, 71, 13, 10, 26, 10]);
+    const f = await fixture({
+      bytes: invalid,
+      filename: "bad.png",
+      declaredMediaType: "image/png",
+    });
+    const materialized = success(
+      await materializeStoredMessagesV1({
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "resource", uri: f.descriptor.uri, mediaType: "image/png" }],
+          },
+        ],
+        blobStore: f.blobStore,
+        resourceAccess: f.service,
+        resourceTarget: { family: "ai-sdk", supportsImage: true, supportsPdf: true },
+      }),
+    );
+    expect(JSON.stringify(materialized)).toContain("resize a copy");
+    expect(JSON.stringify(materialized)).not.toContain('"type":"file"');
+    await closeFixture(f.service, f.blobStore);
+    const bytes = await new Bun.Image(previewBitmap()).resize(100).png().bytes();
+    const small = await fixture({ bytes, filename: "small.png" });
+    const read = success(
+      await small.service.open(small.descriptor.uri, {
+        maxBytes: 25 * 1024 * 1024,
+        modelImage: true,
+      }),
+    );
+    expect(read.imagePreview).toBeUndefined();
+    expect(success(await consumeVerifiedResourceRead(read))).toEqual(bytes);
+    expect(small.uploadCount()).toBe(1);
+    await closeFixture(small.service, small.blobStore);
+  });
+});
+
+test("expired image previews regenerate and decoding respects source and pixel limits", async () => {
+  let now = Date.now();
+  const bytes = previewBitmap();
+  const f = await fixture({ bytes, filename: "wide.bmp", now: () => now });
+  const options = { maxBytes: 25 * 1024 * 1024, modelImage: true };
+  const first = success(await f.service.open(f.descriptor.uri, options));
+  success(await consumeVerifiedResourceRead(first));
+  now = first.blob.expiresAt!;
+  const next = success(await f.service.open(f.descriptor.uri, options));
+  success(await consumeVerifiedResourceRead(next));
+  expect(next.blob.objectId).not.toBe(first.blob.objectId);
+  expect(f.fetchCount()).toBe(1);
+  success(await f.blobStore.maintain({ now, limit: 100 }));
+  expect((await f.openStoredBlob(first.blob)).status).toBe("error");
+  const retainedPreview = success(await f.openStoredBlob(next.blob));
+  await retainedPreview.stream.cancel();
+  await retainedPreview.completion;
+  await closeFixture(f.service, f.blobStore);
+
+  const header = new DataView(bytes.buffer);
+  header.setInt32(18, 10_000, true);
+  header.setInt32(22, 5_000, true);
+  const pixels = await fixture({ bytes, filename: "huge.bmp" });
+  expect(failure(await pixels.service.open(pixels.descriptor.uri, options))._tag).toBe(
+    "ResourceTooLarge",
+  );
+  expect(pixels.uploadCount()).toBe(1);
+  await closeFixture(pixels.service, pixels.blobStore);
+
+  const oversized = await fixture({
+    bytes: new Uint8Array(options.maxBytes + 1),
+    filename: "large.bmp",
+    reportedByteLength: options.maxBytes + 1,
+  });
+  expect(failure(await oversized.service.open(oversized.descriptor.uri, options))._tag).toBe(
+    "ResourceTooLarge",
+  );
+  expect(oversized.store.records.get(oversized.resourceId)?.cache).toBeUndefined();
+  await closeFixture(oversized.service, oversized.blobStore);
 });
