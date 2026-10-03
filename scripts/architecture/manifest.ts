@@ -3777,6 +3777,25 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : [],
     boundaryDecoders: [
+      ...(root === "apps/core"
+        ? [
+            {
+              identity: {
+                module: "src/surface/native/computer.ts",
+                exportName: "decodeComputerViewer",
+              },
+              category: "wire" as const,
+            },
+          ]
+        : []),
+      ...(root === "apps/web"
+        ? [
+            {
+              identity: { module: "src/computer-viewer.ts", exportName: "decodeComputerState" },
+              category: "wire" as const,
+            },
+          ]
+        : []),
       ...(root === "packages/client-protocol"
         ? [
             {

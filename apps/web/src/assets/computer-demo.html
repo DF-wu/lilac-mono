@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Demo desktop</title>
+<style>body{margin:0;padding:24px;box-sizing:border-box;background:#1e1e2e;color:#cdd6f4;font:14px system-ui;height:100vh}textarea{box-sizing:border-box;width:100%;height:65%;padding:12px;border:0;border-radius:8px;background:#313244;color:inherit;resize:none;font:inherit}p{margin-top:0}</style>
+<p>Demo desktop</p><textarea aria-label="Demo editor" disabled>Enable Take control to type here.</textarea>
+<script>
+const origin = new URLSearchParams(location.search).get('parentOrigin');
+window.addEventListener('message', event => {
+  if (event.source !== parent || event.origin !== origin || !event.data) return;
+  if (event.data.type === 'lilac-computer-connect') parent.postMessage({type:'lilac-computer-state',state:'connected'}, origin);
+  if (event.data.type === 'lilac-computer-input') document.querySelector('textarea').disabled = !event.data.enabled;
+});
+</script>
+</html>

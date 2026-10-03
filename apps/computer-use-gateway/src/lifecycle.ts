@@ -108,6 +108,18 @@ export class ComputerLifecycle {
     }, this);
   }
 
+  viewer(session: string) {
+    return this.store.list().map((records) => {
+      const record = records.find((item) => item.session === session);
+      if (!this.ready || !record || record.state !== "ready" || record.expiresAt <= this.now())
+        return { status: "absent" as const };
+      const info = viewerInfo(record, this.config);
+      const url = new URL(info.viewer_url);
+      url.pathname = "/lilac-viewer.html";
+      return { ...info, viewer_url: url.href, viewer_password: record.password };
+    });
+  }
+
   provision(session: string, idleSeconds?: number, signal?: AbortSignal) {
     return this.serial(session, () => this.provisionLocked(session, idleSeconds, signal));
   }

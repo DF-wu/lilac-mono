@@ -8,6 +8,7 @@ const hash = "a".repeat(64);
 const calls: string[] = [];
 const operations = {
   isReady: () => true,
+  viewer: () => Result.ok({ status: "absent" as const }),
   provision: async (session: string) => {
     calls.push(session);
     return Result.ok({
@@ -55,7 +56,7 @@ test("pinned Core MCP client falls back from modern discovery and projects image
   });
   try {
     const tools = await client.tools();
-    expect(Object.keys(tools).sort()).toEqual(["execute", "provision", "terminate"]);
+    expect(Object.keys(tools).sort()).toEqual(["execute", "provision", "terminate", "viewer"]);
     expect(calls).toEqual([]);
     expect(methods).toContain("server/discover");
     expect(methods).toContain("initialize");

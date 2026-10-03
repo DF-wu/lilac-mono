@@ -88,6 +88,11 @@ export function createNativeRouter(
     return next();
   });
   return api.router({
+    computer: {
+      read: secured.computer.read.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.computer.read(context.principal, input, signal)),
+      ),
+    },
     references: {
       range: secured.references.range.handler(async ({ input, context }) =>
         nativeRpcValue(await services.references.range(context.principal, input)),

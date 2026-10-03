@@ -1,4 +1,8 @@
 :root {
+  --ui-computer-width: 480px;
+  --ui-computer-height: 340px;
+  --ui-computer-min-width: 320px;
+  --ui-computer-min-height: 220px;
   --ui-space-unit: 0.25rem;
   --ui-font-sans:
     ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;

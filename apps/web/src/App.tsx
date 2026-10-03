@@ -1,3 +1,4 @@
+import { NativeComputerViewer } from "./components/ComputerViewer";
 import { FloatingChatMenu } from "./components/FloatingChatMenu";
 import { useWorkspaceViewport } from "./use-workspace-viewport";
 import { Kbd } from "./components/ui/kbd";
@@ -1329,6 +1330,13 @@ function Workspace(props: AppProps) {
                   </Button>
                 </div>
               </Modal>
+              {selectedId && !selectedId.startsWith("draft:") ? (
+                <NativeComputerViewer
+                  key={selectedId}
+                  threadId={selectedId}
+                  enabled={active && !external && !reference && !!actionThread?.capabilities.edit}
+                />
+              ) : null}
             </main>
           </Tooltip.Provider>
         </NativeSubagentProvider>

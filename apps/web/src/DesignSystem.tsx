@@ -1,3 +1,5 @@
+import { ComputerViewer } from "./components/ComputerViewer";
+import computerDemoUrl from "./assets/computer-demo.html?url";
 import { AgentAvatar } from "./components/AgentAvatar";
 import { FloatingChatMenu } from "./components/FloatingChatMenu";
 import { useAppShortcuts, useThreadTargets } from "./shortcuts";
@@ -1570,6 +1572,27 @@ function Layout() {
     </Section>
   );
 }
+function ComputerDemo() {
+  const [open, setOpen] = useState(false);
+  return (
+    <Section id="computer" title="Computer viewer">
+      <Button onClick={() => setOpen((value) => !value)}>
+        {open ? "Close demo" : "Open demo"}
+      </Button>
+      {open ? (
+        <ComputerViewer
+          desktop={{
+            generation: "demo",
+            url: new URL(computerDemoUrl, location.origin).href,
+            password: "demo",
+            expiresAt: "2099-01-01T00:00:00Z",
+          }}
+        />
+      ) : null}
+    </Section>
+  );
+}
+
 export default function DesignSystem() {
   const returnThreadId = useLocation({ select: (location) => location.state.chatThreadId });
   const returnDraftId = useLocation({ select: (location) => location.state.draftThreadId });
@@ -1724,6 +1747,7 @@ export default function DesignSystem() {
                   </Specimen>
                 </div>
               </Section>
+              <ComputerDemo />
               <Controls />
               <Overlays />
               <Layout />

@@ -1,0 +1,7 @@
+.computer-viewer {
+  width: var(--ui-computer-width);
+  height: var(--ui-computer-height);
+  min-width: min(var(--ui-computer-min-width), calc(100vw - var(--ui-space-unit) * 4));
+  min-height: min(var(--ui-computer-min-height), calc(100dvh - var(--ui-space-unit) * 4));
+  resize: both;
+}

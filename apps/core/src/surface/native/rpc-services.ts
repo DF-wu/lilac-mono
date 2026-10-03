@@ -1,3 +1,4 @@
+import type { NativeComputer } from "./computer";
 import type { NativeReferences } from "./references";
 import { resolveLinkPreview } from "./link-preview";
 import type { NativeLiveFileService } from "./resources-live";
@@ -33,6 +34,7 @@ import type { NativeSearchStore } from "./store-search";
 import type { NativeSurfaceStore } from "./store-surface";
 
 export type NativeRpcServiceOptions = {
+  computer?: Pick<NativeComputer, "read">;
   references?: Pick<NativeReferences, "resolve" | "read" | "range">;
   files?: Pick<NativeLiveFileService, "resolve">;
   subagents?: Pick<NativeSubagents, "list" | "read">;
@@ -869,6 +871,10 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
           });
         });
       },
+    },
+    computer: {
+      read: (principal, input, signal) =>
+        options.computer?.read(principal.userId, input, signal) ?? Result.ok({ desktop: null }),
     },
     subagents: {
       list: (principal, input) =>

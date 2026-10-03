@@ -270,3 +270,25 @@ and the server SDK's legacy initialization fallback.
 - Multiple gateway replicas, several Lilac installations per gateway, and stronger tenant isolation.
 - Stronger viewer authentication and password rotation during a desktop's lifetime.
 - Mini Lilac integration, other operating systems, and additional execution languages.
+
+## Native web viewer
+
+Native web automatically shows a floating computer viewer for the selected thread when its desktop
+is ready. The user must have edit access to that thread. The viewer logs in automatically and starts
+in view-only mode. Take control forwards mouse and keyboard input; Stop controlling disables it.
+The agent continues running in both modes. Drag the header or use its arrow keys to move the panel,
+resize from its corner, and hide or reopen it with the Computer button. Reopening starts in view-only mode.
+
+Core discovers the gateway by its advertised `lilac-computer-use` server name, so its configured MCP
+server ID can vary. The native viewer polls the gateway's `viewer` tool without provisioning or
+refreshing desktop expiry. Termination or expiry removes the panel. Viewer passwords remain in memory
+and are sent to the runner frame through origin-checked messages, never URL parameters.
+
+The browser must be able to reach the configured viewer host and port. HTTPS native installations
+need HTTPS/WSS viewer access through the deployment's TLS proxy. The proxy must allow the native
+site to embed `/lilac-viewer.html` and forward `/websockify` upgrades.
+
+For an isolated real-desktop browser check, build with `bun run docker:build:computer-use`, then run
+`bun apps/core/tests/surface/native/computer-browser-fixture.ts` and `bun run dev:web`. Use the ordinary
+browser fixture login and the printed thread link with the Vite port. The fixture starts a dedicated
+desktop, uses the real native RPC and MCP registry, and removes its desktop on SIGINT/SIGTERM.

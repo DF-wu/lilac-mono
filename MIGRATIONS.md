@@ -1,5 +1,17 @@
 # MIGRATIONS.md
 
+## Native computer viewer
+
+Native RPC adds `computer.read`. Deploy Core and web together, and rebuild the optional computer-use
+gateway and runner images. The gateway adds a read-only `viewer` MCP tool; the runner serves
+`/lilac-viewer.html` using its bundled noVNC client. Existing desktops must be terminated and
+provisioned again to use the rebuilt runner. No stored-data or configuration migration is needed.
+
+Viewer credentials are fetched under the native thread edit permission, kept in memory, and sent to
+the viewer frame using origin-checked messages. They are not included in URLs or the conversation
+cache. Existing direct noVNC links and provisioning responses remain unchanged.
+
+
 ## Native web keybindings
 
 Keyboard shortcuts are stored only in the browser under `lilac-keybindings-v1`, scoped to the
