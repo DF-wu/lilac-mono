@@ -1203,12 +1203,7 @@ function Workspace(props: AppProps) {
                                 void selectedMetadata.refetch();
                                 void client.selectThread(selectedId);
                               }}
-                              loadingMessage={
-                                selectedMetadata.error?.message ??
-                                (!online && !thread
-                                  ? "This conversation is unavailable while offline."
-                                  : undefined)
-                              }
+                              loadError={selectedMetadata.error?.message}
                               header={
                                 thread ? (
                                   <header className="thread-header flex items-center gap-2 h-8 min-h-0 px-6 py-0.5 [&_h1]:truncate [&_.icon-button]:size-[var(--ui-control-compact)] max-workspace:gap-1 max-workspace:pl-15 group-[.sidebar-hidden]/workspace:pl-15 group-[.right-panel-hidden]/workspace:pr-[calc(var(--ui-space-unit)*5+var(--ui-control-compact))]">

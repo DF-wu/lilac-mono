@@ -40,6 +40,7 @@ import { pendingMessageParts } from "../pending-message";
 export type { PendingInput } from "../pending-input";
 import { Button } from "./ui/button";
 import { Composer } from "./Composer";
+import { ConversationStatus } from "./ConversationStatus";
 import { Timeline, ThinkingIndicator, useLatestReadableTurn } from "./Timeline";
 import { attempt, IconButton, Modal, VirtualList } from "./ui";
 import { toast } from "./ui/toast";
@@ -57,7 +58,7 @@ const emptyDraft: Draft = { text: "", skillIds: [], attachments: [] };
 export type ChatProps = Pick<ChatCommon, "catalog" | "onError"> & {
   threadId: string;
   thread?: NativeThread;
-  loadingMessage?: string;
+  loadError?: string;
   onRetryLoad: () => void;
   onLocalChange: (id: string, update: (thread: DraftThread) => DraftThread) => void;
   onLocalSubmit: (id: string, submission: ComposerSubmission) => void;
@@ -780,25 +781,13 @@ export function Chat(props: ChatProps) {
           </span>
         </div>
       );
-    if (props.loadingMessage)
-      return (
-        <div className="empty-chat" role="status">
-          <p>{props.loadingMessage}</p>
-          {!thread ? (
-            <Button variant="secondary" onClick={props.onRetryLoad}>
-              Retry
-            </Button>
-          ) : null}
-        </div>
-      );
+    const retry = thread ? undefined : props.onRetryLoad;
+    if (props.loadError)
+      return <ConversationStatus state="error" detail={props.loadError} onRetry={retry} />;
+    if (!online && !thread) return <ConversationStatus state="offline" onRetry={retry} />;
     if (historyLoaded) return undefined;
-    return (
-      <div className="empty-chat">
-        {online && !historyError
-          ? "Loading conversation…"
-          : "Conversation history is unavailable. Reconnect to load it."}
-      </div>
-    );
+    if (!online) return <ConversationStatus state="offline" />;
+    return <ConversationStatus state={historyError ? "error" : "loading"} />;
   }
   return (
     <MessageIdentityContext value={identities}>

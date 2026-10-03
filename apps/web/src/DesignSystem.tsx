@@ -18,6 +18,7 @@ import { ConversationBadge, ConversationIcon } from "./components/ConversationRe
 import lilacLogo from "./assets/logo.svg";
 import { LinkPreviewAnchor } from "./components/LinkWithFavicon";
 import { SidebarEmptyState } from "./components/SidebarEmptyState";
+import { ConversationStatus } from "./components/ConversationStatus";
 import { setThemeMode } from "./theme/theme";
 import { clerkAppearance } from "./theme/clerk";
 import { FileIcon } from "./components/FileIcon";
@@ -1305,6 +1306,17 @@ function Controls() {
           <div className="login-shell flex flex-col gap-6 py-12">
             <h1>Lilac</h1>
             <ConnectionLoading />
+          </div>
+        </Specimen>
+        <Specimen title="Conversation status">
+          <div className="grid gap-4 sm:grid-cols-3">
+            <ConversationStatus state="loading" />
+            <ConversationStatus state="offline" onRetry={() => toast.add({ title: "Retrying" })} />
+            <ConversationStatus
+              state="error"
+              detail="Conversation not found"
+              onRetry={() => toast.add({ title: "Retrying" })}
+            />
           </div>
         </Specimen>
         <Specimen title="Sign-in styles">
