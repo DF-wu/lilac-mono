@@ -26,6 +26,26 @@ function Provider({ publishableKey, children }: { publishableKey: string; childr
   );
 }
 
+function RegisterCredentials() {
+  const { getToken, isLoaded } = useAuth();
+  useEffect(() => {
+    if (!isLoaded) return;
+    return registerConnectionCredentials(({ fresh }) =>
+      getToken(fresh ? { skipCache: true } : undefined),
+    );
+  }, [getToken, isLoaded]);
+  return null;
+}
+
+// Mounted for every session state so a cached page's rejected cookie connection can retry with a token.
+export function ClerkCredentials({ publishableKey }: { publishableKey: string }) {
+  return (
+    <Provider publishableKey={publishableKey}>
+      <RegisterCredentials />
+    </Provider>
+  );
+}
+
 function SignInView({ onSignedIn }: { onSignedIn: () => Promise<void> }) {
   const { isLoaded, isSignedIn, getToken } = useAuth();
   const clerk = useClerk();
@@ -126,7 +146,6 @@ function SessionStatus({
       void endSession();
       return () => controller.abort();
     }
-    const stopCredentials = registerConnectionCredentials(() => getToken());
     const refresh = createClerkSessionRefresh({
       client,
       getToken: () => getToken({ skipCache: true }),
@@ -148,7 +167,6 @@ function SessionStatus({
     window.addEventListener("online", retry);
     return () => {
       controller.abort();
-      stopCredentials();
       clearInterval(timer);
       stop();
       window.removeEventListener("focus", retry);

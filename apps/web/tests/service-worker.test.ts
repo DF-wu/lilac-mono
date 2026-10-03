@@ -51,6 +51,9 @@ function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } 
   };
   let networkResponse: Response | undefined;
   let offline = false;
+  let stalled: PromiseWithResolvers<void> | undefined;
+  const timers: Array<() => void> = [];
+  let timerArmed = Promise.withResolvers<void>();
   runInNewContext(script, {
     self: {
       location: { origin: "https://lilac.test" },
@@ -71,10 +74,16 @@ function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } 
     Promise,
     Set,
     Map,
+    setTimeout: (callback: () => void) => {
+      timers.push(callback);
+      timerArmed.resolve();
+      return timers.length;
+    },
     fetch: async (request: Request) => {
       const pathname = new URL(request.url).pathname;
       requests.push(pathname);
       requestCacheModes.push(request.cache);
+      await stalled?.promise;
       if (offline) throw new TypeError("Failed to fetch");
       if (networkResponse) return cloneNetworkResponse(networkResponse);
       if (pathname === "/")
@@ -94,28 +103,41 @@ function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } 
     goOffline: () => {
       offline = true;
     },
+    stallNetwork: () => {
+      stalled = Promise.withResolvers<void>();
+      timerArmed = Promise.withResolvers<void>();
+      return { timerArmed: timerArmed.promise, release: () => stalled?.resolve() };
+    },
+    expireTimers: () => {
+      for (const callback of timers.splice(0)) callback();
+    },
     setNetworkResponse: (value: Response) => {
       networkResponse = value;
     },
     dispatch: async (name: string, fields: object = {}) => {
-      const pending: Promise<unknown>[] = [];
-      let reply: Promise<Response> | undefined;
-      handlers.get(name)!({
-        ...fields,
-        waitUntil: (work: Promise<unknown>) => pending.push(work),
-        respondWith: (work: Promise<Response>) => {
-          reply = work.then((response) => {
-            const copy = response.clone();
-            void response.text();
-            return copy;
-          });
-        },
-      });
-      const response = await reply;
-      await Promise.all(pending);
+      const event = start(name, fields);
+      const response = await event.reply;
+      await event.settled();
       return response;
     },
+    start,
   };
+  function start(name: string, fields: object = {}) {
+    const pending: Promise<unknown>[] = [];
+    let reply: Promise<Response> | undefined;
+    handlers.get(name)!({
+      ...fields,
+      waitUntil: (work: Promise<unknown>) => pending.push(work),
+      respondWith: (work: Promise<Response>) => {
+        reply = work.then((response) => {
+          const copy = response.clone();
+          void response.text();
+          return copy;
+        });
+      },
+    });
+    return { reply, settled: () => Promise.all(pending) };
+  }
 }
 function request(pathname: string, mode = "cors", method = "GET") {
   return { url: `https://lilac.test${pathname}`, mode, method };
@@ -177,6 +199,29 @@ describe("app shell service worker", () => {
     const denied = await f.dispatch("fetch", { request: request("/", "navigate") });
     expect(denied?.status).toBe(401);
     expect(await denied?.text()).toBe("Unauthorized");
+  });
+  test("a stalled network falls back to the cached shell and still refreshes it", async () => {
+    const f = fixture();
+    await f.dispatch("install");
+    const html = `<meta name="lilac-build" content="${buildId}" /><title>Late shell</title>`;
+    f.setNetworkResponse(response(html, "text/html"));
+    const network = f.stallNetwork();
+    const navigation = f.start("fetch", { request: request("/threads/thread-id", "navigate") });
+    await network.timerArmed;
+    f.expireTimers();
+    const served = await (await navigation.reply)?.text();
+    expect(served).toContain(buildId);
+    expect(served).not.toContain("Late shell");
+    network.release();
+    await navigation.settled();
+    expect(await f.stores.get(`lilac-shell-${buildId}`)?.get("/")?.text()).toContain("Late shell");
+  });
+  test("a slow network without a cached shell keeps waiting for the page", async () => {
+    const f = fixture({ storageUnavailable: true });
+    const network = f.stallNetwork();
+    const navigation = f.dispatch("fetch", { request: request("/", "navigate") });
+    network.release();
+    expect(await (await navigation)?.text()).toContain(buildId);
   });
   test("offline navigation without a cached shell returns a network error", async () => {
     const f = fixture();

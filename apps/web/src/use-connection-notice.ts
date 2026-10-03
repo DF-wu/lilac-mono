@@ -3,11 +3,16 @@ import { toast } from "./components/ui/toast";
 import { useEventCallback } from "./use-event-callback";
 
 // Registered at import so the resume time is recorded before the connection lifecycle's
-// visibility listener starts the reconnect that the notice then waits on.
-let resumedAt = -Infinity;
+// visibility listener starts the reconnect that the notice then waits on. Page load counts as a
+// resume because a cached page's first connection also waits for fresh credentials.
+let resumedAt = performance.now();
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") resumedAt = performance.now();
 });
+
+export function connectionNoticeDelay(now = performance.now()): number {
+  return Math.max(1_000, resumedAt + 3_000 - now);
+}
 
 export function useConnectionNotice(online: boolean, reconnect: () => void, id = "connection") {
   const retry = useEventCallback(reconnect);
@@ -23,7 +28,6 @@ export function useConnectionNotice(online: boolean, reconnect: () => void, id =
       clearTimeout(timer);
       toast.close(id);
       if (document.visibilityState !== "visible") return;
-      const delay = Math.max(1_000, resumedAt + 3_000 - performance.now());
       timer = setTimeout(() => {
         toast.add({
           id,
@@ -32,7 +36,7 @@ export function useConnectionNotice(online: boolean, reconnect: () => void, id =
           timeout: 0,
           actionProps: { children: "Retry", onClick: retry },
         });
-      }, delay);
+      }, connectionNoticeDelay());
     };
     arm();
     document.addEventListener("visibilitychange", arm);

@@ -54,7 +54,9 @@ afterEach(async () => {
 function harness(
   options: {
     delayedSubmit?: Promise<void>;
-    prepareConnection?: () => Promise<void>;
+    prepareConnection?: (request: { fresh: boolean }) => Promise<void>;
+    getCatalog?: (signal?: AbortSignal) => Promise<void>;
+    unresponsiveClose?: boolean;
     reauthenticate?: (signal?: AbortSignal) => Promise<BootstrapReply["viewer"]>;
     beforeOpen?: () => void;
     delayedCatalog?: Promise<void>;
@@ -93,8 +95,9 @@ function harness(
     await options.delayedSubmit;
     return { inputId: "input", messageId: "message", state: "admitted" as const, turnId: "turn" };
   });
-  const getCatalog = implement(nativeContract.catalogs.get).handler(async () => {
+  const getCatalog = implement(nativeContract.catalogs.get).handler(async ({ signal }) => {
     fetchingCatalog.resolve();
+    await options.getCatalog?.(signal);
     await options.delayedCatalog;
     return {
       kind: "catalog" as const,
@@ -136,6 +139,8 @@ function harness(
       options.beforeOpen?.();
       const socket = new WebSocket(`ws://127.0.0.1:${server.port}`);
       socket.addEventListener("open", () => opened.resolve());
+      // A dead network path never completes the close handshake, so no close event arrives.
+      if (options.unresponsiveClose) socket.close = () => {};
       return socket;
     },
     bootstrap: async () => {
@@ -673,4 +678,95 @@ test("reauthentication timeout replaces an unresponsive socket even when HTTP re
   expect(state.socketCount()).toBe(2);
   expect(state.client.connectionState).toBe("online");
   expect(state.client.thread("thread").get("slot")).toBeDefined();
+});
+
+test("an expired cached credential retries with a fresh one instead of logging out", async () => {
+  const requests: boolean[] = [];
+  let bootstraps = 0;
+  const state = harness({
+    prepareConnection: async ({ fresh }) => {
+      requests.push(fresh);
+    },
+    bootstrap: async () => {
+      if (bootstraps++ === 0) throw new ORPCError("UNAUTHENTICATED");
+      return bootstrap;
+    },
+  });
+  const recovered = Promise.withResolvers<void>();
+  state.client.subscribe((event) => {
+    if (event.kind === "connection" && event.state === "online") recovered.resolve();
+  });
+  await state.client.start("thread");
+  await recovered.promise;
+  expect(requests).toEqual([false, true]);
+  expect(
+    state.events.some((event) => event.kind === "connection" && event.state === "logged-out"),
+  ).toBe(false);
+  expect(state.client.thread("thread").get("slot")).toBeDefined();
+});
+
+test("a rejected fresh credential still ends the session", async () => {
+  const requests: boolean[] = [];
+  const state = harness({
+    prepareConnection: async ({ fresh }) => {
+      requests.push(fresh);
+    },
+    bootstrap: async () => {
+      throw new ORPCError("UNAUTHENTICATED");
+    },
+  });
+  const loggedOut = Promise.withResolvers<void>();
+  state.client.subscribe((event) => {
+    if (event.kind === "connection" && event.state === "logged-out") loggedOut.resolve();
+  });
+  await state.client.start("thread");
+  await loggedOut.promise;
+  expect(requests).toEqual([false, true]);
+});
+
+test("a connection check replaces a socket that stopped replying", async () => {
+  const deadline = new AbortController();
+  const timer = spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+  disposers.push(() => timer.mockRestore());
+  const probing = Promise.withResolvers<void>();
+  const state = harness({
+    getCatalog: (signal) =>
+      new Promise((resolve) => {
+        probing.resolve();
+        if (signal?.aborted) return resolve();
+        signal?.addEventListener("abort", () => resolve(), { once: true });
+      }),
+  });
+  await state.client.start("thread");
+  await state.watching;
+  const recovered = Promise.withResolvers<void>();
+  state.client.subscribe((event) => {
+    if (event.kind === "connection" && event.state === "online") recovered.resolve();
+  });
+  const checking = state.client.checkConnection();
+  await probing.promise;
+  deadline.abort(new DOMException("Timed out", "TimeoutError"));
+  await checking;
+  await recovered.promise;
+  expect(state.socketCount()).toBe(2);
+  expect(state.client.thread("thread").get("slot")).toBeDefined();
+});
+
+test("a responsive connection check keeps the socket", async () => {
+  const state = harness();
+  await state.client.start("thread");
+  await state.watching;
+  await state.client.checkConnection();
+  expect(state.socketCount()).toBe(1);
+  expect(state.client.connectionState).toBe("online");
+});
+
+test("a send waiting on a replaced socket settles as uncertain", async () => {
+  const state = harness({ delayedSubmit: new Promise(() => {}), unresponsiveClose: true });
+  await state.client.start("thread");
+  await state.watching;
+  const sending = state.client.submit(input);
+  await state.submitting;
+  state.client.reconnect();
+  expect(await sending).toEqual({ kind: "uncertain", commandId: input.commandId });
 });
