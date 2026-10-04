@@ -2129,7 +2129,7 @@ export class ConversationThreadService {
     text: string;
     limit: number;
     semanticFallback: boolean;
-    participantSurface?: "discord" | "native";
+    participantSurface?: ConversationSurface;
     participantIdsAny?: readonly string[];
     excludeThreadIds?: readonly string[];
     autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
