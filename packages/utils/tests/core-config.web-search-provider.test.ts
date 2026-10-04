@@ -226,7 +226,10 @@ describe("core config tools.web openai search provider", () => {
     });
 
     expect(parsed.tools.web.extract.providers).toEqual(["openai", "tavily"]);
-    expect(parsed.tools.web.openai).toEqual({ model: "gpt-5-mini", searchContextSize: "medium" });
+    expect(parsed.tools.web.openai).toEqual({
+      model: "openai/gpt-5-mini",
+      searchContextSize: "medium",
+    });
   });
 
   it("parses explicit openai tuning and leaves the block absent when omitted", () => {

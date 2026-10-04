@@ -856,8 +856,7 @@ describe("web search and permits", () => {
         extractProviders: ["openai"],
         fetchMode: "auto",
         firecrawlPolicy: undefined,
-        openaiPolicy: { model: "terra", searchContextSize: "high" },
-        modelAliases: { terra: { model: "openai-compatible/gpt-5.6-terra" } },
+        openaiPolicy: { model: "openai-compatible/gpt-5.6-terra", searchContextSize: "high" },
       }),
       getProviderEnvironment: () => ({
         ...emptyEnvironment,
@@ -870,7 +869,7 @@ describe("web search and permits", () => {
       },
     });
 
-    await tool.call("search", { query: "terra" });
+    await tool.call("search", { query: "compatible" });
 
     expect(seen).toHaveLength(1);
     expect(seen[0]?.openai).toEqual({
@@ -889,8 +888,7 @@ describe("web search and permits", () => {
         extractProviders: ["openai"],
         fetchMode: "auto",
         firecrawlPolicy: undefined,
-        openaiPolicy: { model: "sonnet", searchContextSize: "medium" },
-        modelAliases: { sonnet: { model: "anthropic/claude-sonnet-5" } },
+        openaiPolicy: { model: "anthropic/claude-sonnet-5", searchContextSize: "medium" },
       }),
       getProviderEnvironment: () => ({
         ...emptyEnvironment,

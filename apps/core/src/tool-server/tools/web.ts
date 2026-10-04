@@ -26,7 +26,6 @@ import {
 } from "./web-search";
 import {
   resolveOpenAIWebSearchModel,
-  type OpenAIWebSearchModelAliases,
   type OpenAIWebSearchModelInvalid,
 } from "./web-search/openai-web-search-model";
 import {
@@ -116,8 +115,6 @@ type WebToolConfig = {
   fetchMode: GetPageMode;
   firecrawlPolicy: FirecrawlPermitPolicy | undefined;
   openaiPolicy: OpenAIWebSearchPolicy | undefined;
-  /** `models.def` presets, so `tools.web.openai.model` may name an alias. */
-  modelAliases?: OpenAIWebSearchModelAliases;
 };
 
 type OpenAIWebSearchPolicy = {
@@ -154,7 +151,6 @@ async function loadDefaultWebToolConfig(): Promise<WebToolConfig> {
     fetchMode: config.tools.web.fetch.mode,
     firecrawlPolicy: config.tools.web.firecrawl,
     openaiPolicy: config.tools.web.openai,
-    modelAliases: config.models.def,
   };
 }
 
@@ -466,7 +462,6 @@ export class Web implements ServerTool {
     const environment = this.dependencies.getProviderEnvironment();
     const searchModel = resolveOpenAIWebSearchModel({
       model: config.openaiPolicy?.model,
-      aliases: config.modelAliases,
       environment: {
         openai: environment.openai,
         ...(environment.openaiCompatible ? { openaiCompatible: environment.openaiCompatible } : {}),
@@ -493,10 +488,6 @@ export class Web implements ServerTool {
       ok: () => null,
       err: (error) => error,
     });
-    const openaiModelAliasTarget =
-      config.openaiPolicy?.model === undefined
-        ? null
-        : (config.modelAliases?.[config.openaiPolicy.model]?.model ?? null);
     const nextKey = JSON.stringify({
       requested: normalizedRequested,
       fetchMode: config.fetchMode,
@@ -512,7 +503,6 @@ export class Web implements ServerTool {
       hasOpenAICompatibleApiKey: Boolean(environment.openaiCompatible?.apiKey),
       openaiCompatibleBaseUrl: environment.openaiCompatible?.baseUrl ?? null,
       openaiPolicy: config.openaiPolicy ?? null,
-      openaiModelAliasTarget,
     });
     if (nextKey === this.webSearchProviderKey) return;
     this.webSearchProviderKey = nextKey;

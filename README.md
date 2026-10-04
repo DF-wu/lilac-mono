@@ -262,11 +262,11 @@ tools:
     extract:
       providers: [tavily, openai]
     openai:
-      model: terra          # a models.def alias, provider/model, or a bare OpenAI model id
+      model: openai-compatible/gpt-5.6-terra
       searchContextSize: medium
 ```
 
-The provider list is the ordered fallback chain for `web.search`, so `openai` only runs when it is listed. `model` names the model that runs the hosted search and may be a `models.def` alias, a `provider/model` spec, or a bare OpenAI model id (default `gpt-5-mini`). An `openai/...` model uses `OPENAI_API_KEY` and `OPENAI_BASE_URL`; an `openai-compatible/...` model uses `OPENAI_COMPATIBLE_API_KEY` and `OPENAI_COMPATIBLE_BASE_URL`. Any gateway it points at must relay the Responses API `web_search` tool. Results carry the model's URL citations, each labeled as an OpenAI-generated summary, followed by retrieved sources that were not cited. `web.extract` skips this provider, so keep `tavily`, `exa`, or `firecrawl` in the list when you need page extraction.
+The provider list is the ordered fallback chain for `web.search`, so `openai` only runs when it is listed. `model` is the `provider/model` that runs the hosted search (default `openai/gpt-5-mini`; a bare model id means `openai/<id>`). An `openai/...` model uses `OPENAI_API_KEY` and `OPENAI_BASE_URL`; an `openai-compatible/...` model uses `OPENAI_COMPATIBLE_API_KEY` and `OPENAI_COMPATIBLE_BASE_URL`. Any gateway it points at must relay the Responses API `web_search` tool. Results carry the model's URL citations, each labeled as an OpenAI-generated summary, followed by retrieved sources that were not cited. `web.extract` skips this provider, so keep `tavily`, `exa`, or `firecrawl` in the list when you need page extraction.
 
 See [`docs/core-config-migrations.md`](./docs/core-config-migrations.md) for the `tools.web.openai` fields and [`docs/fork-differences.md`](./docs/fork-differences.md) for the limitations.
 

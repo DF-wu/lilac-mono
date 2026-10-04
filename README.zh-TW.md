@@ -246,11 +246,11 @@ tools:
     extract:
       providers: [tavily, openai]
     openai:
-      model: terra          # models.def alias、provider/model，或裸的 OpenAI model id
+      model: openai-compatible/gpt-5.6-terra
       searchContextSize: medium
 ```
 
-provider 清單就是 `web.search` 的依序 fallback 鏈，`openai` 只有列在裡面才會被使用。`model` 指定實際執行 hosted search 的模型，可填 `models.def` alias、`provider/model`，或裸的 OpenAI model id（預設 `gpt-5-mini`）。`openai/...` 模型使用 `OPENAI_API_KEY` 與 `OPENAI_BASE_URL`；`openai-compatible/...` 模型使用 `OPENAI_COMPATIBLE_API_KEY` 與 `OPENAI_COMPATIBLE_BASE_URL`。所指向的 gateway 必須能轉送 Responses API 的 `web_search` 工具。結果會先列模型引用的 URL（每筆都標示為 OpenAI 產生的摘要），再附上未被引用的檢索來源。`web.extract` 會略過這個 provider，需要抓取頁面時請保留 `tavily`、`exa` 或 `firecrawl`。
+provider 清單就是 `web.search` 的依序 fallback 鏈，`openai` 只有列在裡面才會被使用。`model` 以 `provider/model` 指定實際執行 hosted search 的模型（預設 `openai/gpt-5-mini`；裸的 model id 視同 `openai/<id>`）。`openai/...` 模型使用 `OPENAI_API_KEY` 與 `OPENAI_BASE_URL`；`openai-compatible/...` 模型使用 `OPENAI_COMPATIBLE_API_KEY` 與 `OPENAI_COMPATIBLE_BASE_URL`。所指向的 gateway 必須能轉送 Responses API 的 `web_search` 工具。結果會先列模型引用的 URL（每筆都標示為 OpenAI 產生的摘要），再附上未被引用的檢索來源。`web.extract` 會略過這個 provider，需要抓取頁面時請保留 `tavily`、`exa` 或 `firecrawl`。
 
 `tools.web.openai` 欄位見 [`docs/core-config-migrations.md`](./docs/core-config-migrations.md)，限制見 [`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md)。
 

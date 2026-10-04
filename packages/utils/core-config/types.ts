@@ -193,9 +193,9 @@ export type UniversalCoreConfig = {
       /** Only meaningful when `extract.providers` includes `openai` (web.search only). */
       openai?: {
         /**
-         * Model that runs the hosted `web_search` call: a `models.def` alias, a
-         * `provider/model` spec, or a bare OpenAI model id. Only `openai` and
-         * `openai-compatible` providers are accepted.
+         * `provider/model` that runs the hosted `web_search` call. Only `openai`
+         * and `openai-compatible` providers are accepted; a bare model id means
+         * `openai/<id>`.
          */
         model: string;
         searchContextSize: "low" | "medium" | "high";

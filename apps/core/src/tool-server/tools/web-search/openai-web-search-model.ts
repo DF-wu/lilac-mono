@@ -4,19 +4,17 @@ import { DEFAULT_OPENAI_WEB_SEARCH_MODEL } from "./openai-web-search-provider";
 
 /**
  * Resolves `tools.web.openai.model` to the endpoint that runs the hosted
- * `web_search` call. The value may be a `models.def` alias, a
- * `provider/model` spec, or a bare OpenAI model id (the original form, kept
- * for existing configs). Only `openai` and `openai-compatible` models can
- * drive the OpenAI Responses `web_search` tool, so the resolved provider
- * selects between the `OPENAI_*` and `OPENAI_COMPATIBLE_*` credentials.
+ * `web_search` call. The value is a `provider/model` spec; a bare model id
+ * (the original form, kept for existing configs) means `openai/<id>`. Only
+ * `openai` and `openai-compatible` models can drive the OpenAI Responses
+ * `web_search` tool, so the provider selects between the `OPENAI_*` and
+ * `OPENAI_COMPATIBLE_*` credentials.
  */
 
 export type OpenAIWebSearchEndpoint = {
   readonly apiKey?: string;
   readonly baseUrl?: string;
 };
-
-export type OpenAIWebSearchModelAliases = Readonly<Record<string, { readonly model: string }>>;
 
 export type OpenAIWebSearchModelEnvironment = {
   readonly openai: OpenAIWebSearchEndpoint;
@@ -28,8 +26,6 @@ export type ResolvedOpenAIWebSearchModel = {
   readonly modelId: string;
   /** Canonical `provider/model` spec. */
   readonly spec: string;
-  /** Set when the configured value was a `models.def` alias. */
-  readonly alias?: string;
   readonly apiKey?: string;
   readonly baseUrl?: string;
 };
@@ -56,28 +52,21 @@ function invalid(model: string, message: string): ResultType<never, OpenAIWebSea
   );
 }
 
-function resolveSpec(
-  raw: string,
-  aliases: OpenAIWebSearchModelAliases | undefined,
-): { spec: string; alias?: string } {
-  const preset = aliases?.[raw];
-  if (preset) return { spec: preset.model.trim(), alias: raw };
-  if (raw.includes("/")) return { spec: raw };
-  return { spec: `openai/${raw}` };
+function resolveSpec(raw: string): string {
+  return raw.includes("/") ? raw : `openai/${raw}`;
 }
 
 export function resolveOpenAIWebSearchModel(input: {
   readonly model: string | undefined;
-  readonly aliases: OpenAIWebSearchModelAliases | undefined;
   readonly environment: OpenAIWebSearchModelEnvironment;
 }): ResultType<ResolvedOpenAIWebSearchModel, OpenAIWebSearchModelInvalid> {
-  const raw = input.model?.trim() || DEFAULT_OPENAI_WEB_SEARCH_MODEL;
-  const { spec, alias } = resolveSpec(raw, input.aliases);
+  const raw = input.model?.trim() || `openai/${DEFAULT_OPENAI_WEB_SEARCH_MODEL}`;
+  const spec = resolveSpec(raw);
   const separator = spec.indexOf("/");
   const provider = separator === -1 ? "" : spec.slice(0, separator);
   const modelId = separator === -1 ? "" : spec.slice(separator + 1).trim();
   if (!provider || !modelId) {
-    return invalid(raw, `resolves to '${spec}', which is not in provider/model format.`);
+    return invalid(raw, "is not in provider/model format.");
   }
   if (!isSupportedProvider(provider)) {
     return invalid(
@@ -90,7 +79,6 @@ export function resolveOpenAIWebSearchModel(input: {
       provider,
       modelId,
       spec,
-      ...(alias === undefined ? {} : { alias }),
       apiKey: input.environment.openai.apiKey,
       baseUrl: input.environment.openai.baseUrl,
     });
@@ -112,7 +100,6 @@ export function resolveOpenAIWebSearchModel(input: {
     provider,
     modelId,
     spec,
-    ...(alias === undefined ? {} : { alias }),
     apiKey: compatible.apiKey,
     baseUrl: compatible.baseUrl,
   });
