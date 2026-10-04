@@ -28,8 +28,9 @@ Call the tool with a prompt and optional structured fields:
 ```
 
 Use `inputImages` for edits or variations and `maskImage` for inpainting. `maskImage` requires at least
-one input image. Use only one of `size` or `aspectRatio`. The tool chooses a fresh output filename and
-returns its path, MIME type, model, warnings, and provider metadata.
+one input image. Use only one of `size` or `aspectRatio`. `tools --help generate.image` lists the
+accepted ratios and size rules per alias. The tool chooses a fresh output filename and returns its path,
+byte count, MIME type, model alias, and provider warnings.
 
 With `tools.generate.image.provider: openai-compatible`, every enabled alias routes only through the
 configured compatible endpoint. There is no official-provider fallback or automatic retry. Inspect the

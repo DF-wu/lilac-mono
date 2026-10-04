@@ -1,9 +1,83 @@
-# OpenAI-Compatible Image Generation
+# Structured `generate.image` And OpenAI-Compatible Routing
 
-Lilac can route the existing `generate.image` model aliases through one
-OpenAI-compatible provider. This changes the request destination only. Existing
-aliases, input validation, image editing behavior, and output handling remain
-unchanged.
+`generate.image` is the fork's structured image tool: a prompt, a Lilac model
+alias, optional dimensions, optional input images and a mask, and an output
+directory. Upstream replaced it with a script runner; the fork keeps the
+structured contract (see [`fork-differences.md`](./fork-differences.md)) and
+adds a routing switch that sends every alias to one OpenAI-compatible endpoint.
+
+This document covers how the tool is put together, how requests flow in both
+routing modes, and how to configure and troubleshoot the OpenAI-compatible
+route. Switching the route changes the request destination only: aliases,
+input validation, image editing, and output handling stay the same.
+
+## How it works
+
+Everything specific to the tool lives in fork-owned modules so upstream merges
+stay mechanical:
+
+| Module | Owns |
+| --- | --- |
+| `apps/core/src/tool-server/tools/generate-image/catalog.ts` | One capability entry per alias: upstream model ID per provider, accepted aspect ratios, the size rule, mask support, and input-image limits; the fallback order; ratio-to-size mapping |
+| `.../generate-image/validation.ts` | Checks a request against the alias's catalog entry before any HTTP request |
+| `.../generate-image/input.ts` | The zod input schema; the `size` and `aspectRatio` help text is generated from the catalog |
+| `.../generate-image/routing.ts` | Resolves the default route or the OpenAI-compatible route from the live config and environment |
+| `.../generate-image/prompt.ts` | Reads input images and the mask into the AI SDK prompt shape |
+| `.../generate-image/callable.ts` | The Level 2 callable: route, pick, validate, generate, write the file |
+| `packages/utils/openai-compatible-image-provider.ts` | The image client for the OpenAI-compatible endpoint |
+| `packages/utils/core-config/generate-image.ts` | The alias list (the config contract) and the `tools.generate` schema |
+
+The catalog is the single source of truth. Adding an alias means adding it to
+`IMAGE_GENERATION_MODEL_ALIASES` in `packages/utils/core-config/generate-image.ts`
+(so `openaiCompatible.models` and `modelIds` accept it) and adding one catalog
+entry; TypeScript rejects a catalog that misses an alias, and a drift test pins
+the fallback order to the alias list. `tools/generate.ts` upstream-side only
+registers the callable and exports a few shared helpers.
+
+### Request flow
+
+```mermaid
+flowchart TD
+    Call["generate.image call"] --> Route["routing.ts: read tools.generate.image"]
+    Route -->|provider: default| Default["Per alias, first configured provider in openai, openrouter, xai"]
+    Route -->|provider: openai-compatible| Compat["Fork-owned client for OPENAI_COMPATIBLE_BASE_URL"]
+    Default --> Pick["pick alias: requested, else fallback order"]
+    Compat --> Pick
+    Pick --> Validate["validation.ts: ratios, size rule, mask, input count"]
+    Validate --> Prompt["prompt.ts: read inputImages and maskImage"]
+    Prompt --> Dims["catalog: aspectRatio to size for gpt aliases"]
+    Dims --> Send["AI SDK generateImage"]
+    Send -->|no input images| Gen["POST /images/generations (JSON)"]
+    Send -->|input images| Edit["POST /images/edits (multipart)"]
+    Gen --> Write["write generated-image.ext in outputDir"]
+    Edit --> Write
+```
+
+Both routes share every step except the model construction and the request
+options. A validation failure is a `usage` error naming the alias and is
+returned before any HTTP request; a missing compatible base URL is also a
+`usage` error, returned before model selection.
+
+### Default route
+
+With `provider: default` (or no `tools.generate.image` at all), each alias is
+served by the first provider in the order `openai`, `openrouter`, `xai` that
+both has credentials in the environment and has a model ID for that alias in
+the catalog. An alias with no serviceable provider is not advertised. The tool
+catalog lists the serviceable aliases in fallback order.
+
+### OpenAI-compatible route
+
+With `provider: openai-compatible`, every advertised alias is served by one
+client built for `OPENAI_COMPATIBLE_BASE_URL` and `OPENAI_COMPATIBLE_API_KEY`.
+The client is built by the fork for image traffic and differs from the shared
+chat provider in one way: multipart uploads to `/images/edits` carry filenames
+(`image.png`, `mask.png`, ...). Bun serializes unnamed blobs with `filename=""`,
+which OpenAI-style endpoints reject, and the AI SDK's compatible provider does
+not name them. The official OpenAI provider receives the same fix from upstream.
+
+The route sends exactly one attempt per call and never falls back to the
+official providers.
 
 ## Requirements
 
@@ -17,8 +91,8 @@ The configured base URL is prepended to those paths. For example, a base URL of
 `https://provider.example.com/v1/images/generations`.
 
 The provider must accept the model IDs Lilac sends. By default these are the
-canonical model IDs listed in [Model aliases](#model-aliases); use
-`openaiCompatible.modelIds` to override the ID sent for individual aliases.
+IDs listed in [Model aliases](#model-aliases); use `openaiCompatible.modelIds`
+to override the ID sent for individual aliases.
 
 ## Configuration
 
@@ -67,24 +141,26 @@ The API key is sent as an `Authorization: Bearer` header. The endpoint is an
 operator-controlled trust boundary: image prompts, source images, and masks are
 sent to it when `generate.image` is called.
 
-Restart the runtime or standalone tool bridge after changing environment
-variables.
+The config is read on every call, so a `core-config.yaml` change applies
+without a restart. Restart the runtime or standalone tool bridge after changing
+environment variables.
 
 ## Model aliases
 
 Callers continue to use Lilac's existing aliases. In OpenAI-compatible mode,
-Lilac sends the corresponding canonical model ID to the provider by default.
+Lilac sends the alias's first upstream model ID from the catalog, in the
+provider order `openai`, `openrouter`, `xai`:
 
-| Lilac alias | Default model ID sent upstream |
-| --- | --- |
-| `gpt-image-2` | `gpt-image-2` |
-| `gpt-5-image` | `gpt-image-1.5` |
-| `nanobanana` | `google/gemini-2.5-flash-image` |
-| `nanobanana-2` | `google/gemini-3.1-flash-image-preview` |
-| `nanobanana-2-lite` | `google/gemini-3.1-flash-lite-image` |
-| `nanobanana-pro` | `google/gemini-3-pro-image-preview` |
-| `grok-imagine-image` | `grok-imagine-image` |
-| `grok-imagine-image-pro` | `grok-imagine-image-pro` |
+| Lilac alias | Default model ID sent upstream | Taken from |
+| --- | --- | --- |
+| `gpt-image-2` | `gpt-image-2` | openai |
+| `gpt-5-image` | `gpt-image-1.5` | openai |
+| `nanobanana` | `google/gemini-2.5-flash-image` | openrouter |
+| `nanobanana-2` | `google/gemini-3.1-flash-image-preview` | openrouter |
+| `nanobanana-2-lite` | `google/gemini-3.1-flash-lite-image` | openrouter |
+| `nanobanana-pro` | `google/gemini-3-pro-image-preview` | openrouter |
+| `grok-imagine-image` | `grok-imagine-image` | xai |
+| `grok-imagine-image-pro` | `grok-imagine-image-pro` | xai |
 
 `openaiCompatible.modelIds` overrides the upstream model ID per alias. For
 example, `modelIds: { nanobanana-2: gemini-3.1-flash-image-preview }` sends
@@ -139,7 +215,8 @@ path, byte count, MIME type, requested Lilac alias, and provider warnings.
 
 Alias-specific validation still applies. For example, unsupported GPT image
 sizes and unsupported Grok mask combinations are rejected before an HTTP
-request is sent.
+request is sent. `tools --help generate.image` prints the accepted ratios and
+size rules per alias; that text is generated from the catalog.
 
 ## Edit an image
 
@@ -161,8 +238,9 @@ Run it with:
 ./apps/tool-bridge/dist/index.js generate.image --input=@edit-image.json --output=json
 ```
 
-Lilac sends edits as multipart requests to `/images/edits`. The provider must
-support the selected model and edit operation.
+Lilac sends edits as multipart requests to `/images/edits` with named parts
+(`image`, `mask`). The provider must support the selected model and edit
+operation.
 
 ## Default routing
 
@@ -176,7 +254,8 @@ tools:
 ```
 
 Omitting the field also defaults to `default`. In that mode, Lilac uses its
-existing OpenAI, OpenRouter, and xAI provider selection behavior.
+existing OpenAI, OpenRouter, and xAI provider selection behavior described in
+[Default route](#default-route).
 
 ## Errors and fallback behavior
 
@@ -215,7 +294,7 @@ those aliases never send a colon-form `size`.
 
 ### The provider returns model-not-found
 
-Confirm that the provider recognizes the model ID Lilac sends: the canonical
+Confirm that the provider recognizes the model ID Lilac sends: the default
 ID from the alias table, or the `openaiCompatible.modelIds` override when one
 is configured. If the provider expects a different ID for an alias (for
 example `gemini-3.1-flash-image-preview` without the `google/` prefix), map it
