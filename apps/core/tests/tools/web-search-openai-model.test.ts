@@ -109,6 +109,18 @@ describe("resolveOpenAIWebSearchModel", () => {
     expect(result.isErr() && result.error.message).toMatch(/OPENAI_COMPATIBLE_BASE_URL/u);
   });
 
+  it("rejects an openai-compatible model when the compatible API key is missing", () => {
+    const result = resolveOpenAIWebSearchModel({
+      model: "openai-compatible/kimi-k3",
+      aliases: undefined,
+      environment: {
+        openai: environment.openai,
+        openaiCompatible: { baseUrl: "http://gateway.internal/v1" },
+      },
+    });
+    expect(result.isErr() && result.error.message).toMatch(/OPENAI_COMPATIBLE_API_KEY/u);
+  });
+
   it("rejects an alias whose target is not provider/model", () => {
     const result = resolveOpenAIWebSearchModel({
       model: "broken",

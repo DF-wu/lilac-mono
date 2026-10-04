@@ -102,6 +102,12 @@ export function resolveOpenAIWebSearchModel(input: {
       "resolves to an openai-compatible model, but OPENAI_COMPATIBLE_BASE_URL is not configured.",
     );
   }
+  if (!compatible.apiKey) {
+    return invalid(
+      raw,
+      "resolves to an openai-compatible model, but OPENAI_COMPATIBLE_API_KEY is not configured.",
+    );
+  }
   return Result.ok({
     provider,
     modelId,
