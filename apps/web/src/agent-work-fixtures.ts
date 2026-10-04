@@ -31,8 +31,9 @@ function activity(
   state: Activity["data"]["state"],
   detail: string,
   durationMs?: number,
+  result: Pick<Activity["data"], "output" | "exitCode" | "file"> = {},
 ): Activity {
-  return { type: "data-activity", id, data: { kind, label, state, detail, durationMs } };
+  return { type: "data-activity", id, data: { kind, label, state, detail, durationMs, ...result } };
 }
 function message(
   id: string,
@@ -65,28 +66,60 @@ function turn(
 const thought = activity(
   "demo_think",
   "thinking",
-  "Compared the two plans",
+  "Thinking",
   "complete",
-  "Sample reasoning summary: compare weather, travel time, opening hours, and indoor alternatives.",
+  "**Comparing both plans**\n\nThe forecast decides between them. A dry morning favors the riverside walk; rain points to the museum, so I need its Saturday hours as a fallback.",
   2100,
+);
+const forecast = activity(
+  "demo_forecast",
+  "tool",
+  "bash curl -s https://weather.example/kyoto/saturday | jq '.summary'",
+  "complete",
+  "bash curl -s https://weather.example/kyoto/saturday | jq '.summary'",
+  640,
+  { output: '"18°C, light cloud, 10% chance of rain"', exitCode: 0 },
+);
+const notes = activity(
+  "demo_notes",
+  "tool",
+  "read ~/notes/kyoto-weekend.md",
+  "complete",
+  "read ~/notes/kyoto-weekend.md",
+  90,
+  {
+    output:
+      "# Kyoto weekend\n\n- Prefer walking routes under two hours\n- Museum pass expires in October",
+  },
+);
+const routeMap = activity(
+  "demo_route_map",
+  "tool",
+  "read ~/Pictures/riverside-route.svg",
+  "complete",
+  "read ~/Pictures/riverside-route.svg",
+  120,
+  { file: { path: "~/Pictures/riverside-route.svg", mediaType: "image/svg+xml" } },
 );
 const weather = activity(
   "demo_weather",
   "tool",
   'weather.lookup {"city":"Kyoto","day":"Saturday"}',
   "complete",
-  'weather.lookup({ city: "Kyoto", day: "Saturday" })\n\n18°C, light cloud, 10% chance of rain.',
+  'weather.lookup {"city":"Kyoto","day":"Saturday"}',
   850,
+  { output: '{"tempC":18,"sky":"light cloud","rainChance":0.1}' },
 );
 const hours = activity(
   "demo_hours",
   "tool",
   'web.search {"query":"Kyoto museum Saturday hours"}',
   "complete",
-  'web.search({ query: "Kyoto museum Saturday hours" })\n\nOpen 10:00–18:00. Last admission 17:30.',
+  'web.search {"query":"Kyoto museum Saturday hours"}',
   1200,
+  { output: "Open 10:00–18:00. Last admission 17:30." },
 );
-const work = message("demo_work", [thought, weather, hours]);
+const work = message("demo_work", [thought, notes, routeMap, forecast, weather, hours]);
 const commentary = message("demo_commentary", [
   {
     type: "text",
@@ -96,7 +129,7 @@ const commentary = message("demo_commentary", [
 const multiple = [
   message("demo_reasoning", [thought]),
   commentary,
-  message("demo_tools", [weather, hours]),
+  message("demo_tools", [forecast, hours]),
   message("demo_comparison", [
     {
       type: "text",
@@ -107,9 +140,9 @@ const multiple = [
     activity(
       "demo_route",
       "tool",
-      "Checking the walking route…",
+      "bash ./scripts/route.sh --from 'Sanjo Station' --to 'Riverside café' --mode walk",
       "running",
-      'maps.route({ from: "Sanjo Station", to: "Riverside café", mode: "walk" })',
+      "bash ./scripts/route.sh --from 'Sanjo Station' --to 'Riverside café' --mode walk",
     ),
   ]),
 ];
@@ -303,7 +336,13 @@ const foldedActivityMessages = [
     { type: "text", text: "The agent is checking opening hours while I finish the plan." },
   ]),
   message("demo_latest_thought", [
-    activity("thinking", "thinking", "Thinking", "running", "Finishing the recommendation."),
+    activity(
+      "demo_latest_think",
+      "thinking",
+      "Thinking",
+      "running",
+      "Finishing the recommendation.",
+    ),
   ]),
 ];
 
@@ -611,10 +650,11 @@ export const agentWorkStages: AgentWorkStage[] = [
           activity(
             "demo_weather",
             "tool",
-            "Weather lookup",
+            "bash curl -sf https://weather.example/kyoto/saturday",
             "failed",
-            "Request timed out. The forecast service did not respond.",
+            "bash curl -sf https://weather.example/kyoto/saturday",
             5000,
+            { output: "curl: (28) Operation timed out after 5000 milliseconds", exitCode: 28 },
           ),
         ]),
         message("demo_fallback", [

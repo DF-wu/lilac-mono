@@ -174,40 +174,12 @@
     height: var(--ui-control-compact);
   }
 
-  .work-summary:hover,
-  .work-summary:focus-visible,
-  .work-summary[aria-expanded="true"] {
-    color: var(--ui-foreground);
-    background: var(--ui-surface-hover);
-  }
-
   .work-participant + .work-participant {
     margin-left: calc(-1 * calc(var(--ui-space-unit) * 2));
   }
   .work-participant:hover {
     z-index: 1;
   }
-  .work-summary svg {
-    transition: transform var(--ui-motion-duration) ease;
-  }
-
-  .activity-summary,
-  .activity-item-trigger {
-    width: 100%;
-    height: auto;
-    min-height: var(--ui-control-compact);
-    padding: calc(var(--ui-space-unit) * 1) calc(var(--ui-space-unit) * 2);
-    text-align: left;
-    justify-content: flex-start;
-    color: var(--ui-muted-foreground);
-  }
-
-  .activity-time,
-  .activity-state {
-    flex-shrink: 0;
-    font-size: var(--ui-text-xs);
-  }
-
   .compaction,
   .input-state,
   .turn-status,
@@ -724,12 +696,6 @@
   }
 }
 
-.activity-summary:hover .activity-time,
-.activity-summary:focus-visible .activity-time,
-.activity-item-trigger:hover .activity-time,
-.activity-item-trigger:focus-visible .activity-time {
-  opacity: 1;
-}
 .agent-response > [data-slot="message-avatar"] {
   align-self: flex-start;
   background: transparent;

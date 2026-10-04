@@ -558,3 +558,49 @@ test("native work retains command details and start time through completion", ()
   expect(completed.slot.startedAt).toBe(100);
   expect(completed.slot.settledAt).toBe(28100);
 });
+
+test("completed activity carries reasoning text, tool output, exit code, and duration", () => {
+  const thinking = projectNativeOutput(
+    slot(),
+    event({
+      type: "activity",
+      activityId: "thought",
+      stepId: "step",
+      position: 1,
+      kind: "thinking",
+      state: "complete",
+      detail: "**Plan** the change",
+    }),
+  );
+  const tool = projectNativeOutput(
+    thinking.slot,
+    event(
+      {
+        type: "activity",
+        activityId: "tool",
+        stepId: "step",
+        position: 2,
+        kind: "tool",
+        state: "failed",
+        label: "bash false",
+        output: "x".repeat(5000),
+        exitCode: 1,
+        durationMs: 40,
+      },
+      "attempt",
+      2,
+    ),
+    thinking.projection,
+  );
+  const [, reasoning, command] = tool.slot.messages.map((message) => message.parts[0]);
+  expect(reasoning).toMatchObject({
+    type: "data-activity",
+    data: { kind: "thinking", label: "Thinking", detail: "**Plan** the change" },
+  });
+  expect(command).toMatchObject({
+    type: "data-activity",
+    data: { state: "failed", detail: "bash false", exitCode: 1, durationMs: 40 },
+  });
+  expect(command?.type === "data-activity" && command.data.output?.length).toBe(4096);
+  for (const message of tool.slot.messages) displayMessageSchema.parse(message);
+});

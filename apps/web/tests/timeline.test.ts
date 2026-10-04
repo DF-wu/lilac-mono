@@ -3,14 +3,17 @@ import type { DisplayMessage, DisplayPart } from "@stanley2058/lilac-client-prot
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
-  Activity,
   Message,
-  ActivityItem,
-  activitySummary,
   groupActivityMessages,
   groupParts,
   messageArrivalIds,
 } from "../src/components/Timeline";
+import {
+  Activity,
+  ActivityItem,
+  LiveTailContext,
+  RequestActiveContext,
+} from "../src/components/ActivityLog";
 
 function activity(id: string): DisplayMessage {
   return {
@@ -75,39 +78,82 @@ describe("native turn activity disclosure", () => {
       id: "tool",
       data: {
         kind: "tool",
-        label: "Searched the workspace",
+        label: "bash ls -la",
         state: "complete",
-        detail: "Tool result detail",
+        detail: "bash ls -la",
+        output: "total 0",
+        exitCode: 0,
         durationMs: 2200,
       },
     },
   ];
-  it("summarizes the work and keeps its rows collapsed on initial render", () => {
+  it("summarizes several activities and keeps the group collapsed on initial render", () => {
     const html = renderToStaticMarkup(createElement(Activity, { parts }));
-    expect(html).toContain("Thought and used 1 tool");
+    expect(html).toContain("Ran 1 command");
     expect(html).toContain('aria-expanded="false"');
-    expect(html).not.toContain("Searched the workspace");
     expect(html).not.toContain("Reasoning detail");
-    expect(html).not.toContain("Tool result detail");
-    expect(html).not.toContain("activities");
+    expect(html).not.toContain("total 0");
   });
-  it("keeps each tool result collapsed when its group becomes visible", () => {
+  it("renders a single visible activity as its own row", () => {
+    const empty = { ...parts[0]!, data: { ...parts[0]!.data, detail: undefined } };
+    const html = renderToStaticMarkup(createElement(Activity, { parts: [empty, parts[1]!] }));
+    expect(html).toContain("ls -la");
+    expect(html).not.toContain("Ran 1 command");
+    expect(html).not.toContain("Thought");
+  });
+  it("keeps each command result collapsed", () => {
     const html = renderToStaticMarkup(createElement(ActivityItem, { part: parts[1]! }));
-    expect(html).toContain("Searched the workspace");
-    expect(html).toContain("2s");
+    expect(html).toContain("ls -la");
+    expect(html).not.toContain("bash ls");
     expect(html).toContain('aria-expanded="false"');
-    expect(html).not.toContain("Tool result detail");
-    expect(html).not.toContain(">complete<");
+    expect(html).not.toContain("Process exited");
   });
-  it("shows the current running label and preserves failures without a success badge", () => {
-    const running = { ...parts[1]!, data: { ...parts[1]!.data, state: "running" as const } };
-    expect(activitySummary([parts[0]!, running])).toBe("Thought and used 1 tool");
+  it("shows a running command by its program name", () => {
+    const running = {
+      ...parts[1]!,
+      data: {
+        ...parts[1]!.data,
+        label: "bash cd /tmp && ./search.sh --since 1d",
+        detail: "bash cd /tmp && ./search.sh --since 1d",
+        state: "running" as const,
+      },
+    };
+    const html = renderToStaticMarkup(createElement(Activity, { parts: [parts[0]!, running] }));
+    expect(html).toContain("Running search.sh");
+    expect(html).toContain("working-text");
+  });
+  it("keeps the Thinking fallback when a settled subagent ends a running turn", () => {
+    const agent: (typeof parts)[number] = {
+      type: "data-activity",
+      id: "agent",
+      data: { kind: "tool", label: "subagent (explore) Check hours", state: "complete" },
+    };
+    const html = renderToStaticMarkup(
+      createElement(
+        RequestActiveContext,
+        { value: true },
+        createElement(
+          LiveTailContext,
+          { value: "agent" },
+          createElement(Activity, { parts: [parts[1]!, agent] }),
+        ),
+      ),
+    );
+    expect(html).toContain('<span class="working-text">Thinking</span>');
+  });
+  it("marks failures on the icon without a badge", () => {
     const failed = {
       ...parts[1]!,
-      data: { ...parts[1]!.data, state: "failed" as const, detail: undefined },
+      data: {
+        ...parts[1]!.data,
+        state: "failed" as const,
+        detail: undefined,
+        output: undefined,
+        exitCode: undefined,
+      },
     };
     const html = renderToStaticMarkup(createElement(ActivityItem, { part: failed }));
-    expect(html).toContain("Failed");
+    expect(html).toContain("text-danger");
     expect(html).not.toContain("<button");
   });
 });

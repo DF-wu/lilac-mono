@@ -33,6 +33,11 @@ export const nativeOutputPayloadSchema = z.discriminatedUnion("type", [
     kind: z.enum(["thinking", "tool"]),
     state: z.enum(["start", "complete", "failed"]),
     label: z.string().optional(),
+    detail: z.string().optional(),
+    output: z.string().optional(),
+    exitCode: z.number().int().optional(),
+    file: z.strictObject({ path: id, mediaType: id }).optional(),
+    durationMs: position.optional(),
   }),
   z.strictObject({
     type: z.literal("compaction"),

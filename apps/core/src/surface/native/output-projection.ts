@@ -16,6 +16,8 @@ interface ProjectedTurn {
 
 type PositionedPayload = Extract<NativeOutputPayload, { position: number }>;
 const TEXT_PART_LIMIT = 8_192;
+const DETAIL_LIMIT = 8_192;
+const OUTPUT_LIMIT = 4_096;
 
 function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 24);
@@ -161,9 +163,24 @@ function projectActivity(
         (payload.kind === "thinking" ? "Thinking" : "Tool call")
       ).slice(0, 256),
       state: payload.state === "start" ? "running" : payload.state,
-      ...(payload.kind === "tool" && payload.label ? { detail: payload.label.slice(0, 8192) } : {}),
+      ...activityDetail(payload),
+      ...(payload.output === undefined ? {} : { output: payload.output.slice(0, OUTPUT_LIMIT) }),
+      ...(payload.exitCode === undefined ? {} : { exitCode: payload.exitCode }),
+      ...(payload.file === undefined || payload.file.path.length > 4096
+        ? {}
+        : { file: payload.file }),
+      ...(payload.durationMs === undefined ? {} : { durationMs: payload.durationMs }),
     },
   });
+}
+
+function activityDetail(payload: Extract<NativeOutputPayload, { type: "activity" }>): {
+  detail?: string;
+} {
+  if (payload.detail) return { detail: payload.detail.slice(0, DETAIL_LIMIT) };
+  if (payload.kind === "tool" && payload.label)
+    return { detail: payload.label.slice(0, DETAIL_LIMIT) };
+  return {};
 }
 
 function projectCompaction(

@@ -3,8 +3,15 @@ import { LoadingSpinner } from "./ui/loading-spinner";
 import { AddReaction, MessageReactions } from "./MessageReactions";
 import { OptimisticTurns, type OptimisticTurn } from "../optimistic-turns";
 import { CopyReferenceButton, useConversation } from "./ConversationReference";
-import { useSubagents, subagentProfileName } from "./subagent-context";
-import type { SubagentSummary } from "@stanley2058/lilac-client-protocol";
+import {
+  Activity,
+  ActivityTimesContext,
+  ElapsedTime,
+  LiveThinkingRow,
+  LiveTailContext,
+  RequestActiveContext,
+} from "./ActivityLog";
+import { formatDuration } from "../activity-presentation";
 import { copyMessage, messageClipboard } from "../message-clipboard";
 import { MessageArrivals } from "../message-arrivals";
 import { MessageArrivalsContext, LiveMessageContext, useMessageArrival } from "./message-arrivals";
@@ -28,17 +35,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
-import {
-  ChevronDown,
-  ChevronRight,
-  RotateCcw,
-  Copy,
-  CopyCheck,
-  Bot,
-  Brain,
-  Wrench,
-  Workflow,
-} from "lucide-react";
+import { ChevronDown, ChevronRight, RotateCcw, Copy, CopyCheck } from "lucide-react";
 import type { NativeClient, NativeThreadStore } from "@stanley2058/lilac-client";
 import type {
   DisplayMessage,
@@ -428,9 +425,6 @@ const SlotRow = memo(function SlotRow(props: {
   );
 });
 
-const RequestActiveContext = createContext<boolean | undefined>(undefined);
-const LastActivityContext = createContext<ActivityPart | undefined>(undefined);
-
 export const Turn = memo(function Turn(props: {
   slot: ReadyTurnSlot;
   animateArrivals?: boolean;
@@ -451,13 +445,9 @@ export const Turn = memo(function Turn(props: {
     () => groupActivityMessages(slot.messages.filter((message) => message.id !== firstUser?.id)),
     [slot.messages, firstUser?.id],
   );
-  const lastActivity = useMemo(
-    () =>
-      remaining
-        .flatMap((message) => message.parts)
-        .findLast((part) => part.type === "data-activity"),
-    [remaining],
-  );
+  // Start times never change, so one stable map keeps streaming updates from rerendering every row.
+  const [times] = useState(() => new Map<string, number>());
+  recordActivityTimes(times, slot.messages);
   const lastIntermediate = remaining.findLastIndex(
     (message) => message.role !== "assistant" || message.metadata?.phase !== "final",
   );
@@ -469,9 +459,13 @@ export const Turn = memo(function Turn(props: {
     startedAt !== undefined && slot.settledAt !== undefined
       ? Math.max(0, slot.settledAt - startedAt)
       : undefined;
-  const waiting =
-    (slot.state === "pending" || slot.state === "running") &&
-    !remaining.some((message) => message.role === "assistant");
+  const active = slot.state === "pending" || slot.state === "running";
+  const waiting = active && !remaining.some((message) => message.role === "assistant");
+  // A running turn always ends in a live row: the trailing activity run, or Thinking after text.
+  const tail = waiting ? undefined : liveTailActivity(remaining);
+  const thinkingAfter =
+    active && !waiting && !tail && !finals.length && !remaining.at(-1)?.metadata?.incomplete;
+  const folded = slot.state === "complete" && intermediate.length > 0;
   return (
     <article
       className="turn pt-4 px-6 pb-8 max-workspace:pt-3 max-workspace:px-4 max-workspace:pb-6"
@@ -501,78 +495,79 @@ export const Turn = memo(function Turn(props: {
         </div>
       ) : null}
       <RequestActiveContext value={!settled}>
-        <LastActivityContext value={lastActivity}>
-          <div className="agent-response flex flex-col gap-2">
-            {waiting ||
-            (remaining.length > 0 &&
-              (settled ||
-                remaining.find((message) => message.role !== "system")?.role === "assistant")) ? (
-              <AuthorAvatar author={identities.agent} role="Agent" />
-            ) : null}
-            {waiting ? (
-              <MessageBody
-                live={true}
-                showAvatar={false}
-                message={{
-                  id: `${slot.turnId}:thinking`,
-                  role: "assistant",
-                  parts: [
-                    {
-                      type: "data-activity",
-                      id: `${slot.turnId}:thinking`,
-                      data: { kind: "thinking", state: "running", label: "Thinking…" },
-                    },
-                  ],
-                }}
-              />
-            ) : null}
-            {settled && intermediate.length > 0 ? (
-              <Collapsible open={expanded} onOpenChange={setExpanded}>
-                <CollapsibleTrigger
-                  render={
-                    <Button
-                      variant="ghost"
-                      className="work-summary w-full flex items-center gap-2 text-muted-foreground text-sm p-2 rounded-lg text-left h-auto justify-start"
-                    />
-                  }
+        <LiveTailContext value={tail}>
+          <ActivityTimesContext value={times}>
+            <div className="agent-response flex flex-col gap-2">
+              {waiting ||
+              (remaining.length > 0 &&
+                (settled ||
+                  remaining.find((message) => message.role !== "system")?.role === "assistant")) ? (
+                <AuthorAvatar author={identities.agent} role="Agent" />
+              ) : null}
+              {active ? (
+                <div
+                  data-ui="work-summary"
+                  className="work-summary flex items-center gap-2 border-b border-border/60 pt-1 pb-2 text-sm text-muted-foreground tabular-nums"
                 >
-                  <Marker render={<span />}>
-                    <MarkerContent className="work-summary-label flex flex-1 flex-wrap items-center gap-2">
+                  {startedAt === undefined ? (
+                    "Working…"
+                  ) : (
+                    <span>
+                      Working for <ElapsedTime since={startedAt} />
+                    </span>
+                  )}
+                  <TurnParticipants messages={slot.messages} />
+                </div>
+              ) : null}
+              {folded ? (
+                <Collapsible open={expanded} onOpenChange={setExpanded}>
+                  <CollapsibleTrigger
+                    render={
+                      <button
+                        type="button"
+                        data-ui="work-summary"
+                        className="work-summary flex w-full cursor-pointer items-center gap-2 border-b border-border/60 pt-1 pb-2 text-left text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:text-foreground focus-visible:outline-2 focus-visible:outline-focus"
+                      />
+                    }
+                  >
+                    <span className="work-summary-label flex min-w-0 flex-wrap items-center gap-2">
                       <span>
                         {duration === undefined
                           ? "Worked"
                           : `Worked for ${formatDuration(duration)}`}
                       </span>
                       <TurnParticipants messages={slot.messages} />
-                    </MarkerContent>
-                    {slot.state !== "complete" ? (
-                      <span className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap">
-                        {slot.state}
-                      </span>
-                    ) : null}
-                    <ChevronRight className={expanded ? "rotated [transform:rotate(90deg)]" : ""} />
-                  </Marker>
-                </CollapsibleTrigger>
-                <CollapsibleContent data-ui="expanded-work" className="expanded-work mb-4">
-                  <TurnMessages messages={intermediate} live={false} showFirstAvatar={false} />
-                </CollapsibleContent>
-              </Collapsible>
-            ) : (
-              <TurnMessages messages={intermediate} live={!settled} showFirstAvatar={false} />
-            )}
-            <TurnMessages
-              messages={finals}
-              live={props.animateArrivals ?? true}
-              showFirstAvatar={!settled && intermediate.at(-1)?.role === "user"}
-              finalMessageId={settled ? finals.at(-1)?.id : undefined}
-              finalText={finals.map(messageText).filter(Boolean).join("\n\n")}
-            />
-          </div>
-        </LastActivityContext>
+                    </span>
+                    <ChevronRight
+                      aria-hidden="true"
+                      className={`size-3.5 shrink-0 opacity-70 transition-transform ${expanded ? "rotate-90" : ""}`}
+                    />
+                  </CollapsibleTrigger>
+                  <CollapsibleContent
+                    data-ui="expanded-work"
+                    className="expanded-work flex flex-col gap-2 pt-2"
+                  >
+                    <TurnMessages messages={intermediate} live={false} showFirstAvatar={false} />
+                  </CollapsibleContent>
+                </Collapsible>
+              ) : (
+                <TurnMessages messages={intermediate} live={!settled} showFirstAvatar={false} />
+              )}
+              {waiting || thinkingAfter ? <LiveThinkingRow /> : null}
+              <TurnMessages
+                messages={finals}
+                live={props.animateArrivals ?? true}
+                showFirstAvatar={!settled && intermediate.at(-1)?.role === "user"}
+                finalMessageId={settled ? finals.at(-1)?.id : undefined}
+                finalText={finals.map(messageText).filter(Boolean).join("\n\n")}
+              />
+            </div>
+          </ActivityTimesContext>
+        </LiveTailContext>
       </RequestActiveContext>
-      {settled && !intermediate.length && slot.state !== "complete" ? (
-        <Marker className="turn-status">
-          <MarkerContent>{slot.state}</MarkerContent>
+      {slot.state === "failed" || slot.state === "canceled" ? (
+        <Marker className="turn-status px-0.5">
+          <MarkerContent>{slot.state === "failed" ? "Run failed" : "Stopped"}</MarkerContent>
         </Marker>
       ) : null}
       {slot.partsCursor ? (
@@ -588,6 +583,23 @@ export const Turn = memo(function Turn(props: {
     </article>
   );
 });
+
+function recordActivityTimes(times: Map<string, number>, messages: readonly DisplayMessage[]) {
+  for (const message of messages) {
+    const createdAt = message.metadata?.createdAt;
+    if (createdAt === undefined) continue;
+    for (const part of message.parts)
+      if (part.type === "data-activity" && !times.has(part.id)) times.set(part.id, createdAt);
+  }
+}
+
+/** The last activity of a turn when nothing but activity follows it. */
+function liveTailActivity(messages: readonly DisplayMessage[]): string | undefined {
+  const last = messages.at(-1);
+  if (last?.role !== "assistant") return undefined;
+  const part = last.parts.at(-1);
+  return part?.type === "data-activity" ? part.id : undefined;
+}
 
 function TurnParticipants({ messages }: { messages: readonly DisplayMessage[] }) {
   const identities = useContext(MessageIdentityContext);
@@ -748,12 +760,6 @@ export function messageText(message: DisplayMessage): string {
     .filter((part) => part.type === "text")
     .map((part) => part.text)
     .join("");
-}
-function formatDuration(duration: number): string {
-  const seconds = Math.floor(duration / 1000);
-  return seconds >= 60
-    ? `${Math.floor(seconds / 60)}m${seconds % 60 ? ` ${seconds % 60}s` : ""}`
-    : `${seconds}s`;
 }
 type MessageProps = Pick<
   TimelineProps,
@@ -1112,7 +1118,7 @@ const MessageBody = memo(function MessageBody(
     <LiveMessageContext value={props.live ?? false}>
       <ChatMessage
         align={self ? "end" : "start"}
-        className={`message leading-normal py-2 px-0 wrap-anywhere message-${message.role} native-message text-base`}
+        className={`message leading-normal ${conversational ? "py-1" : "py-0"} px-0 wrap-anywhere message-${message.role} native-message text-base`}
         data-message-id={message.id}
       >
         {(props.showAvatar ?? conversational) ? (
@@ -1137,14 +1143,7 @@ const MessageBody = memo(function MessageBody(
                     }
                   />
                 );
-              if (group.kind === "activity")
-                return (
-                  <Activity
-                    key={index}
-                    parts={group.parts}
-                    createdAt={message.metadata?.createdAt}
-                  />
-                );
+              if (group.kind === "activity") return <Activity key={index} parts={group.parts} />;
               const part = group.part;
               switch (part.type) {
                 case "data-compaction":
@@ -1214,229 +1213,3 @@ const MessageBody = memo(function MessageBody(
     </LiveMessageContext>
   );
 });
-
-type ActivityPart = Extract<DisplayPart, { type: "data-activity" }>;
-
-export function activitySummary(
-  parts: readonly ActivityPart[],
-  agents: ReadonlyMap<string, SubagentSummary> = new Map(),
-  active = true,
-): string {
-  const spawned = parts.filter((part) => subagentActivity(part, agents)).length;
-  if (spawned) {
-    const tools = parts.filter(
-      (part) => part.data.kind === "tool" && !subagentActivity(part, agents),
-    ).length;
-    const labels = [];
-    if (tools) labels.push(`Used ${tools} ${tools === 1 ? "tool" : "tools"}`);
-    labels.push(
-      `${tools ? "spawned" : "Spawned"} ${spawned} ${spawned === 1 ? "agent" : "agents"}`,
-    );
-    return labels.join(" and ");
-  }
-  const running = parts.find((part) => part.data.state === "running");
-  if (running && parts.length === 1) return activityLabel(running, active);
-  const only = parts.length === 1 ? parts[0] : undefined;
-  if (only?.data.state === "complete" && only.data.durationMs !== undefined)
-    return `${only.data.kind === "thinking" ? "Thought" : "Worked"} for ${formatDuration(only.data.durationMs)}`;
-  if (parts.length === 1) return activityLabel(parts[0]!, false);
-  const tools = parts.filter((part) => part.data.kind === "tool").length;
-  const workflows = parts.filter((part) => part.data.kind === "workflow").length;
-  const thinking = parts.some((part) => part.data.kind === "thinking");
-  const labels = [];
-  if (thinking) labels.push("Thought");
-  if (tools)
-    labels.push(`${thinking ? "used" : "Used"} ${tools} ${tools === 1 ? "tool" : "tools"}`);
-  if (workflows)
-    labels.push(
-      `${labels.length ? "ran" : "Ran"} ${workflows} ${workflows === 1 ? "workflow" : "workflows"}`,
-    );
-  return labels.join(" and ");
-}
-
-function activityLabel(part: ActivityPart, running: boolean): string {
-  if (part.data.kind === "thinking" && !running && /^thinking[.…]*$/i.test(part.data.label))
-    return "Thought";
-  return part.data.label;
-}
-
-function ActivityIcon({ part, running }: { part: ActivityPart; running: boolean }) {
-  if (running) return <LoadingSpinner />;
-  if (part.data.kind === "thinking") return <Brain />;
-  if (part.data.kind === "workflow") return <Workflow />;
-  return <Wrench />;
-}
-
-export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdAt?: number }) {
-  const { agents } = useSubagents();
-  const requestActive = useContext(RequestActiveContext);
-  const lastActivity = useContext(LastActivityContext);
-  const runningAgent = parts.some((part) => subagentActivity(part, agents)?.state === "running");
-  const active = requestActive ?? parts.some((part) => part.data.state === "running");
-  const working =
-    active && (runningAgent || lastActivity === undefined || parts.at(-1) === lastActivity);
-  const spawned = parts.some((part) => subagentActivity(part, agents));
-  const arrivalRef = useMessageArrival(`activity:${parts[0]?.id}`);
-  const [open, setOpen] = useState(false);
-  const representative =
-    parts.find((part) => part.data.state === "running") ??
-    parts.find((part) => part.data.kind === "tool") ??
-    parts[0];
-  if (!representative) return null;
-  return (
-    <Collapsible
-      ref={arrivalRef}
-      className="activity-block w-full min-w-0 my-2"
-      open={open}
-      onOpenChange={setOpen}
-    >
-      <CollapsibleTrigger
-        render={
-          <Button variant="ghost" className="activity-summary h-auto justify-start px-2 py-1" />
-        }
-      >
-        <Marker render={<span />}>
-          <MarkerIcon>
-            {spawned ? (
-              <Bot />
-            ) : (
-              <ActivityIcon
-                part={representative}
-                running={working && representative.data.state === "running"}
-              />
-            )}
-          </MarkerIcon>
-          <MarkerContent className="activity-label flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
-            <span className={working ? "working-text" : undefined}>
-              {activitySummary(parts, agents, working)}
-            </span>
-          </MarkerContent>
-          {createdAt !== undefined ? (
-            <time
-              className="activity-time opacity-0 [transition:opacity_var(--ui-motion-duration)_ease]"
-              dateTime={new Date(createdAt).toISOString()}
-            >
-              {new Date(createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
-            </time>
-          ) : null}
-          <ChevronRight className={open ? "rotated [transform:rotate(90deg)]" : ""} />
-        </Marker>
-      </CollapsibleTrigger>
-      <CollapsibleContent className="activity-details pl-3">
-        {parts.map((part) => (
-          <ActivityItem key={part.id} part={part} />
-        ))}
-      </CollapsibleContent>
-    </Collapsible>
-  );
-}
-
-function subagentActivity(
-  part: ActivityPart,
-  agents: ReadonlyMap<string, SubagentSummary>,
-): (Pick<SubagentSummary, "profile" | "title" | "state"> & { id?: string }) | undefined {
-  const agent = agents.get(part.id);
-  if (agent) return agent;
-  const profile = /^subagent(?:_delegate)? \((explore|general|self)(?:;|\))/.exec(
-    part.data.label,
-  )?.[1];
-  if (profile !== "explore" && profile !== "general" && profile !== "self") return;
-  const current = part.data.label
-    .split("\n")
-    .findLast((line) => line.includes("> "))
-    ?.split("> ")[1];
-  return {
-    profile,
-    title: current ?? (part.data.state === "running" ? "Thinking…" : "Completed"),
-    state: part.data.state,
-    id: undefined,
-  };
-}
-
-export function ActivityItem({ part }: { part: ActivityPart }) {
-  const { agents, open: openAgent } = useSubagents();
-  const agent = subagentActivity(part, agents);
-  const requestActive = useContext(RequestActiveContext);
-  const running = requestActive !== false && part.data.state === "running";
-  const arrivalRef = useMessageArrival(`activity-item:${part.id}`);
-  const [open, setOpen] = useState(false);
-  if (agent)
-    return (
-      <div ref={arrivalRef}>
-        <Button
-          variant="ghost"
-          className="subagent-activity w-full h-auto text-left justify-start text-muted-foreground py-1 px-2"
-          onClick={() => openAgent(agent.id ?? part.id)}
-        >
-          <AgentAvatar
-            decorative
-            profile={agent.profile}
-            displayName={subagentProfileName(agent.profile)}
-            size="sm"
-          />
-          <span>
-            {subagentProfileName(agent.profile)} -{" "}
-            <span
-              className={
-                requestActive !== false && agent.state === "running" ? "working-text" : undefined
-              }
-            >
-              {agent.title}
-            </span>
-          </span>
-          <ChevronRight />
-        </Button>
-      </div>
-    );
-  const row = (
-    <Marker render={<span />}>
-      <MarkerIcon>
-        <ActivityIcon part={part} running={running} />
-      </MarkerIcon>
-      <MarkerContent className="activity-label flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
-        <span className={running ? "working-text" : undefined}>{activityLabel(part, running)}</span>
-      </MarkerContent>
-      {part.data.state === "failed" ? (
-        <span className="activity-state text-danger">Failed</span>
-      ) : null}
-      {part.data.durationMs !== undefined ? (
-        <span className="activity-time opacity-0 [transition:opacity_var(--ui-motion-duration)_ease]">
-          {formatDuration(part.data.durationMs)}
-        </span>
-      ) : null}
-      {part.data.detail ? (
-        <ChevronRight className={open ? "rotated [transform:rotate(90deg)]" : ""} />
-      ) : null}
-    </Marker>
-  );
-  if (!part.data.detail)
-    return (
-      <div ref={arrivalRef} className="activity-item text-sm activity-item-trigger">
-        {row}
-      </div>
-    );
-  return (
-    <Collapsible
-      ref={arrivalRef}
-      className="activity-item text-sm"
-      open={open}
-      onOpenChange={setOpen}
-    >
-      <CollapsibleTrigger
-        render={
-          <Button
-            variant="ghost"
-            className="activity-item-trigger h-auto justify-start px-2 py-1"
-          />
-        }
-      >
-        {row}
-      </CollapsibleTrigger>
-      <CollapsibleContent>
-        <pre className="activity-detail m-[calc(var(--ui-space-unit)*2)_calc(var(--ui-space-unit)*2)_calc(var(--ui-space-unit)*3)_calc(var(--ui-space-unit)*8)] p-3 rounded-sm bg-surface max-w-full overflow-auto whitespace-pre-wrap wrap-anywhere text-xs text-muted-foreground">
-          {part.data.detail}
-        </pre>
-      </CollapsibleContent>
-    </Collapsible>
-  );
-}

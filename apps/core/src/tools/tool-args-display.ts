@@ -261,6 +261,25 @@ export const formatApplyPatchToolArgs: ToolArgsFormatter = (args) => {
   return " " + truncateMiddle(first, PATH_HEAD_LEN, PATH_TAIL_LEN, DISPLAY_MAX_LEN) + suffix;
 };
 
+/** Every path an edit tool changes, untruncated, so summaries can count distinct files. */
+export function editedPathsForDisplay(toolName: string, args: unknown): string[] {
+  switch (toolName) {
+    case "edit":
+    case "edit_file": {
+      const path = normalizeRemoteDisplay(getPathArg(args) ?? "");
+      return path ? [path] : [];
+    }
+    case "patch":
+    case "apply_patch": {
+      const parsed = safeValidateSync(localApplyPatchArgsSchema, args);
+      if (!isRecord(parsed) || typeof parsed["patchText"] !== "string") return [];
+      return parseApplyPatchPathsFromPatchText(parsed["patchText"]);
+    }
+    default:
+      return [];
+  }
+}
+
 export const formatEditFileToolArgs: ToolArgsFormatter = (args) => {
   const parsedPath = getPathArg(args);
   if (!parsedPath) return "";

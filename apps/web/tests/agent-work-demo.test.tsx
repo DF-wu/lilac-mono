@@ -18,8 +18,9 @@ test("every demo frame is a valid native turn rendered by the production turn co
       </MessageServicesContext>,
     );
     expect(html).toContain('data-turn-id="demo_turn"');
-    if (stage.id === "complete" || stage.id === "failed" || stage.id === "canceled")
-      expect(html).toContain("Worked for 12s");
+    if (stage.id === "complete") expect(html).toContain("Worked for 12s");
+    if (stage.id === "failed") expect(html).toContain("Run failed");
+    if (stage.id === "canceled") expect(html).toContain("Stopped");
   }
 });
 
@@ -152,7 +153,7 @@ test("subagents retain activity identity as results arrive and settle under the 
       expect(html.match(/data-ui="message-controls"/gu)).toHaveLength(2);
       continue;
     }
-    expect(html).toContain("Used 1 tool and spawned 2 agents");
+    expect(html.match(/subagent-activity/gu)).toHaveLength(2);
     expect(html).not.toContain('data-message-id="demo_final"');
     expect(html.match(/data-ui="message-controls"/gu)).toHaveLength(1);
   }
@@ -238,11 +239,9 @@ test("reaction sits between time and rewind, and rewind is disabled for an activ
 
 test("a sent prompt immediately shows thinking and suppresses the queue marker", () => {
   const html = renderStage("sent");
-  expect(html).toContain("activity-summary");
-  expect(html).toContain('data-slot="loading-spinner"');
-  expect(html).toContain("working-text");
-  expect(html).toContain('aria-expanded="false"');
-  expect(html).toContain("Thinking…");
+  expect(html).toContain('data-ui="thinking"');
+  expect(html).toContain('<span class="working-text">Thinking</span>');
+  expect(html).toContain("Working for");
   expect(html).not.toContain(">queued<");
   expect(html.match(/aria-label="About Lilac"/gu)).toHaveLength(1);
 });
@@ -257,8 +256,8 @@ test("work duration uses the prompt timestamp for older turns without a start ti
 test("only the last folded section and sections with running agents shine", () => {
   const html = renderStage("folded-activity-running");
   expect(html.match(/class="working-text"/gu)).toHaveLength(2);
-  expect(html).toContain(">Thought</span>");
-  expect(html).toContain(">Spawned 1 agent</span>");
+  expect(html).toContain(">Compared both options.</span>");
+  expect(html).toContain('<span class="working-text">General Agent - Thinking…</span>');
   expect(html).toContain('<span class="working-text">Thinking</span>');
 });
 
@@ -274,6 +273,6 @@ test("terminal turns suppress stale running activity even in final messages", ()
       })),
     });
     expect(html).not.toContain('class="working-text"');
-    expect(html.match(/>Thought<\/span>/gu)).toHaveLength(2);
+    expect(html).toContain(">Compared both options.</span>");
   }
 });
