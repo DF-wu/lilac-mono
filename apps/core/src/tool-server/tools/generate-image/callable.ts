@@ -1,10 +1,10 @@
-import { errorMessage, type CoreConfig } from "@stanley2058/lilac-utils";
+import type { CoreConfig } from "@stanley2058/lilac-utils";
 import type {
   ServerToolCallableDefinition,
   ServerToolResult,
 } from "@stanley2058/lilac-plugin-runtime";
-import { Panic, Result } from "better-result";
-import { generateImage, type ImageModel } from "ai";
+import { Result } from "better-result";
+import { generateImage } from "ai";
 import fs from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -13,7 +13,6 @@ import {
   inferExtensionFromMimeType,
   resolveToolPathForRequestContext,
 } from "../../../shared/attachment-utils";
-import { preserveToolPanic } from "../../../tools/tool-result-adapters";
 import type { RegisteredSurfacePlatform } from "../../../surface/types";
 import type { ServerToolCallOptions } from "../../types";
 import {
@@ -25,26 +24,21 @@ import {
   writeFileWithUniqueName,
 } from "../generate";
 import {
-  imageGenerateInputSchema,
-  type ImageGenerateInput,
-  type ImageGenerationPrompt,
-} from "./input";
-import {
   DEFAULT_IMAGE_MODEL_FALLBACK_ORDER,
-  getAvailableImageModels,
-  IMAGE_MODEL_DESCRIPTORS,
-  orderImageModelIds,
   resolveImageDimensions,
   type SupportedImageModelId,
-} from "./models";
+} from "./catalog";
+import { generateFailureFromCause } from "./failures";
+import { imageGenerateInputSchema, type ImageGenerateInput } from "./input";
 import { buildImageGenerationPrompt } from "./prompt";
-import { resolveImageRouting } from "./routing";
+import { resolveImageRoute, type ImageRoute } from "./routing";
+import { validateImageGenerationInputForModel } from "./validation";
 
 const DEFAULT_IMAGE_OUTPUT_BASENAME = "generated-image";
 
 const IMAGE_CALLABLE_DESCRIPTION =
   "Generate or edit an image with a configured provider and write it to a local file in outputDir (or cwd). Returns absolute output path + MIME type. " +
-  "Recommended/default: gpt-image-2 when available.";
+  `Recommended/default: ${DEFAULT_IMAGE_MODEL_FALLBACK_ORDER[0]} when available.`;
 
 /**
  * Reads `tools.generate.image` lazily so config changes apply without
@@ -71,36 +65,9 @@ export type GenerateImageCallableDefinition = ServerToolCallableDefinition<
   RegisteredSurfacePlatform
 >;
 
-export function generateImageWithModel(
-  model: ImageModel,
-  prompt: ImageGenerationPrompt,
-  opts?: {
-    abortSignal?: AbortSignal;
-    size?: `${number}x${number}`;
-    aspectRatio?: `${number}:${number}`;
-    maxRetries?: number;
-    providerOptions?: Parameters<typeof generateImage>[0]["providerOptions"];
-  },
-) {
-  return generateImage({
-    model,
-    prompt,
-    abortSignal: opts?.abortSignal,
-    size: opts?.size,
-    aspectRatio: opts?.aspectRatio,
-    maxRetries: opts?.maxRetries,
-    providerOptions: opts?.providerOptions,
-  });
-}
-
-async function resolveRouting(getConfig: GenerateImageConfigSource | undefined) {
+async function resolveRoute(getConfig: GenerateImageConfigSource | undefined): Promise<ImageRoute> {
   const config = await getConfig?.();
-  const imageConfig = config?.tools.generate.image;
-  return resolveImageRouting({
-    imageConfig,
-    descriptors: IMAGE_MODEL_DESCRIPTORS,
-    resolveDefaultModels: getAvailableImageModels,
-  });
+  return resolveImageRoute(config?.tools.generate.image);
 }
 
 async function runGenerateImage(
@@ -109,25 +76,17 @@ async function runGenerateImage(
   getConfig: GenerateImageConfigSource | undefined,
 ): Promise<ServerToolResult<GenerateImageResult>> {
   return Result.gen(async function* () {
-    const routing = await resolveRouting(getConfig);
-    if (routing.configurationError) {
-      return Result.err(generateFailure("usage", routing.configurationError));
+    const route = await resolveRoute(getConfig);
+    if (route.configurationError) {
+      return Result.err(generateFailure("usage", route.configurationError));
     }
-    const availableModels = routing.availableModels();
     const picked = yield* pickModel(
-      availableModels.available,
+      route.resolveModels().models,
       payload.model,
       DEFAULT_IMAGE_MODEL_FALLBACK_ORDER,
       "image",
     );
-
-    const descriptor = availableModels.byId.get(picked.id);
-    if (!descriptor) {
-      return Result.err(
-        generateFailure("internal", `Model descriptor not found for '${picked.id}'.`),
-      );
-    }
-    yield* descriptor.validateInput(payload);
+    yield* validateImageGenerationInputForModel(picked.id, payload);
 
     const cwd = opts?.context?.cwd ?? process.cwd();
     const resolvedOutputDir = yield* settleCapturedError(
@@ -141,32 +100,24 @@ async function runGenerateImage(
           }),
         catch: captureGenerateFailure,
       }),
-      (cause) => {
-        if (Panic.is(cause)) return preserveToolPanic(cause);
-        return generateFailure("denied", errorMessage(cause));
-      },
+      generateFailureFromCause("denied"),
     );
 
-    const generationOptions = routing.generationOptions(resolveImageDimensions(picked.id, payload));
     const prompt = yield* Result.await(buildImageGenerationPrompt(cwd, payload, opts?.context));
-
+    const requestOptions = route.requestOptions(resolveImageDimensions(picked.id, payload));
     const res = yield* Result.await(
       settleCapturedPromise(
         Result.tryPromise({
           try: () =>
-            generateImageWithModel(picked.model, prompt, {
+            generateImage({
+              model: picked.model,
+              prompt,
               abortSignal: opts?.signal,
-              ...generationOptions,
+              ...requestOptions,
             }),
           catch: captureGenerateFailure,
         }),
-        (cause) => {
-          if (Panic.is(cause)) return preserveToolPanic(cause);
-          return generateFailure(
-            opts?.signal?.aborted ? "cancelled" : "unavailable",
-            errorMessage(cause),
-          );
-        },
+        generateFailureFromCause(() => (opts?.signal?.aborted ? "cancelled" : "unavailable")),
       ),
     );
 
@@ -180,10 +131,7 @@ async function runGenerateImage(
           try: () => fs.mkdir(dirname(targetWithExt), { recursive: true }),
           catch: captureGenerateFailure,
         }),
-        (cause) => {
-          if (Panic.is(cause)) return preserveToolPanic(cause);
-          return generateFailure("unavailable", errorMessage(cause));
-        },
+        generateFailureFromCause("unavailable"),
       ),
     );
     const outPath = yield* Result.await(writeFileWithUniqueName(targetWithExt, image.uint8Array));
@@ -214,8 +162,8 @@ export function createGenerateImageCallable(input: {
     validation: "zod",
     primaryPositional: "prompt",
     catalog: async () => {
-      const routing = await resolveRouting(input.getConfig);
-      const imageModels = orderImageModelIds(routing.catalogModelIds);
+      const route = await resolveRoute(input.getConfig);
+      const imageModels = route.catalogModelIds();
       if (imageModels.length === 0) return false;
       return {
         description: `${IMAGE_CALLABLE_DESCRIPTION} Available models: ${imageModels.join(", ")}`,

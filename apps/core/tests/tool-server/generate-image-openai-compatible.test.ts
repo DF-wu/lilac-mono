@@ -177,13 +177,14 @@ describe("Generate OpenAI-compatible image routing", () => {
     expect(result.unwrap()).toMatchObject({ path: join(outputDir, "generated-image.png") });
   });
 
-  it("uses the multipart edit path", async () => {
+  it("uses the multipart edit path with named blobs", async () => {
     // Given
     let capture: { method: string; path: string; fields: Record<string, string> } | undefined;
     const server = startServer(async (request) => {
       const fields: Record<string, string> = {};
       for (const [key, value] of await request.formData()) {
-        fields[key] = typeof value === "string" ? value : `${value.type}:${value.size}`;
+        fields[key] =
+          typeof value === "string" ? value : `${value.type}:${value.size}:${value.name}`;
       }
       capture = { method: request.method, path: new URL(request.url).pathname, fields };
       return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
@@ -212,8 +213,8 @@ describe("Generate OpenAI-compatible image routing", () => {
       method: "POST",
       path: "/v1/images/edits",
       fields: {
-        image: "image/png:70",
-        mask: "image/png:70",
+        image: "image/png:70:image.png",
+        mask: "image/png:70:mask.png",
         model: "gpt-image-1.5",
         n: "1",
         prompt: "edit prompt",
@@ -246,6 +247,29 @@ describe("Generate OpenAI-compatible image routing", () => {
       "compatible failed",
     );
     expect(requestCount).toBe(1);
+  });
+
+  it("reports an abort during generation as cancelled", async () => {
+    // Given
+    const controller = new AbortController();
+    const server = startServer(() => {
+      controller.abort();
+      return new Promise<Response>(() => {});
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-cancel-"));
+    temporaryPaths.push(outputDir);
+
+    // When
+    const result = await new Generate({ getConfig: compatibleConfig }).call(
+      "generate.image",
+      { prompt: "cancel me", model: "gpt-5-image", outputDir },
+      { signal: controller.signal },
+    );
+
+    // Then
+    expect(result.match({ ok: () => "", err: (error) => error.kind })).toBe("cancelled");
+    expect(await Array.fromAsync(new Bun.Glob("*").scan({ cwd: outputDir }))).toEqual([]);
   });
 
   it("rejects a malformed success response after one request without output", async () => {
