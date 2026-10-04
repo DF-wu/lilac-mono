@@ -113,13 +113,15 @@ const components: Components = {
   code: ({ className, children }) => {
     const file = !className && typeof children === "string" ? parseFilePath(children) : undefined;
     if (file) return <FileLink target={file} />;
-    if (!className?.includes("math-inline")) return <code className={className}>{children}</code>;
+    const display = className?.includes("math-display") ?? false;
+    if (!display && !className?.includes("math-inline"))
+      return <code className={className}>{children}</code>;
     const source = typeof children === "string" ? children : "";
     const fallback = <code>{source}</code>;
     return (
       <RichRenderBoundary key={source} fallback={fallback}>
         <Suspense fallback={fallback}>
-          <MathExpression source={source} display={false} />
+          <MathExpression source={source} display={display} />
         </Suspense>
       </RichRenderBoundary>
     );
