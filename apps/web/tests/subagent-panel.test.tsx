@@ -4,7 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { agentWorkStages, demoSubagents, demoSubagentTranscript } from "../src/agent-work-fixtures";
 import { SubagentPanelView } from "../src/components/SubagentPanel";
 import { SubagentContext } from "../src/components/subagent-context";
-import { ActivityItem } from "../src/components/Timeline";
+import { ActivityItem } from "../src/components/ActivityLog";
 import { createPanelStore, defaultRightPanel } from "../src/panel-store";
 
 const actions = { onSelect: () => {}, onBack: () => {} };
@@ -66,7 +66,7 @@ test("shared panel shows agent status and production messages without editing co
     expect(html).toContain('data-message-id="child_prompt"');
     if (state === "running") {
       expect(html).toContain('data-message-id="child_thought"');
-      expect(html.match(/class="activity-block/g)).toHaveLength(1);
+      expect(html.match(/class="activity-group/g)).toHaveLength(1);
     } else {
       expect(html).toContain("Worked");
       expect(html).toContain('data-message-id="child_final"');

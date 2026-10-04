@@ -216,6 +216,11 @@ import {
 import { type AnthropicFallbackBlobStore } from "./bus-agent-runner/anthropic-fallback-media";
 import { formatUnknownErrorForDisplay } from "./bus-agent-runner/error-display";
 import {
+  nativeToolActivityDetail,
+  nativeToolActivityResult,
+  type NativeToolActivityResult,
+} from "./bus-agent-runner/native-activity-result";
+import {
   debugJsonStringify,
   safeStringify,
   sanitizeFilenameToken,
@@ -5238,6 +5243,7 @@ export async function startBusAgentRunner(params: {
       status: "start" | "update" | "end",
       label: string,
       ok?: boolean,
+      outcome?: NativeToolActivityResult & { durationMs?: number },
     ): void => {
       const stepId = nativeToolSteps.get(toolCallId) ?? nativeStepId();
       nativeToolSteps.set(toolCallId, stepId);
@@ -5248,6 +5254,7 @@ export async function startBusAgentRunner(params: {
         kind: "tool",
         state: status === "end" ? terminalState : "start",
         label,
+        ...outcome,
       });
     };
     const publishNonAgentToolStatus = async (
@@ -7745,11 +7752,13 @@ export async function startBusAgentRunner(params: {
               event.assistantMessageEvent.type === "thinking_end"
             ) {
               const chunkId = event.assistantMessageEvent.id;
+              const reasoning = reasoningChunkState.chunks.get(chunkId)?.trim();
               nativeOutput?.activity({
                 activityId: chunkId,
                 stepId: nativeStepId(),
                 kind: "thinking",
                 state: "complete",
+                ...(reasoning ? { detail: reasoning } : {}),
               });
               consumeReasoningChunkEvent(reasoningChunkState, {
                 type: "end",
@@ -7764,6 +7773,8 @@ export async function startBusAgentRunner(params: {
                   event.toolCallId,
                   "start",
                   `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event, 8192)}`,
+                  undefined,
+                  nativeToolActivityDetail({ toolName: event.toolName, event }),
                 );
               const startedAt = Date.now();
               toolStartMs.set(event.toolCallId, startedAt);
@@ -7816,6 +7827,11 @@ export async function startBusAgentRunner(params: {
                   "end",
                   `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event, 8192)}`,
                   ok,
+                  {
+                    ...nativeToolActivityDetail({ toolName: event.toolName, event }),
+                    ...nativeToolActivityResult({ toolName: event.toolName, event }),
+                    ...(toolDurationMs === undefined ? {} : { durationMs: toolDurationMs }),
+                  },
                 );
               const interruptedForShutdown = shutdownAbortRequestIds.has(headers.request_id);
               const toolFailureError = toolFailure.error ?? "tool failed";

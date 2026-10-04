@@ -49,6 +49,14 @@ export const displayPartSchema = z.discriminatedUnion("type", [
       label: z.string().max(256),
       state: z.enum(["running", "complete", "failed"]),
       detail: z.string().max(MAX_REPLAY_TEXT_LENGTH).optional(),
+      output: z.string().max(MAX_REPLAY_TEXT_LENGTH).optional(),
+      exitCode: z.number().int().min(-2_147_483_648).max(2_147_483_647).optional(),
+      file: z
+        .strictObject({
+          path: z.string().min(1).max(4096),
+          mediaType: z.string().min(1).max(256),
+        })
+        .optional(),
       durationMs: revisionSchema.optional(),
     }),
   }),

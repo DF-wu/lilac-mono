@@ -56,13 +56,6 @@
   max-width: 100%;
 }
 
-.subagent-activity > span:not([data-slot="avatar"]) {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .right-panel-toggle {
   position: absolute;
   top: 0;

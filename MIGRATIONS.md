@@ -1,5 +1,17 @@
 # MIGRATIONS.md
 
+## Native activity details
+
+Native output activity payloads and `data-activity` display parts add optional `output`,
+`exitCode`, and `file`. `file` holds the path and media type of a file that a read attaches, such
+as an image; the web app resolves it with `files.resolve` only when the row is expanded. Completed
+thinking activities now carry their reasoning text in `detail`, and completed tools carry
+`durationMs` plus a redacted result preview of at most 4,096 characters. Bash activities carry the
+redacted command in `detail`, and edit and patch activities list every changed path in `detail`, one
+per line. Stored turns
+need no backfill: older activities render without these details, and thinking rows without reasoning
+text are hidden. Update Core and web together because older strict validators reject the new fields.
+
 ## Native computer viewer
 
 Native RPC adds `computer.read`. Deploy Core and web together, and rebuild the optional computer-use

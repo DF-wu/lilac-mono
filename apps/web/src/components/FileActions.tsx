@@ -4,8 +4,8 @@ import { Copy, ScanEye, PanelRight } from "lucide-react";
 import { copyMessage, messageClipboardData } from "../message-clipboard";
 import { copyPreviewImage } from "../image-clipboard";
 import type { FileTarget } from "../file-target";
-import { useFileViewer } from "./file-viewer-context";
-import { FileTargetPreview, useFileResolution } from "./FileViewer";
+import { useFileResolution, useFileViewer } from "./file-viewer-context";
+import { FileTargetPreview } from "./FileViewer";
 import {
   ContextMenu,
   ContextMenuTrigger,

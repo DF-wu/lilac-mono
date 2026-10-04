@@ -11,12 +11,11 @@ import {
   DropdownMenuItem,
 } from "./ui/dropdown-menu";
 import { IconButton } from "./ui";
-import { useQuery } from "@tanstack/react-query";
 import { useStore } from "zustand";
 import { Bot, Plus, X } from "lucide-react";
 import { useOptionalWorkspace, useWorkspace } from "../workspace-context";
 import type { FileTarget } from "../file-target";
-import { useFileViewer } from "./file-viewer-context";
+import { useFileResolution, useFileViewer } from "./file-viewer-context";
 import {
   AttachmentPreviewBody,
   ResourcePreview,
@@ -28,38 +27,6 @@ import { NativeSubagentPanel } from "./SubagentPanel";
 import { Button } from "./ui/button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "./ui/tooltip";
 import "./file-viewer.css";
-
-export function useFileResolution(target: FileTarget, enabled = true) {
-  const workspace = useOptionalWorkspace();
-  const viewer = useFileViewer();
-  const path = target.type === "path" ? target.path : undefined;
-  const query = useQuery({
-    queryKey: ["file-resolution", viewer?.threadId, path],
-    queryFn: ({ signal }) =>
-      workspace!.client.rpc!.files.resolve({ threadId: viewer!.threadId, path: path! }, { signal }),
-    enabled:
-      enabled &&
-      !!path &&
-      !!viewer?.threadId &&
-      !viewer.threadId.startsWith("draft:") &&
-      !!workspace?.client.rpc,
-    staleTime: 0,
-    gcTime: 60_000,
-    retry: false,
-  });
-  if (target.type === "resource") return { file: target, error: undefined };
-  const file: Extract<FileTarget, { type: "resource" }> | undefined = query.data
-    ? { type: "resource", ...query.data, line: target.line, endLine: target.endLine }
-    : undefined;
-  const unavailable =
-    !workspace?.client.rpc || !viewer?.threadId || viewer.threadId.startsWith("draft:");
-  return {
-    file,
-    error:
-      query.error?.message ??
-      (unavailable ? "File browsing is unavailable in this conversation." : undefined),
-  };
-}
 
 export function FileTargetPreview({
   target,
