@@ -63,6 +63,8 @@ export type WebProviderEnvironment = {
   exa: { apiKey?: string; baseUrl?: string };
   tavily: { apiKey?: string; apiBaseUrl?: string };
   openai: { apiKey?: string; baseUrl?: string };
+  /** Credentials used when `tools.web.openai.model` resolves to an openai-compatible model. */
+  openaiCompatible?: { apiKey?: string; baseUrl?: string };
 };
 
 /**

@@ -848,6 +848,67 @@ describe("web search and permits", () => {
     expect(settled).toEqual({ status: "rejected", reason: panic });
   });
 
+  it("builds the openai search provider from the resolved tools.web.openai.model", async () => {
+    const seen: Parameters<WebDependencies["createSearchProviders"]>[0][] = [];
+    const tool = new Web({
+      ...baseWebDependencies,
+      loadWebToolConfig: async () => ({
+        extractProviders: ["openai"],
+        fetchMode: "auto",
+        firecrawlPolicy: undefined,
+        openaiPolicy: { model: "terra", searchContextSize: "high" },
+        modelAliases: { terra: { model: "openai-compatible/gpt-5.6-terra" } },
+      }),
+      getProviderEnvironment: () => ({
+        ...emptyEnvironment,
+        openai: { apiKey: "openai-key", baseUrl: "https://api.openai.com/v1" },
+        openaiCompatible: { apiKey: "compat-key", baseUrl: "http://gateway.internal/v1" },
+      }),
+      createSearchProviders: (config) => {
+        seen.push(config);
+        return [configuredProvider("openai")];
+      },
+    });
+
+    await tool.call("search", { query: "terra" });
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.openai).toEqual({
+      apiKey: "compat-key",
+      baseUrl: "http://gateway.internal/v1",
+      model: "gpt-5.6-terra",
+      searchContextSize: "high",
+    });
+  });
+
+  it("leaves the openai search provider unconfigured when its model cannot run web_search", async () => {
+    const seen: Parameters<WebDependencies["createSearchProviders"]>[0][] = [];
+    const tool = new Web({
+      ...baseWebDependencies,
+      loadWebToolConfig: async () => ({
+        extractProviders: ["openai"],
+        fetchMode: "auto",
+        firecrawlPolicy: undefined,
+        openaiPolicy: { model: "sonnet", searchContextSize: "medium" },
+        modelAliases: { sonnet: { model: "anthropic/claude-sonnet-5" } },
+      }),
+      getProviderEnvironment: () => ({
+        ...emptyEnvironment,
+        openai: { apiKey: "openai-key" },
+      }),
+      createSearchProviders: (config) => {
+        seen.push(config);
+        return createDefaultWebSearchProviders(config);
+      },
+    });
+
+    await expect(tool.call("search", { query: "sonnet" })).resolves.toMatchObject({
+      status: "error",
+      error: { message: expect.stringContaining("OPENAI_API_KEY is not configured") },
+    });
+    expect(seen[0]?.openai).toEqual({ apiKey: undefined });
+  });
+
   it("preserves Panic from web config loading", async () => {
     const panic = new Panic({ message: "web config invariant" });
     const tool = createTool({

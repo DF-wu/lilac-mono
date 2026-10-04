@@ -34,10 +34,13 @@ tools:
     #   maxConcurrency: 2
     #   queueTtl: 3s
     # `openai` in extract.providers runs web.search through the OpenAI Responses web_search tool
-    # (uses OPENAI_API_KEY; search-only, web.extract skips it). Dates are prompt
-    # guidance with this provider, not enforced publication-date filters.
+    # (search-only, web.extract skips it). Dates are prompt guidance with this
+    # provider, not enforced publication-date filters. `model` picks the model that
+    # runs the hosted search: a models.def alias, a provider/model spec, or a bare
+    # OpenAI model id. `openai/...` uses OPENAI_API_KEY / OPENAI_BASE_URL;
+    # `openai-compatible/...` uses OPENAI_COMPATIBLE_API_KEY / OPENAI_COMPATIBLE_BASE_URL.
     # openai:
-    #   model: gpt-5-mini
+    #   model: gpt-5-mini          # or an alias such as `terra`, or openai-compatible/gpt-5.6-terra
     #   searchContextSize: medium
   inspect:
     # Must start with google/.
