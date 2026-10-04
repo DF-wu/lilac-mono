@@ -37,7 +37,7 @@ server.
 Architecture and ownership are documented in [`PROJECT.md`](./PROJECT.md). Repository rules for coding agents are in [`AGENTS.md`](./AGENTS.md).
 
 > [!IMPORTANT]
-> This is a downstream fork that continuously tracks [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) through Git history and the `upstream` remote. It is not an official upstream release. This project regularly merges upstream updates while maintaining independent Telegram, OpenAI-compatible image routing, GitHub reply permalink, and deployment automation features.
+> This is a downstream fork that continuously tracks [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) through Git history and the `upstream` remote. It is not an official upstream release. This project regularly merges upstream updates while maintaining independent Telegram, OpenAI-compatible image routing, OpenAI `web.search`, GitHub reply permalink, and deployment automation features.
 
 Lilac brings platform messaging, routing, model execution, tools, Skills, and recoverable workflows
 into one runtime.
@@ -50,6 +50,7 @@ The table below lists only behavior that still differs from upstream. For the fu
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
 | Telegram surface                | DMs, groups, forum topics, streaming HTML replies, cancellation, reactions, command menu, inbound/outbound attachments, workflow cards, same-surface tools, and Telegram history in cross-surface conversation memory | Disabled by default; long polling only; memory indexes one thread per chat or topic |
 | OpenAI-compatible image routing | Routes the existing `generate.image` aliases through a single operator-specified OpenAI-compatible endpoint                                            | `configVersion: 2` only; no automatic fallback or custom alias mapping                            |
+| OpenAI `web.search` provider    | `openai` in `tools.web.extract.providers` runs `web.search` through the OpenAI Responses `web_search` tool and returns the answer's cited sources     | `configVersion: 2` only; search-only (`web.extract` skips it); date filters are model guidance only |
 | GitHub reply UX                 | `In reply to` can link directly to an issue/PR body or a specified comment's canonical permalink                                                       | GitHub comment self-loop protection has been accepted upstream and is no longer fork-only         |
 | Custom media plugin             | Deployable Level 2 image/video plugin example demonstrating strict configuration and file-safety handling                                              | The plugin is trusted in-process code; restricted callers currently cannot use external callables |
 | Operations and delivery         | Upstream checks every 6 hours, GHCR publishes verified `catalina`/`claudia` tags, and CI enforces the upstream-footprint allowlist                     | Automatic merges still require manual handling when conflicts occur                               |
@@ -251,6 +252,24 @@ When running from source, export the variables with the same names before starti
 
 See [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md) for aliases, the `openaiCompatible.models` allowlist and `openaiCompatible.modelIds` overrides, generation/edit endpoints, the absence of fallback behavior, and colon-form `size` aspect-ratio forwarding.
 
+### Search the Web Through OpenAI
+
+```yaml
+configVersion: 2
+
+tools:
+  web:
+    extract:
+      providers: [tavily, openai]
+    openai:
+      model: gpt-5-mini
+      searchContextSize: medium
+```
+
+The provider list is the ordered fallback chain for `web.search`, so `openai` only runs when it is listed. It reads `OPENAI_API_KEY` and, when set, `OPENAI_BASE_URL`; a gateway at `OPENAI_BASE_URL` must relay the Responses API `web_search` tool. Results carry the model's URL citations, each labeled as an OpenAI-generated summary, followed by retrieved sources that were not cited. `web.extract` skips this provider, so keep `tavily`, `exa`, or `firecrawl` in the list when you need page extraction.
+
+See [`docs/core-config-migrations.md`](./docs/core-config-migrations.md) for the `tools.web.openai` fields and [`docs/fork-differences.md`](./docs/fork-differences.md) for the limitations.
+
 ### Use the Custom Media Plugin Example
 
 ```bash
@@ -308,7 +327,7 @@ See [`AGENTS.md`](./AGENTS.md) for each workspace's build, test, and typecheck c
 
 `.github/workflows/sync-upstream.yml` checks upstream `main` every 6 hours and attempts to merge new commits into this fork's `main`. A clean merge triggers an image build; maintainers handle conflicts manually.
 
-- Report new fork features, deployment workflows, Telegram issues, or OpenAI-compatible image-routing issues in [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues).
+- Report new fork features, deployment workflows, Telegram issues, OpenAI `web.search` issues, or OpenAI-compatible image-routing issues in [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues).
 - For an issue reproducible without fork modifications, first confirm the upstream state, then report it to [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono/issues).
 - Features historically contributed by this fork and accepted upstream are no longer listed as current differences. See [`docs/fork-differences.md`](./docs/fork-differences.md#accepted-upstream-contributions) for the list.
 - Fork behavior lives in fork-owned modules; upstream files are touched only at thin seams. `bun run fork:footprint` checks every modified upstream file against [`scripts/fork/upstream-footprint.txt`](./scripts/fork/upstream-footprint.txt), and [`docs/fork-differences.md`](./docs/fork-differences.md#fork-code-layout) maps each feature to its modules and seams.
