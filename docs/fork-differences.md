@@ -28,7 +28,7 @@ The comparison baseline is the merge base with upstream `main` as of 2026-09-26 
 Telegram is currently the largest fork-only product delta. The main implemented paths include:
 
 - DMs, groups, supergroups, and forum topics.
-- Mention/active routing, streamed edits, HTML rendering, and 4096-character chunking.
+- Mention/active routing through a router that mirrors the upstream Discord router (debounce batching, the shared LLM gate, steer/interrupt/follow-up, `!model:`/`!continue`/`!interrupt` directives), streamed edits, HTML rendering, and 4096-character chunking.
 - Reply context, cancellation, typing indicators, reactions, custom commands, and menu aliases.
 - Inbound photos/documents, outbound attachments, workflow progress/actions, `waitForReply`, and allowlist-bound surface tools.
 - Conversation memory: Telegram chats are indexed, summarized, searched, and auto-recalled through the shared cross-surface thread store, gated by `allowedChatIds` (see [`telegram-surface.md`](./telegram-surface.md#conversation-memory)).
@@ -39,8 +39,9 @@ Items that remain unimplemented or are constrained by the platform:
 - Conversation memory indexes one thread per chat or topic (no segmentation of long chats), has no run-in-progress signal, and projects attachments as metadata only; Lilac `/?ref=telegram:` references are not recognized yet.
 - There is no inline query support, business account support, or voice/video transcription.
 - Message history includes only content the bot actually observed or sent, not Telegram's complete pre-existing history.
+- The ask-user question port, session divider, `/model` and `/context` commands, reasoning text, skipped-output cleanup, and several Level 2 tool operations remain Discord-only.
 
-See [`telegram-surface.md`](./telegram-surface.md#10-what-works-and-what-does-not) for the precise feature matrix and platform differences.
+See [`telegram-surface.md`](./telegram-surface.md#10-what-works-and-what-does-not) for the operator-facing feature matrix, and [`telegram-feature-parity.md`](./telegram-feature-parity.md) for the capability-by-capability comparison with Discord, including why each gap exists and what closing it would take.
 
 ## Accepted Upstream Contributions
 
@@ -80,7 +81,7 @@ The fork keeps behavior in fork-owned modules and touches upstream files only at
 
 | Feature | Fork-owned modules | Upstream seams |
 | --- | --- | --- |
-| Telegram surface | `apps/core/src/surface/telegram/` (adapter, ingress, router, output, store, protocol). `telegram-surface-runtime.ts` is the single wiring entry Core calls: startup adapter resolution, the runtime descriptor entry, config hot-reload, and workflow target authorization | `runtime/create-core-runtime.ts` (four one-line call sites), `runtime/compose-builtin-surface-runtimes.ts` (one descriptor entry), the closed platform unions in `surface/types.ts`, `builtin-surface-protocols.ts`, `bridge/request-ids.ts`, and the workflow target types |
+| Telegram surface | `apps/core/src/surface/telegram/` (adapter, ingress, output, store, protocol, and the router split into `telegram-request-router.ts`, `telegram-request-router-composition.ts`, and `telegram-request-router-publish.ts`; the router mirrors the upstream Discord router and imports the shared helpers under `surface/discord/discord-request-router/` unchanged, see [`telegram-feature-parity.md`](./telegram-feature-parity.md)). `telegram-surface-runtime.ts` is the single wiring entry Core calls: startup adapter resolution, the runtime descriptor entry, config hot-reload, and workflow target authorization | `runtime/create-core-runtime.ts` (four one-line call sites), `runtime/compose-builtin-surface-runtimes.ts` (one descriptor entry), the closed platform unions in `surface/types.ts`, `builtin-surface-protocols.ts`, `bridge/request-ids.ts`, and the workflow target types |
 | Telegram conversation memory | `apps/core/src/surface/telegram/telegram-conversation-source.ts` (SQL views over `telegram-surface.db`, projection decoders, attachment metadata) and the `telegramConversationMemoryInput` / `hydrateTelegramConversationAttachments` helpers in `telegram-surface-runtime.ts` | `conversation/thread-store.ts` (a third source branch, `telegram_thread` kind, allowlist clause), `thread-service.ts` (surface labels and allowlist checks), the summarization worker protocol, `bus-agent-runner.ts` (recall surface label), `tool-server/tools/conversation-thread.ts` (enum) |
 | Telegram configuration | `packages/utils/core-config/telegram-surface.ts` (type, defaults, v2 schema) and `telegram-runtime.ts` (token and database-path helpers) | `core-config/types.ts`, `v1.ts`, `v2.ts` (one field each) and `core-config.ts` re-exports |
 | Structured `generate.image` | `apps/core/src/tool-server/tools/generate-image/` (`input`, `models`, `prompt`, `routing`, `callable`) | `tool-server/tools/generate.ts` (callable hook plus exported shared helpers) and `plugins/builtin/server-tools.ts` (passes core config) |

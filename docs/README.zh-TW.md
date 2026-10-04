@@ -18,6 +18,7 @@
 | --- | --- |
 | [`docker-deployment.md`](./docker-deployment.md) | Docker/Compose、operator token、持久化、UID、安全邊界與診斷 |
 | [`telegram-surface.md`](./telegram-surface.md) | BotFather、allowlists、群組、forum topics、workflow、對話記憶、驗證與限制 |
+| [`telegram-feature-parity.zh-TW.md`](./telegram-feature-parity.zh-TW.md) | Telegram 與 Discord 的能力對照：router 重寫對齊了什麼、每個剩餘差異的原因與所需改動，以及 Telegram 獨有的優勢 |
 | [`github-reply-permalinks.md`](./github-reply-permalinks.md) | GitHub issue/PR body 與 comment reply permalink contract |
 
 ## Generation 與 Extensions
