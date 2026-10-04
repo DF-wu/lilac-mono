@@ -158,7 +158,7 @@ test.skipIf(process.env.LILAC_COMPUTER_DOCKER_TEST !== "1")(
       });
       await registry.init();
       const tools = [...registry.getTools()];
-      expect(tools).toHaveLength(3);
+      expect(tools).toHaveLength(4);
       const options = { toolCallId: "integration", messages: [], context: {} };
       async function call(
         session: string,

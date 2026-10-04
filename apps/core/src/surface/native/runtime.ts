@@ -1,3 +1,4 @@
+import { NativeComputer } from "./computer";
 import { NativeReferences } from "./references";
 import { nativeStoreTransaction, type NativeStoreError } from "./store";
 import { serverToolFailure } from "@stanley2058/lilac-plugin-runtime";
@@ -89,7 +90,7 @@ export type NativeRuntimeOptions = {
   denyPaths: readonly string[];
   subscriptionPrefix: string;
   customCommands: CustomCommandManager;
-  mcpRegistry: Pick<McpRegistryApi, "reload">;
+  mcpRegistry: Pick<McpRegistryApi, "reload" | "getCatalogServers" | "getTools">;
   adapters: SurfaceAdapterResolver;
   conversationThreads: () => ConversationThreadToolService | undefined;
   runner: () => (NativeRunnerControl & SubagentReader) | undefined;
@@ -285,6 +286,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   });
   const nativeConfig = options.getConfig().surface.native;
   const services = createNativeRpcServices({
+    computer: new NativeComputer(store, options.mcpRegistry),
     references,
     files: liveFiles,
     subagents: new NativeSubagents({

@@ -34,6 +34,7 @@ import { z } from "zod";
 
 import {
   resourceCacheV1Schema,
+  resourceImagePreviewSchema,
   resourceOriginV1Schema,
   resourceRecordV1Schema,
   type ResourceCacheV1,
@@ -41,7 +42,7 @@ import {
 } from "../resource/contracts";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 
-export const TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION = 13 as const;
+export const TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION = 14 as const;
 export const COMPACTION_CHECKPOINT_FORMAT_VERSION = 1 as const;
 export const CORE_SURFACE_PROJECTION_FORMAT_VERSION = 1 as const;
 export const CORE_TRANSCRIPT_DIGEST_VERSION = 2 as const;
@@ -206,6 +207,7 @@ export type PersistedResourceRecordRow = {
   readonly created_ts: number;
   readonly cache_blob_ref_json: string | null;
   readonly cache_cached_ts: number | null;
+  readonly image_preview_json?: string | null;
 };
 
 export type DecodedCoreNamedClaudeBindingRow = {
@@ -429,7 +431,7 @@ export type CoreStoredLineageManifestV2 = {
 };
 
 type DecodedSchemaVersion = {
-  readonly version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13;
+  readonly version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14;
   readonly provenance: "current" | "migrated";
 };
 
@@ -469,6 +471,7 @@ const resourceRecordRowSchema = z.strictObject({
   created_ts: nonNegativeIntegerSchema,
   cache_blob_ref_json: z.string().nullable(),
   cache_cached_ts: nullableNonNegativeIntegerSchema,
+  image_preview_json: z.string().nullable().optional(),
 });
 const coreNamedClaudeBindingRowSchema = z.strictObject({
   request_client: adapterPlatformSchema,
@@ -677,6 +680,7 @@ function decodeSchemaVersion(
     case 11:
     case 12:
     case 13:
+    case 14:
       return Result.ok({
         version,
         provenance: version === TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION ? "current" : "migrated",
@@ -748,6 +752,11 @@ function adaptTranscriptPersistenceDecodeResult<T>(
 
 export function normalizeResourceRecordV1(value: unknown): ResourceRecordV1 | null {
   const decoded = resourceRecordV1Schema.safeParse(value);
+  return decoded.success ? decoded.data : null;
+}
+
+export function normalizeResourceImagePreview(value: unknown) {
+  const decoded = resourceImagePreviewSchema.safeParse(value);
   return decoded.success ? decoded.data : null;
 }
 
@@ -881,6 +890,27 @@ export function decodeResourceRecordRow(input: {
         }
         cache = decodedCache.data;
       }
+      if (version.version >= 14 && row.image_preview_json === undefined) {
+        return Result.err(
+          corrupt({
+            table: RESOURCE_TABLE,
+            field: "image_preview_json",
+            version: version.version,
+            issueCode: "missing-required-field",
+            recordId: input.recordId,
+          }),
+        );
+      }
+      const imagePreview =
+        row.image_preview_json == null
+          ? undefined
+          : yield* decodeSerialized({
+              raw: row.image_preview_json,
+              table: RESOURCE_TABLE,
+              field: "image_preview_json",
+              version: version.version,
+              recordId: input.recordId,
+            });
       const decodedRecord = resourceRecordV1Schema.safeParse({
         version: row.record_version,
         resourceId: row.resource_id,
@@ -893,6 +923,7 @@ export function decodeResourceRecordRow(input: {
           : { reportedByteLength: row.reported_byte_length }),
         createdAt: row.created_ts,
         ...(cache === undefined ? {} : { cache }),
+        ...(imagePreview === undefined ? {} : { imagePreview }),
       });
       if (!decodedRecord.success) {
         return Result.err(
@@ -1957,11 +1988,12 @@ const fixtureResourceRow = {
   created_ts: 1,
   cache_blob_ref_json: `{"version":1,"objectId":"b1_${"34".repeat(16)}","sha256":"${"56".repeat(32)}","byteLength":7}`,
   cache_cached_ts: 2,
+  image_preview_json: null,
 } as const satisfies PersistedResourceRecordRow;
 
 export const resourceRecordRowCodecCases = {
   current: {
-    input: { row: fixtureResourceRow, schemaVersion: 13, recordId: "current-resource" },
+    input: { row: fixtureResourceRow, schemaVersion: 14, recordId: "current-resource" },
     outcome: "ok",
     provenance: "current",
   },
@@ -1974,7 +2006,7 @@ export const resourceRecordRowCodecCases = {
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureResourceRow, schemaVersion: 14, recordId: "future-resource" },
+    input: { row: fixtureResourceRow, schemaVersion: 15, recordId: "future-resource" },
     outcome: "error",
   },
   "malformed-serialization": {
@@ -2029,7 +2061,7 @@ const fixtureSurfaceMessageLinkRow = {
 
 export const surfaceMessageLinkRowCodecCases = {
   current: {
-    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 13, recordId: "current" },
+    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 14, recordId: "current" },
     outcome: "ok",
     provenance: "current",
   },
@@ -2043,7 +2075,7 @@ export const surfaceMessageLinkRowCodecCases = {
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 14, recordId: "unsupported" },
+    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 15, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
@@ -2066,7 +2098,7 @@ export const surfaceMessageLinkRowCodecCases = {
 
 export const recentAgentWriteRowCodecCases = {
   current: {
-    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 13, recordId: "current" },
+    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 14, recordId: "current" },
     outcome: "ok",
     provenance: "current",
   },
@@ -2080,7 +2112,7 @@ export const recentAgentWriteRowCodecCases = {
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 14, recordId: "unsupported" },
+    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 15, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
@@ -2115,7 +2147,7 @@ const fixtureDiscoveryRecordRow = {
 
 export const discoveryRecordRowCodecCases = {
   current: {
-    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 13, recordId: "current" },
+    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 14, recordId: "current" },
     outcome: "ok",
     provenance: "current",
   },
@@ -2129,7 +2161,7 @@ export const discoveryRecordRowCodecCases = {
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 14, recordId: "unsupported" },
+    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 15, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
@@ -2154,7 +2186,7 @@ export const transcriptCompactionContextCodecCases = {
   current: {
     input: {
       raw: '{"type":"compaction","formatVersion":1}',
-      schemaVersion: 13,
+      schemaVersion: 14,
       recordId: "current",
     },
     outcome: "ok",
@@ -2171,7 +2203,7 @@ export const transcriptCompactionContextCodecCases = {
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { raw: null, schemaVersion: 14, recordId: "unsupported" },
+    input: { raw: null, schemaVersion: 15, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
@@ -2192,7 +2224,7 @@ export const transcriptProviderStateCodecCases = {
   current: {
     input: {
       raw: '{"lastFamily":"ai-sdk","containsCrossFamilyTurns":false}',
-      schemaVersion: 13,
+      schemaVersion: 14,
       recordId: "current",
     },
     outcome: "ok",
@@ -2213,7 +2245,7 @@ export const transcriptProviderStateCodecCases = {
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { raw: null, schemaVersion: 14, recordId: "unsupported" },
+    input: { raw: null, schemaVersion: 15, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
@@ -2235,7 +2267,7 @@ export const transcriptRowCodecCases = {
         provider_state_json: '{"lastFamily":"ai-sdk","containsCrossFamilyTurns":false}',
         loaded_catalog_ids_json: '["mcp_docs_search"]',
       },
-      schemaVersion: 13,
+      schemaVersion: 14,
     },
     outcome: "ok",
     provenance: "current",
@@ -2246,12 +2278,12 @@ export const transcriptRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: fixtureTranscriptRow, schemaVersion: 13 },
+    input: { row: fixtureTranscriptRow, schemaVersion: 14 },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { row: fixtureTranscriptRow, schemaVersion: 14 },
+    input: { row: fixtureTranscriptRow, schemaVersion: 15 },
     outcome: "error",
   },
   "malformed-serialization": {
@@ -2295,7 +2327,7 @@ export const transcriptStoreRowFixtures = {
     input: {
       storeKind: "named-binding",
       row: fixtureNamedBindingRow,
-      schemaVersion: 13,
+      schemaVersion: 14,
       recordId: "current-binding",
     },
     outcome: "ok",
@@ -2335,7 +2367,7 @@ const fixtureProjectionRow = {
 
 export const coreSurfaceProjectionRowCodecCases = {
   current: {
-    input: { row: fixtureProjectionRow, schemaVersion: 13 },
+    input: { row: fixtureProjectionRow, schemaVersion: 14 },
     outcome: "ok",
     provenance: "current",
   },
@@ -2350,7 +2382,7 @@ export const coreSurfaceProjectionRowCodecCases = {
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { row: fixtureProjectionRow, schemaVersion: 14 },
+    input: { row: fixtureProjectionRow, schemaVersion: 15 },
     outcome: "error",
   },
   "malformed-serialization": {
@@ -2398,7 +2430,7 @@ const fixtureLineageRow = {
 
 export const coreLineageManifestRowCodecCases = {
   current: {
-    input: { row: fixtureLineageRow, schemaVersion: 13 },
+    input: { row: fixtureLineageRow, schemaVersion: 14 },
     outcome: "ok",
     provenance: "current",
   },
@@ -2412,7 +2444,7 @@ export const coreLineageManifestRowCodecCases = {
     outcome: "ok",
     provenance: "missing-defaulted",
   },
-  "unsupported-version": { input: { row: fixtureLineageRow, schemaVersion: 14 }, outcome: "error" },
+  "unsupported-version": { input: { row: fixtureLineageRow, schemaVersion: 15 }, outcome: "error" },
   "malformed-serialization": {
     input: { row: { ...fixtureLineageRow, manifest_json: "{" }, schemaVersion: 9 },
     outcome: "error",

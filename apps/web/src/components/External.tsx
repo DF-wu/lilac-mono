@@ -33,12 +33,7 @@ export function External({ threadId }: { threadId?: string }) {
               <ExternalLink /> Open in {view.thread.surface === "discord" ? "Discord" : "GitHub"}
             </Button>
           ) : null}
-          <CopyReferenceButton
-            label="Copy conversation link"
-            target={
-              reference ? { surface: reference.surface, sessionId: reference.sessionId } : undefined
-            }
-          />
+          <CopyReferenceButton label="Copy conversation link" target={reference} />
           <IconButton
             label="Refresh conversation"
             disabled={read.isFetching}

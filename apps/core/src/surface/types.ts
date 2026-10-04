@@ -241,6 +241,8 @@ export type ContentOpts = {
   text?: string;
   format?: "markdown" | "plain";
   accentColor?: number;
+  /** Discord text style for sends without actions. Defaults to embed. */
+  style?: "embed" | "plain";
   attachments?: SurfaceAttachment[];
   actions?: SurfaceAction[];
 };

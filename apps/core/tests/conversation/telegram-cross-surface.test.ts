@@ -295,6 +295,34 @@ describe("telegram conversation source", () => {
     expect(await service.getAutoInjectRankingCorpusDocuments()).toEqual([]);
   });
 
+  test("the Jev shortlist follows the chat allowlist and refreshes deleted sessions", async () => {
+    const chat = seedChat();
+    seedChat(OTHER_CHAT);
+    const refreshed = await service.runSummarization({ now: Date.now() });
+    expect(refreshed.summarized).toBe(2);
+
+    const shortlist = (
+      await service.shortlistAutoInjectCandidates({
+        text: "deployment",
+        limit: 5,
+        semanticFallback: false,
+      })
+    ).unwrap();
+    expect(shortlist.source).toBe("lexical");
+    expect(shortlist.results.map((hit) => hit.threadId)).toEqual([chat]);
+    expect(shortlist.results[0]?.surface).toBe("telegram");
+
+    for (const id of ["1", "2"]) telegram.markDeleted({ sessionId: CHAT, messageId: id });
+    const afterDelete = (
+      await service.shortlistAutoInjectCandidates({
+        text: "deployment",
+        limit: 5,
+        semanticFallback: false,
+      })
+    ).unwrap();
+    expect(afterDelete.results).toEqual([]);
+  });
+
   test("the conversation.thread tool accepts the telegram surface", async () => {
     seedChat();
     await service.runSummarization({ now: Date.now() });

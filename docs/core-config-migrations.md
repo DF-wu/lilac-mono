@@ -28,6 +28,23 @@ Explicit port, URL and origin values are preserved. To move an existing deployme
 public URL changes, also update `publicUrl`, `allowedOrigins` and any reverse-proxy destination.
 The installer preserves existing deployment port mappings. No config-version bump is required.
 
+## Jev auto-inject lane
+
+Version 2 accepts `conversation.thread.autoInjectMode`, defaulting to `llm`, which keeps the existing
+length gate, planner and ranking. Set it to `jev` to replace them with one TypeSafe Jev call. The call
+decides whether the latest message needs past context and which shortlisted threads help. The shortlist
+matches any message word against thread summaries. When nothing matches and embeddings are configured, it
+falls back to a single embedding search. `conversation.thread.autoInject.enabled` still turns the feature
+on, and `filterCurrentParticipants` applies to both lanes.
+
+`conversation.thread.jevAutoInject` holds the Jev options: `model`, `limit`, `candidateLimit`,
+`semanticFallback`, and the probability thresholds `recallMinProbability`,
+`durableSubjectMinProbability`, `casualMaxProbability` and `relevanceMinProbability`. The `jev` mode
+requires `TYPESAFE_AI_API_KEY`; `TYPESAFE_AI_BASE_URL` optionally overrides the API endpoint. Without a
+key, Lilac logs an error and answers without injected metadata.
+
+Both fields are optional; no config rewrite is required. Remove them before using an older parser.
+
 ## Native title model
 
 Version 2 accepts `surface.native.titleModel`, defaulting to `fast`. Use `main`, `fast`, a configured

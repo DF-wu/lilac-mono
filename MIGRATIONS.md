@@ -1,5 +1,17 @@
 # MIGRATIONS.md
 
+## Native computer viewer
+
+Native RPC adds `computer.read`. Deploy Core and web together, and rebuild the optional computer-use
+gateway and runner images. The gateway adds a read-only `viewer` MCP tool; the runner serves
+`/lilac-viewer.html` using its bundled noVNC client. Existing desktops must be terminated and
+provisioned again to use the rebuilt runner. No stored-data or configuration migration is needed.
+
+Viewer credentials are fetched under the native thread edit permission, kept in memory, and sent to
+the viewer frame using origin-checked messages. They are not included in URLs or the conversation
+cache. Existing direct noVNC links and provisioning responses remain unchanged.
+
+
 ## Native web keybindings
 
 Keyboard shortcuts are stored only in the browser under `lilac-keybindings-v1`, scoped to the
@@ -875,3 +887,13 @@ derived Telegram rows are rebuilt whenever a session's message count, latest tim
 deletion count changes. Removing the Telegram surface leaves stale `telegram_thread` rows that the
 next materialization pass deletes. Downgrading to a runtime without the Telegram source requires the
 same derived-index rebuild as above.
+
+## Transcript schema 14: model image previews
+
+Schema 14 adds nullable `image_preview_json` to `core_resources`. Existing originals and resource
+references are unchanged. Core lazily generates previews for model input above 1 MiB, with a 25 MiB
+source-read limit and a 40-million-pixel decode limit. Preview metadata records the source hash,
+resize policy version, dimensions, media type, and a separate expiring blob reference. Preview blobs
+expire after 24 hours through existing blob maintenance, including abandoned or replaced previews.
+Missing or expired previews regenerate on demand. Original downloads remain unchanged.
+Older binaries reject schema 14; rollback requires a pre-upgrade backup.

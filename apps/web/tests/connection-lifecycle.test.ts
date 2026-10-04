@@ -1,5 +1,13 @@
-import { expect, test } from "bun:test";
-import { watchConnectionLifecycle } from "../src/connection-lifecycle";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import {
+  CONNECTION_CHECK_INTERVAL_MS,
+  watchConnectionLifecycle,
+} from "../src/connection-lifecycle";
+
+const restore: Array<() => void> = [];
+afterEach(() => {
+  for (const undo of restore.splice(0)) undo();
+});
 
 test("resuming a suspended app reconnects once and removes lifecycle listeners on cleanup", () => {
   const page = Object.assign(new EventTarget(), {
@@ -12,6 +20,7 @@ test("resuming a suspended app reconnects once and removes lifecycle listeners o
     reconnect: () => {
       reconnects++;
     },
+    checkConnection: async () => {},
   };
   const stop = watchConnectionLifecycle(client, page, events);
   events.dispatchEvent(new Event("focus"));
@@ -42,6 +51,7 @@ test("focusing an offline desktop window bypasses reconnect backoff", () => {
       reconnect: () => {
         reconnects++;
       },
+      checkConnection: async () => {},
     },
     page,
     events,
@@ -49,4 +59,42 @@ test("focusing an offline desktop window bypasses reconnect backoff", () => {
   events.dispatchEvent(new Event("focus"));
   expect(reconnects).toBe(1);
   stop();
+});
+
+test("a visible page probes its socket so a silently dropped connection is replaced", () => {
+  const originalInterval = globalThis.setInterval;
+  let tick: (() => void) | undefined;
+  const interval = spyOn(globalThis, "setInterval").mockImplementation(
+    Object.assign((...args: Parameters<typeof setInterval>) => {
+      const [callback, delay] = args;
+      if (delay === CONNECTION_CHECK_INTERVAL_MS) tick = () => callback();
+      return originalInterval(...args);
+    }, originalInterval),
+  );
+  restore.push(() => interval.mockRestore());
+  const cleared = spyOn(globalThis, "clearInterval");
+  restore.push(() => cleared.mockRestore());
+  const page = Object.assign(new EventTarget(), {
+    visibilityState: "visible" as DocumentVisibilityState,
+  });
+  let checks = 0;
+  const stop = watchConnectionLifecycle(
+    {
+      connectionState: "online",
+      reconnect: () => {},
+      checkConnection: async () => {
+        checks++;
+      },
+    },
+    page,
+    new EventTarget(),
+  );
+  expect(tick).toBeDefined();
+  tick!();
+  expect(checks).toBe(1);
+  page.visibilityState = "hidden";
+  tick!();
+  expect(checks).toBe(1);
+  stop();
+  expect(cleared).toHaveBeenCalled();
 });

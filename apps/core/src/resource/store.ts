@@ -1,6 +1,12 @@
 import type { Result } from "better-result";
 
-import type { ResourceCacheV1, ResourceId, ResourceOriginV1, ResourceRecordV1 } from "./contracts";
+import type {
+  ResourceCacheV1,
+  ResourceImagePreview,
+  ResourceId,
+  ResourceOriginV1,
+  ResourceRecordV1,
+} from "./contracts";
 import type { ResourceStoreFailure } from "./errors";
 
 export type ResourceRegisterDecision =
@@ -33,6 +39,12 @@ export interface ResourceStore {
     readonly next: ResourceCacheV1;
     readonly detectedMediaType?: string;
   }): Result<ResourceCacheAttachDecision, ResourceStoreFailure>;
+
+  setImagePreview(input: {
+    readonly resourceId: ResourceId;
+    readonly source: ResourceCacheV1;
+    readonly preview: ResourceImagePreview;
+  }): Result<boolean, ResourceStoreFailure>;
 
   clearCache(input: {
     readonly resourceId: ResourceId;

@@ -27,7 +27,12 @@ export function ReconnectionDemo() {
   }, []);
   useConnectionNotice(online, reconnect, "reconnection-demo");
   useEffect(
-    () => watchConnectionLifecycle({ connectionState: online ? "online" : "offline", reconnect }),
+    () =>
+      watchConnectionLifecycle({
+        connectionState: online ? "online" : "offline",
+        reconnect,
+        checkConnection: async () => {},
+      }),
     [online, reconnect],
   );
   const release = useEventCallback(() => {

@@ -102,6 +102,10 @@ export function parseEnv() {
         baseUrl: env.AI_GATEWAY_BASE_URL,
         apiKey: env.AI_GATEWAY_API_KEY,
       },
+      typesafe: {
+        baseUrl: env.TYPESAFE_AI_BASE_URL,
+        apiKey: env.TYPESAFE_AI_API_KEY,
+      },
     },
     tools: {
       web: {

@@ -18,6 +18,13 @@ bootstrap supplies identity, construct the client with that scope, the already-c
 and a callback that returns that first bootstrap response once before using normal HTTP fetches.
 HTTP callbacks should translate authentication responses into `ORPCError("UNAUTHENTICATED")`.
 A selected-thread authorization failure belongs in the successful bootstrap's thread result.
+After the first visit, the web client sends bootstraps over the socket once it opens. A resumed page
+can reuse a pooled HTTP connection that died in the background, while each socket opens a new one.
+It falls back to HTTP when the socket closes first, because browsers hide upgrade statuses.
+
+`prepareConnection({ fresh })` runs before each connection attempt. An authentication failure
+reconnects once with `fresh: true`, so a provider can bypass its token cache. A second failure logs
+out.
 
 Use `selectThread(id)` for navigation. `thread(id)` immediately returns the stable store. Subscribe
 to `store.subscribeSlot(slotId, callback)` for row updates and `store.subscribe(...)` for structural
@@ -57,6 +64,9 @@ Retryable connection failures emit `offline`; other failures emit `error`. A clo
 bounded jittered exponential backoff. `reconnect()` bypasses backoff and replaces the socket without
 clearing thread stores or pending commands. `connectionState` becomes `online` after both the socket
 and bootstrap are ready. Web clients call `reconnect()` when returning to the foreground or network.
-`reauthenticate(token)` refreshes the connection identity. Switching principal logs out rather than
-reusing a private store. `dispose()` aborts subscriptions, waits for their protocol cleanup and closes
+`checkConnection()` sends an unchanged catalog read and replaces the socket when no reply arrives
+within ten seconds. A network path can drop silently without a close event. Web clients call it
+periodically while visible. A reconnect settles sends still waiting on the old socket as
+`uncertain`. `reauthenticate(token)` refreshes the connection identity. Switching principal logs out
+rather than reusing a private store. `dispose()` aborts subscriptions, waits for their protocol cleanup and closes
 the socket. Await it when shutting down a test or terminal process.

@@ -128,6 +128,20 @@ export const turnPageSchema = z
     },
   );
 export const nativeContract = {
+  computer: {
+    read: procedure.input(threadIdInput).output(
+      z.strictObject({
+        desktop: z
+          .strictObject({
+            generation: z.string().min(1).max(128),
+            url: z.url().max(8192),
+            password: z.string().min(1).max(256),
+            expiresAt: z.string().max(64),
+          })
+          .nullable(),
+      }),
+    ),
+  },
   links: {
     preview: procedure.input(z.strictObject({ url: z.string().min(1).max(8192) })).output(
       z.strictObject({

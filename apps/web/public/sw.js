@@ -103,14 +103,25 @@ async function cachedResponse(pathname, shell) {
   });
 }
 
+const SHELL_NETWORK_TIMEOUT_MS = 3_000;
+
 async function navigationResponse(event) {
   // A cached shell can reference lazy chunks removed by a newer deployment.
-  const response = await bestEffort(() =>
+  const network = bestEffort(() =>
     fetch(new Request(new URL("/", self.location.origin), { cache: "no-cache" })),
   );
-  if (!response || response.status >= 500)
-    return (await cachedResponse("/", true)) ?? response ?? Response.error();
-  event.waitUntil(storeResponse("/", response));
+  // Registered first so the cache copy is cloned before the page can read the body.
+  event.waitUntil(network.then((response) => response && storeResponse("/", response)));
+  const cached = await cachedResponse("/", true);
+  // A resumed phone can reuse a dead connection that the browser detects only after several
+  // seconds, so a cached shell wins once the network is slower than the timeout.
+  const response = cached
+    ? await Promise.race([
+        network,
+        new Promise((resolve) => setTimeout(resolve, SHELL_NETWORK_TIMEOUT_MS)),
+      ])
+    : await network;
+  if (!response || response.status >= 500) return cached ?? response ?? Response.error();
   return response;
 }
 

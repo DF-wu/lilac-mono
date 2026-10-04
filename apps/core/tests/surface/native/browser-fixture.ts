@@ -1,11 +1,13 @@
+import type { NativeRuntimeOptions } from "../../../src/surface/native/runtime";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createNativeIntegrationFixture } from "./integration-fixture";
 import { seedNativeBrowserFixture } from "./browser-seed";
 
-export async function startNativeBrowserFixture() {
+export async function startNativeBrowserFixture(mcpRegistry?: NativeRuntimeOptions["mcpRegistry"]) {
   let threads: ReturnType<typeof seedNativeBrowserFixture> | undefined;
   const fixture = await createNativeIntegrationFixture({
+    mcpRegistry,
     port: 8789,
     password: process.env.TEST_NATIVE_PASSWORD ?? "native-fixture-password",
     allowedOrigins: [

@@ -38,6 +38,7 @@ export function ThreadCard({
   shortcutId,
   starterName,
   starterAvatarUrl,
+  starterIcon,
   updatedAt,
   now,
   state,
@@ -51,6 +52,7 @@ export function ThreadCard({
   shortcutId?: string;
   starterName: string;
   starterAvatarUrl?: string;
+  starterIcon?: ReactNode;
   updatedAt?: number;
   now?: number;
   state: ThreadDisplayState;
@@ -86,7 +88,13 @@ export function ThreadCard({
                 <SquarePen />
               </span>
             ) : null}
-            <ActorAvatar displayName={starterName} avatarUrl={starterAvatarUrl} />
+            {starterIcon ? (
+              <span className="thread-starter-icon flex-none grid place-items-center size-[var(--ui-text-lg)]">
+                {starterIcon}
+              </span>
+            ) : (
+              <ActorAvatar displayName={starterName} avatarUrl={starterAvatarUrl} />
+            )}
             <span>{starterName}</span>
           </span>
           <span className="thread-card-meta ml-auto flex-none flex items-center gap-1">

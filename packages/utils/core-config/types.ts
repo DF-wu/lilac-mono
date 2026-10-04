@@ -251,6 +251,17 @@ export type UniversalCoreConfig = {
         mode: "hybrid" | "semantic" | "lexical";
         filterCurrentParticipants: boolean;
       };
+      autoInjectMode: "llm" | "jev";
+      jevAutoInject: {
+        model: string;
+        limit: number;
+        candidateLimit: number;
+        semanticFallback: boolean;
+        recallMinProbability: number;
+        durableSubjectMinProbability: number;
+        casualMaxProbability: number;
+        relevanceMinProbability: number;
+      };
     };
   };
 

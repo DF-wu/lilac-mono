@@ -45,7 +45,10 @@ import {
   openNativeInstallation,
   type NativeInstallationSecrets,
 } from "../../../src/surface/native/installation";
-import { createNativeRuntime } from "../../../src/surface/native/runtime";
+import {
+  createNativeRuntime,
+  type NativeRuntimeOptions,
+} from "../../../src/surface/native/runtime";
 import type { CoreToolPluginManager, BuiltLevel1Toolset } from "../../../src/plugins";
 
 export function integrationValue<T, E>(result: ResultType<T, E>): T {
@@ -104,6 +107,7 @@ function fixturePluginManager(): CoreToolPluginManager {
 
 export async function createNativeIntegrationFixture(
   options: {
+    mcpRegistry?: NativeRuntimeOptions["mcpRegistry"];
     port?: number;
     operatorTokenSha256?: string;
     password?: string;
@@ -313,7 +317,11 @@ export async function createNativeIntegrationFixture(
       denyPaths: [],
       subscriptionPrefix: "native-integration",
       customCommands,
-      mcpRegistry: { reload: async () => Result.ok([]) },
+      mcpRegistry: options.mcpRegistry ?? {
+        reload: async () => Result.ok([]),
+        getCatalogServers: () => [],
+        getTools: () => [],
+      },
       adapters: { registeredPlatforms: () => [], resolve: () => null },
       conversationThreads: () => undefined,
       runner: () => runner,

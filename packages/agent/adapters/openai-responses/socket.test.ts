@@ -142,9 +142,15 @@ for (const frame of ["invalid JSON", new Uint8Array([1])]) {
     expect(
       (await events.next()).value?.match({
         ok: () => undefined,
-        err: (error: AgentAdapterFailure) => error.replaySafety,
+        err: (error: AgentAdapterFailure) => ({
+          replaySafety: error.replaySafety,
+          message: error.message,
+        }),
       }),
-    ).toBe("reconcile");
+    ).toEqual({
+      replaySafety: "reconcile",
+      message: "OpenAI sent an invalid WebSocket response. Please retry.",
+    });
     socket.close();
     await harness.closed.promise;
     expect((await events.next()).done).toBe(true);
@@ -354,7 +360,16 @@ test("server closes preserve close code reason and unsent count in diagnostics",
     await harness.connect(new AbortController().signal, recording.diagnostics)
   ).unwrap();
   socket.send({ type: "response.create", input: [] }).unwrap();
-  expect((await socket.events[Symbol.asyncIterator]().next()).value?.isErr()).toBe(true);
+  expect(
+    (await socket.events[Symbol.asyncIterator]().next()).value?.match({
+      ok: () => undefined,
+      err: (error: AgentAdapterFailure) => error,
+    }),
+  ).toMatchObject({
+    message:
+      "OpenAI connection closed before the response finished (WebSocket code 1011: backend unavailable). Please retry.",
+    replaySafety: "reconcile",
+  });
   await recording.closed.promise;
   expect(recording.logs.find((entry) => entry.event === "socket.close")?.fields).toEqual({
     closeCode: 1011,
@@ -362,6 +377,37 @@ test("server closes preserve close code reason and unsent count in diagnostics",
     unsentCount: 0,
     intentional: false,
   });
+  socket.close();
+});
+
+test("message-size rejection provides image guidance without automatically replaying the request", async () => {
+  const harness = serve((ws) => ws.close(1009));
+  const socket = (await harness.connect(new AbortController().signal)).unwrap();
+  socket.send({ type: "response.create", input: [] }).unwrap();
+  expect(
+    (await socket.events[Symbol.asyncIterator]().next()).value?.match({
+      ok: () => undefined,
+      err: (error: AgentAdapterFailure) => error,
+    }),
+  ).toMatchObject({
+    message:
+      "OpenAI WebSocket message was too large (code 1009). Retry with smaller image previews or fewer attachments.",
+    replaySafety: "reconcile",
+    cause: { closeCode: 1009 },
+  });
+  socket.close();
+});
+
+test("close reason redacts credentials before reaching the visible error", async () => {
+  const harness = serve((ws) => ws.close(1011, "backend failed api_key=secret"));
+  const socket = (await harness.connect(new AbortController().signal)).unwrap();
+  socket.send({ type: "response.create", input: [] }).unwrap();
+  const failure = (await socket.events[Symbol.asyncIterator]().next()).value?.match({
+    ok: () => undefined,
+    err: (error: AgentAdapterFailure) => error,
+  });
+  expect(failure?.message).toContain("api_key=<redacted>");
+  expect(failure?.message).not.toContain("secret");
   socket.close();
 });
 

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,6 +6,7 @@ import path from "node:path";
 import { Result } from "better-result";
 import { parseCoreConfigV1ToUniversal } from "@stanley2058/lilac-utils";
 import { NativeStore } from "../../src/surface/native/store";
+import * as nativeSource from "../../src/surface/native/conversation-source";
 import { NativeSearchStore } from "../../src/surface/native/store-search";
 import { NativeSearchService } from "../../src/surface/native/search";
 import { DiscordSearchStore } from "../../src/surface/store/discord-search-store";
@@ -167,6 +168,98 @@ function removeThread(item: ReturnType<typeof createNative>) {
     .unwrap();
   native.finishMutation(item.id, mutation.historyGeneration!).unwrap();
 }
+
+test("unchanged native sources skip rescanning across hybrid query variants", async () => {
+  const item = createNative();
+  await service.runSummarization({ now: Date.now() });
+  const getThread = spyOn(index, "getThread");
+  try {
+    for (let i = 0; i < 8; i++) index.refreshNativeThreads();
+    expect(getThread).not.toHaveBeenCalled();
+    const result = (
+      await service.search({
+        query: ["deployment", "deployment native", "deployment answer"],
+        mode: "hybrid",
+        queryAboutness: aboutness,
+      })
+    ).unwrap();
+    expect(result.results.map((hit) => hit.threadId)).toEqual([item.ref]);
+    // The service still checks the recalled hit's revision after the network wait.
+    expect(getThread).toHaveBeenCalledTimes(1);
+    getThread.mockClear();
+    await service.getAutoInjectRankingCorpusDocuments();
+    expect(getThread).not.toHaveBeenCalled();
+    createNative("bob");
+    index.refreshNativeThreads();
+    expect(getThread).toHaveBeenCalled();
+    getThread.mockClear();
+    index.refreshNativeThreads();
+    expect(getThread).not.toHaveBeenCalled();
+  } finally {
+    getThread.mockRestore();
+  }
+});
+
+test("search observes deletion committed during an embedding request", async () => {
+  const item = createNative();
+  await service.runSummarization({ now: Date.now() });
+  duringEmbedding = () => removeThread(item);
+  const result = (
+    await service.search({ query: "deployment", mode: "hybrid", queryAboutness: aboutness })
+  ).unwrap();
+  expect(result.results).toEqual([]);
+  expect(await service.getAutoInjectRankingCorpusDocuments()).toEqual([]);
+});
+
+test("a source commit only reloads messages for changed threads", async () => {
+  const unchanged = createNative();
+  const changed = createNative("bob");
+  await service.runSummarization({ now: Date.now() });
+  const summary = index.getSummary(unchanged.ref).unwrap();
+  const readMessages = spyOn(nativeSource, "readNativeConversationMessages");
+  try {
+    native
+      .postMessage("bob", changed.id, {
+        id: "new-message",
+        role: "assistant",
+        parts: [{ type: "text", text: "new deployment information" }],
+      })
+      .unwrap();
+    index.refreshNativeThreads();
+    expect(readMessages).toHaveBeenCalledTimes(1);
+    expect(readMessages.mock.calls[0]?.[1]).toBe(changed.id);
+    expect(index.getSummary(unchanged.ref).unwrap()).toEqual(summary);
+    expect(index.getSummary(changed.ref).unwrap()).toBeNull();
+    expect(index.listMessages(changed.ref).at(-1)?.text).toBe("new deployment information");
+  } finally {
+    readMessages.mockRestore();
+  }
+});
+
+test("a source attached after store creation is materialized on its first refresh", () => {
+  const item = createNative();
+  const late = new ConversationThreadStore(path.join(dir, "late-search.db"));
+  try {
+    late.refreshNativeThreads();
+    late.attachNativeSource(path.join(dir, "native.db"));
+    late.refreshNativeThreads();
+    expect(late.getThread(item.ref)).not.toBeNull();
+  } finally {
+    late.close();
+  }
+});
+
+test("failed native refreshes retry without a new source commit", () => {
+  const item = createNative();
+  db.run("UPDATE native_records SET format_version=99 WHERE id=?", [item.id]);
+  for (let i = 0; i < 2; i++) {
+    expect(() => index.refreshNativeThreads()).toThrow();
+    expect(index.getThread(item.ref)).toBeNull();
+  }
+  db.run("UPDATE native_records SET format_version=1 WHERE id=?", [item.id]);
+  index.refreshNativeThreads();
+  expect(index.getThread(item.ref)).not.toBeNull();
+});
 test("both origins search one hybrid index and read globally without changing native grants", async () => {
   const alice = createNative();
   const bob = createNative("bob");

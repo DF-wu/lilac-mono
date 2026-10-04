@@ -163,6 +163,14 @@ import {
   type RankedAutoInjectThread,
 } from "../../conversation/thread-auto-inject-ranking";
 import {
+  createJevAutoInjectEvaluator,
+  decideJevAutoInject,
+  type JevAutoInjectAnswers,
+  type JevAutoInjectDecision,
+  type JevAutoInjectEvaluator,
+  type JevAutoInjectUnavailable,
+} from "../../conversation/thread-auto-inject-jev";
+import {
   createStoredMessageIdentityProjectionV1,
   materializeStoredMessagesV1,
   projectStoredMessagesV1,
@@ -236,7 +244,11 @@ import {
   type AgentOutputPublishFailed,
   createAgentOutputPublisher,
 } from "./bus-agent-runner/output-publisher";
-import { latestUserInput, shouldRunAutoInjectedThreadSearch } from "./bus-agent-runner/text-units";
+import {
+  latestUserInput,
+  measureMeaningfulTextUnits,
+  shouldRunAutoInjectedThreadSearch,
+} from "./bus-agent-runner/text-units";
 import { createTransientModelRetryController } from "./bus-agent-runner/transient-retry";
 import {
   type materializeClaudeCodeRunResult,
@@ -1080,9 +1092,31 @@ type AutoInjectedThreadSearchAppendedEvent = {
   corpusDocumentCount: number;
 };
 
+type JevAutoInjectedThreadSearchEvent = {
+  toolCallId: string;
+  model: string;
+  source: "lexical" | "semantic";
+  candidateCount: number;
+  participantFilterUserCount: number;
+  gate: JevAutoInjectDecision["gate"];
+  gateProbabilities: Pick<JevAutoInjectAnswers, "asksToRecall" | "durableSubject" | "casual">;
+  selected: JevAutoInjectDecision["selected"];
+  highestRejected: JevAutoInjectDecision["highestRejected"];
+  entries: readonly AutoInjectedThreadSearchEntry[];
+};
+
+type AutoInjectToolStatusUpdate = {
+  toolCallId: string;
+  status: "start" | "end";
+  display: string;
+  ok?: boolean;
+  error?: string;
+};
+
 export function buildAutoInjectedThreadSearchMessages(params: {
   toolCallId: string;
   entries: readonly AutoInjectedThreadSearchEntry[];
+  note?: string;
 }): ModelMessage[] {
   const payload: AutoInjectedThreadSearchPayload = {
     entries: params.entries.map((entry) => ({
@@ -1103,7 +1137,7 @@ export function buildAutoInjectedThreadSearchMessages(params: {
           toolCallId: params.toolCallId,
           toolName: AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME,
           input: {
-            note: "auto-injected after long user input",
+            note: params.note ?? "auto-injected after long user input",
           },
         },
       ],
@@ -1133,17 +1167,15 @@ function formatAutoInjectedThreadBrief(brief: string): string | undefined {
   return `${trimmed.slice(0, AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH).trimEnd()} ...(${trimmed.length - AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH} remaining)`;
 }
 
-function formatRankedAutoInjectedThread(
-  candidate: RankedAutoInjectThread,
+function formatAutoInjectedThreadSearchResult(
+  result: ConversationThreadSearchResult["results"][number],
 ): AutoInjectedThreadSearchEntry {
-  const timeRange = candidate.result.timeRange
-    ? formatInjectedThreadTimeRange(candidate.result.timeRange)
-    : undefined;
-  const brief = formatAutoInjectedThreadBrief(candidate.result.brief);
+  const timeRange = result.timeRange ? formatInjectedThreadTimeRange(result.timeRange) : undefined;
+  const brief = formatAutoInjectedThreadBrief(result.brief);
   return {
-    threadId: candidate.result.threadId,
-    surface: candidate.result.surface,
-    title: candidate.result.title,
+    threadId: result.threadId,
+    surface: result.surface,
+    title: result.title,
     ...(brief ? { brief } : {}),
     ...(timeRange ? { timeRange } : {}),
   };
@@ -1211,29 +1243,231 @@ export function conversationSurfaceOfRequestClient(client: AdapterPlatform): Con
   return "discord";
 }
 
-export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
+async function publishAutoInjectToolStatusBestEffort(
+  params: {
+    publishToolStatus: (update: AutoInjectToolStatusUpdate) => Promise<void>;
+    onError: (message: string, error: BusAgentRunnerErrorProjection) => void;
+  },
+  update: AutoInjectToolStatusUpdate,
+): Promise<void> {
+  const attempt = await Result.tryPromise({
+    try: async () => {
+      await params.publishToolStatus(update);
+    },
+    catch: captureError,
+  });
+
+  if (attempt.isErr()) {
+    params.onError(
+      "auto-injected thread search status publish failed; continuing",
+      projectBusAgentRunnerError(attempt.error.cause),
+    );
+  }
+}
+
+function notifyAutoInjectObserverBestEffort(
+  onError: (message: string, error: BusAgentRunnerErrorProjection) => void,
+  notify: () => void,
+): void {
+  const attempt = Result.try({ try: notify, catch: captureError });
+
+  if (attempt.isErr()) {
+    onError(
+      "auto-injected thread search append log failed; continuing",
+      projectBusAgentRunnerError(attempt.error.cause),
+    );
+  }
+}
+
+type AutoInjectedThreadSearchParams = {
   surface?: ConversationSurface;
   cfg: CoreConfig;
   conversationThreads?: ConversationThreadToolService;
   requestId: string;
+  /** Session of the request; for native requests this is also the current conversation thread id. */
+  sessionId?: string;
   raw?: AgentRunnerRaw;
   previousMessages?: readonly ModelMessage[];
   userMessages: readonly ModelMessage[];
-  publishToolStatus: (update: {
-    toolCallId: string;
-    status: "start" | "end";
-    display: string;
-    ok?: boolean;
-    error?: string;
-  }) => Promise<void>;
+  publishToolStatus: (update: AutoInjectToolStatusUpdate) => Promise<void>;
   onInjected?: (event: AutoInjectedThreadSearchAppendedEvent) => void;
+  onJevEvaluated?: (event: JevAutoInjectedThreadSearchEvent) => void;
   onError: (message: string, error: BusAgentRunnerErrorProjection) => void;
   autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
-}): Promise<ModelMessage[]> {
+  /** Overrides the env-configured TypeSafe evaluator; used by tests. */
+  createJevEvaluator?: (
+    model: string,
+  ) => ResultType<JevAutoInjectEvaluator, JevAutoInjectUnavailable>;
+};
+
+type JevEvaluatorResolution =
+  | { kind: "ready"; evaluator: JevAutoInjectEvaluator }
+  | { kind: "unavailable"; message: string };
+
+type JevEvaluationOutcome =
+  | { kind: "answered"; answers: JevAutoInjectAnswers }
+  | { kind: "failed"; message: string };
+
+function createEnvJevAutoInjectEvaluator(
+  model: string,
+): ResultType<JevAutoInjectEvaluator, JevAutoInjectUnavailable> {
+  return createJevAutoInjectEvaluator({
+    apiKey: env.providers.typesafe.apiKey,
+    baseUrl: env.providers.typesafe.baseUrl,
+    model,
+  });
+}
+
+function resolveJevAutoInjectEvaluator(
+  params: AutoInjectedThreadSearchParams,
+): JevEvaluatorResolution {
+  const create = params.createJevEvaluator ?? createEnvJevAutoInjectEvaluator;
+  return create(params.cfg.conversation.thread.jevAutoInject.model).match<JevEvaluatorResolution>({
+    ok: (evaluator) => ({ kind: "ready", evaluator }),
+    err: (error) => ({ kind: "unavailable", message: error.message }),
+  });
+}
+
+async function maybeBuildJevAutoInjectedThreadSearchMessages(
+  params: AutoInjectedThreadSearchParams & { conversationThreads: ConversationThreadToolService },
+): Promise<ModelMessage[]> {
+  const jev = params.cfg.conversation.thread.jevAutoInject;
+  const autoInject = params.cfg.conversation.thread.autoInject;
+  const shortlist = params.conversationThreads.shortlistAutoInjectCandidates;
+  if (!shortlist) return [];
+
+  // Attachment marker lines would add filename and MIME words to the shortlist query.
+  const message = latestUserInput(params.userMessages).authoredText;
+  if (measureMeaningfulTextUnits(message) === 0) return [];
+
+  const resolution = resolveJevAutoInjectEvaluator(params);
+  if (resolution.kind === "unavailable") {
+    params.onError(
+      "Jev auto-inject is unavailable; continuing without metadata",
+      projectBusAgentRunnerError(new Error(resolution.message)),
+    );
+    return [];
+  }
+
+  const excludeThreadIds = [...collectAutoInjectedThreadIds(params.previousMessages ?? [])];
+  if (params.surface === "native" && params.sessionId) excludeThreadIds.push(params.sessionId);
+  const participantIds =
+    autoInject.filterCurrentParticipants && params.surface !== "native"
+      ? getParticipantUserIdsFromRaw(params.raw)
+      : [];
+  const autoInjectUsage =
+    params.autoInjectUsage ??
+    createConversationThreadAutoInjectUsageAccumulator({ requestId: params.requestId });
+  const toolCallId = buildAutoInjectedThreadSearchToolCallId(params.requestId);
+  const display = `${AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME} auto-injected metadata`;
+  const endToolStatus = async (failure?: BusAgentRunnerErrorProjection) =>
+    await publishAutoInjectToolStatusBestEffort(params, {
+      toolCallId,
+      status: "end",
+      display,
+      ok: !failure,
+      ...(failure ? { error: failure.message } : {}),
+    });
+
+  const shortlistStartedAt = performance.now();
+  const shortlisted = await Result.tryPromise({
+    try: async () =>
+      await shortlist({
+        text: message,
+        limit: jev.candidateLimit,
+        semanticFallback: jev.semanticFallback,
+        excludeThreadIds,
+        autoInjectUsage,
+        ...(participantIds.length > 0
+          ? { participantIdsAny: participantIds, participantSurface: params.surface }
+          : {}),
+      }),
+    catch: captureError,
+  });
+  autoInjectUsage.recordTiming("shortlist", performance.now() - shortlistStartedAt);
+  if (shortlisted.isErr()) {
+    params.onError(
+      "auto-injected thread shortlist failed; continuing without metadata",
+      projectBusAgentRunnerError(shortlisted.error.cause),
+    );
+    autoInjectUsage.finish({ status: "failed" });
+    return [];
+  }
+  const { source, results } = shortlisted.value;
+  if (source === "none" || results.length === 0) {
+    autoInjectUsage.finish({ status: "abstained" });
+    return [];
+  }
+
+  // Without a length gate most messages end here, so status is shown only once Jev has work.
+  await publishAutoInjectToolStatusBestEffort(params, { toolCallId, status: "start", display });
+  const evaluator = resolution.evaluator;
+  const jevStartedAt = performance.now();
+  const evaluated = await evaluator.evaluate({
+    message,
+    candidates: results.map((result) => ({
+      threadId: result.threadId,
+      title: result.title,
+      brief: result.brief,
+    })),
+  });
+  autoInjectUsage.recordTiming("jev", performance.now() - jevStartedAt);
+  const outcome = evaluated.match<JevEvaluationOutcome>({
+    ok: (answers) => ({ kind: "answered", answers }),
+    err: (error) => ({ kind: "failed", message: error.message }),
+  });
+  if (outcome.kind === "failed") {
+    const failure = projectBusAgentRunnerError(new Error(outcome.message));
+    await endToolStatus(failure);
+    params.onError("Jev auto-inject evaluation failed; continuing without metadata", failure);
+    autoInjectUsage.finish({ status: "failed" });
+    return [];
+  }
+
+  const { answers } = outcome;
+  autoInjectUsage.recordJevUsage({ model: evaluator.model, ...answers.usage });
+  const decision = decideJevAutoInject({ answers, candidates: results, options: jev });
+  const entries = decision.selected.map((candidate) =>
+    formatAutoInjectedThreadSearchResult(results[candidate.index]!),
+  );
+  await endToolStatus();
+  notifyAutoInjectObserverBestEffort(params.onError, () =>
+    params.onJevEvaluated?.({
+      toolCallId,
+      model: evaluator.model,
+      source,
+      candidateCount: results.length,
+      participantFilterUserCount: participantIds.length,
+      gate: decision.gate,
+      gateProbabilities: {
+        asksToRecall: answers.asksToRecall,
+        durableSubject: answers.durableSubject,
+        casual: answers.casual,
+      },
+      selected: decision.selected,
+      highestRejected: decision.highestRejected,
+      entries,
+    }),
+  );
+  autoInjectUsage.finish({ status: entries.length > 0 ? "completed" : "abstained" });
+  if (entries.length === 0) return [];
+  return buildAutoInjectedThreadSearchMessages({
+    toolCallId,
+    entries,
+    note: "auto-injected for the latest user input",
+  });
+}
+
+export async function maybeBuildAutoInjectedThreadSearchMessages(
+  params: AutoInjectedThreadSearchParams,
+): Promise<ModelMessage[]> {
   const autoInject = params.cfg.conversation.thread.autoInject;
   if (!autoInject.enabled) return [];
   if (!params.conversationThreads) return [];
   const conversationThreads = params.conversationThreads;
+  if (params.cfg.conversation.thread.autoInjectMode === "jev") {
+    return await maybeBuildJevAutoInjectedThreadSearchMessages({ ...params, conversationThreads });
+  }
 
   const latestInput = latestUserInput(params.userMessages);
   const text = latestInput.text;
@@ -1266,41 +1500,21 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
 
   const toolCallId = buildAutoInjectedThreadSearchToolCallId(params.requestId);
   const display = `${AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME} auto-injected metadata`;
-  const publishToolStatusBestEffort = async (update: {
-    toolCallId: string;
-    status: "start" | "end";
-    display: string;
-    ok?: boolean;
-    error?: string;
-  }) => {
-    {
-      const attempt = await Result.tryPromise({
-        try: async () => {
-          await params.publishToolStatus(update);
-        },
-        catch: captureError,
-      });
-
-      if (attempt.isErr()) {
-        const error = attempt.error.cause;
-        params.onError(
-          "auto-injected thread search status publish failed; continuing",
-          projectBusAgentRunnerError(error),
-        );
-      }
-    }
-  };
+  const publishToolStatusBestEffort = async (update: AutoInjectToolStatusUpdate) =>
+    await publishAutoInjectToolStatusBestEffort(params, update);
 
   await publishToolStatusBestEffort({ toolCallId, status: "start", display });
 
   {
     const attempt = await Result.tryPromise({
       try: async () => {
+        const planningStartedAt = performance.now();
         const plan = await conversationThreads.planAutoInjectSearch({
           text,
           content: latestInput.content,
           autoInjectUsage,
         });
+        autoInjectUsage.recordTiming("planning", performance.now() - planningStartedAt);
         usageSearchCount = plan.searches.length;
         usageQueryCount = plan.searches.reduce(
           (sum, searchPlan) => sum + searchPlan.queries.length,
@@ -1317,6 +1531,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
           return [];
         }
         const searchRecallLimit = Math.min(50, Math.max(autoInject.limit * 5, 10));
+        const searchStartedAt = performance.now();
         const settledSearches = await Promise.allSettled(
           plan.searches.map((searchPlan) =>
             conversationThreads.search({
@@ -1333,6 +1548,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
             }),
           ),
         );
+        autoInjectUsage.recordTiming("search", performance.now() - searchStartedAt);
         let fulfilledSearches = 0;
         const successfulSearches: Array<{
           searchIndex: number;
@@ -1368,8 +1584,11 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
           return [];
         }
         usageStatus = fulfilledSearches === plan.searches.length ? "completed" : "partial";
+        const corpusStartedAt = performance.now();
         const corpusDocuments =
           (await conversationThreads.getAutoInjectRankingCorpusDocuments?.()) ?? [];
+        autoInjectUsage.recordTiming("corpus", performance.now() - corpusStartedAt);
+        const rankingStartedAt = performance.now();
         const rankingResult = rankAutoInjectedThreadSearchResults({
           plan,
           searches: successfulSearches,
@@ -1378,8 +1597,11 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
           limit: autoInject.limit,
           expansionMinConfidence: autoInject.expansionMinConfidence,
         });
+        autoInjectUsage.recordTiming("ranking", performance.now() - rankingStartedAt);
         const rankedEntries = rankingResult.selected;
-        const entries = rankedEntries.map(formatRankedAutoInjectedThread);
+        const entries = rankedEntries.map((candidate) =>
+          formatAutoInjectedThreadSearchResult(candidate.result),
+        );
 
         await publishToolStatusBestEffort({
           toolCallId,
@@ -7787,11 +8009,29 @@ export async function startBusAgentRunner(params: {
                             })
                           : params.conversationThreads,
                       requestId: headers.request_id,
+                      sessionId: headers.session_id,
                       raw: next.raw,
                       previousMessages: agent.state.messages,
                       userMessages: mergedInitial,
                       publishToolStatus: publishNonAgentToolStatus,
                       onError: reportAutoInjectedThreadSearchError,
+                      onJevEvaluated: (event) => {
+                        logger.info("conversation.thread.auto_inject.jev", {
+                          requestId: headers.request_id,
+                          sessionId: headers.session_id,
+                          toolCallId: event.toolCallId,
+                          model: event.model,
+                          source: event.source,
+                          candidateCount: event.candidateCount,
+                          participantFilterUserCount: event.participantFilterUserCount,
+                          gate: event.gate,
+                          gateProbabilities: event.gateProbabilities,
+                          selected: event.selected,
+                          highestRejected: event.highestRejected,
+                          appendedCount: event.entries.length,
+                          entries: event.entries,
+                        });
+                      },
                       onInjected: (event) => {
                         logger.info("conversation.thread.auto_inject.appended", {
                           requestId: headers.request_id,

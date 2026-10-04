@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 
-import { coreConfigInputSchemaV2, coreConfigSchema } from "../core-config";
+import {
+  coreConfigInputSchemaV2,
+  coreConfigSchema,
+  parseCoreConfigV1ToUniversal,
+} from "../core-config";
 
 describe("coreConfigSchema models.capability", () => {
   it("defaults conversation thread summarization, embedding, and auto injection config", () => {
@@ -97,6 +101,60 @@ describe("coreConfigSchema models.capability", () => {
             autoInject: { expansionMinConfidence: 1.01 },
           },
         },
+      }),
+    ).toThrow();
+  });
+
+  it("defaults conversation thread auto inject to the LLM lane with Jev options", () => {
+    const v2 = coreConfigInputSchemaV2.parse({ configVersion: 2 });
+    const v1 = parseCoreConfigV1ToUniversal({ configVersion: 1 });
+    const expectedJev = {
+      model: "jev-1.13.0",
+      limit: 3,
+      candidateLimit: 30,
+      semanticFallback: true,
+      recallMinProbability: 0.7,
+      durableSubjectMinProbability: 0.6,
+      casualMaxProbability: 0.6,
+      relevanceMinProbability: 0.6,
+    };
+
+    expect(v2.conversation.thread.autoInjectMode).toBe("llm");
+    expect(v2.conversation.thread.jevAutoInject).toEqual(expectedJev);
+    expect(v1.conversation.thread.autoInjectMode).toBe("llm");
+    expect(v1.conversation.thread.jevAutoInject).toEqual(expectedJev);
+  });
+
+  it("accepts Jev auto inject mode and partial option overrides", () => {
+    const parsed = coreConfigInputSchemaV2.parse({
+      configVersion: 2,
+      conversation: {
+        thread: {
+          autoInjectMode: "jev",
+          jevAutoInject: { candidateLimit: 12, relevanceMinProbability: 0.75 },
+        },
+      },
+    });
+
+    expect(parsed.conversation.thread.autoInjectMode).toBe("jev");
+    expect(parsed.conversation.thread.jevAutoInject).toMatchObject({
+      model: "jev-1.13.0",
+      candidateLimit: 12,
+      relevanceMinProbability: 0.75,
+    });
+  });
+
+  it("rejects unknown auto inject modes and Jev probabilities outside zero through one", () => {
+    expect(() =>
+      coreConfigInputSchemaV2.parse({
+        configVersion: 2,
+        conversation: { thread: { autoInjectMode: "planner" } },
+      }),
+    ).toThrow();
+    expect(() =>
+      coreConfigInputSchemaV2.parse({
+        configVersion: 2,
+        conversation: { thread: { jevAutoInject: { casualMaxProbability: 1.2 } } },
       }),
     ).toThrow();
   });
