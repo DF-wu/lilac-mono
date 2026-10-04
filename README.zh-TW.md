@@ -25,7 +25,7 @@
 </p>
 
 > [!IMPORTANT]
-> 這是以 Git history 與 `upstream` remote 持續追蹤 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的 downstream fork，不是上游官方發行版。本專案定期合併上游更新，同時維護 Telegram、相容式圖像路由、GitHub 回覆連結與部署自動化等獨立功能。
+> 這是以 Git history 與 `upstream` remote 持續追蹤 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的 downstream fork，不是上游官方發行版。本專案定期合併上游更新，同時維護 Telegram、相容式圖像路由、OpenAI `web.search`、GitHub 回覆連結與部署自動化等獨立功能。
 
 Lilac 把平台訊息、路由、模型執行、工具、Skills 與可恢復工作流程放在同一套 Core runtime 中。
 
@@ -37,6 +37,7 @@ Lilac 把平台訊息、路由、模型執行、工具、Skills 與可恢復工�
 | --- | --- | --- |
 | Telegram surface | DMs、群組、forum topics、串流 HTML 回覆、取消、reaction、command menu、inbound/outbound attachments、workflow cards、同 surface tools，以及納入跨 surface 對話記憶的 Telegram 歷史 | 預設停用；僅 long polling；記憶以每個聊天或 topic 為一個 thread |
 | OpenAI-compatible 圖像路由 | 將既有 `generate.image` aliases 統一路由到 operator 指定的 OpenAI-compatible endpoint | 僅 `configVersion: 2`；無自動 fallback 或自訂 alias mapping |
+| OpenAI `web.search` provider | `tools.web.extract.providers` 填入 `openai` 後，`web.search` 改走 OpenAI Responses 的 `web_search` 工具，回傳答案引用的來源 | 僅 `configVersion: 2`；只做搜尋（`web.extract` 會略過）；日期限制只是對模型的指示 |
 | GitHub 回覆 UX | `In reply to` 可直接連到 issue/PR body 或指定 comment 的 canonical permalink | GitHub comment self-loop 防護已被上游接收，不再列為 fork-only |
 | Custom media plugin | 可部署的 Level 2 image/video plugin 範例，示範嚴格設定與檔案安全處理 | Plugin 是 trusted in-process code；restricted caller 目前不能使用 external callables |
 | 維運與交付 | 每 6 小時檢查 upstream、發布經驗證的 GHCR `catalina`/`claudia` tags，CI 並強制執行 upstream-footprint allowlist | 自動合併發生衝突時仍需人工處理 |
@@ -235,6 +236,24 @@ docker compose up -d --force-recreate --wait --wait-timeout 120 lilac
 
 Alias、`openaiCompatible.models` allowlist 與 `openaiCompatible.modelIds` overrides、generation/edit endpoints、無 fallback 行為與 colon-form `size` aspect-ratio 轉送見 [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md)。
 
+### 透過 OpenAI 搜尋網頁
+
+```yaml
+configVersion: 2
+
+tools:
+  web:
+    extract:
+      providers: [tavily, openai]
+    openai:
+      model: gpt-5-mini
+      searchContextSize: medium
+```
+
+provider 清單就是 `web.search` 的依序 fallback 鏈，`openai` 只有列在裡面才會被使用。它讀取 `OPENAI_API_KEY`，有設定時也讀取 `OPENAI_BASE_URL`；若 `OPENAI_BASE_URL` 指向 gateway，該 gateway 必須能轉送 Responses API 的 `web_search` 工具。結果會先列模型引用的 URL（每筆都標示為 OpenAI 產生的摘要），再附上未被引用的檢索來源。`web.extract` 會略過這個 provider，需要抓取頁面時請保留 `tavily`、`exa` 或 `firecrawl`。
+
+`tools.web.openai` 欄位見 [`docs/core-config-migrations.md`](./docs/core-config-migrations.md)，限制見 [`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md)。
+
 ### 使用 custom-media plugin 範例
 
 ```bash
@@ -287,7 +306,7 @@ bun run fmt:check
 
 `.github/workflows/sync-upstream.yml` 每 6 小時檢查一次 upstream `main`，有新 commits 時嘗試 merge 到本 fork 的 `main`。乾淨合併後會觸發 image build；發生 conflict 時由維護者人工處理。
 
-- 本 fork 新功能、部署 workflow、Telegram 或相容式圖像路由問題：請在 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues) 回報。
+- 本 fork 新功能、部署 workflow、Telegram、OpenAI `web.search` 或相容式圖像路由問題：請在 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues) 回報。
 - 可在未修改 upstream 重現的問題：先確認 upstream 狀態，再向 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono/issues) 回報。
 - 歷史上由本 fork 回饋並已被 upstream 接收的功能，不再列為當前差異。清單見 [`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md#已被上游接收的貢獻)。
 - Fork 的行為放在 fork 自有模組；upstream 檔案只保留很薄的接縫。`bun run fork:footprint` 會把每個被修改的 upstream 檔案對照 [`scripts/fork/upstream-footprint.txt`](./scripts/fork/upstream-footprint.txt)，[`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md#fork-程式碼配置) 則列出每項功能對應的模組與接縫。
