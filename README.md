@@ -262,13 +262,13 @@ tools:
     extract:
       providers: [tavily, openai]
     openai:
-      model: gpt-5-mini
+      model: openai-compatible/gpt-5.6-terra
       searchContextSize: medium
 ```
 
-The provider list is the ordered fallback chain for `web.search`, so `openai` only runs when it is listed. It reads `OPENAI_API_KEY` and, when set, `OPENAI_BASE_URL`; a gateway at `OPENAI_BASE_URL` must relay the Responses API `web_search` tool. Results carry the model's URL citations, each labeled as an OpenAI-generated summary, followed by retrieved sources that were not cited. `web.extract` skips this provider, so keep `tavily`, `exa`, or `firecrawl` in the list when you need page extraction.
+The provider list is the ordered fallback chain for `web.search`, so `openai` only runs when it is listed. `model` is the `provider/model` that runs the hosted search (default `openai/gpt-5-mini`; a bare model id means `openai/<id>`). An `openai/...` model uses `OPENAI_API_KEY` and `OPENAI_BASE_URL`; an `openai-compatible/...` model uses `OPENAI_COMPATIBLE_API_KEY` and `OPENAI_COMPATIBLE_BASE_URL`. Any gateway it points at must relay the Responses API `web_search` tool. Results carry the model's URL citations, each labeled as an OpenAI-generated summary, followed by retrieved sources that were not cited. `web.extract` skips this provider, so keep `tavily`, `exa`, or `firecrawl` in the list when you need page extraction.
 
-See [`docs/core-config-migrations.md`](./docs/core-config-migrations.md) for the `tools.web.openai` fields and [`docs/fork-differences.md`](./docs/fork-differences.md) for the limitations.
+See [`docs/web-search-openai.md`](./docs/web-search-openai.md) for the full data flow (exactly what the mediator model receives and what the conversation model gets back), errors, and limitations, and [`docs/core-config-migrations.md`](./docs/core-config-migrations.md) for the `tools.web.openai` fields.
 
 ### Use the Custom Media Plugin Example
 

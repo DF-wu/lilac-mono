@@ -25,6 +25,10 @@ import {
   type WebSearchProviderId,
 } from "./web-search";
 import {
+  resolveOpenAIWebSearchModel,
+  type OpenAIWebSearchModelInvalid,
+} from "./web-search/openai-web-search-model";
+import {
   FirecrawlPermitPool,
   FirecrawlPermitQueueTimedOut,
   type FirecrawlPermit,
@@ -167,6 +171,10 @@ function getDefaultWebProviderEnvironment(): WebProviderEnvironment {
     openai: {
       apiKey: env.providers.openai.apiKey,
       baseUrl: env.providers.openai.baseUrl,
+    },
+    openaiCompatible: {
+      apiKey: env.providers.openaiCompatible.apiKey,
+      baseUrl: env.providers.openaiCompatible.baseUrl,
     },
   };
 }
@@ -452,6 +460,34 @@ export class Web implements ServerTool {
       providerId.trim().toLowerCase(),
     );
     const environment = this.dependencies.getProviderEnvironment();
+    const searchModel = resolveOpenAIWebSearchModel({
+      model: config.openaiPolicy?.model,
+      environment: {
+        openai: environment.openai,
+        ...(environment.openaiCompatible ? { openaiCompatible: environment.openaiCompatible } : {}),
+      },
+    });
+    const openaiSearch = searchModel.match<
+      | {
+          readonly kind: "ready";
+          readonly modelId: string;
+          readonly apiKey?: string;
+          readonly baseUrl?: string;
+        }
+      | { readonly kind: "invalid" }
+    >({
+      ok: (value) => ({
+        kind: "ready",
+        modelId: value.modelId,
+        ...(value.apiKey === undefined ? {} : { apiKey: value.apiKey }),
+        ...(value.baseUrl === undefined ? {} : { baseUrl: value.baseUrl }),
+      }),
+      err: () => ({ kind: "invalid" }),
+    });
+    const openaiSearchFailure = searchModel.match<OpenAIWebSearchModelInvalid | null>({
+      ok: () => null,
+      err: (error) => error,
+    });
     const nextKey = JSON.stringify({
       requested: normalizedRequested,
       fetchMode: config.fetchMode,
@@ -464,6 +500,8 @@ export class Web implements ServerTool {
       tavilyApiBaseUrl: environment.tavily.apiBaseUrl ?? null,
       hasOpenAIApiKey: Boolean(environment.openai.apiKey),
       openaiBaseUrl: environment.openai.baseUrl ?? null,
+      hasOpenAICompatibleApiKey: Boolean(environment.openaiCompatible?.apiKey),
+      openaiCompatibleBaseUrl: environment.openaiCompatible?.baseUrl ?? null,
       openaiPolicy: config.openaiPolicy ?? null,
     });
     if (nextKey === this.webSearchProviderKey) return;
@@ -483,13 +521,22 @@ export class Web implements ServerTool {
       exa: { baseUrl: environment.exa.baseUrl, apiKey: environment.exa.apiKey },
       tavilyApiKey: environment.tavily.apiKey,
       tavilyApiBaseUrl: environment.tavily.apiBaseUrl,
-      openai: {
-        apiKey: environment.openai.apiKey,
-        baseUrl: environment.openai.baseUrl,
-        model: config.openaiPolicy?.model,
-        searchContextSize: config.openaiPolicy?.searchContextSize,
-      },
+      openai:
+        openaiSearch.kind === "ready"
+          ? {
+              apiKey: openaiSearch.apiKey,
+              baseUrl: openaiSearch.baseUrl,
+              model: openaiSearch.modelId,
+              searchContextSize: config.openaiPolicy?.searchContextSize,
+            }
+          : { apiKey: undefined },
     });
+    if (openaiSearchFailure && normalizedRequested.includes("openai")) {
+      this.logger.logError(
+        "web.search provider 'openai' is unavailable: tools.web.openai.model cannot run web_search",
+        formatTaggedErrorForLog(openaiSearchFailure),
+      );
+    }
     const resolved = resolveWebSearchProvider({
       requested: config.extractProviders,
       providers,

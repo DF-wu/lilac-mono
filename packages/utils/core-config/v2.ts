@@ -438,7 +438,7 @@ const webConfigSchemaV2 = z
         .optional(),
       openai: z
         .object({
-          model: z.string().trim().min(1).default("gpt-5-mini"),
+          model: z.string().trim().min(1).default("openai/gpt-5-mini"),
           searchContextSize: z.enum(["low", "medium", "high"]).default("medium"),
         })
         .optional(),

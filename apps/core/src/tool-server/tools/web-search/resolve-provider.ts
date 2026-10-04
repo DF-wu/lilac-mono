@@ -28,7 +28,7 @@ function missingConfigMessage(id: WebSearchProviderId): string | null {
     return "web.search is unavailable: TAVILY_API_KEY is not configured (set env var TAVILY_API_KEY).";
   }
   if (id === "openai") {
-    return "web.search is unavailable: OPENAI_API_KEY is not configured (set env var OPENAI_API_KEY).";
+    return "web.search is unavailable: OPENAI_API_KEY is not configured (set env var OPENAI_API_KEY, or OPENAI_COMPATIBLE_API_KEY when tools.web.openai.model is an openai-compatible model).";
   }
   return null;
 }

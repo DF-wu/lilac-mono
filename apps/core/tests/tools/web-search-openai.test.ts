@@ -137,7 +137,7 @@ describe("web-search (openai)", () => {
 
     expect(resolved.providers).toEqual([]);
     expect(resolved.error).toBe(
-      "web.search is unavailable: OPENAI_API_KEY is not configured (set env var OPENAI_API_KEY).",
+      "web.search is unavailable: OPENAI_API_KEY is not configured (set env var OPENAI_API_KEY, or OPENAI_COMPATIBLE_API_KEY when tools.web.openai.model is an openai-compatible model).",
     );
   });
 

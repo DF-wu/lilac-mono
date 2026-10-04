@@ -134,9 +134,14 @@ New v2 fields:
 - `tools.web.extract.providers` accepts `openai` in v2: `web.search` then runs the OpenAI Responses
   `web_search` tool with `OPENAI_API_KEY` (and `OPENAI_BASE_URL` when set) and returns the answer's URL
   citations followed by uncited retrieved sources. It is search-only; `web.extract` skips it and uses the
-  next configured provider. `tools.web.openai.model` (default `gpt-5-mini`) and
-  `tools.web.openai.searchContextSize` (`low` | `medium` | `high`, default `medium`) tune the call;
-  set `model` to one your endpoint serves when `OPENAI_BASE_URL` points at a gateway. Cited URLs lose
+  next configured provider. `tools.web.openai.model` (default `openai/gpt-5-mini`) and
+  `tools.web.openai.searchContextSize` (`low` | `medium` | `high`, default `medium`) tune the call.
+  `model` is a `provider/model` spec: an `openai/...` model uses `OPENAI_API_KEY` / `OPENAI_BASE_URL`,
+  an `openai-compatible/...` model uses `OPENAI_COMPATIBLE_API_KEY` / `OPENAI_COMPATIBLE_BASE_URL`,
+  and any other provider leaves the `openai` provider unconfigured with a logged error. A bare model
+  id from an existing config means `openai/<id>`. Set `model` to one your endpoint serves when the
+  base URL points at a gateway. [`web-search-openai.md`](./web-search-openai.md) documents the full
+  request and result contract. Cited URLs lose
   the `utm_source=openai` tag; cited `content` is explicitly labeled as an OpenAI-generated summary,
   not a page excerpt, and may combine cited sources. Date constraints are model instructions, not
   enforced publication-date filters.
