@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import MarkdownContent from "../src/components/MarkdownContent";
 import MathExpression, { sanitizeMathTree } from "../src/components/rich-math";
 import { highlightCode } from "../src/components/rich-code";
+import { remarkChatMath } from "../src/components/remark-chat-math";
 import { diagramSourceAllowed, markdownUrl } from "../src/components/markdown-policy";
 
 describe("markdown", () => {
@@ -74,6 +78,40 @@ describe("markdown", () => {
       expect(rendered).toMatch(/<code|markdown-math/);
       expect(rendered).not.toContain("$x");
     }
+  });
+
+  test("renders LaTeX bracket delimiters without capturing escaped prose brackets", () => {
+    const render = (text: string) =>
+      renderToStaticMarkup(
+        <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath, remarkChatMath]}>
+          {text}
+        </ReactMarkdown>,
+      );
+    expect(render("\\[ N > \\frac{0.20X + 0.48}{0.20(X -\n0.10)} \\]")).toBe(
+      '<p><code class="language-math math-display"> N &gt; \\frac{0.20X + 0.48}{0.20(X -\n0.10)} </code></p>',
+    );
+    expect(render("> - \\[\n>   a \\\\ b\n> \\]")).toContain(
+      '<code class="language-math math-display">\na \\\\ b\n</code>',
+    );
+    expect(render("\\[\nx\n\\]  \nafter")).toBe(
+      '<p><code class="language-math math-display">\nx\n</code>\nafter</p>',
+    );
+    expect(render("Pay $10 when \\(r_1 + r_2\\) and $7")).toBe(
+      '<p>Pay $10 when <code class="language-math math-inline">r_1 + r_2</code> and $7</p>',
+    );
+    expect(render("中文\\(x\\)")).toBe(
+      '<p>中文<code class="language-math math-inline">x</code></p>',
+    );
+    const literals = [
+      ["array\\[0\\] and see \\[1\\]", "<p>array[0] and see [1]</p>"],
+      ["\\[x\\] done", "<p>[x] done</p>"],
+      ["f\\(x\\) and \\[unclosed", "<p>f(x) and [unclosed</p>"],
+      ["`\\(code\\)` and \\\\(x\\\\)", "<p><code>\\(code\\)</code> and \\(x\\)</p>"],
+      ["\\(a\n\nb\\)", "<p>(a</p>\n<p>b)</p>"],
+      ["## \\[Draft\\] *title*", "<h2>[Draft] <em>title</em></h2>"],
+      ["| a |\n| - |\n| \\[1\\] |", "<td>[1]</td>"],
+    ] as const;
+    for (const [text, html] of literals) expect(render(text)).toContain(html);
   });
 
   test("closes emphasis and strikethrough after CJK punctuation followed by CJK text", () => {
