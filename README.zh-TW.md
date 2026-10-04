@@ -252,7 +252,7 @@ tools:
 
 provider 清單就是 `web.search` 的依序 fallback 鏈，`openai` 只有列在裡面才會被使用。`model` 以 `provider/model` 指定實際執行 hosted search 的模型（預設 `openai/gpt-5-mini`；裸的 model id 視同 `openai/<id>`）。`openai/...` 模型使用 `OPENAI_API_KEY` 與 `OPENAI_BASE_URL`；`openai-compatible/...` 模型使用 `OPENAI_COMPATIBLE_API_KEY` 與 `OPENAI_COMPATIBLE_BASE_URL`。所指向的 gateway 必須能轉送 Responses API 的 `web_search` 工具。結果會先列模型引用的 URL（每筆都標示為 OpenAI 產生的摘要），再附上未被引用的檢索來源。`web.extract` 會略過這個 provider，需要抓取頁面時請保留 `tavily`、`exa` 或 `firecrawl`。
 
-`tools.web.openai` 欄位見 [`docs/core-config-migrations.md`](./docs/core-config-migrations.md)，限制見 [`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md)。
+完整資料流（中介模型究竟拿到什麼、對話模型收到什麼）、錯誤與限制見 [`docs/web-search-openai.md`](./docs/web-search-openai.md)；`tools.web.openai` 欄位見 [`docs/core-config-migrations.md`](./docs/core-config-migrations.md)。
 
 ### 使用 custom-media plugin 範例
 

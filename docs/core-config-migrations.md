@@ -140,7 +140,8 @@ New v2 fields:
   an `openai-compatible/...` model uses `OPENAI_COMPATIBLE_API_KEY` / `OPENAI_COMPATIBLE_BASE_URL`,
   and any other provider leaves the `openai` provider unconfigured with a logged error. A bare model
   id from an existing config means `openai/<id>`. Set `model` to one your endpoint serves when the
-  base URL points at a gateway. Cited URLs lose
+  base URL points at a gateway. [`web-search-openai.md`](./web-search-openai.md) documents the full
+  request and result contract. Cited URLs lose
   the `utm_source=openai` tag; cited `content` is explicitly labeled as an OpenAI-generated summary,
   not a page excerpt, and may combine cited sources. Date constraints are model instructions, not
   enforced publication-date filters.

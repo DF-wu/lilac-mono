@@ -25,6 +25,7 @@ Language: [`English (primary / canonical)`](../README.md) · [`Traditional Chine
 | Document | Contents |
 | --- | --- |
 | [`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md) | Route `generate.image` to an OpenAI-compatible endpoint |
+| [`web-search-openai.md`](./web-search-openai.md) | `web.search` through the OpenAI Responses `web_search` tool: what the mediator model receives, what the conversation model gets back, configuration, and limitations |
 | [`../PLUGIN_AUTHORING.md`](../PLUGIN_AUTHORING.md) | Level 1/Level 2 external plugin contract, lifecycle, and permissions |
 | [`../examples/plugins/custom-media/README.md`](../examples/plugins/custom-media/README.md) | Deployable OpenAI-compatible image/video plugin example |
 
