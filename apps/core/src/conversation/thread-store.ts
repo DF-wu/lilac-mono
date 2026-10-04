@@ -2318,7 +2318,7 @@ export class ConversationThreadStore {
     allowlist?: ConversationThreadSearchAllowlist;
     excludeThreadIds?: readonly string[];
   }): ResultType<ConversationThreadSearchHit[], PersistedDataError> {
-    this.refreshNativeThreads();
+    this.refreshSourceThreads();
     const ftsQuery = buildAnyTermFtsQuery(input.text);
     if (!ftsQuery) return Result.ok([]);
 

@@ -2212,7 +2212,8 @@ export class ConversationThreadService {
       if (hit.kind === "native_thread") {
         return this.params.store.getThread(hit.threadId)?.summary_input_hash === hit.sourceRevision;
       }
-      return shouldAllowDiscordThread(cfg, {
+      return shouldAllowThread(cfg, {
+        kind: hit.kind,
         channelId: hit.channelId,
         parentChannelId: hit.parentChannelId,
         guildId: hit.guildId,
