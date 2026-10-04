@@ -11,6 +11,7 @@ import {
   clampReasoningDetail,
   escapeDiscordMarkdown,
   formatReasoningAsBlockquote,
+  sendDiscordStyledMessage,
   toPreviewTail,
 } from "../../../../src/surface/discord/output/discord-output-stream";
 import type { SurfaceToolStatusUpdate } from "../../../../src/surface/adapter";
@@ -1415,6 +1416,51 @@ describe("attachment finalization", () => {
       throw new Error("expected overflow reply message with files");
     }
     expect(res.last.messageId).toBe(replyFileMsg.messageId);
+  });
+});
+
+describe("styled message send", () => {
+  const sessionRef = { platform: "discord" as const, channelId: "chan" };
+
+  it("sends plain style as a content reply chain without a preview", async () => {
+    const { client, operations, deletedMessageIds } = createFakeDiscordClient();
+
+    const result = await sendDiscordStyledMessage({
+      client,
+      sessionRef,
+      content: { text: "x".repeat(4500), style: "plain", attachments: [makeAttachment(1)] },
+      opts: { replyTo: { platform: "discord", channelId: "chan", messageId: "origin" } },
+      useSmartSplitting: false,
+    });
+    const last = resultValue(result);
+
+    const created = operations.filter((op) => op.kind === "send" || op.kind === "reply");
+    expect(created.map((op) => contentFromOptions(op.options)?.length)).toEqual([2000, 2000, 500]);
+    expect(created.some((op) => hasEmbeds(op.options))).toBe(false);
+    expect(created[0]?.options).toMatchObject({ reply: { messageReference: "origin" } });
+    expect(created[1]?.parentId).toBe(created[0]?.messageId);
+    expect(created[2]?.parentId).toBe(created[1]?.messageId);
+    expect(uploadedFileNames(created[2]?.options)).toEqual(["image-1.png"]);
+    expect(deletedMessageIds).toEqual([]);
+    expect(created[2]?.messageId).toBe(last.messageId);
+  });
+
+  it("keeps embed style as the default", async () => {
+    const { client, operations } = createFakeDiscordClient();
+
+    resultValue(
+      await sendDiscordStyledMessage({
+        client,
+        sessionRef,
+        content: { text: "hello" },
+        useSmartSplitting: false,
+      }),
+    );
+
+    expect(operations.map((op) => embedDescriptionsFromOptions(op.options))).toContainEqual([
+      "hello",
+    ]);
+    expect(operations.some((op) => contentFromOptions(op.options) === "hello")).toBe(false);
   });
 });
 

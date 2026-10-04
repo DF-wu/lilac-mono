@@ -347,7 +347,7 @@ describe("Core resource SQLite store", () => {
     const inspected = new Database(dbPath);
     expect(
       inspected.query("SELECT MAX(version) AS version FROM transcript_schema_migrations").get(),
-    ).toEqual({ version: 13 });
+    ).toEqual({ version: 14 });
     expect(inspected.query("PRAGMA foreign_key_check").all()).toEqual([]);
     inspected.close();
     await fs.rm(directory, { recursive: true, force: true });
@@ -397,4 +397,53 @@ describe("Core resource SQLite store", () => {
     store.close();
     await fs.rm(directory, { recursive: true, force: true });
   });
+});
+
+it("persists image previews across reopen and rejects stale or unretained sources", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "resource-preview-"));
+  const dbPath = path.join(dir, "transcript.sqlite");
+  let store = new SqliteTranscriptStore(dbPath);
+  const id = resourceId("91");
+  const preview = {
+    policyVersion: 1 as const,
+    sourceSha256: cache.blob.sha256,
+    blob: { ...cache.blob, objectId: `b1_${"92".repeat(16)}`, expiresAt: Date.now() + 60_000 },
+    mediaType: "image/png" as const,
+    originalWidth: 2000,
+    originalHeight: 1000,
+    width: 1000,
+    height: 500,
+  };
+  try {
+    register(store, id);
+    value(
+      store.saveRequestTranscript({
+        requestId: "preview-request",
+        sessionId: "session",
+        requestClient: "discord",
+        messages: [resourceMessage(id)],
+      }),
+    );
+    value(store.compareAndSwapCache({ resourceId: id, next: cache }));
+    expect(value(store.setImagePreview({ resourceId: id, source: cache, preview }))).toBe(true);
+    store.close();
+    store = new SqliteTranscriptStore(dbPath);
+    expect(value(store.getRetained(id))?.imagePreview).toEqual(preview);
+    expect(value(store.getRetained(id))?.cache).toEqual(cache);
+    expect(
+      value(store.setImagePreview({ resourceId: id, source: { ...cache, cachedAt: 99 }, preview })),
+    ).toBe(false);
+    value(
+      store.saveRequestTranscript({
+        requestId: "preview-request",
+        sessionId: "session",
+        requestClient: "discord",
+        messages: [{ role: "user", content: "removed" }],
+      }),
+    );
+    expect(value(store.setImagePreview({ resourceId: id, source: cache, preview }))).toBe(false);
+  } finally {
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });

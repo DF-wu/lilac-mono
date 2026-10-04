@@ -1,3 +1,5 @@
+import { ComputerViewer } from "./components/ComputerViewer";
+import computerDemoUrl from "./assets/computer-demo.html?url";
 import { AgentAvatar } from "./components/AgentAvatar";
 import { FloatingChatMenu } from "./components/FloatingChatMenu";
 import { useAppShortcuts, useThreadTargets } from "./shortcuts";
@@ -12,10 +14,11 @@ import { SPINNERS } from "loading-dev";
 import { LoadingSpinner } from "./components/ui/loading-spinner";
 import { ConnectionLoading } from "./components/ui/connection-loading";
 import { ReconnectionDemo } from "./components/ReconnectionDemo";
-import { ConversationBadge } from "./components/ConversationReference";
+import { ConversationBadge, ConversationIcon } from "./components/ConversationReference";
 import lilacLogo from "./assets/logo.svg";
 import { LinkPreviewAnchor } from "./components/LinkWithFavicon";
 import { SidebarEmptyState } from "./components/SidebarEmptyState";
+import { ConversationStatus } from "./components/ConversationStatus";
 import { setThemeMode } from "./theme/theme";
 import { clerkAppearance } from "./theme/clerk";
 import { FileIcon } from "./components/FileIcon";
@@ -515,10 +518,20 @@ function Threads() {
           <ThreadCard
             title="Calendar Enums"
             starterName="Discord"
+            starterIcon={<ConversationIcon surface="discord" />}
             updatedAt={now}
             now={now}
             state="idle"
             selected
+            onSelect={() => {}}
+          />
+          <ThreadCard
+            title="Fix search pagination"
+            starterName="GitHub"
+            starterIcon={<ConversationIcon surface="github" />}
+            updatedAt={now - 3 * 86_400_000}
+            now={now}
+            state="idle"
             onSelect={() => {}}
           />
           <ExternalSkeleton />
@@ -917,6 +930,7 @@ function ComposerSpecimen() {
           rightOpen={rightOpen}
           onToggleSidebar={() => setSidebarOpen((open) => !open)}
           onToggleRight={() => setRightOpen((open) => !open)}
+          onNewThread={() => toast.add({ title: "New thread selected", type: "info" })}
           onShare={() => toast.add({ title: "Share selected", type: "info" })}
           onRename={() => toast.add({ title: "Rename selected", type: "info" })}
           onArchive={() => toast.add({ title: "Archive selected", type: "info" })}
@@ -1294,6 +1308,17 @@ function Controls() {
             <ConnectionLoading />
           </div>
         </Specimen>
+        <Specimen title="Conversation status">
+          <div className="grid gap-4 sm:grid-cols-3">
+            <ConversationStatus state="loading" />
+            <ConversationStatus state="offline" onRetry={() => toast.add({ title: "Retrying" })} />
+            <ConversationStatus
+              state="error"
+              detail="Conversation not found"
+              onRetry={() => toast.add({ title: "Retrying" })}
+            />
+          </div>
+        </Specimen>
         <Specimen title="Sign-in styles">
           <div className={clerkAppearance.signIn.elements.cardBox}>
             <div className={`flex flex-col ${clerkAppearance.signIn.elements.card}`}>
@@ -1559,6 +1584,27 @@ function Layout() {
     </Section>
   );
 }
+function ComputerDemo() {
+  const [open, setOpen] = useState(false);
+  return (
+    <Section id="computer" title="Computer viewer">
+      <Button onClick={() => setOpen((value) => !value)}>
+        {open ? "Close demo" : "Open demo"}
+      </Button>
+      {open ? (
+        <ComputerViewer
+          desktop={{
+            generation: "demo",
+            url: new URL(computerDemoUrl, location.origin).href,
+            password: "demo",
+            expiresAt: "2099-01-01T00:00:00Z",
+          }}
+        />
+      ) : null}
+    </Section>
+  );
+}
+
 export default function DesignSystem() {
   const returnThreadId = useLocation({ select: (location) => location.state.chatThreadId });
   const returnDraftId = useLocation({ select: (location) => location.state.draftThreadId });
@@ -1713,6 +1759,7 @@ export default function DesignSystem() {
                   </Specimen>
                 </div>
               </Section>
+              <ComputerDemo />
               <Controls />
               <Overlays />
               <Layout />

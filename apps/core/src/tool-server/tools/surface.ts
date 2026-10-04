@@ -924,6 +924,12 @@ const messagesSendInputSchema = baseInputSchema.extend({
     .boolean()
     .optional()
     .describe("Disable all notifications for this message (mentions + reply ping)."),
+  style: z
+    .enum(["embed", "plain"])
+    .default("plain")
+    .describe(
+      "Discord message style. 'plain' (default) sends regular message content; 'embed' puts the text in an embed.",
+    ),
   paths: optionalNonEmptyStringListInputSchema.describe(
     "Local file paths to attach (resolved relative to request cwd)",
   ),
@@ -1229,6 +1235,8 @@ export class Surface implements ServerTool {
           ],
           replyToMessageId: "When sending a message, optionally reply to an existing messageId.",
           silent: "When true, suppress all notifications for this send (mentions + reply ping).",
+          style:
+            "Discord send style: 'plain' (default) sends regular message content; 'embed' puts text in an embed.",
           attachments:
             "Outbound: local files offered to the selected adapter (paths resolved relative to request cwd; unsupported adapters reject them explicitly). Inbound: message attachment/media metadata is first-class on surface.messages.read and hinted on surface.messages.list.",
         },
@@ -1990,6 +1998,7 @@ export class Surface implements ServerTool {
           target.sessionRef,
           {
             text: input.text,
+            style: input.style,
             attachments,
           },
           sendOpts,

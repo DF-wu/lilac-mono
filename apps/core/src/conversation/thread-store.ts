@@ -701,6 +701,7 @@ export class ConversationThreadStore {
   private readonly mainAgentUserNames: ReadonlySet<string>;
   private hasNativeSource = false;
   private hasTelegramSource = false;
+  private nativeDataVersion: number | undefined;
   private readonly onPersistenceDiagnostic: (
     diagnostic: ConversationThreadPersistenceDiagnostic,
   ) => void;
@@ -739,6 +740,7 @@ export class ConversationThreadStore {
   attachNativeSource(databasePath: string): void {
     installNativeConversationSource(this.db, databasePath);
     this.hasNativeSource = true;
+    this.nativeDataVersion = undefined;
   }
 
   attachTelegramSource(databasePath: string, botName?: string): void {
@@ -764,7 +766,17 @@ export class ConversationThreadStore {
 
   refreshNativeThreads(): void {
     if (!this.hasNativeSource) return;
+    const version = this.db
+      .query<{ data_version: number }, []>("PRAGMA native_conversation.data_version")
+      .get()?.data_version;
+    if (version !== undefined && version === this.nativeDataVersion) return;
+    const startedAt = performance.now();
     this.db.transaction(() => this.materializeNativeThreads())();
+    // Remember the version from before the scan so a concurrent commit cannot be skipped.
+    this.nativeDataVersion = version;
+    threadStoreLogger.debug("conversation.thread.native_refresh", {
+      elapsedMs: performance.now() - startedAt,
+    });
   }
 
   refreshTelegramThreads(): void {
@@ -831,8 +843,8 @@ export class ConversationThreadStore {
       const threadId = `native:${thread.id}`;
       const existing = this.getThread(threadId);
       const hash = `native:${stableHash(thread.revision)}`;
-      const sourceMessages = selectResultValue(readNativeConversationMessages(this.db, thread.id));
       if (existing?.summary_input_hash === hash) continue;
+      const sourceMessages = selectResultValue(readNativeConversationMessages(this.db, thread.id));
       const messages: IndexedMessageRow[] = sourceMessages.map((message) => ({
         ...message,
         guild_id: null,
@@ -2295,6 +2307,105 @@ export class ConversationThreadStore {
     return Result.ok(hits);
   }
 
+  /**
+   * Ranks threads matching any term of raw user text. Unlike `search`, which ANDs a planner query,
+   * this is meant for unplanned message text where most words will not appear in any summary.
+   */
+  searchAnyTerm(input: {
+    text: string;
+    limit?: number;
+    filters?: ConversationThreadSearchFilters;
+    allowlist?: ConversationThreadSearchAllowlist;
+    excludeThreadIds?: readonly string[];
+  }): ResultType<ConversationThreadSearchHit[], PersistedDataError> {
+    this.refreshNativeThreads();
+    const ftsQuery = buildAnyTermFtsQuery(input.text);
+    if (!ftsQuery) return Result.ok([]);
+
+    const limit = Math.min(SEARCH_LIMIT_MAX, Math.max(1, Math.floor(input.limit ?? 5)));
+    const filter = buildSearchFilterClause(input.filters, input.allowlist);
+    const excluded = [...new Set(input.excludeThreadIds ?? [])];
+    const excludeSql =
+      excluded.length > 0 ? `AND t.thread_id NOT IN (${excluded.map(() => "?").join(", ")})` : "";
+    // FTS5 rejects bm25 ranking inside joins and aggregates, so rank the matches once in a
+    // materialized CTE before joining.
+    const rows = this.db
+      .query(
+        `
+        WITH hits AS MATERIALIZED (
+          SELECT rowid, rank
+          FROM conversation_thread_facets_fts
+          WHERE conversation_thread_facets_fts MATCH ?
+        )
+        SELECT
+          t.*,
+          s.title,
+          s.brief,
+          s.topics_json,
+          s.retrieval_hints_json,
+          s.aboutness_json,
+          s.importance,
+          s.importance_reasons_json,
+          s.created_at,
+          s.updated_at,
+          s.summary_format_version,
+          -min(hits.rank) AS lexical_score
+        FROM hits
+        JOIN conversation_thread_facets f ON f.rowid = hits.rowid
+        JOIN conversation_threads t ON t.thread_id = f.thread_id
+        JOIN conversation_thread_summaries s ON s.thread_id = t.thread_id
+        WHERE ${filter.sql}
+          ${excludeSql}
+        GROUP BY t.thread_id
+        ORDER BY lexical_score DESC, t.end_ts DESC
+        LIMIT ?
+        `,
+      )
+      .all(ftsQuery, ...filter.values, ...excluded, limit) as ThreadSearchRow[];
+
+    const hits: ConversationThreadSearchHit[] = [];
+    for (const row of rows) {
+      const decoded = decodeConversationThreadSummaryRow(row);
+      const decodeError = resultErrorOrNull(decoded);
+      if (decodeError) {
+        this.reportPersistenceError(decodeError);
+        return Result.err(decodeError);
+      }
+      const summary = selectResultValue(decoded).value;
+      const summarized =
+        row.last_summarized_at !== null &&
+        row.last_summarized_at >= row.updated_at &&
+        row.summary_version === CONVERSATION_THREAD_SUMMARY_VERSION;
+      const lexicalScore = row.lexical_score ?? 0;
+      hits.push({
+        threadId: row.thread_id,
+        channelId: row.channel_id,
+        guildId: row.guild_id ?? undefined,
+        parentChannelId: row.parent_channel_id ?? undefined,
+        kind: row.kind,
+        sourceRevision: row.summary_input_hash ?? undefined,
+        title: summary.title,
+        brief: summary.brief,
+        topics: summary.topics,
+        retrievalHints: summary.retrievalHints,
+        aboutness: summary.aboutness,
+        importance: summary.importance,
+        importanceReasons: summary.importanceReasons,
+        startTs: row.start_ts,
+        endTs: row.end_ts,
+        messageCount: row.message_count,
+        score: lexicalScore,
+        lexicalScore,
+        semanticScore: 0,
+        startMessageId: row.start_message_id,
+        endMessageId: row.end_message_id,
+        summarized,
+        stale: !summarized,
+      });
+    }
+    return Result.ok(hits);
+  }
+
   searchSemantic(input: {
     embedding: Float32Array;
     modelId: string;
@@ -2546,6 +2657,29 @@ function buildThreadScopeClause(filters?: {
     sql: clauses.length > 0 ? clauses.join(" AND ") : "1 = 1",
     values,
   };
+}
+
+const ANY_TERM_URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>()]+/giu;
+const ANY_TERM_CJK_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const ANY_TERM_MAX_TERMS = 40;
+const ANY_TERM_STOPWORDS = new Set(
+  (
+    "the and for are but not you your with this that have has had was were will would could " +
+    "should can what when where which who how why its don dont doesn didn isn wasn just like about " +
+    "from into then than they them there their also some any all more most very really tho idk lol"
+  ).split(" "),
+);
+
+function buildAnyTermFtsQuery(input: string): string | null {
+  const tokens =
+    input
+      .toLowerCase()
+      .replace(ANY_TERM_URL_RE, " ")
+      .match(/[\p{L}\p{N}]+/gu)
+      ?.filter((token) => token.length >= (ANY_TERM_CJK_RE.test(token) ? 2 : 3))
+      .filter((token) => !ANY_TERM_STOPWORDS.has(token)) ?? [];
+  const unique = [...new Set(tokens)].slice(0, ANY_TERM_MAX_TERMS);
+  return unique.length > 0 ? unique.map((token) => `"${token}"`).join(" OR ") : null;
 }
 
 function normalizeFtsQuery(input: string): string | null {

@@ -143,6 +143,30 @@ conversation:
       # in the composed request/reply-chain context.
       # Native candidates and native-origin cross-surface recall remain global.
       filterCurrentParticipants: false
+    # Which lane decides auto-injection when autoInject.enabled is true:
+    # - llm: the length gate, planner model, and search ranking configured above.
+    # - jev: one TypeSafe Jev call judges the latest message and a local shortlist.
+    #   Requires TYPESAFE_AI_API_KEY; TYPESAFE_AI_BASE_URL is optional.
+    #   Ignores the autoInject length, planner, score, and mode settings.
+    autoInjectMode: llm
+    jevAutoInject:
+      # TypeSafe evaluation model id.
+      model: jev-1.13.0
+      # Max thread titles to inject.
+      limit: 3
+      # Threads shortlisted for Jev to judge. Latency barely changes with this value.
+      candidateLimit: 30
+      # Search summary embeddings once when no summary shares a word with the
+      # message, for example CJK text. Needs conversation.thread.embedding.
+      semanticFallback: true
+      # Inject when P(message asks to recall a past conversation) reaches this...
+      recallMinProbability: 0.7
+      # ...or when P(message is about a lasting subject) reaches this and
+      # P(message is casual chatter) stays below casualMaxProbability.
+      durableSubjectMinProbability: 0.6
+      casualMaxProbability: 0.6
+      # Minimum P(reading the thread helps respond) for each injected thread.
+      relevanceMinProbability: 0.6
 
 surface:
   native:

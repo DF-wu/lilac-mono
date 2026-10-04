@@ -34,6 +34,7 @@ import { Panic, Result, TaggedError, type Result as ResultType } from "better-re
 import {
   parseResourceUri,
   type ResourceCacheV1,
+  type ResourceImagePreview,
   type ResourceId,
   type ResourceOriginV1,
   type ResourceRecordV1,
@@ -61,6 +62,7 @@ import {
   defaultStoredBlobFilename,
   hashCanonicalStoredMessagesV2,
   normalizeResourceCacheV1,
+  normalizeResourceImagePreview,
   normalizeResourceDetectedMediaType,
   normalizeResourceRecordV1,
   normalizeStoredMessagesV1,
@@ -1973,6 +1975,13 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           [13, Date.now()],
         );
       }
+      if (version < 14) {
+        this.db.run("ALTER TABLE core_resources ADD COLUMN image_preview_json TEXT");
+        this.db.run(
+          "INSERT INTO transcript_schema_migrations (version, applied_ts) VALUES (?, ?)",
+          [14, Date.now()],
+        );
+      }
       const foreignKeyFailures = this.db
         .query<DecodedTranscriptForeignKeyFailureRow, []>("PRAGMA foreign_key_check")
         .all()
@@ -2555,6 +2564,41 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           : Result.ok({ kind: "lost", record });
       },
       (cause) => classifyResourceSqliteDriverFailure("attach-resource-cache", cause),
+    );
+  }
+
+  setImagePreview(input: {
+    readonly resourceId: ResourceId;
+    readonly source: ResourceCacheV1;
+    readonly preview: ResourceImagePreview;
+  }): ResultType<boolean, ResourceStoreFailure> {
+    const preview = normalizeResourceImagePreview(input.preview);
+    const source = normalizeResourceCacheV1(input.source);
+    if (!preview || !source || preview.sourceSha256 !== source.blob.sha256) {
+      return Result.err(
+        new ResourceStoreFailure({
+          operation: "set-image-preview",
+          message: "Invalid image preview",
+        }),
+      );
+    }
+    return this.readFromSqlite(
+      "set-image-preview",
+      () =>
+        this.db.run(
+          `UPDATE core_resources SET image_preview_json = ?
+       WHERE resource_id = ? AND cache_blob_ref_json = ? AND cache_cached_ts = ?
+       AND (EXISTS (SELECT 1 FROM core_transcript_resource_refs WHERE resource_id = core_resources.resource_id)
+         OR EXISTS (SELECT 1 FROM core_surface_projection_resource_refs WHERE resource_id = core_resources.resource_id)
+         OR EXISTS (SELECT 1 FROM core_native_resource_refs WHERE resource_id = core_resources.resource_id))`,
+          [JSON.stringify(preview), input.resourceId, JSON.stringify(source.blob), source.cachedAt],
+        ).changes > 0,
+    ).mapError(
+      () =>
+        new ResourceStoreFailure({
+          operation: "set-image-preview",
+          message: "Image preview could not be saved",
+        }),
     );
   }
 

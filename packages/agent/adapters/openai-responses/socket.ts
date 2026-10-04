@@ -243,15 +243,7 @@ function observeSocket(
           }
           failed = true;
           if (event.type === "error") rethrowAgentPanic(sdkFailureCause(event.error));
-          yield Result.err(
-            connectionFailure(
-              event.type === "error"
-                ? event.error.message
-                : "OpenAI WebSocket closed or sent an invalid protocol frame",
-              "reconcile",
-              event.type === "error" ? event.error : undefined,
-            ),
-          );
+          yield Result.err(socketStreamFailure(event));
           return;
         }
         settleDiagnosticFailure();
@@ -308,6 +300,33 @@ function observeSocket(
       if (failure) signalSocketCloseFailure(sdkFailureCause(failure));
     },
   };
+}
+
+function socketStreamFailure(event: ResponsesStreamMessage): AgentAdapterFailure {
+  if (event.type === "error")
+    return connectionFailure(event.error.message, "reconcile", event.error);
+  if (event.type === "raw")
+    return connectionFailure(
+      "OpenAI sent an invalid WebSocket response. Please retry.",
+      "reconcile",
+    );
+  if (event.type !== "close")
+    return connectionFailure(
+      "OpenAI WebSocket connection was interrupted. Please retry.",
+      "reconcile",
+    );
+  if (event.code === 1009)
+    return connectionFailure(
+      "OpenAI WebSocket message was too large (code 1009). Retry with smaller image previews or fewer attachments.",
+      "reconcile",
+      { closeCode: event.code },
+    );
+  const reason = event.reason ? `: ${redactErrorTextForLog(event.reason)}` : "";
+  return connectionFailure(
+    `OpenAI connection closed before the response finished (WebSocket code ${event.code}${reason}). Please retry.`,
+    "reconcile",
+    { closeCode: event.code },
+  );
 }
 
 function signalSocketCloseFailure(cause: OpaqueAgentValue): never {

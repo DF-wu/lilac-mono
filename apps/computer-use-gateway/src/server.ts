@@ -21,7 +21,10 @@ Lifetime: Desktop state, files, and Python variables persist across calls and tu
 
 Limits: Code is limited to 32000 characters, execution to 120 seconds, text to 64 KiB, and images to eight / 12 MiB total base64. An uncertain execution destroys the runner. Call provision for a fresh desktop, inspect the current application state, and determine what completed before continuing; never replay uncertain actions automatically.`;
 
-type Operations = Pick<ComputerLifecycle, "isReady" | "provision" | "execute" | "terminate">;
+type Operations = Pick<
+  ComputerLifecycle,
+  "isReady" | "viewer" | "provision" | "execute" | "terminate"
+>;
 
 function toolFailure(error: GatewayFailure): CallToolResult {
   return {
@@ -68,6 +71,26 @@ export function createGatewayHandler(lifecycle: Operations, bearer: string) {
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
     });
+    server.registerTool(
+      "viewer",
+      {
+        description:
+          "Read this session's current desktop viewer credentials without provisioning or extending its lifetime.",
+        inputSchema: z.strictObject({}),
+        annotations: { readOnlyHint: true },
+      },
+      async () => {
+        if (!session)
+          return toolFailure(failure("invalid", "Missing or invalid Lilac session header"));
+        return lifecycle.viewer(session).match({
+          ok: (value) => ({
+            content: [{ type: "text", text: JSON.stringify(value) }],
+            structuredContent: value,
+          }),
+          err: toolFailure,
+        });
+      },
+    );
     server.registerTool(
       "provision",
       {

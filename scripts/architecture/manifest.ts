@@ -409,6 +409,7 @@ export const BLOB_STORAGE_ARCHITECTURE_POLICY = {
       module: "src/surface/bridge/request-composition/prepare-bus-messages",
     },
     { workspace: "apps/core", module: "src/resource/service" },
+    { workspace: "apps/core", module: "src/resource/image-preview" },
     { workspace: "apps/core", module: "src/surface/native/resources" },
     { workspace: "apps/core", module: "src/tool-server/tools/attachment" },
     { workspace: "apps/core", module: "src/workflow/workflow-artifact-store" },
@@ -2941,6 +2942,7 @@ const CORE_THREAD_PERSISTED_CODECS = [
 const CORE_THREAD_PERSISTED_CONSUMERS = [
   "ConversationThreadStore.getSummary",
   "ConversationThreadStore.search",
+  "ConversationThreadStore.searchAnyTerm",
   "ConversationThreadStore.searchSemantic",
 ].map(
   (exportName): PersistedStoreConsumerRegistration => ({
@@ -3795,6 +3797,25 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : [],
     boundaryDecoders: [
+      ...(root === "apps/core"
+        ? [
+            {
+              identity: {
+                module: "src/surface/native/computer.ts",
+                exportName: "decodeComputerViewer",
+              },
+              category: "wire" as const,
+            },
+          ]
+        : []),
+      ...(root === "apps/web"
+        ? [
+            {
+              identity: { module: "src/computer-viewer.ts", exportName: "decodeComputerState" },
+              category: "wire" as const,
+            },
+          ]
+        : []),
       ...(root === "packages/client-protocol"
         ? [
             {
@@ -4214,6 +4235,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "decodeSurfaceMessageLinkRow",
               "normalizeResourceRecordV1",
               "normalizeResourceCacheV1",
+              "normalizeResourceImagePreview",
               "normalizeResourceDetectedMediaType",
               "decodeResourceRecordRow",
             ].map((exportName) => ({

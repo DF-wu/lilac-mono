@@ -10,6 +10,7 @@ import { Result } from "better-result";
 import { WebSessionController, webCache } from "./bootstrap";
 import { LocalLogin } from "./auth";
 import { readAuthInfo, resourceUrl, uploadResource, type AuthInfo } from "./http";
+import { requireConnectionCredentials } from "./connection-credentials";
 import { watchAppUpdates, watchAppUpdateChecks, type AppUpdate } from "./updates";
 import { showAppUpdateToast } from "./app-update-toast";
 import { AccountLoadBoundary } from "./AccountLoadBoundary";
@@ -24,13 +25,23 @@ const ClerkSession = lazy(() =>
 const ClerkAccount = lazy(() =>
   import("./clerk").then((module) => ({ default: module.ClerkAccount })),
 );
+const ClerkCredentials = lazy(() =>
+  import("./clerk").then((module) => ({ default: module.ClerkCredentials })),
+);
 const sessions = new WebSessionController();
 let authInfo: ReturnType<typeof readAuthInfo> | undefined;
 let sessionStarted = false;
+function clerkKey(result: Awaited<ReturnType<typeof readAuthInfo>>): string | undefined {
+  return result.match({
+    ok: (auth) => (auth.provider === "clerk" ? auth.publishableKey : undefined),
+    err: () => undefined,
+  });
+}
 function enterChat() {
   authInfo ??= readAuthInfo();
   if (sessionStarted) return;
   sessionStarted = true;
+  requireConnectionCredentials(authInfo.then((result) => !!clerkKey(result)));
   start();
 }
 const start = () => {
@@ -177,6 +188,21 @@ function Root() {
   );
 }
 
+function ConnectionCredentials() {
+  const [publishableKey, setPublishableKey] = useState<string>();
+  useEffect(() => {
+    void authInfo?.then((result) => setPublishableKey(clerkKey(result)));
+  }, []);
+  if (!publishableKey) return null;
+  return (
+    <AccountLoadBoundary>
+      <Suspense fallback={null}>
+        <ClerkCredentials publishableKey={publishableKey} />
+      </Suspense>
+    </AccountLoadBoundary>
+  );
+}
+
 function RouteShell() {
   const chat = useMatch({ from: "/chat", shouldThrow: false, select: () => true }) ?? false;
   const [visitedChat, setVisitedChat] = useState(chat);
@@ -186,6 +212,7 @@ function RouteShell() {
       {visitedChat ? (
         <div hidden={!chat} style={{ height: "100%" }}>
           <SurfaceVisibilityContext value={chat}>
+            <ConnectionCredentials />
             <Root />
           </SurfaceVisibilityContext>
         </div>

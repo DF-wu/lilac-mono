@@ -3546,6 +3546,86 @@ describe("conversation thread store", () => {
     threadStore.close();
   });
 
+  it("shortlists auto-inject candidates by any term with a semantic fallback", async () => {
+    const dbPath = await createDbPath();
+    const searchStore = new DiscordSearchStore(dbPath);
+    const threadStore = new ConversationThreadStore(dbPath);
+    searchStore.upsertMessages([
+      msg({ channelId: "c1", messageId: "m1", userId: "u1", text: "sqlite storage", ts: 1 }),
+      msg({ channelId: "c1", messageId: "m2", userId: "u2", text: "database indexing", ts: 2 }),
+      msg({
+        channelId: "c1",
+        messageId: "m3",
+        userId: "u1",
+        text: "later cooking discussion",
+        ts: 2 + 2 * 60 * 60 * 1000,
+      }),
+      msg({
+        channelId: "c1",
+        messageId: "m4",
+        userId: "u3",
+        text: "banana dessert follow-up",
+        ts: 3 + 2 * 60 * 60 * 1000,
+      }),
+    ]);
+    const service = new ConversationThreadService({
+      store: threadStore,
+      getConfig: async () => testConfig(),
+      getEmbeddingAdapter: async () => fakeEmbeddingAdapter,
+      summarizer: async ({ threadId }) =>
+        threadId.endsWith(":m3")
+          ? {
+              title: "Dessert planning",
+              brief: "Conversation about making a banana dessert recipe.",
+              topics: ["dessert recipe"],
+            }
+          : {
+              title: "Database storage",
+              brief: "Conversation about sqlite storage and indexing tradeoffs.",
+              topics: ["database indexing"],
+            },
+    });
+    await service.runSummarization({ now: Date.now() + 2 * 60 * 60 * 1000 });
+    const shortlist = async (
+      input: Partial<
+        Parameters<RuntimeConversationThreadService["shortlistAutoInjectCandidates"]>[0]
+      >,
+    ) =>
+      okValue(
+        await service.shortlistAutoInjectCandidates({
+          text: "",
+          limit: 5,
+          semanticFallback: true,
+          ...input,
+        }),
+      );
+
+    // One matching word is enough; the planner-style search would require every token.
+    const lexical = await shortlist({ text: "what did we decide on sqlite pragmas last week?" });
+    expect(lexical.source).toBe("lexical");
+    expect(lexical.results.map((result) => result.title)).toEqual(["Database storage"]);
+    expect(lexical.results[0]?.timeRange).toBeDefined();
+
+    const excluded = await shortlist({
+      text: "sqlite yellow fruit",
+      excludeThreadIds: [lexical.results[0]!.threadId],
+    });
+    expect(excluded.source).toBe("semantic");
+    expect(excluded.results[0]?.title).toBe("Dessert planning");
+    expect(excluded.results.map((result) => result.threadId)).not.toContain(
+      lexical.results[0]!.threadId,
+    );
+
+    const noFallback = await shortlist({ text: "黃色水果", semanticFallback: false });
+    expect(noFallback).toEqual({ source: "none", results: [] });
+
+    const stopwordsOnly = await shortlist({ text: "what was that about", semanticFallback: false });
+    expect(stopwordsOnly).toEqual({ source: "none", results: [] });
+
+    searchStore.close();
+    threadStore.close();
+  });
+
   it("uses the latest embedding adapter on subsequent runs", async () => {
     const dbPath = await createDbPath();
     const searchStore = new DiscordSearchStore(dbPath);

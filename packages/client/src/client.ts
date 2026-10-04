@@ -36,7 +36,7 @@ export type NativeClientOptions = {
   scope: CacheScope;
   openSocket: () => WebSocket;
   bootstrap: (input: BootstrapInput, signal: AbortSignal) => Promise<BootstrapReply>;
-  prepareConnection?: () => Promise<void>;
+  prepareConnection?: (request: { fresh: boolean }) => Promise<void>;
   cache?: NativeCache;
   catalogs?: DisplayCatalogCache;
   onEvent?: (event: ClientEvent) => void;
@@ -98,6 +98,7 @@ export class NativeClient {
   private connectionAttempt = 0;
   private connectionLifetime = new AbortController();
   private connectionDeadline: ReturnType<typeof setTimeout> | undefined;
+  private credentialRetry = false;
   private state: Extract<ClientEvent, { kind: "connection" }>["state"] = "connecting";
 
   constructor(private readonly options: NativeClientOptions) {
@@ -234,10 +235,14 @@ export class NativeClient {
     await this.bootstrap();
   }
   private async prepareConnection(
-    operation: () => Promise<void>,
+    operation: NonNullable<NativeClientOptions["prepareConnection"]>,
     attempt: number,
   ): Promise<boolean> {
-    const prepared = await Result.tryPromise({ try: operation, catch: captureFailure });
+    const fresh = this.credentialRetry;
+    const prepared = await Result.tryPromise({
+      try: () => operation({ fresh }),
+      catch: captureFailure,
+    });
     if (this.stopped || attempt !== this.connectionAttempt) return false;
     const error = prepared.match({ ok: () => undefined, err: (error) => error });
     if (error) {
@@ -334,6 +339,7 @@ export class NativeClient {
       return;
     }
     const reply = outcome.reply;
+    this.credentialRetry = false;
     if (
       reply.installationId !== this.options.scope.installationId ||
       reply.viewer.id !== this.options.scope.principalId
@@ -620,6 +626,25 @@ export class NativeClient {
       err: (error) => this.emit({ kind: "error", error }),
     });
   }
+  // A network path that drops silently leaves the socket open with no close event. An unchanged
+  // catalog read is the cheapest round trip that proves the socket still delivers replies.
+  async checkConnection(): Promise<void> {
+    const rpc = this.connection;
+    if (!rpc || this.stopped || this.state !== "online") return;
+    const captured = await Result.tryPromise({
+      try: () =>
+        rpc.catalogs.get(
+          { revision: this.catalogs.get(this.options.scope)?.revision },
+          {
+            signal: AbortSignal.any([this.connectionLifetime.signal, AbortSignal.timeout(10_000)]),
+          },
+        ),
+      catch: captureFailure,
+    });
+    if (rpc !== this.connection || this.stopped) return;
+    const failed = captured.match({ ok: () => false, err: (error) => error.kind === "network" });
+    if (failed) this.reconnect();
+  }
   async reauthenticate(token: string): Promise<boolean> {
     const rpc = this.connection;
     if (!rpc) return false;
@@ -671,8 +696,11 @@ export class NativeClient {
     this.pending.set(input.commandId, structuredClone(input));
     const rpc = this.connection;
     if (!rpc) return { kind: "uncertain", commandId: input.commandId };
+    // A dead socket reports its close only after the browser gives up, so a replaced connection
+    // settles the send as uncertain.
+    const signal = this.connectionLifetime.signal;
     const captured = await Result.tryPromise({
-      try: () => rpc.inputs.submit(input),
+      try: () => rpc.inputs.submit(input, { signal }),
       catch: captureFailure,
     });
     if (
@@ -710,6 +738,13 @@ export class NativeClient {
     return { kind: "rejected", error: { kind: "rejected", message: "Unknown command" } };
   }
   private async failure(error: ClientFailure): Promise<void> {
+    // A cached provider token can expire by the server's clock. Only a rejected fresh token ends the
+    // session, because logout purges cached private data.
+    if (error.kind === "auth" && !this.credentialRetry && !this.stopped) {
+      this.credentialRetry = true;
+      this.reconnect();
+      return;
+    }
     if (error.kind === "auth") {
       await this.logout();
       return;

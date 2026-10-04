@@ -353,3 +353,24 @@ test("configuration separates bind address and rendered origin", () => {
   ])
     expect(decodeConfig(env).isErr()).toBe(true);
 });
+
+test("viewer lookup is session scoped and never provisions or refreshes expiry", async () => {
+  const { lifecycle, docker, advance } = await setup();
+  expect(value(lifecycle.viewer(sessionA))).toEqual({ status: "absent" });
+  expect(docker.starts).toBe(0);
+  const provisioned = value(await lifecycle.provision(sessionA, 60));
+  advance(1000);
+  expect(value(lifecycle.viewer(sessionA))).toMatchObject({
+    status: "ready",
+    generation: provisioned.generation,
+    viewer_password: provisioned.viewer_password,
+    viewer_url: "https://vnc.example.com:17000/lilac-viewer.html",
+    expires_at: provisioned.expires_at,
+  });
+  expect(value(lifecycle.viewer(sessionB))).toEqual({ status: "absent" });
+  advance(60000);
+  expect(value(lifecycle.viewer(sessionA))).toEqual({ status: "absent" });
+  expect(docker.starts).toBe(1);
+  value(await lifecycle.terminate(sessionA));
+  expect(value(lifecycle.viewer(sessionA))).toEqual({ status: "absent" });
+});

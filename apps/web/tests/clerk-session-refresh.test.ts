@@ -6,20 +6,25 @@ function setup() {
   const controller = new AbortController();
   const errors: string[] = [];
   let signedOut = 0;
+  let tokens = 0;
   const client = {
     rpc: {} as NonNullable<NativeClient["rpc"]>,
     reauthenticate: async (_token: string) => true,
+    connectionState: "online" as NativeClient["connectionState"],
   };
   const refresh = createClerkSessionRefresh({
     client,
-    getToken: async () => "test-token",
+    getToken: async () => {
+      tokens++;
+      return "test-token";
+    },
     signal: controller.signal,
     onSignedOut: async () => {
       signedOut++;
     },
     onError: (message) => errors.push(message),
   });
-  return { client, controller, refresh, errors, signedOut: () => signedOut };
+  return { client, controller, refresh, errors, signedOut: () => signedOut, tokens: () => tokens };
 }
 
 test("online during an old refresh retries the current connection without showing the old failure", async () => {
@@ -60,6 +65,34 @@ test("a focus refresh requested in flight is retained even on the same connectio
   await first;
   expect(calls).toBe(2);
   expect(state.errors).toEqual([""]);
+});
+
+test("refreshes wait for a reconnect so its credential check does not queue behind them", async () => {
+  const state = setup();
+  state.client.connectionState = "connecting";
+  await state.refresh();
+  expect(state.tokens()).toBe(0);
+  state.client.connectionState = "online";
+  await state.refresh();
+  expect(state.tokens()).toBe(1);
+});
+
+test("a refresh in flight when a reconnect starts does not fetch another token", async () => {
+  const state = setup();
+  const started = Promise.withResolvers<void>();
+  const old = Promise.withResolvers<boolean>();
+  state.client.reauthenticate = async () => {
+    started.resolve();
+    return old.promise;
+  };
+  const first = state.refresh();
+  await started.promise;
+  state.client.rpc = {} as NonNullable<NativeClient["rpc"]>;
+  state.client.connectionState = "connecting";
+  old.resolve(false);
+  await first;
+  expect(state.tokens()).toBe(1);
+  expect(state.errors).toEqual([]);
 });
 
 test("unmount cancels queued refreshes and suppresses stale feedback", async () => {

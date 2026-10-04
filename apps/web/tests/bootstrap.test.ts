@@ -49,6 +49,7 @@ function setup(options: WebSessionOptions = {}) {
     server.stop(true);
     cache.close();
   });
+  const fetchBootstrap = options.bootstrap ?? (async () => bootstrap);
   const controller = new WebSessionController({
     cache,
     openSocket: () => {
@@ -56,11 +57,12 @@ function setup(options: WebSessionOptions = {}) {
       opened.push(socket);
       return socket;
     },
-    bootstrap: async () => bootstrap,
+    socketBootstrap: (_rpc, input, signal) => fetchBootstrap(input, signal),
     logout: async () => Result.ok(),
     currentUrl: () => new URL("http://localhost/threads/selected"),
     channel: null,
     ...options,
+    bootstrap: fetchBootstrap,
   });
   cleanup.push(() => controller.dispose());
   return { controller, cache, opened };
@@ -152,6 +154,59 @@ describe("WebSessionController", () => {
     await starting;
     expect(test.controller.getSnapshot().kind).toBe("login");
     expect(await test.cache.readLatestBootstrap()).toBeUndefined();
+  });
+
+  test("a cached session bootstraps over its new socket instead of pooled HTTP", async () => {
+    const cache = new WebNativeCache({ indexedDB: null });
+    await cache.saveBootstrap(scope, bootstrap);
+    const transports: string[] = [];
+    const test = setup({
+      cache,
+      bootstrap: async () => {
+        transports.push("http");
+        return bootstrap;
+      },
+      socketBootstrap: async () => {
+        transports.push("socket");
+        return bootstrap;
+      },
+    });
+    await test.controller.start();
+    const state = test.controller.getSnapshot();
+    if (state.kind !== "ready") throw new Error("Session did not start");
+    state.session.client.reconnect();
+    const recovered = Promise.withResolvers<void>();
+    state.session.client.subscribe((event) => {
+      if (event.kind === "connection" && event.state === "online") recovered.resolve();
+    });
+    await recovered.promise;
+    expect(transports).toEqual(["socket", "socket"]);
+  });
+
+  test("a socket that cannot open falls back to HTTP so an ended session is reported", async () => {
+    const cache = new WebNativeCache({ indexedDB: null });
+    await cache.saveBootstrap(scope, bootstrap);
+    const transports: string[] = [];
+    const test = setup({
+      cache,
+      openSocket: () => new WebSocket("ws://127.0.0.1:1"),
+      bootstrap: async () => {
+        transports.push("http");
+        throw new ORPCError("UNAUTHENTICATED");
+      },
+      socketBootstrap: async () => {
+        transports.push("socket");
+        return bootstrap;
+      },
+    });
+    const ended = Promise.withResolvers<void>();
+    test.controller.subscribe(() => {
+      if (test.controller.getSnapshot().kind === "login") ended.resolve();
+    });
+    await test.controller.start();
+    await ended.promise;
+    expect(transports).toEqual(["http", "http"]);
+    expect(await cache.readLatestBootstrap()).toBeUndefined();
   });
 
   test("a late bootstrap cache write is drained then purged by logout", async () => {

@@ -1,6 +1,6 @@
 import { threadIdFromUrl } from "./thread-location";
 import { NativeClient, type CacheScope } from "@stanley2058/lilac-client";
-import type { BootstrapReply } from "@stanley2058/lilac-client-protocol";
+import type { BootstrapInput, BootstrapReply } from "@stanley2058/lilac-client-protocol";
 import { ORPCError } from "@orpc/client";
 import { Result } from "better-result";
 import { z } from "zod";
@@ -23,12 +23,37 @@ export type WebSessionOptions = {
   cache?: WebNativeCache;
   openSocket?: () => WebSocket;
   bootstrap?: typeof readBootstrap;
+  socketBootstrap?: SocketBootstrap;
   logout?: () => Promise<Result<void, Error>>;
   currentUrl?: () => URL;
   channel?: BroadcastChannel | null;
 };
 
+type SocketBootstrap = (
+  rpc: NonNullable<NativeClient["rpc"]>,
+  input: BootstrapInput,
+  signal: AbortSignal,
+) => Promise<BootstrapReply>;
+
 export const webCache = createWebNativeCache();
+
+function socketOpened(socket: WebSocket, signal: AbortSignal): Promise<boolean> {
+  if (socket.readyState === WebSocket.OPEN) return Promise.resolve(true);
+  if (socket.readyState !== WebSocket.CONNECTING || signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const finish = (opened: boolean) => {
+      socket.removeEventListener("open", onOpen);
+      socket.removeEventListener("close", onClose);
+      signal.removeEventListener("abort", onClose);
+      resolve(opened);
+    };
+    const onOpen = () => finish(true);
+    const onClose = () => finish(false);
+    socket.addEventListener("open", onOpen, { once: true });
+    socket.addEventListener("close", onClose, { once: true });
+    signal.addEventListener("abort", onClose, { once: true });
+  });
+}
 
 function requestError(error: unknown): WebState {
   if (
@@ -82,6 +107,7 @@ export class WebSessionController {
   private readonly cache: WebNativeCache;
   private readonly openSocket: () => WebSocket;
   private readonly fetchBootstrap: typeof readBootstrap;
+  private readonly socketBootstrap: SocketBootstrap;
   private readonly endRemoteSession: () => Promise<Result<void, Error>>;
   private readonly currentUrl: () => URL;
   private readonly channel: BroadcastChannel | undefined;
@@ -90,6 +116,8 @@ export class WebSessionController {
     this.cache = options.cache ?? webCache;
     this.openSocket = options.openSocket ?? openNativeSocket;
     this.fetchBootstrap = options.bootstrap ?? readBootstrap;
+    this.socketBootstrap =
+      options.socketBootstrap ?? ((rpc, input, signal) => rpc.bootstrap.get(input, { signal }));
     this.endRemoteSession = options.logout ?? logoutHttp;
     this.currentUrl = options.currentUrl ?? (() => new URL(location.href));
     this.channel =
@@ -161,13 +189,7 @@ export class WebSessionController {
         selectedThreadUnavailable: _unavailable,
         ...initial
       } = cached.bootstrap;
-      const session = this.create(
-        cached.scope,
-        initial,
-        threadId,
-        this.openSocket,
-        this.fetchBootstrap,
-      );
+      const session = this.create(cached.scope, initial, threadId, this.openSocket);
       this.set({ kind: "ready", session });
       await session.client.start(threadId);
       return;
@@ -186,7 +208,6 @@ export class WebSessionController {
       projectionVersion: 1,
     };
     let firstSocket = true;
-    let firstBootstrap = true;
     const session = this.create(
       scope,
       bootstrap,
@@ -199,13 +220,7 @@ export class WebSessionController {
         firstSocket = false;
         return this.openSocket();
       },
-      async (input, requestSignal) => {
-        if (firstBootstrap) {
-          firstBootstrap = false;
-          return bootstrap;
-        }
-        return this.fetchBootstrap(input, requestSignal);
-      },
+      bootstrap,
     );
     this.startingSocket = undefined;
     this.set({ kind: "ready", session });
@@ -216,13 +231,22 @@ export class WebSessionController {
     initial: BootstrapReply,
     initialThreadId: string | undefined,
     openSocket: () => WebSocket,
-    bootstrap: typeof readBootstrap,
+    prefetched?: BootstrapReply,
   ): WebSession {
-    const client = new NativeClient({
+    let socket: WebSocket | undefined;
+    let pending = prefetched;
+    const client: NativeClient = new NativeClient({
       scope,
       cache: this.cache,
-      openSocket,
-      bootstrap,
+      openSocket: () => {
+        socket = openSocket();
+        return socket;
+      },
+      bootstrap: async (input, signal) => {
+        const reply = pending;
+        pending = undefined;
+        return reply ?? this.connectionBootstrap(client, socket, input, signal);
+      },
       prepareConnection: prepareWebConnection,
     });
     if (initial.catalog.kind === "catalog") client.catalogs.put(scope, initial.catalog.catalog);
@@ -248,6 +272,20 @@ export class WebSessionController {
       });
     });
     return { client, scope, initial, initialThreadId };
+  }
+  private async connectionBootstrap(
+    client: NativeClient,
+    socket: WebSocket | undefined,
+    input: BootstrapInput,
+    signal: AbortSignal,
+  ): Promise<BootstrapReply> {
+    const rpc = client.rpc;
+    // A resumed page can reuse a pooled HTTP connection that died in the background, while each
+    // socket opens a new connection.
+    if (socket && rpc && (await socketOpened(socket, signal)))
+      return this.socketBootstrap(rpc, input, signal);
+    // Browsers hide the status of a rejected upgrade, so HTTP reports whether the session ended.
+    return this.fetchBootstrap(input, signal);
   }
   private async saveSnapshot(
     epoch: number,

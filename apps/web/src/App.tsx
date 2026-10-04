@@ -1,3 +1,4 @@
+import { NativeComputerViewer } from "./components/ComputerViewer";
 import { FloatingChatMenu } from "./components/FloatingChatMenu";
 import { useWorkspaceViewport } from "./use-workspace-viewport";
 import { Kbd } from "./components/ui/kbd";
@@ -25,7 +26,12 @@ import { WorkspacePanels, WorkspaceSidePanel } from "./components/WorkspacePanel
 import { PanelToggleButton } from "./components/PanelToggleButton";
 import { NativeSubagentProvider, RightPanelToggle } from "./components/SubagentPanel";
 import { useLocation, useNavigate, useMatch, useRouter } from "@tanstack/react-router";
-import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useInfiniteQuery,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   updateComposerDraft,
   profileOptions,
@@ -244,10 +250,16 @@ function Workspace(props: AppProps) {
   const searchResults = useInfiniteQuery({
     ...searchOptions(client, searchQuery),
     enabled: online && !!searchQuery,
+    placeholderData: online ? keepPreviousData : undefined,
+  });
+  const changeSearchQuery = useEventCallback((query: string) => {
+    // Clearing ends the search, so the next query must not show these results as placeholders.
+    if (!query) void queries.resetQueries({ queryKey: ["search"] });
+    setSearchQuery(query);
   });
   const results = searchQuery
     ? {
-        items: searchResults.data?.pages.flatMap((page) => page.items) ?? [],
+        items: keyedSearchHits(searchResults.data?.pages.flatMap((page) => page.items) ?? []),
         nextCursor: searchResults.hasNextPage,
       }
     : undefined;
@@ -825,7 +837,7 @@ function Workspace(props: AppProps) {
   const sidebarToolbar = useMemo(
     () => (
       <div className="sidebar-search-row flex items-center gap-1 min-w-0 mb-2">
-        <SidebarSearch onSearch={setSearchQuery} />
+        <SidebarSearch onSearch={changeSearchQuery} />
         <nav
           className="sidebar-tabs flex items-center py-2 px-0"
           aria-label="Conversation filters and actions"
@@ -929,6 +941,7 @@ function Workspace(props: AppProps) {
                 rightOpen={rightOpen}
                 onToggleSidebar={panels.getState().toggleSidebar}
                 onToggleRight={() => panels.getState().toggle(selectedId)}
+                onNewThread={createThread}
                 archived={actionThread?.archived}
                 onShare={owner && actionThread ? () => setSharing(true) : undefined}
                 onRename={
@@ -1005,7 +1018,7 @@ function Workspace(props: AppProps) {
                         <>
                           <VirtualList
                             items={results.items}
-                            itemKey={(hit) => `${hit.threadId}:${hit.turnId ?? hit.excerpt}`}
+                            itemKey={(hit) => hit.key}
                             label="Search results"
                             className="thread-list flex-1"
                             estimate={92}
@@ -1190,12 +1203,7 @@ function Workspace(props: AppProps) {
                                 void selectedMetadata.refetch();
                                 void client.selectThread(selectedId);
                               }}
-                              loadingMessage={
-                                selectedMetadata.error?.message ??
-                                (!online && !thread
-                                  ? "This conversation is unavailable while offline."
-                                  : undefined)
-                              }
+                              loadError={selectedMetadata.error?.message}
                               header={
                                 thread ? (
                                   <header className="thread-header flex items-center gap-2 h-8 min-h-0 px-6 py-0.5 [&_h1]:truncate [&_.icon-button]:size-[var(--ui-control-compact)] max-workspace:gap-1 max-workspace:pl-15 group-[.sidebar-hidden]/workspace:pl-15 group-[.right-panel-hidden]/workspace:pr-[calc(var(--ui-space-unit)*5+var(--ui-control-compact))]">
@@ -1317,6 +1325,13 @@ function Workspace(props: AppProps) {
                   </Button>
                 </div>
               </Modal>
+              {selectedId && !selectedId.startsWith("draft:") ? (
+                <NativeComputerViewer
+                  key={selectedId}
+                  threadId={selectedId}
+                  enabled={active && !external && !reference && !!actionThread?.capabilities.edit}
+                />
+              ) : null}
             </main>
           </Tooltip.Provider>
         </NativeSubagentProvider>
@@ -1325,6 +1340,19 @@ function Workspace(props: AppProps) {
   );
 }
 export default App;
+
+// Search returns one hit per message, so a turn can match more than once.
+function keyedSearchHits<T extends { threadId: string; turnId?: string; excerpt: string }>(
+  hits: readonly T[],
+) {
+  const seen = new Map<string, number>();
+  return hits.map((hit) => {
+    const base = `${hit.threadId}:${hit.turnId ?? hit.excerpt}`;
+    const count = seen.get(base) ?? 0;
+    seen.set(base, count + 1);
+    return { ...hit, key: count ? `${base}:${count}` : base };
+  });
+}
 
 function SearchThreadButton({
   id,

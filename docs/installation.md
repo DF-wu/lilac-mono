@@ -89,6 +89,8 @@ in front of that port and supply its origin as the Native web URL.
 
 Clerk setup takes an existing application's owner user ID, issuer, secret key and publishable key.
 The terminal console does not use Clerk. The installer does not enroll users or create a Clerk application.
+Before exposing native web, follow the [Lilac-specific Clerk setup notes](native-surface.md#clerk),
+including invite-only signup, separate Lilac enrollment, and the shared agent-memory scope.
 
 Existing installations retain their current enabled surfaces and port bindings during update or
 reinstall. Enabling native on an existing Discord installation is an explicit manual configuration

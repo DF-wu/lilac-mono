@@ -24,7 +24,7 @@ export async function resumeClerkSession(options: {
 }
 
 export function createClerkSessionRefresh(options: {
-  client: Pick<NativeClient, "rpc" | "reauthenticate">;
+  client: Pick<NativeClient, "rpc" | "reauthenticate" | "connectionState">;
   getToken: () => Promise<string | null>;
   signal: AbortSignal;
   onSignedOut: () => Promise<void>;
@@ -39,6 +39,9 @@ export function createClerkSessionRefresh(options: {
     if (refreshing) return;
     refreshing = true;
     while (requested && !signal.aborted) {
+      // A forced Clerk fetch replaces the cached token with its pending request, so the reconnect's
+      // credential check would wait on it. The connection's online event refreshes afterward.
+      if (client.connectionState === "connecting") break;
       requested = false;
       const rpc = client.rpc;
       const refreshed = await Result.tryPromise({

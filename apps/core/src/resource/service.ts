@@ -18,6 +18,8 @@ import { Panic, Result, type Result as ResultType } from "better-result";
 
 import {
   createResourceId,
+  RESOURCE_IMAGE_INLINE_MAX_BYTES,
+  type ResourceImagePreview,
   DEFAULT_RESOURCE_LIMITS,
   formatResourceUri,
   parseResourceUri,
@@ -58,7 +60,10 @@ import type { ResourceCacheAttachDecision, ResourceStore } from "./store";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import { captureError } from "../shared/error-capture";
 
+import { ResourceImagePreviews } from "./image-preview";
+
 export type VerifiedResourceRead = {
+  readonly imagePreview?: ResourceImagePreview;
   readonly descriptor: ResourceDescriptor;
   readonly classification: ResourceClassification;
   readonly blob: BlobRefV1;
@@ -67,6 +72,7 @@ export type VerifiedResourceRead = {
 };
 
 export type ResourceOpenOptions = {
+  readonly modelImage?: boolean;
   readonly maxBytes: number;
   readonly expected?: "text" | "image" | "pdf" | "any";
   readonly signal?: AbortSignal;
@@ -310,6 +316,7 @@ function extensionForMediaType(mediaType: string | undefined): string {
 }
 
 export class CoreResourceService implements ResourceRegistry, ResourceAccess {
+  readonly #imagePreviews: ResourceImagePreviews;
   readonly #store: ResourceStore;
   readonly #blobStore: BlobStore;
   readonly #originAdapters: ResourceOriginAdapterRegistry;
@@ -332,6 +339,11 @@ export class CoreResourceService implements ResourceRegistry, ResourceAccess {
     this.#randomBytes = dependencies.randomBytes ?? ((length) => nodeRandomBytes(length));
     this.#limits = { ...DEFAULT_RESOURCE_LIMITS, ...dependencies.limits };
     this.#logger = dependencies.logger;
+    this.#imagePreviews = new ResourceImagePreviews({
+      store: this.#store,
+      blobStore: this.#blobStore,
+      now: this.#now,
+    });
   }
 
   async register(
@@ -457,7 +469,19 @@ export class CoreResourceService implements ResourceRegistry, ResourceAccess {
       err: (error) => ({ kind: "error", error }),
     });
     if (openedDecision.kind === "error") return Result.err(openedDecision.error);
-    return this.#classifyOpened(openedDecision.value, options);
+    const classified = await this.#classifyOpened(openedDecision.value, options);
+    const decision = classified.match<
+      { kind: "read"; read: VerifiedResourceRead } | { kind: "error"; error: ResourceAccessError }
+    >({ ok: (read) => ({ kind: "read", read }), err: (error) => ({ kind: "error", error }) });
+    if (decision.kind === "error") return Result.err(decision.error);
+    if (
+      options.modelImage &&
+      decision.read.classification.kind === "image" &&
+      decision.read.blob.byteLength > RESOURCE_IMAGE_INLINE_MAX_BYTES
+    ) {
+      return this.#imagePreviews.open(decision.read, record);
+    }
+    return Result.ok(decision.read);
   }
 
   async materialize(

@@ -33,3 +33,5 @@ COPY runtime.py /opt/lilac-computer/runtime.py
 COPY executor.conf /tmp/lilac-executor.conf
 RUN cat /tmp/lilac-executor.conf >> /etc/supervisor/supervisord.conf \
     && rm /tmp/lilac-executor.conf
+
+COPY lilac-viewer.html lilac-viewer.js /usr/share/novnc/

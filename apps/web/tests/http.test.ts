@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { BootstrapReply } from "@stanley2058/lilac-client-protocol";
+import { registerConnectionCredentials } from "../src/connection-credentials";
 import {
   readBootstrap,
   readAuthInfo,
@@ -21,6 +22,7 @@ const bootstrap: BootstrapReply = {
   catalogCursor: "cursor",
 };
 const originals = new Map<string, PropertyDescriptor | undefined>();
+let stopCredentials: (() => void) | undefined;
 function replaceGlobal(key: string, value: unknown): void {
   if (!originals.has(key)) originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
   Object.defineProperty(globalThis, key, { value, writable: true, configurable: true });
@@ -29,6 +31,8 @@ beforeEach(() => {
   replaceGlobal("location", { origin: "https://lilac.test", protocol: "https:" });
 });
 afterEach(() => {
+  stopCredentials?.();
+  stopCredentials = undefined;
   mock.restore();
   for (const [key, descriptor] of originals) {
     if (descriptor) Object.defineProperty(globalThis, key, descriptor);
@@ -99,6 +103,51 @@ describe("native web HTTP", () => {
     expect(init).toMatchObject({ credentials: "same-origin", cache: "no-store" });
   });
 
+  test("bootstrap uses refreshed credentials before Clerk updates the cookie", async () => {
+    const token = Promise.withResolvers<string>();
+    stopCredentials = registerConnectionCredentials(() => token.promise);
+    const fetcher = spyOn(globalThis, "fetch").mockImplementation(
+      Object.assign(
+        async (_url: RequestInfo | URL, init?: RequestInit) => {
+          // The cookie still contains an expired token. Only the freshly returned token is valid.
+          if (new Headers(init?.headers).get("authorization") !== "Bearer fresh-token")
+            return new Response(null, { status: 401 });
+          return Response.json(bootstrap);
+        },
+        { preconnect: fetch.preconnect },
+      ),
+    );
+    const reading = readBootstrap({ threadId: "thread" });
+    expect(fetcher).not.toHaveBeenCalled();
+    token.resolve("fresh-token");
+    expect(await reading).toEqual(bootstrap);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  test("a failed token refresh is retryable and an ended session requires sign-in", async () => {
+    const fetcher = spyOn(globalThis, "fetch");
+    stopCredentials = registerConnectionCredentials(async () => {
+      throw new Error("Provider temporarily unavailable");
+    });
+    await expect(readBootstrap({})).rejects.toMatchObject({ code: "SERVICE_UNAVAILABLE" });
+    stopCredentials();
+    stopCredentials = registerConnectionCredentials(async () => null);
+    await expect(readBootstrap({})).rejects.toMatchObject({ code: "UNAUTHENTICATED" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  test("canceling during credential refresh prevents a stale bootstrap request", async () => {
+    const token = Promise.withResolvers<string>();
+    stopCredentials = registerConnectionCredentials(() => token.promise);
+    const controller = new AbortController();
+    const fetcher = spyOn(globalThis, "fetch");
+    const reading = readBootstrap({}, controller.signal);
+    controller.abort();
+    token.resolve("fresh-token");
+    await expect(reading).rejects.toMatchObject({ code: "CLIENT_CLOSED_REQUEST" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   test.each([
     [401, "UNAUTHENTICATED"],
     [403, "FORBIDDEN"],
@@ -117,9 +166,14 @@ describe("native web HTTP", () => {
 
   test("aborted bootstrap forwards its signal and has a distinct outcome", async () => {
     const controller = new AbortController();
-    controller.abort();
-    const fetcher = spyOn(globalThis, "fetch").mockRejectedValue(
-      new DOMException("Aborted", "AbortError"),
+    const fetcher = spyOn(globalThis, "fetch").mockImplementation(
+      Object.assign(
+        async () => {
+          controller.abort();
+          throw new DOMException("Aborted", "AbortError");
+        },
+        { preconnect: fetch.preconnect },
+      ),
     );
     await expect(readBootstrap({}, controller.signal)).rejects.toMatchObject({
       code: "CLIENT_CLOSED_REQUEST",

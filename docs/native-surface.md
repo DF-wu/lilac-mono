@@ -51,6 +51,11 @@ the native question capability remains unimplemented.
 
 ## Clerk
 
+**Use an invite-only Clerk application for Lilac.** Clerk defaults to open signup; Lilac's
+sign-in-only screen does not change that application-wide policy. Neither the installer nor Core
+configures it for you. Follow Clerk's [access-mode documentation](https://clerk.com/docs/guides/secure/restricting-access#invite-only)
+to select Invite-only before exposing the native web app.
+
 Choose Clerk per installation with `surface.native.auth.provider: clerk`. Configure the owner's native
 `ownerId`, Clerk `ownerProviderUserId` and `clerkIssuer`. Browser sessions do not require a `clerkOAuthClientId`. Set
 `CLERK_SECRET_KEY` and `CLERK_PUBLISHABLE_KEY` in the server environment. `CLERK_JWT_KEY` is optional.
@@ -60,13 +65,33 @@ Settings → Account embeds Clerk's profile and security controls, including con
 Local-password installations keep the name and avatar editor. Thread preferences and the access
 summary are in Settings → Options.
 
-The owner adds existing Clerk accounts to the native user directory and shares threads with read or
-edit access. Signing in does not enroll an account. The web app has no registration or onboarding
-flow. The CLI's administrator login and an application's end-user account are separate identities.
+Clerk account creation and Lilac enrollment are separate steps:
+
+1. Create the account through Clerk, or have the invitee complete Clerk's
+   [invitation flow](https://clerk.com/docs/guides/users/inviting) using its Account Portal. Lilac has
+   no sign-up page to use as an invitation destination.
+2. The configured owner signs in to Lilac and adds the existing Clerk user ID in Settings → User,
+   choosing Restricted or Full access. Accepting an invitation or signing in does not enroll an
+   account; Core rejects accounts missing from its native user directory.
+3. Share existing threads separately with read or edit access.
+
+The configured `ownerProviderUserId` is enrolled automatically with owner and full tool access.
+Use the intended end-user account from the same Clerk instance as the configured keys and issuer;
+a Clerk Dashboard or CLI administrator login does not itself identify the Lilac owner. Clerk
+organization membership and roles do not grant Lilac permissions.
+
+When changing the web domain or using Vite, update Lilac's `publicUrl` and `allowedOrigins` as
+described in [Local setup](#local-setup). Core checks the browser session's authorized-party origin
+against `allowedOrigins`; a successful Clerk sign-in alone does not establish Lilac access.
 
 The owner sees all threads and config. Other users see only their threads. Restricted users can
 operate threads they started but cannot edit another starter's thread. Runs use the starter's tool
 and data authority. Human author attribution remains separate.
+
+Invite only people trusted to use this Core installation. Thread sharing controls native UI access
+and modification, but agent conversation search and automatic recall can read other retained native
+threads and allowlisted Discord conversations. Restricted tool access does not make conversation
+memory private between users. See [Surface tools](#surface-tools) for the retrieval scope.
 
 ## Conversation behavior
 

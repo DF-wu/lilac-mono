@@ -1570,9 +1570,25 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   }
 
   async finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>> {
-    const finished = await captureDiscordOutputOperation("finish-output", () =>
-      this.finishOutput(),
+    return await this.captureFinishOutput(() => this.finishOutput());
+  }
+
+  /** Posts complete text as plain content without creating a streaming preview first. */
+  async sendPlain(
+    text: string,
+    attachments: readonly SurfaceAttachment[],
+  ): Promise<SurfaceOperationResult<SurfaceOutputResult>> {
+    this.textAcc = text;
+    this.pendingAttachments = [...attachments];
+    return await this.captureFinishOutput(async () =>
+      this.completeFinalReply(await this.postFinalReplyPlain()),
     );
+  }
+
+  private async captureFinishOutput(
+    effect: () => Promise<SurfaceOutputResult>,
+  ): Promise<SurfaceOperationResult<SurfaceOutputResult>> {
+    const finished = await captureDiscordOutputOperation("finish-output", effect);
     if (this.created.length === 0) return finished;
     return finished.mapError(
       (error) =>
@@ -1583,6 +1599,19 @@ export class DiscordOutputStream implements SurfaceOutputStream {
           message: `Discord output partially completed: ${error.message}`,
         }),
     );
+  }
+
+  private async completeFinalReply(finalReply: {
+    created: MsgRef[];
+    lastMsg: Message;
+  }): Promise<SurfaceOutputResult> {
+    const attachmentCreated = await this.attachPendingAttachmentsToFinalMessage(finalReply.lastMsg);
+    return {
+      created: [...finalReply.created, ...attachmentCreated],
+      last:
+        attachmentCreated.at(-1) ??
+        asDiscordMsgRef(finalReply.lastMsg.channelId, finalReply.lastMsg.id),
+    };
   }
 
   private async finishOutput(): Promise<SurfaceOutputResult> {
@@ -1630,24 +1659,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
               });
         throw failure;
       }
-      const finalReply = finalReplySettled.value;
-
-      const attachmentCreated = await this.attachPendingAttachmentsToFinalMessage(
-        finalReply.lastMsg,
-      );
-      const created = [...finalReply.created, ...attachmentCreated];
-      const last = created.at(-1);
-
-      if (!last) {
-        throw new DiscordOutputInvariantViolation({
-          message: "DiscordOutputStream produced no final messages",
-        });
-      }
-
-      return {
-        created,
-        last,
-      };
+      return await this.completeFinalReply(finalReplySettled.value);
     }
 
     // If we never started the embed pusher (attachments-only), remove the cancel control.
@@ -1776,6 +1788,11 @@ export async function sendDiscordStyledMessage(params: {
     reasoningDisplayMode: "none",
     workingIndicators: ["Working"],
   });
+
+  if (params.content.style === "plain") {
+    const sent = await out.sendPlain(text, attachments);
+    return sent.map((value) => value.last);
+  }
 
   const pushAttachmentAt = async (index: number): Promise<SurfaceOperationResult<MsgRef>> => {
     const attachment = attachments[index];

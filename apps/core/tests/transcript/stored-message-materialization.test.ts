@@ -31,6 +31,9 @@ function resourceAccess(input: {
   readonly bytes: Uint8Array;
   readonly openError?: ResourceOriginUnavailable | ResourceTooLarge;
   readonly onOpen?: (maxBytes: number) => void;
+  readonly reportedByteLength?: number;
+  readonly cachedByteLength?: number;
+  readonly onCancel?: () => void;
 }): Pick<ResourceAccess, "describe" | "open"> {
   const uri = "resource://r1_00000000000000000000000000000001" as const;
   return {
@@ -39,6 +42,8 @@ function resourceAccess(input: {
         uri,
         filename: input.filename ?? "attachment.bin",
         ...(input.mediaType === undefined ? {} : { declaredMediaType: input.mediaType }),
+        reportedByteLength: input.reportedByteLength,
+        cachedByteLength: input.cachedByteLength,
       }),
     open: async (_uri, options) => {
       input.onOpen?.(options.maxBytes);
@@ -60,6 +65,7 @@ function resourceAccess(input: {
             controller.enqueue(input.bytes);
             controller.close();
           },
+          cancel: input.onCancel,
         }),
         completion: Promise.resolve(
           Result.ok({
@@ -1053,9 +1059,135 @@ describe("stored message materialization", () => {
 
     expect(materialized[0]?.content).toContainEqual({
       type: "text",
-      text: `[resource_inline_error uri="resource://r1_00000000000000000000000000000001" code="too_large" limit=${RESOURCE_MODEL_INLINE_MAX_BYTES}]`,
+      text: `[resource_inline_error uri="resource://r1_00000000000000000000000000000001" code="too_large" limit=${1024 * 1024}]`,
     });
 
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+  });
+
+  for (const sizeSource of ["reportedByteLength", "cachedByteLength", "size"] as const) {
+    it(`checks actual bytes when image metadata overstates size (${sizeSource})`, async () => {
+      const blobStore = resultValue(await createMemoryBlobStore());
+      const original = [
+        {
+          role: "user",
+          content: [
+            {
+              ...storedImageResource[0]!.content[0]!,
+              ...(sizeSource === "size" ? { size: 1024 * 1024 + 1 } : {}),
+            },
+          ],
+        },
+      ] satisfies StoredMessageV1[];
+      const identityProjection = createStoredMessageIdentityProjectionV1();
+      let opened = false;
+      const materialized = resultValue(
+        await materializeStoredMessagesV1({
+          messages: original,
+          blobStore,
+          identityProjection,
+          resourceAccess: resourceAccess({
+            bytes: new Uint8Array(),
+            mediaType: "image/png",
+            classification: { kind: "image", mediaType: "image/png" },
+            ...(sizeSource === "size" ? {} : { [sizeSource]: 1024 * 1024 + 1 }),
+            onOpen: () => {
+              opened = true;
+            },
+          }),
+          resourceTarget: { family: "ai-sdk", supportsImage: true, supportsPdf: true },
+        }),
+      );
+      expect(opened).toBe(true);
+      expect(materialized[0]?.content).toContainEqual({
+        type: "file",
+        data: new Uint8Array(),
+        mediaType: "image/png",
+        filename: "image.png",
+      });
+      expect(resultValue(identityProjection.project(materialized))).toEqual(original);
+      const pastedMarker = [
+        { role: "user", content: [{ type: "text", text: original[0]!.content[0]!.uri }] },
+      ] satisfies ModelMessage[];
+      expect(resultValue(identityProjection.project(pastedMarker))).toEqual(pastedMarker);
+      resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+    });
+  }
+
+  it("checks verified image size when metadata is missing or understated", async () => {
+    const blobStore = resultValue(await createMemoryBlobStore());
+    for (const mediaType of [undefined, "image/png"]) {
+      const messages = [
+        {
+          role: "user",
+          content: [{ type: "resource", uri: storedImageResource[0]!.content[0]!.uri }],
+        },
+      ] satisfies StoredMessageV1[];
+      let cancelled = false;
+      const materialized = resultValue(
+        await materializeStoredMessagesV1({
+          messages,
+          blobStore,
+          resourceAccess: resourceAccess({
+            bytes: new Uint8Array(1024 * 1024 + 1),
+            mediaType,
+            reportedByteLength: 4,
+            classification: { kind: "image", mediaType: "image/png" },
+            onCancel: () => {
+              cancelled = true;
+            },
+          }),
+          resourceTarget: { family: "ai-sdk", supportsImage: true, supportsPdf: true },
+        }),
+      );
+      expect(cancelled).toBe(true);
+      expect(materialized[0]?.content).toContainEqual({
+        type: "text",
+        text: expect.stringContaining("Image exceeds"),
+      });
+      expect(JSON.stringify(materialized)).not.toContain('"type":"file"');
+    }
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+  });
+
+  it("retains the existing PDF inline limit", async () => {
+    const blobStore = resultValue(await createMemoryBlobStore());
+    const bytes = new Uint8Array(1024 * 1024 + 1);
+    const messages = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "resource",
+            uri: storedImageResource[0]!.content[0]!.uri,
+            mediaType: "application/pdf",
+          },
+        ],
+      },
+    ] satisfies StoredMessageV1[];
+    let openedWith = 0;
+    const materialized = resultValue(
+      await materializeStoredMessagesV1({
+        messages,
+        blobStore,
+        resourceAccess: resourceAccess({
+          bytes,
+          mediaType: "application/pdf",
+          reportedByteLength: bytes.byteLength,
+          classification: { kind: "pdf", mediaType: "application/pdf" },
+          onOpen: (maxBytes) => {
+            openedWith = maxBytes;
+          },
+        }),
+        resourceTarget: { family: "ai-sdk", supportsImage: true, supportsPdf: true },
+      }),
+    );
+    expect(openedWith).toBe(RESOURCE_MODEL_INLINE_MAX_BYTES);
+    expect(materialized[0]?.content).toContainEqual({
+      type: "file",
+      data: bytes,
+      mediaType: "application/pdf",
+    });
     resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
   });
 
@@ -1150,9 +1282,9 @@ describe("stored message materialization", () => {
         blobStore,
         resourceAccess: observedAccess,
         resourceTarget: {
-          family: "ai-sdk",
+          family: "claude-code",
           supportsImage: true,
-          supportsPdf: true,
+          supportsPdf: false,
         },
       }),
     );
