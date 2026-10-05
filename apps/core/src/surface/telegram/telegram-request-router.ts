@@ -761,10 +761,14 @@ async function flushPendingMentionRepliesAsPrompt(
   const pending = ctx.state.pendingMentionReplyBySession;
   const batch = pending.get(input.sessionId);
   if (!batch || batch.sourceRequestId !== input.sourceRequestId) return Result.ok(undefined);
-  pending.delete(input.sessionId);
   const last = batch.items[batch.items.length - 1];
-  if (!last) return Result.ok(undefined);
+  if (!last) {
+    pending.delete(input.sessionId);
+    return Result.ok(undefined);
+  }
 
+  // The batch stays queued until its prompt is published: a composition
+  // failure parks the lifecycle event, and the redelivery must find it.
   const cfg = await ctx.currentConfig();
   const self = await ctx.adapter.getSelf();
   const overrideCarrier = [...batch.items].reverse().find((item) => item.requestModelOverride);
@@ -802,13 +806,20 @@ async function flushPendingMentionRepliesAsPrompt(
     composed,
     origin: { userId: last.event.userId, messageRef: messageRef(last.event) },
   });
-  published.match({
-    ok: () => markActive(ctx, input.sessionId, requestId),
-    err: () => {
-      if (!pending.has(input.sessionId)) pending.set(input.sessionId, batch);
-    },
+  return published.map(() => {
+    if (pending.get(input.sessionId) === batch) pending.delete(input.sessionId);
+    markActive(ctx, input.sessionId, requestId);
   });
-  return published;
+}
+
+/**
+ * Forget a settled request, unless flushing its deferred replies already made
+ * a newer request active for the session.
+ */
+function releaseSettledRequest(state: RouterState, sessionId: string, requestId: string): void {
+  if (state.activeBySession.get(sessionId)?.requestId === requestId) {
+    state.activeBySession.delete(sessionId);
+  }
 }
 
 async function handleMentionMode(ctx: RouterContext, routed: RoutedMessage): RoutingResult {
@@ -1181,8 +1192,12 @@ export async function startTelegramRequestRouter(
         message.data.state === "resolved" ||
         message.data.state === "failed" ||
         message.data.state === "cancelled";
-      if (!settled || current?.requestId !== requestId) return Result.ok(undefined);
-      state.activeBySession.delete(sessionId);
+      if (!settled) return Result.ok(undefined);
+      const ownsPendingReplies =
+        state.pendingMentionReplyBySession.get(sessionId)?.sourceRequestId === requestId;
+      if (current?.requestId !== requestId && !ownsPendingReplies) return Result.ok(undefined);
+      // A failed flush parks this event; the active entry and the batch both
+      // survive so the redelivery can retry.
       const flushed = await Result.tryPromise({
         try: () =>
           flushPendingMentionRepliesAsPrompt(ctx, { sessionId, sourceRequestId: requestId }),
@@ -1190,9 +1205,9 @@ export async function startTelegramRequestRouter(
       });
       return flushed.match<ResultType<void, TelegramRequestRoutingFailed>>({
         ok: (result) =>
-          result.mapError((error) =>
-            toRoutingFailure(error, "Telegram pending reply flush failed"),
-          ),
+          result
+            .map(() => releaseSettledRequest(state, sessionId, requestId))
+            .mapError((error) => toRoutingFailure(error, "Telegram pending reply flush failed")),
         err: (failure) => {
           rethrowPanic(failure.cause);
           return Result.err(toRoutingFailure(failure.cause, "Telegram pending reply flush failed"));
@@ -1273,10 +1288,12 @@ export async function startTelegramRequestRouter(
       // same batch twice.
       const bufferedSessions = Array.from(state.buffers.keys());
       for (const sessionId of bufferedSessions) await runDebounceTimer(sessionId);
-      for (const subscription of subscriptions) {
-        adaptSubscriptionStopToHost(await subscription.stop());
-      }
+      // Every subscription gets its stop attempt before the first failure
+      // propagates, so a failed stop cannot leave the others running.
+      const stopped: ResultType<void, EventDeliveryStopFailed>[] = [];
+      for (const subscription of subscriptions) stopped.push(await subscription.stop());
       state.pendingMentionReplyBySession.clear();
+      for (const result of stopped) adaptSubscriptionStopToHost(result);
     },
   };
 }

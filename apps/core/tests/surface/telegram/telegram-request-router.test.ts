@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Result } from "better-result";
 
-import { createLilacBus, lilacEventTypes, type Message } from "@stanley2058/lilac-event-bus";
+import {
+  EventDeliveryStopFailed,
+  createLilacBus,
+  lilacEventTypes,
+  type LilacBus,
+  type Message,
+} from "@stanley2058/lilac-event-bus";
 
 import { CustomCommandManager } from "../../../src/custom-commands/manager";
 import type {
@@ -189,9 +195,11 @@ async function startRouter(
   } = {},
 ) {
   const deliveries: string[] = [];
+  const lifecycleDeliveries: string[] = [];
   const bus = createLilacBus(
     createInMemoryDeliveryBus((observation) => {
       if (observation.topic === "evt.adapter") deliveries.push(observation.disposition);
+      if (observation.topic === "evt.request") lifecycleDeliveries.push(observation.disposition);
     }),
   );
   const published: Array<Message<unknown>> = [];
@@ -231,7 +239,7 @@ async function startRouter(
     shouldSuppressAdapterEvent: opts.shouldSuppressAdapterEvent,
   });
 
-  return { bus, deliveries, published, reanchors, router };
+  return { bus, deliveries, lifecycleDeliveries, published, reanchors, router };
 }
 
 async function publishTelegramMessage(
@@ -1040,5 +1048,102 @@ describe("the Telegram request router with custom commands", () => {
       await router.stop();
       await commands.cleanup();
     }
+  });
+});
+
+/** Fails the first indexed read of one message, the way a transient store error would. */
+class FlakyReadAdapter extends FakeTelegramAdapter {
+  private failed = false;
+
+  constructor(private readonly failOnceFor: string) {
+    super();
+  }
+
+  override async readMsg(msgRef: MsgRef) {
+    if (!this.failed && msgRef.messageId === this.failOnceFor) {
+      this.failed = true;
+      throw new Error("transient index failure");
+    }
+    return super.readMsg(msgRef);
+  }
+}
+
+describe("the Telegram request router when flushing deferred replies fails", () => {
+  it("keeps the replies and the active correlation until a redelivery flushes them", async () => {
+    const adapter = new FlakyReadAdapter("21");
+    const { bus, lifecycleDeliveries, published, router } = await startRouter(adapter, {
+      config: routerConfig({ defaultMode: "mention" }),
+    });
+
+    try {
+      await publishTelegramMessage(bus, {
+        messageId: "20",
+        text: `@${TELEGRAM_HANDLE} hello`,
+        raw: groupRaw("20", { mentionsBot: true }),
+      });
+      const first = await waitForPublish(published);
+      const requestA = String(first.headers?.request_id ?? "");
+      await publishLifecycle(bus, requestA, "running");
+      await publishOutputCreated(bus, requestA, "600");
+      await publishTelegramMessage(bus, {
+        messageId: "21",
+        text: "what about the edge cases?",
+        raw: groupRaw("21", { replyToBot: true, replyToMessageId: "600" }),
+      });
+      expect(published).toHaveLength(1);
+
+      // The first settle attempt composes the deferred reply, hits the read
+      // failure, and is parked for redelivery. Nothing may be lost here.
+      await publishLifecycle(bus, requestA, "resolved");
+      await waitFor(() => lifecycleDeliveries.includes("park-pending"), "the parked settle event");
+      expect(published).toHaveLength(1);
+
+      // Redelivery finds both the batch and the request it belonged to.
+      await publishLifecycle(bus, requestA, "resolved");
+      const [, flushed] = await waitForPublishCount(published, 2);
+      expect(flushed?.headers?.request_id).toBe(`telegram:${CHAT}:21`);
+      const data = requestData(flushed!);
+      expect(data.queue).toBe("prompt");
+      expect(data.raw.triggerType).toBe("reply");
+      expect(JSON.stringify(data.messages)).toContain("what about the edge cases?");
+    } finally {
+      await router.stop();
+    }
+  });
+});
+
+describe("the Telegram request router when a subscription refuses to stop", () => {
+  it("still stops the remaining subscriptions before reporting the failure", async () => {
+    const inner = createLilacBus(createInMemoryDeliveryBus());
+    const stoppedTopics: string[] = [];
+    const subscribeTopic: LilacBus["subscribeTopic"] = async (topic, opts, handler, policy) => {
+      const started = await inner.subscribeTopic(topic, opts, handler, policy);
+      return started.map((subscription) => ({
+        done: subscription.done,
+        stop: async () => {
+          stoppedTopics.push(topic);
+          await subscription.stop();
+          if (topic !== "evt.surface") return Result.ok(undefined);
+          return Result.err(
+            new EventDeliveryStopFailed({
+              cause: new Error("forced stop failure"),
+              topic,
+              message: "Forced stop failure",
+            }),
+          );
+        },
+      }));
+    };
+    const bus: LilacBus = { ...inner, subscribeTopic };
+    const router = await startTelegramRequestRouter({
+      adapter: new FakeTelegramAdapter(),
+      bus,
+      blobStore: await getTestBlobStore(),
+      subscriptionId: "telegram-router-stop-test",
+      config: routerConfig(),
+    });
+
+    await expect(router.stop()).rejects.toBeInstanceOf(EventDeliveryStopFailed);
+    expect([...stoppedTopics].sort()).toEqual(["evt.adapter", "evt.request", "evt.surface"]);
   });
 });
