@@ -43,6 +43,7 @@ import type {
   DisplayPart,
 } from "@stanley2058/lilac-client-protocol";
 import { IconButton, attempt } from "./ui";
+import { WorkingText } from "./ui/working-text";
 import { ResourceAttachment } from "./ResourceAttachment";
 import { ActorAvatar, type ActorIdentity } from "./ActorAvatar";
 import { MessageIdentityContext } from "./message-identity";
@@ -377,7 +378,7 @@ export function ThinkingIndicator({ spinner }: { spinner?: ReactNode } = {}) {
     <Marker className="px-2 py-1" role="status" data-ui="thinking">
       <MarkerIcon>{spinner ?? <LoadingSpinner />}</MarkerIcon>
       <MarkerContent>
-        <span className="working-text">Thinking...</span>
+        <WorkingText>Thinking...</WorkingText>
       </MarkerContent>
     </Marker>
   );

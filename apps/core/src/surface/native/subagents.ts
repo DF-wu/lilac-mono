@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import type {
-  DisplayMessage,
-  DisplayPart,
-  SubagentSummary,
+import {
+  MAX_REPLAY_TEXT_LENGTH,
+  type DisplayMessage,
+  type DisplayPart,
+  type SubagentSummary,
 } from "@stanley2058/lilac-client-protocol";
 import type { ModelMessage } from "ai";
 import type { StoredMessageV1 } from "@stanley2058/lilac-event-bus";
@@ -29,10 +30,23 @@ export type SubagentReader = {
 
 const digest = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 24);
 
+export type SubagentStreamingMode = "paragraph" | "complete";
+
+// Mirrors the native output publisher: paragraph mode reveals finished paragraphs, complete mode
+// reveals text when the step ends.
+function visibleStreamText(text: string, mode: SubagentStreamingMode, lastPart: boolean) {
+  if (mode === "complete") return "";
+  if (!lastPart) return text;
+  const normalized = text.replaceAll("\r\n", "\n");
+  const boundary = normalized.lastIndexOf("\n\n");
+  return boundary < 0 ? "" : normalized.slice(0, boundary + 2);
+}
+
 export function subagentMessages(
   messages: readonly (StoredMessageV1 | ModelMessage)[],
   streaming = false,
   activeTools: NonNullable<SubagentSnapshot["activeTools"]> = [],
+  mode: SubagentStreamingMode = "paragraph",
 ): DisplayMessage[] {
   const result: DisplayMessage[] = [];
   const activeIds = new Set(activeTools.map((tool) => tool.toolCallId));
@@ -43,18 +57,20 @@ export function subagentMessages(
       typeof message.content === "string"
         ? [{ type: "text" as const, text: message.content }]
         : message.content;
+    const streamed = streaming && index === messages.length - 1;
     let segment = 0;
     for (const part of content) {
       const id = `child_${index}_${segment++}`;
       if (part.type === "text") {
-        for (let offset = 0; offset < part.text.length; offset += 2000)
+        const text = streamed
+          ? visibleStreamText(part.text, mode, part === content.at(-1))
+          : part.text;
+        for (let offset = 0; offset < text.length; offset += MAX_REPLAY_TEXT_LENGTH)
           result.push({
             id: `${id}_${offset}`,
             role: message.role,
-            ...(streaming && index === messages.length - 1
-              ? { metadata: { incomplete: true } }
-              : {}),
-            parts: [{ type: "text", text: part.text.slice(offset, offset + 2000) }],
+            ...(streamed ? { metadata: { incomplete: true } } : {}),
+            parts: [{ type: "text", text: text.slice(offset, offset + MAX_REPLAY_TEXT_LENGTH) }],
           });
         continue;
       }
@@ -126,6 +142,7 @@ export class NativeSubagents {
       workflows: Pick<DurableWorkflowStore, "listSubagentRuns" | "getRun" | "listOperations">;
       transcripts: Pick<TranscriptStore, "getRequestTranscript">;
       live: () => SubagentReader | undefined;
+      streamingMode: () => SubagentStreamingMode;
     },
   ) {}
 
@@ -243,6 +260,7 @@ export class NativeSubagents {
         live?.messages ?? saved?.messages ?? [],
         live?.streaming,
         live?.activeTools,
+        this.options.streamingMode(),
       );
       const before = Math.min(input.before ?? projected.length, projected.length);
       const start =

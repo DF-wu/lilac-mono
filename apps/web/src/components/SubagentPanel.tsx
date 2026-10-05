@@ -30,6 +30,7 @@ import { Turn } from "./Timeline";
 import { MessageServicesContext, type MessageServices } from "./message-services";
 import { Button } from "./ui/button";
 import { IconButton } from "./ui";
+import { WorkingText } from "./ui/working-text";
 import { PanelToggleButton } from "./PanelToggleButton";
 import "./subagent-panel.css";
 
@@ -266,20 +267,16 @@ export function SubagentPanelView({
           ) : (
             <Bot />
           )}
-          <h2>{selected ? subagentProfileName(selected.profile) : "Agents"}</h2>
-        </header>
-      ) : null}
-      {selected ? (
-        <div className="subagent-heading grid gap-2 p-3 wrap-anywhere">
-          <span>{selected.name}</span>
-          <span className="subagent-status flex gap-2 items-center min-w-0 text-muted-foreground text-sm">
-            <AgentStatus agent={selected} />
-            <span className={selected.state === "running" ? "working-text" : undefined}>
-              {selected.title}
+          <h2 title={selected?.name}>
+            {selected ? subagentProfileName(selected.profile) : "Agents"}
+          </h2>
+          {selected ? (
+            <span className="subagent-status flex flex-1 gap-1.5 items-center min-w-0 text-muted-foreground text-xs">
+              <AgentStatus agent={selected} />
+              <StatusTitle agent={selected} />
             </span>
-          </span>
-          <small>Read-only</small>
-        </div>
+          ) : null}
+        </header>
       ) : null}
       {error ? (
         <p className="subagent-notice p-3 text-muted-foreground text-sm" role="alert">
@@ -354,9 +351,7 @@ export function SubagentPanelView({
                 </span>
                 <span className="subagent-status flex gap-2 items-center min-w-0 text-muted-foreground text-sm">
                   <AgentStatus agent={agent} />
-                  <span className={agent.state === "running" ? "working-text" : undefined}>
-                    {agent.title}
-                  </span>
+                  <StatusTitle agent={agent} />
                 </span>
               </span>
             </Button>
@@ -366,6 +361,11 @@ export function SubagentPanelView({
       )}
     </aside>
   );
+}
+
+function StatusTitle({ agent }: { agent: SubagentSummary }) {
+  if (agent.state === "running") return <WorkingText>{agent.title}</WorkingText>;
+  return <span>{agent.title}</span>;
 }
 
 function AgentStatus({ agent }: { agent: SubagentSummary }) {

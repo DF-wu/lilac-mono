@@ -59,7 +59,7 @@ test("shared panel shows agent status and production messages without editing co
       <SubagentPanelView items={agents} selected={selected} messages={messages} {...actions} />,
     );
     expect(html).toContain("Subagent transcript");
-    expect(html).toContain("Read-only");
+    expect(html).toContain(`title="${selected.name}"`);
     expect(html).toContain(selected.title);
     expect(html).toContain('aria-label="About Lilac"');
     expect(html).not.toContain("Participant");

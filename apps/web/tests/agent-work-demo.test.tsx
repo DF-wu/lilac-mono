@@ -240,7 +240,9 @@ test("reaction sits between time and rewind, and rewind is disabled for an activ
 test("a sent prompt immediately shows thinking and suppresses the queue marker", () => {
   const html = renderStage("sent");
   expect(html).toContain('data-ui="thinking"');
-  expect(html).toContain('<span class="working-text">Thinking</span>');
+  expect(html).toContain(
+    '>Thinking<span aria-hidden="true" class="working-text-shine">Thinking</span>',
+  );
   expect(html).toContain("Working for");
   expect(html).not.toContain(">queued<");
   expect(html.match(/aria-label="About Lilac"/gu)).toHaveLength(1);
@@ -255,10 +257,14 @@ test("work duration uses the prompt timestamp for older turns without a start ti
 
 test("only the last folded section and sections with running agents shine", () => {
   const html = renderStage("folded-activity-running");
-  expect(html.match(/class="working-text"/gu)).toHaveLength(2);
+  expect(html.match(/class="working-text[ "]/gu)).toHaveLength(2);
   expect(html).toContain(">Compared both options.</span>");
-  expect(html).toContain('<span class="working-text">General Agent - Thinking…</span>');
-  expect(html).toContain('<span class="working-text">Thinking</span>');
+  expect(html).toContain(
+    '>General Agent - Thinking…<span aria-hidden="true" class="working-text-shine">General Agent - Thinking…</span>',
+  );
+  expect(html).toContain(
+    '>Thinking<span aria-hidden="true" class="working-text-shine">Thinking</span>',
+  );
 });
 
 test("terminal turns suppress stale running activity even in final messages", () => {
@@ -272,7 +278,7 @@ test("terminal turns suppress stale running activity even in final messages", ()
         metadata: { ...message.metadata, phase: "final" },
       })),
     });
-    expect(html).not.toContain('class="working-text"');
+    expect(html).not.toContain("working-text");
     expect(html).toContain(">Compared both options.</span>");
   }
 });

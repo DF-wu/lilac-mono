@@ -40,7 +40,7 @@
     border-top: 1px solid var(--ui-border);
   }
 
-  .ds-section h2 {
+  .ds-section-heading h2 {
     font-size: var(--ui-text-xl);
     font-weight: 600;
     margin-bottom: calc(var(--ui-space-unit) * 1);
