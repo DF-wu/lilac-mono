@@ -10,6 +10,7 @@ import type {
 } from "../../adapter";
 
 import { markGithubAgentComment } from "../../../github/github-comment-marker";
+import { githubReplyPrefix } from "../../../github/github-ids";
 
 export class GithubOutputStream implements SurfaceOutputStream {
   private text = "";
@@ -19,6 +20,7 @@ export class GithubOutputStream implements SurfaceOutputStream {
     private readonly sessionRef: GithubSessionRef,
     private readonly api: {
       createComment(body: string): Promise<SurfaceOperationResult<{ readonly id: number }>>;
+      resolveWebBaseUrl(): Promise<string>;
     },
     private readonly opts?: { replyTo?: MsgRef },
   ) {}
@@ -63,12 +65,20 @@ export class GithubOutputStream implements SurfaceOutputStream {
     }
   }
 
+  /** GitHub comments have no native reply target, so replies carry a permalink prefix instead. */
+  private async replyPrefix(): Promise<string> {
+    const replyTo = this.opts?.replyTo;
+    if (replyTo?.platform !== "github") return "";
+    const webBaseUrl = await this.api.resolveWebBaseUrl();
+    return githubReplyPrefix({
+      sessionId: replyTo.channelId,
+      messageId: replyTo.messageId,
+      webBaseUrl,
+    });
+  }
+
   async finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>> {
-    const replyPrefix = (() => {
-      const replyTo = this.opts?.replyTo;
-      if (!replyTo || replyTo.platform !== "github") return "";
-      return `In reply to ${replyTo.messageId}:\n\n`;
-    })();
+    const replyPrefix = await this.replyPrefix();
 
     const body = markGithubAgentComment(`${replyPrefix}${this.text}`);
     const res = await this.api.createComment(body);
