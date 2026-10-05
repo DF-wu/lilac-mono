@@ -70,7 +70,7 @@ tools:
       # No route falls back to another provider after a failure.
       provider: default
       # Optional allowlist of Lilac aliases to advertise and serve. Omit to
-      # expose every alias. Catalog and fallback honor it.
+      # consider every alias; only serviceable ones are advertised.
       # models: [nanobanana-2, gpt-image-2]
       # Optional per-alias routes as "<provider>/<model id>" with provider
       # openai, openrouter, xai, or openai-compatible. The model id may itself

@@ -63,8 +63,10 @@ The field is optional; no config rewrite is required. Remove it before using an 
 `openaiCompatible.modelIds` entry becomes `routes.<alias>: openai-compatible/<model id>`. Routes also
 accept `openai`, `openrouter`, and `xai`, so one alias can leave the compatible endpoint while the rest
 follow `provider`. Configs that still contain `openaiCompatible` fail to parse with a message that names
-the replacement; no config version bump is required. Older builds reject `models` and `routes` at this
-level, so move them back under `openaiCompatible` before downgrading.
+the replacement; no config version bump is required. Older builds do not reject `models` and `routes` at
+this level: they log them as unknown keys and ignore them while keeping `provider`, so a downgrade with
+`provider: openai-compatible` silently advertises every alias with its canonical model ID. Move the fields
+back under `openaiCompatible` before starting an older build.
 
 ## Image table style
 

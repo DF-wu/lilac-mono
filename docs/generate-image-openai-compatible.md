@@ -136,7 +136,7 @@ tools:
     image:
       provider: openai-compatible
       # Optional allowlist of Lilac aliases to advertise and serve.
-      # Omitted = all aliases.
+      # Omitted = every alias whose route is serviceable.
       models: [nanobanana-2, gpt-image-2, grok-imagine-image]
       # Optional per-alias routes as "<provider>/<model id>".
       # provider: openai | openrouter | xai | openai-compatible
@@ -223,7 +223,10 @@ a caller selects `nanobanana-2`.
 `models` declares which aliases exist. When present, the tool catalog
 advertises only those aliases, the default fallback picks only among them, and
 requesting any other alias fails before an HTTP request is sent. When omitted,
-all aliases are advertised.
+every alias is eligible, and the catalog advertises the serviceable ones: on the
+`default` route an alias needs a configured provider, while explicit routes and
+the bulk `openai-compatible` route are advertised even when their credentials
+are missing (see [Routes](#routes)).
 
 ## Start the standalone tool server
 
