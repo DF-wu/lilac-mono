@@ -58,8 +58,12 @@
   list-style-type: decimal;
 }
 
-.composer-editor [data-slate-placeholder] {
+.composer-editor p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
   color: var(--ui-muted-foreground);
+  pointer-events: none;
 }
 
 .completion-popover[data-slot="popover-content"] {
@@ -67,9 +71,6 @@
   inset: auto;
   width: min(calc(100vw - calc(var(--ui-space-unit) * 8)), var(--anchor-width));
   height: min(20rem, var(--available-height));
-}
-.composer-editor [data-slate-placeholder] {
-  opacity: 1 !important;
 }
 
 .composer-attachment-chip > img,

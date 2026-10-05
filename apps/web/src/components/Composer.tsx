@@ -15,8 +15,6 @@ import {
   useCallback,
   useRef,
   useState,
-  type KeyboardEvent,
-  type ClipboardEvent,
   type DragEvent,
 } from "react";
 import { ArrowUp, Paperclip, Square, X, Upload } from "lucide-react";
@@ -202,8 +200,8 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     setMenuHidden(true);
   }
 
-  function keydown(event: KeyboardEvent<HTMLDivElement>) {
-    if (event.nativeEvent.isComposing) return;
+  function keydown(event: KeyboardEvent) {
+    if (event.isComposing) return;
     if (
       completions.length &&
       ["ArrowDown", "ArrowUp", "Enter", "Tab", "Escape"].includes(event.key)
@@ -309,8 +307,8 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     pastes.current.delete(paste);
   }
 
-  function paste(event: ClipboardEvent<HTMLDivElement>) {
-    if (disabled) return;
+  function paste(event: ClipboardEvent) {
+    if (disabled || !event.clipboardData) return;
     const message = readMessageClipboard(event.clipboardData.getData("text/html"));
     if (message && workspace) {
       event.preventDefault();
@@ -350,12 +348,11 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       !visibleText.startsWith(`/${chosen.name} `)
     )
       setCommandId(undefined);
-    setSkills(
-      skillIds.filter((id) => {
-        const skill = catalog?.skills.find((item) => item.id === id);
-        return !!skill && hasSkillMention(visibleText, skill.name);
-      }),
-    );
+    const retainedSkills = skillIds.filter((id) => {
+      const skill = catalog?.skills.find((item) => item.id === id);
+      return !!skill && hasSkillMention(visibleText, skill.name);
+    });
+    if (retainedSkills.length !== skillIds.length) setSkills(retainedSkills);
     onText(value);
     setMenuHidden(false);
     setSelected(0);
