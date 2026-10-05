@@ -70,7 +70,10 @@ tools:
       # No route falls back to another provider after a failure.
       provider: default
       # Optional allowlist of Lilac aliases to advertise and serve. Omit to
-      # consider every alias; only serviceable ones are advertised.
+      # consider every alias. Default-routed aliases without a configured
+      # provider are not advertised; explicit routes and openai-compatible
+      # routes stay advertised when their credentials are missing, so a call
+      # reports the exact gap.
       # models: [nanobanana-2, gpt-image-2]
       # Optional per-alias routes as "<provider>/<model id>" with provider
       # openai, openrouter, xai, or openai-compatible. The model id may itself
@@ -397,13 +400,14 @@ surface:
       # over older history.
       maxBytesPerRequest: 10MiB
 
-    # Streaming title phrases for in-progress updates.
+    # Streaming title phrases for in-progress updates. At least one entry.
     # Defaults live in packages/utils/working-indicators.ts.
-    # workingIndicators: []
+    # workingIndicators: [Composing, Distilling]
 
     # Telegram renders fixed-width tables well inside <pre> blocks.
     markdownTableRender:
       enabled: true
+      # Style: unicode | ascii. The Discord-only image style is rejected here.
       style: unicode
       maxWidth: 50
       fallbackMode: list

@@ -1,7 +1,7 @@
 # Lilac Mono
 
 <p align="center">
-  <strong>面向 Discord、Telegram、GitHub 與本機終端的事件驅動 AI Agent Runtime</strong>
+  <strong>面向 Web、Discord、Telegram、GitHub 與本機終端的事件驅動 AI Agent Runtime</strong>
 </p>
 
 <p align="center">
@@ -16,7 +16,6 @@
 </p>
 
 <p align="center">
-  <a href="#選擇執行方式">選擇執行方式</a> ·
   <a href="#本-fork-的主要差異">Fork 差異</a> ·
   <a href="#快速開始">快速開始</a> ·
   <a href="#core-surfaces">Surfaces</a> ·
@@ -117,6 +116,8 @@ curl -fsS http://localhost:8080/readyz
 
 `compose.yaml` 同時啟動 Redis，並把 `./data` 掛載到 `/data`。正式部署、operator token、UID、持久化與診斷方式見 [`docs/docker-deployment.md`](./docs/docker-deployment.md)。
 
+引導式安裝程式、provider 認證、terminal-only 存取與 native Web 登入見 [`docs/installation.md`](./docs/installation.md)。臨時的 operator TUI 可用 `docker compose exec --user root lilac lilac-tui` 開啟；啟用 native Web 後請開啟 `http://localhost:8789`。
+
 > [!WARNING]
 > Core tool server 沒有一般用途的 public HTTP authentication。請將 `8080` 保留在可信任的主機或網路邊界，不要直接暴露到公網。
 
@@ -140,6 +141,7 @@ Core 必須有 `REDIS_URL` 與有效的 model 設定。啟用 Discord 時才需�
 
 | Surface | 最低設定 | 預設保護 | 詳細文件 |
 | --- | --- | --- | --- |
+| Native | `surface.native.enabled: true`、installation ID、local 或 Clerk 認證，以及 provider credentials | 預設停用；僅限已認證的 owner 存取 | [`docs/native-surface.md`](./docs/native-surface.md) |
 | Discord | `DISCORD_TOKEN`；設定 `allowedChannelIds` 或 `allowedGuildIds` | 兩個 allowlist 都空時忽略所有 Discord traffic | [`core-config.example.yaml`](./packages/utils/config-templates/core-config.example.yaml) |
 | Telegram | `configVersion: 2`、`enabled: true`、`token`、`allowedChatIds` | 預設停用；空 chat allowlist 時忽略所有 chats | [`docs/telegram-surface.md`](./docs/telegram-surface.md) |
 | GitHub | GitHub App auth、`GITHUB_WEBHOOK_SECRET`、可被 GitHub 連到的 HTTPS/reverse proxy；user token 是可選的 preferred outbound identity | 沒有 GitHub App secret 時整個 surface 不啟動；signature 不符回傳 `401` | [`docs/github-reply-permalinks.md`](./docs/github-reply-permalinks.md) |
@@ -153,7 +155,7 @@ docker compose exec -T lilac /usr/local/bin/tools --operator --help onboarding.g
 docker compose exec -T lilac /usr/local/bin/tools --operator --help onboarding.github_user_token
 ```
 
-Telegram 支援完整對話路徑、workflow cards 與同 surface tools，但平台能力不等於 Discord。Inbound media、history、reaction 與 search 差異請以 [`Telegram feature status`](./docs/telegram-surface.md#10-what-works-and-what-does-not) 為準。
+Telegram 支援完整對話路徑、workflow cards 與同 surface tools，其 request router 也鏡射上游 Discord router（debounce 批次、LLM gate、steer/interrupt/follow-up，以及 `!model:`、`!continue`、`!interrupt` directives），但平台能力不等於 Discord。Inbound media、history、reaction 與 search 差異請以 [`Telegram feature status`](./docs/telegram-surface.md#10-what-works-and-what-does-not) 為準；與 Discord 逐項能力對照見 [`docs/telegram-feature-parity.zh-TW.md`](./docs/telegram-feature-parity.zh-TW.md)。
 
 ## 工具、Skills 與工作流程
 
@@ -219,6 +221,18 @@ tools:
       provider: openai-compatible
 ```
 
+要路由個別 alias，請以 `<provider>/<model id>` 加入 `routes` 項目，provider 可為 `openai`、`openrouter`、`xai` 或 `openai-compatible`；未列出的 alias 依 `provider` 路由，舊的 `openaiCompatible` 區塊會在解析時被拒絕：
+
+```yaml
+tools:
+  generate:
+    image:
+      provider: openai-compatible
+      routes:
+        nanobanana-2: openai-compatible/gemini-3.1-flash-image-preview
+        gpt-image-2: openai/gpt-image-2
+```
+
 Docker Compose 請把 endpoint 與 credential 寫入已由 `compose.override.yaml` 載入的 `.env`：
 
 ```dotenv
@@ -234,7 +248,7 @@ docker compose up -d --force-recreate --wait --wait-timeout 120 lilac
 
 從 source 執行時，改為 `export` 同名變數後再啟動 Core。
 
-Alias、`models` allowlist 與 per-alias `routes`（`<provider>/<model id>`）、generation/edit endpoints、無 fallback 行為與 colon-form `size` aspect-ratio 轉送見 [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md)。
+Alias、`models` allowlist 與 per-alias `routes`（`<provider>/<model id>`）、從已移除的 `openaiCompatible` 區塊遷移、generation/edit endpoints、結果中的 `providerMetadata`、無 fallback 行為與 colon-form `size` aspect-ratio 轉送見 [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md)。
 
 ### 透過 OpenAI 搜尋網頁
 
@@ -294,11 +308,16 @@ bun run ci
 `bun run ci` 會依序檢查 codegen、lint、root/workspace tests、TypeScript 與 formatting。常用的個別命令：
 
 ```bash
+bun run check
+bun run ci
+bun run test:core
 bun run test:all
 bun run typecheck
 bun run lint
 bun run fmt:check
 ```
+
+`bun run check` 執行並行的本機 repository gates；`bun run ci` 執行保守的序列 CI 流程。完整套件包含常設的 architecture 與 production-syntax gates。
 
 各 workspace 的 build、test 與 typecheck 命令見 [`AGENTS.md`](./AGENTS.md)；專案名詞與完整架構見 [`PROJECT.md`](./PROJECT.md)。
 

@@ -9,14 +9,17 @@ Language: [`English (primary / canonical)`](../README.md) · [`Traditional Chine
 | Document | Contents |
 | --- | --- |
 | [`fork-differences.md`](./fork-differences.md) | Current differences from upstream, limitations, sync policy, and upstreamed contributions |
-| [`../PROJECT.md`](../PROJECT.md) | Complete Core and Mini Lilac architecture, terminology, data flow, and configuration model |
+| [`../PROJECT.md`](../PROJECT.md) | Durable Core architecture, terminology, workspace ownership, trust boundaries, and persistence guide |
 | [`../MIGRATIONS.md`](../MIGRATIONS.md) | Core configuration and storage-format migration contract |
+| [`core-config-migrations.md`](./core-config-migrations.md) | Manual `core-config.yaml` upgrades between config versions, including the fork's v2 keys |
+| [`architecture-blob-publication-design.md`](./architecture-blob-publication-design.md) | Design record for recoverable workflow artifact publication: ownership and concurrency decisions |
 
 ## Deployment and Surfaces
 
 | Document | Contents |
 | --- | --- |
 | [`docker-deployment.md`](./docker-deployment.md) | Docker/Compose, operator tokens, persistence, UID, security boundaries, and diagnostics |
+| [`native-surface.md`](./native-surface.md) | Native Web surface: authentication, configuration, operation, and the temporary operator console |
 | [`telegram-surface.md`](./telegram-surface.md) | BotFather, allowlists, groups, forum topics, workflows, conversation memory, verification, and limitations |
 | [`telegram-feature-parity.md`](./telegram-feature-parity.md) | Telegram versus Discord capability matrix: what the router rewrite aligned, every remaining gap with its reason and the change needed, and Telegram-only strengths |
 | [`github-reply-permalinks.md`](./github-reply-permalinks.md) | GitHub issue/PR body and comment reply permalink contract |
@@ -29,11 +32,15 @@ Language: [`English (primary / canonical)`](../README.md) · [`Traditional Chine
 | [`web-search-openai.md`](./web-search-openai.md) | `web.search` through the OpenAI Responses `web_search` tool: what the mediator model receives, what the conversation model gets back, configuration, and limitations |
 | [`../PLUGIN_AUTHORING.md`](../PLUGIN_AUTHORING.md) | Level 1/Level 2 external plugin contract, lifecycle, and permissions |
 | [`../examples/plugins/custom-media/README.md`](../examples/plugins/custom-media/README.md) | Deployable OpenAI-compatible image/video plugin example |
+| [`skill-authoring.md`](./skill-authoring.md) | Skill format, discovery, and authoring guidance |
+| [`claude-code.md`](./claude-code.md) | Claude Code provider: authentication, tools, continuation, and storage |
 
 ## Applications
 
 | Document | Contents |
 | --- | --- |
+| [`installation.md`](./installation.md) | Guided installer: system requirements, setup, provider authentication, reconfiguration, and release overrides |
+| [`computer-use.md`](./computer-use.md) | Optional computer-use desktop gateway and runner: build, Core configuration, agent use, and verification |
 
 ## Contributors
 
