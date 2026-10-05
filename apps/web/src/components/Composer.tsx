@@ -24,6 +24,7 @@ import "./composer-drop.css";
 import type { Completion } from "@stanley2058/lilac-client";
 import type { ChatCommon, ComposerSubmission, Attachment } from "../types";
 import { readMessageClipboard, type MessageClipboard } from "../message-clipboard";
+import { namePastedImage } from "../pasted-file";
 import { IconButton, VirtualList, attempt } from "./ui";
 import type { ComposerEditorHandle } from "./composer-editor";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "./ui/select";
@@ -318,7 +319,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     const files = [...event.clipboardData.files];
     if (files.length) {
       event.preventDefault();
-      props.onAttach(files);
+      props.onAttach(files.map(namePastedImage));
     }
   }
   function drop(event: DragEvent) {
