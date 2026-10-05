@@ -10,6 +10,7 @@ import {
   deleteIssueReactionById,
   editIssueComment,
   getGithubAppSlugOrNull,
+  getGithubWebBaseUrl,
   getIssue,
   getIssueComment,
   getPreferredGithubActorLoginOrNull,
@@ -21,7 +22,11 @@ import {
 } from "../../github/github-api";
 import { GithubAuthFailed } from "../../github/github-auth";
 import { markGithubAgentComment } from "../../github/github-comment-marker";
-import { isGithubIssueTriggerId, parseGithubSessionId } from "../../github/github-ids";
+import {
+  DEFAULT_GITHUB_WEB_BASE_URL,
+  isGithubIssueTriggerId,
+  parseGithubSessionId,
+} from "../../github/github-ids";
 import {
   SurfaceInvalidInput,
   SurfaceMessageNotFound,
@@ -93,6 +98,7 @@ const DEFAULT_GITHUB_ADAPTER_API = {
   deleteIssueReactionById,
   deleteIssueCommentReactionById,
   getGithubAppSlugOrNull,
+  getGithubWebBaseUrl,
   getPreferredGithubActorLoginOrNull,
 };
 
@@ -109,8 +115,9 @@ function continueResult<T, E, ROk, RErr>(
 
 export type GithubAdapterApi = Omit<
   typeof DEFAULT_GITHUB_ADAPTER_API,
-  "getPreferredGithubActorLoginOrNull"
+  "getGithubWebBaseUrl" | "getPreferredGithubActorLoginOrNull"
 > & {
+  readonly getGithubWebBaseUrl?: typeof getGithubWebBaseUrl;
   readonly getPreferredGithubActorLoginOrNull?: typeof getPreferredGithubActorLoginOrNull;
 };
 
@@ -478,6 +485,12 @@ export class GithubAdapter implements SurfaceAdapter {
     );
   }
 
+  private async resolveWebBaseUrl(): Promise<string> {
+    return this.api.getGithubWebBaseUrl
+      ? await this.api.getGithubWebBaseUrl()
+      : DEFAULT_GITHUB_WEB_BASE_URL;
+  }
+
   async startOutput(
     sessionRef: SessionRef,
     opts?: StartOutputOpts,
@@ -518,12 +531,7 @@ export class GithubAdapter implements SurfaceAdapter {
                         );
                         return created.map((value) => ({ id: value.id }));
                       },
-                      getIssue: async (input) => {
-                        const issue = await captureGithubOperation("read-message", () =>
-                          this.api.getIssue(input),
-                        );
-                        return issue.map((value) => ({ id: value.id }));
-                      },
+                      resolveWebBaseUrl: () => this.resolveWebBaseUrl(),
                     },
                     opts?.replyTo ? { replyTo: opts.replyTo } : undefined,
                   ),

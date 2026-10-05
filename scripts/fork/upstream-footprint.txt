@@ -106,10 +106,11 @@ apps/tool-bridge/index.ts  # tool-bridge plugin manager wiring
 packages/plugin-runtime/types.ts  # originSessionId / requestInitiator in RequestContext
 
 # --- GitHub reply permalinks and trigger-loop hardening
-apps/core/src/github/github-api.ts  # issue vs comment permalink resolution
-apps/core/src/github/github-ids.ts  # issue vs comment permalink identifiers
+apps/core/src/github/github-api.ts  # getGithubWebBaseUrl resolves the configured host for reply permalinks
+apps/core/src/github/github-ids.ts  # reply permalink URL builder and web host derivation
 apps/core/src/github/webhook/github-webhook-server.ts  # duplicate final publication and self-trigger guards
-apps/core/src/surface/github/github-adapter.ts  # single publisher for replies
+apps/core/src/surface/github/github-adapter.ts  # wires the configured web host into reply permalinks
+apps/core/src/surface/github/github-runtime-descriptor.ts  # workflow progress replies carry reply permalinks
 apps/core/src/surface/github/output/github-output-stream.ts  # reply permalinks
 
 # --- Config layer seams
@@ -131,10 +132,9 @@ apps/core/tests/surface/authenticated-request.test.ts  # Telegram principals
 apps/core/tests/surface/bridge/adapter-event-projection.test.ts  # Telegram adapter events
 apps/core/tests/surface/bridge/bus-agent-runner.test.ts  # Telegram authority
 apps/core/tests/surface/bridge/subscribe-from-bus.test.ts  # platform-generic relay refs
-apps/core/tests/surface/github/github-adapter.test.ts  # single publisher replies
+apps/core/tests/surface/github/github-adapter.test.ts  # reply permalinks and workflow progress reply links
 apps/core/tests/surface/github/github-output-stream.test.ts  # reply permalinks
 apps/core/tests/surface/operation-contract.test.ts  # resolve-attachment operation
-apps/core/tests/surface/reference-adapter-contract.test.ts  # attachment-resolver capability
 apps/core/tests/surface/runtime-descriptor.test.ts  # Telegram descriptor
 apps/core/tests/tool-server-create-tool-server.test.ts  # origin-session authority
 apps/core/tests/tool-server-image-generation.test.ts  # structured generate.image

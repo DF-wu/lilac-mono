@@ -106,7 +106,7 @@ function createGithubApi(
 ): GithubAdapterApi {
   let nextId = 100;
   return {
-    getIssue: async () => ({ id: 1, title: "Issue", body: "Body" }),
+    getIssue: async () => ({ title: "Issue", body: "Body" }),
     listIssueComments: async () => [],
     createIssueComment: async ({ body }) => {
       if (input.createFailure) throw input.createFailure;

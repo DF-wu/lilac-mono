@@ -1,25 +1,28 @@
 import { describe, expect, it } from "bun:test";
 import { Result } from "better-result";
 
-import {
-  type SurfaceOutputPart,
-  type SurfaceOutputPartDisposition,
-  SurfaceUnavailable,
-} from "../../../src/surface/adapter";
+import type { SurfaceOutputPart, SurfaceOutputPartDisposition } from "../../../src/surface/adapter";
 import { GithubOutputStream } from "../../../src/surface/github/output/github-output-stream";
+
+type StreamApi = ConstructorParameters<typeof GithubOutputStream>[1];
+
+function createApi(comments: string[], overrides: Partial<StreamApi> = {}): StreamApi {
+  return {
+    createComment: async (body) => {
+      comments.push(body);
+      return Result.ok({ id: 1 });
+    },
+    resolveWebBaseUrl: async () => "https://github.com",
+    ...overrides,
+  };
+}
 
 describe("GithubOutputStream", () => {
   it("buffers text without provider calls and publishes only on finish", async () => {
     const comments: string[] = [];
     const stream = new GithubOutputStream(
       { platform: "github", channelId: "octo/repo#1" },
-      {
-        createComment: async (body) => {
-          comments.push(body);
-          return Result.ok({ id: 1 });
-        },
-        getIssue: async () => Result.ok({ id: 100 }),
-      },
+      createApi(comments),
     );
 
     await expect(stream.push({ type: "text.set", text: "buffered" })).resolves.toEqual(
@@ -39,14 +42,8 @@ describe("GithubOutputStream", () => {
 
   it("distinguishes visible, terminal-only, and ignored presentation parts", async () => {
     const stream = new GithubOutputStream(
-      {
-        platform: "github",
-        channelId: "octo/repo#1",
-      },
-      {
-        createComment: async () => Result.ok({ id: 1 }),
-        getIssue: async () => Result.ok({ id: 100 }),
-      },
+      { platform: "github", channelId: "octo/repo#1" },
+      createApi([]),
     );
     const optionalParts = [
       { type: "text.delta", delta: "Visible text" },
@@ -80,82 +77,64 @@ describe("GithubOutputStream", () => {
     await expect(stream.abort("test")).resolves.toEqual(Result.ok(undefined));
   });
 
-  it("links issue and pull request body replies to the body anchor", async () => {
+  it("links issue and pull request body replies to the thread", async () => {
     const comments: string[] = [];
     const stream = new GithubOutputStream(
       { platform: "github", channelId: "octo/repo#47" },
-      {
-        createComment: async (body) => {
-          comments.push(body);
-          return Result.ok({ id: 1 });
-        },
-        getIssue: async (input) => {
-          expect(input).toEqual({ owner: "octo", repo: "repo", number: 47 });
-          return Result.ok({ id: 5_014_377_739 });
-        },
-      },
-      {
-        replyTo: { platform: "github", channelId: "octo/repo#47", messageId: "47" },
-      },
-    );
-
-    await stream.finish();
-
-    expect(comments[0]).toContain(
-      "In reply to https://github.com/octo/repo/issues/47#issue-5014377739",
-    );
-  });
-
-  it("links comment replies without looking up the issue", async () => {
-    const comments: string[] = [];
-    const stream = new GithubOutputStream(
-      { platform: "github", channelId: "octo/repo#47" },
-      {
-        createComment: async (body) => {
-          comments.push(body);
-          return Result.ok({ id: 1 });
-        },
-        getIssue: async () => {
-          throw new Error("comment replies must not look up the issue");
-        },
-      },
-      {
-        replyTo: { platform: "github", channelId: "octo/repo#47", messageId: "4152921803" },
-      },
-    );
-
-    await stream.finish();
-
-    expect(comments[0]).toContain(
-      "In reply to https://github.com/octo/repo/issues/47#issuecomment-4152921803",
-    );
-  });
-
-  it("falls back to the thread URL when the body lookup fails", async () => {
-    const comments: string[] = [];
-    const stream = new GithubOutputStream(
-      { platform: "github", channelId: "octo/repo#47" },
-      {
-        createComment: async (body) => {
-          comments.push(body);
-          return Result.ok({ id: 1 });
-        },
-        getIssue: async () =>
-          Result.err(
-            new SurfaceUnavailable({
-              platform: "github",
-              operation: "read-message",
-              message: "unavailable",
-            }),
-          ),
-      },
-      {
-        replyTo: { platform: "github", channelId: "octo/repo#47", messageId: "47" },
-      },
+      createApi(comments),
+      { replyTo: { platform: "github", channelId: "octo/repo#47", messageId: "47" } },
     );
 
     await stream.finish();
 
     expect(comments[0]).toContain("In reply to https://github.com/octo/repo/issues/47:");
+  });
+
+  it("links comment replies to the comment anchor", async () => {
+    const comments: string[] = [];
+    const stream = new GithubOutputStream(
+      { platform: "github", channelId: "octo/repo#47" },
+      createApi(comments),
+      { replyTo: { platform: "github", channelId: "octo/repo#47", messageId: "4152921803" } },
+    );
+
+    await stream.finish();
+
+    expect(comments[0]).toContain(
+      "In reply to https://github.com/octo/repo/issues/47#issuecomment-4152921803:",
+    );
+  });
+
+  it("builds reply links on the configured GitHub host", async () => {
+    const comments: string[] = [];
+    const stream = new GithubOutputStream(
+      { platform: "github", channelId: "octo/repo#47" },
+      createApi(comments, { resolveWebBaseUrl: async () => "https://github.example.com" }),
+      { replyTo: { platform: "github", channelId: "octo/repo#47", messageId: "4152921803" } },
+    );
+
+    await stream.finish();
+
+    expect(comments[0]).toContain(
+      "In reply to https://github.example.com/octo/repo/issues/47#issuecomment-4152921803:",
+    );
+  });
+
+  it("does not resolve the web host without a reply target", async () => {
+    const comments: string[] = [];
+    const stream = new GithubOutputStream(
+      { platform: "github", channelId: "octo/repo#47" },
+      createApi(comments, {
+        resolveWebBaseUrl: async () => {
+          throw new Error("no reply target, the host must not be resolved");
+        },
+      }),
+    );
+    await stream.push({ type: "text.set", text: "plain" });
+
+    const finished = await stream.finish();
+
+    expect(finished.status).toBe("ok");
+    expect(comments[0]).not.toContain("In reply to");
   });
 });
