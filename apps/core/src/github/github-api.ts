@@ -9,6 +9,7 @@ import {
   deriveApiBaseUrl,
   readGithubAppPrivateKeyPemResult,
   readGithubAppSecret,
+  readGithubAppSecretResult,
 } from "./github-app";
 import {
   getGithubUserLoginOrNull as getGithubUserLoginFromAuth,
@@ -17,6 +18,8 @@ import {
   getPreferredGithubAuthResult,
   type GithubAuthFailed,
 } from "./github-auth";
+import { githubWebBaseUrl } from "./github-ids";
+import { readGithubUserTokenSecretResult } from "./github-user-token";
 
 type GithubApiCtx = {
   apiBaseUrl: string;
@@ -39,7 +42,6 @@ const githubIssueCommentSchema = z.object({
     .optional(),
 });
 const githubIssueSchema = z.object({
-  id: z.number().int(),
   title: z.string(),
   body: z.string().nullable(),
   html_url: z.string().optional(),
@@ -407,7 +409,6 @@ export async function deleteIssueComment(input: {
 }
 
 export async function getIssue(input: { owner: string; repo: string; number: number }): Promise<{
-  id: number;
   title: string;
   body: string | null;
   html_url?: string;
@@ -561,6 +562,19 @@ export async function getPreferredGithubActorLoginOrNull(): Promise<string | nul
   const slug = await getGithubAppSlugOrNull();
   if (!slug) return null;
   return `${slug}[bot]`;
+}
+
+/**
+ * Web origin of the configured GitHub host, for links in agent replies. Reads the stored auth
+ * secrets (user token first, then GitHub App) without minting a token; an unreadable secret
+ * falls back to github.com.
+ */
+export async function getGithubWebBaseUrl(): Promise<string> {
+  const user = await readGithubUserTokenSecretResult(env.dataDir);
+  const userSecret = user.match({ ok: (value) => value, err: () => null });
+  const app = userSecret ? null : await readGithubAppSecretResult(env.dataDir);
+  const secret = userSecret ?? app?.match({ ok: (value) => value, err: () => null });
+  return githubWebBaseUrl({ host: secret?.host, apiBaseUrl: secret?.apiBaseUrl });
 }
 
 export async function getGithubAppSlugOrNull(): Promise<string | null> {

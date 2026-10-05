@@ -24,7 +24,7 @@ import { createGithubWorkflowProgressPort } from "../../../src/surface/github/gi
 
 function createGithubApi(overrides: Partial<GithubAdapterApi> = {}): GithubAdapterApi {
   return {
-    getIssue: async () => ({ id: 1, title: "Issue", body: "Body" }),
+    getIssue: async () => ({ title: "Issue", body: "Body" }),
     listIssueComments: async () => [],
     createIssueComment: async () => ({ id: 42 }),
     getIssueComment: async ({ commentId }) => ({ id: commentId, body: "Comment" }),
@@ -477,6 +477,48 @@ describe("GitHub adapter reaction pagination", () => {
   });
 });
 
+describe("GitHub adapter reply permalinks", () => {
+  async function replyBody(api: Partial<GithubAdapterApi>): Promise<string> {
+    const creates: string[] = [];
+    const adapter = new GithubAdapter({
+      api: createGithubApi({
+        createIssueComment: async ({ body }) => {
+          creates.push(body);
+          return { id: 7 };
+        },
+        ...api,
+      }),
+    });
+    const started = await adapter.startOutput(
+      { platform: "github", channelId: "octo/repo#12" },
+      { replyTo: { platform: "github", channelId: "octo/repo#12", messageId: "4152921803" } },
+    );
+    if (started.status === "error") throw started.error;
+    await started.value.push({ type: "text.set", text: "Done" });
+    const finished = await started.value.finish();
+    if (finished.status === "error") throw finished.error;
+    return creates[0] ?? "";
+  }
+
+  it("links replies on the configured GitHub host", async () => {
+    const body = await replyBody({
+      getGithubWebBaseUrl: async () => "https://github.example.com",
+    });
+
+    expect(body).toContain(
+      "In reply to https://github.example.com/octo/repo/issues/12#issuecomment-4152921803:",
+    );
+  });
+
+  it("falls back to github.com when the API resolves no host", async () => {
+    const body = await replyBody({});
+
+    expect(body).toContain(
+      "In reply to https://github.com/octo/repo/issues/12#issuecomment-4152921803:",
+    );
+  });
+});
+
 describe("GitHub normalized workflow progress port", () => {
   it("uses textual reply composition and workflow-owned markers", async () => {
     const creates: Array<Parameters<GithubAdapterApi["createIssueComment"]>[0]> = [];
@@ -492,7 +534,9 @@ describe("GitHub normalized workflow progress port", () => {
         },
       }),
     });
-    const port = createGithubWorkflowProgressPort(adapter);
+    const port = createGithubWorkflowProgressPort(adapter, {
+      getGithubWebBaseUrl: async () => "https://github.example.com",
+    });
 
     const sent = await port.send({
       channelId: "octo/repo#12",
@@ -503,7 +547,9 @@ describe("GitHub normalized workflow progress port", () => {
     expect(sent).toEqual(
       Result.ok({ platform: "github", channelId: "octo/repo#12", messageId: "55" }),
     );
-    expect(creates[0]?.body).toBe(`${GITHUB_AGENT_COMMENT_MARKER}\nIn reply to 12:\n\nQueued`);
+    expect(creates[0]?.body).toBe(
+      `${GITHUB_AGENT_COMMENT_MARKER}\nIn reply to https://github.example.com/octo/repo/issues/12:\n\nQueued`,
+    );
 
     expect(
       await port.edit({ channelId: "octo/repo#12", messageId: "55" }, { text: "Running" }),

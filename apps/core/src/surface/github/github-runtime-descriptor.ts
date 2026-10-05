@@ -6,9 +6,10 @@ import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import {
   deleteIssueCommentReactionById,
   deleteIssueReactionById,
+  getGithubWebBaseUrl,
   GithubApiError,
 } from "../../github/github-api";
-import { parseGithubSessionId } from "../../github/github-ids";
+import { githubReplyPrefix, parseGithubSessionId } from "../../github/github-ids";
 import { markGithubAgentComment } from "../../github/github-comment-marker";
 import {
   clearGithubAck,
@@ -18,6 +19,7 @@ import {
   type GithubAckState,
 } from "../../github/github-state";
 import type { SurfaceAdapter, SurfaceOperationError } from "../adapter";
+import type { ContentOpts } from "../types";
 import { resolveBuiltinSurfaceRequestMessageRef } from "../builtin-surface-protocols";
 import { githubSurfaceProtocol } from "./github-surface-protocol";
 import type {
@@ -27,6 +29,7 @@ import type {
   SurfaceRuntimeDescriptor,
   SurfaceWorkflowProgressPort,
   WorkflowProgressOperationFailed,
+  WorkflowProgressSendInput,
 } from "../runtime-descriptor";
 import {
   SurfaceIngressAcknowledgementCleanupFailed,
@@ -50,8 +53,29 @@ function githubWorkflowError(
   return { kind: "failed", error: workflowProgressOperationFailure(operation, error) };
 }
 
+export type GithubWorkflowProgressApi = {
+  readonly getGithubWebBaseUrl: typeof getGithubWebBaseUrl;
+};
+
+const DEFAULT_GITHUB_WORKFLOW_PROGRESS_API: GithubWorkflowProgressApi = { getGithubWebBaseUrl };
+
+/** GitHub comments have no native reply target, so replies carry a permalink prefix instead. */
+async function composeGithubWorkflowSendContent(
+  input: WorkflowProgressSendInput,
+  api: GithubWorkflowProgressApi,
+): Promise<ContentOpts> {
+  if (!input.replyToMessageId) return input.content;
+  const prefix = githubReplyPrefix({
+    sessionId: input.channelId,
+    messageId: input.replyToMessageId,
+    webBaseUrl: await api.getGithubWebBaseUrl(),
+  });
+  return { ...input.content, text: `${prefix}${input.content.text ?? ""}` };
+}
+
 export function createGithubWorkflowProgressPort(
   adapter: SurfaceAdapter,
+  api: GithubWorkflowProgressApi = DEFAULT_GITHUB_WORKFLOW_PROGRESS_API,
 ): SurfaceWorkflowProgressPort<"github"> {
   return {
     configurationRevision: GITHUB_WORKFLOW_PROGRESS_CONFIGURATION_REVISION,
@@ -70,12 +94,7 @@ export function createGithubWorkflowProgressPort(
       });
     },
     send: async (input) => {
-      const content = input.replyToMessageId
-        ? {
-            ...input.content,
-            text: `In reply to ${input.replyToMessageId}:\n\n${input.content.text ?? ""}`,
-          }
-        : input.content;
+      const content = await composeGithubWorkflowSendContent(input, api);
       const sent = await adapter.sendMsg(
         { platform: "github", channelId: input.channelId },
         content,
