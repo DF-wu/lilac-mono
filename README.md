@@ -169,7 +169,7 @@ docker compose exec -T lilac /usr/local/bin/tools --operator --help onboarding.g
 docker compose exec -T lilac /usr/local/bin/tools --operator --help onboarding.github_user_token
 ```
 
-Telegram supports the full conversation path, workflow cards, and same-surface tools, but its platform capabilities are not identical to Discord. See [`Telegram feature status`](./docs/telegram-surface.md#10-what-works-and-what-does-not) for differences in inbound media, history, reactions, and search.
+Telegram supports the full conversation path, workflow cards, and same-surface tools, and its request router mirrors the upstream Discord router (debounce batching, the LLM gate, steer/interrupt/follow-up, and the `!model:`, `!continue`, and `!interrupt` directives), but its platform capabilities are not identical to Discord. See [`Telegram feature status`](./docs/telegram-surface.md#10-what-works-and-what-does-not) for differences in inbound media, history, reactions, and search, and [`docs/telegram-feature-parity.md`](./docs/telegram-feature-parity.md) for the capability-by-capability comparison with Discord.
 
 ## Tools, Skills, and Workflows
 
@@ -235,6 +235,18 @@ tools:
       provider: openai-compatible
 ```
 
+To route individual aliases, add `routes` entries as `<provider>/<model id>` with provider `openai`, `openrouter`, `xai`, or `openai-compatible`; unlisted aliases follow `provider`, and the former `openaiCompatible` block is rejected at parse time:
+
+```yaml
+tools:
+  generate:
+    image:
+      provider: openai-compatible
+      routes:
+        nanobanana-2: openai-compatible/gemini-3.1-flash-image-preview
+        gpt-image-2: openai/gpt-image-2
+```
+
 For Docker Compose, put the endpoint and credential in `.env`, which is loaded by `compose.override.yaml`:
 
 ```dotenv
@@ -250,7 +262,7 @@ docker compose up -d --force-recreate --wait --wait-timeout 120 lilac
 
 When running from source, export the variables with the same names before starting Core.
 
-See [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md) for aliases, the `models` allowlist and per-alias `routes` (`<provider>/<model id>`), generation/edit endpoints, the absence of fallback behavior, and colon-form `size` aspect-ratio forwarding.
+See [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md) for aliases, the `models` allowlist and per-alias `routes` (`<provider>/<model id>`), migration from the removed `openaiCompatible` block, generation/edit endpoints, `providerMetadata` in results, the absence of fallback behavior, and colon-form `size` aspect-ratio forwarding.
 
 ### Search the Web Through OpenAI
 

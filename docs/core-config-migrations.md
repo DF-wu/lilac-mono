@@ -226,6 +226,21 @@ New v2 fields:
 - `surface.discord.markdownMathRender`: Discord markdown math rendering policy. Defaults to
   `{ enabled: false, maxWidth: 50, fallbackMode: source }`; frozen v1 configs receive this disabled
   universal fallback but cannot configure it.
+- `surface.telegram`: opt-in Telegram surface; `enabled` defaults to `false`, and the adapter is
+  constructed only when it is `true` and `token` is set (otherwise startup logs a warning and skips the
+  surface). `token` holds the Bot API token; a `tokenEnv` key is rejected with migration guidance, so
+  copy the secret to `token`. `botName` defaults to `lilac` and must not contain
+  spaces; `botUsername` is optional, must omit the leading `@`, and is resolved from `getMe` when unset.
+  `allowedChatIds` fails closed when empty and `allowedUserIds` is an optional second gate; both hold
+  string ids. `dbPath` and `apiRoot` (a full URL; the runtime defaults to `https://api.telegram.org`)
+  are optional. `outputMode` (`inline` | `preview`, default `preview`), `parseMode` (`html` | `plain`,
+  default `html`), `streamEditIntervalMs` (`500` through `60000`, default `1500`), `outputNotification`
+  (default `true`), `workingIndicators` (at least one entry), `commandMenu` (default `true`), and
+  `markdownTableRender` (`unicode` | `ascii` only, otherwise the Discord defaults) complete the surface.
+  Frozen v1 configs receive the disabled universal fallback but cannot configure any of these fields.
+- `surface.telegram.inboundMedia`: inbound photo and document delivery to the model. Defaults to
+  `{ enabled: true, maxBytesPerAttachment: 5MiB, maxBytesPerRequest: 10MiB }`; the byte-size fields accept
+  the suffixes listed below, and oversized media degrades to a metadata marker.
 
 Local example:
 

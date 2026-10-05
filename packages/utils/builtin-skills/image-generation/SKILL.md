@@ -33,5 +33,6 @@ accepted ratios and size rules per alias. The tool chooses a fresh output filena
 byte count, MIME type, model alias, provider warnings, and the provider's metadata for the call.
 
 Operators route aliases with `tools.generate.image.provider` (bulk) and `tools.generate.image.routes`
-(per-alias `<provider>/<model id>`). A route never falls back to another provider or retries. Inspect the
+(per-alias `<provider>/<model id>`). A route never falls back to another provider; the `openai-compatible`
+route also sends exactly one attempt, while other providers keep the AI SDK's default retries. Inspect the
 saved image before attaching it, and do not blindly repeat a paid request after an uncertain outcome.

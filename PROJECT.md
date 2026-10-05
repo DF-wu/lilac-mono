@@ -2,7 +2,7 @@
 
 This is the durable map of the current Lilac monorepo: product boundaries, terminology, ownership, trust boundaries, persistence categories, and the best places to make changes. It intentionally omits route inventories, configuration field catalogs, startup call order, and implementation-plan history.
 
-The DF-wu fork extends Core with a Telegram surface and OpenAI-compatible image routing while preserving these upstream ownership boundaries.
+The DF-wu fork extends Core with a Telegram surface, the structured `generate.image` tool with OpenAI-compatible image routing, and an OpenAI `web.search` provider while preserving these upstream ownership boundaries.
 
 ## Documentation Authority
 
