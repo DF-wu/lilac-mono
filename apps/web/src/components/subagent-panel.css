@@ -1,8 +1,15 @@
 .subagent-panel-header h2 {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: var(--ui-text-sm);
   font-weight: 500;
+}
+.subagent-panel-header .subagent-status svg {
+  width: 0.875rem;
+  height: 0.875rem;
 }
 .subagent-panel-header > svg {
   width: 1rem;
@@ -13,8 +20,6 @@
   height: var(--ui-control-compact);
 }
 
-.subagent-heading > span:first-child,
-.subagent-heading small,
 .subagent-name {
   color: var(--ui-muted-foreground);
   font-size: var(--ui-text-xs);

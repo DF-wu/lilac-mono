@@ -1,7 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Result } from "better-result";
-import { displayMessageSchema, subagentSummarySchema } from "@stanley2058/lilac-client-protocol";
+import {
+  MAX_REPLAY_TEXT_LENGTH,
+  displayMessageSchema,
+  subagentSummarySchema,
+} from "@stanley2058/lilac-client-protocol";
 import type { StoredMessageV1 } from "@stanley2058/lilac-event-bus";
 import type { WorkflowOperation, WorkflowRun } from "../../workflow/workflow-domain";
 import { NativeStore } from "./store";
@@ -119,6 +123,7 @@ function fixture() {
   ];
   const service = new NativeSubagents({
     native,
+    streamingMode: () => "paragraph",
     workflows: {
       getRun: (id) => {
         workflowReads++;
@@ -212,7 +217,7 @@ test("live named-session history and streaming content preserve IDs at completio
       { role: "user", content: "Earlier prompt" },
       { role: "assistant", content: "Earlier answer" },
       { role: "user", content: "Research" },
-      { role: "assistant", content: [{ type: "text", text: "Working answer" }] },
+      { role: "assistant", content: [{ type: "text", text: "Working answer\n\nMore" }] },
     ],
   });
   const live = f.read().unwrap();
@@ -281,9 +286,13 @@ test("transcript pagination bounds large messages and omits private provider dat
           toolName: "search",
           input: { private: "PRIVATE INPUT" },
         },
-        { type: "text", text: "a".repeat(2000 * 25) },
+        { type: "text", text: "a".repeat(MAX_REPLAY_TEXT_LENGTH * 2 + 1) },
       ],
     },
+    ...Array.from(
+      { length: 22 },
+      (_, index): StoredMessageV1 => ({ role: "assistant", content: `Message ${index}` }),
+    ),
   ]);
   const latest = f.read().unwrap();
   expect(latest.messages).toHaveLength(20);
@@ -320,6 +329,33 @@ test("live reasoning and tools keep their working state until completion", () =>
   expect(subagentMessages(messages)[0]?.parts[0]).toMatchObject({ data: { state: "complete" } });
   expect(subagentMessages([], false, [tool])[0]?.parts[0]).toMatchObject({
     data: { label: "search", state: "running" },
+  });
+});
+
+test("live text follows the output streaming mode", () => {
+  const messages = [
+    {
+      role: "assistant" as const,
+      content: [
+        { type: "text" as const, text: "Before tool" },
+        { type: "reasoning" as const, text: "private" },
+        { type: "text" as const, text: "First\n\nSecond partial" },
+      ],
+    },
+  ];
+  const texts = (mode: "paragraph" | "complete", streaming = true) =>
+    subagentMessages(messages, streaming, [], mode).flatMap((message) =>
+      message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+    );
+  expect(texts("paragraph")).toEqual(["Before tool", "First\n\n"]);
+  expect(texts("complete")).toEqual([]);
+  expect(texts("complete", false)).toEqual(["Before tool", "First\n\nSecond partial"]);
+  const partial = [{ role: "assistant" as const, content: "No paragraph yet" }];
+  expect(subagentMessages(partial, true, [], "paragraph")).toEqual([]);
+  const crlf = [{ role: "assistant" as const, content: "First\r\n\r\nSecond" }];
+  expect(subagentMessages(crlf, true, [], "paragraph")[0]?.parts[0]).toEqual({
+    type: "text",
+    text: "First\n\n",
   });
 });
 

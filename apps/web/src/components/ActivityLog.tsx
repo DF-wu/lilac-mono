@@ -44,6 +44,7 @@ import type { FileTarget } from "../file-target";
 import { useFileResolution, useFileViewer } from "./file-viewer-context";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
 import { Skeleton } from "./ui/skeleton";
+import { WorkingText } from "./ui/working-text";
 
 export type { ActivityPart };
 
@@ -106,11 +107,9 @@ function Chevron({ open }: { open: boolean }) {
 }
 
 function Label({ children, live }: { children: ReactNode; live?: boolean }) {
-  return (
-    <span className="activity-label min-w-0 flex-1 truncate">
-      <span className={live ? "working-text" : undefined}>{children}</span>
-    </span>
-  );
+  const className = "activity-label min-w-0 flex-1 truncate";
+  if (live) return <WorkingText className={className}>{children}</WorkingText>;
+  return <span className={className}>{children}</span>;
 }
 
 export function subagentActivity(

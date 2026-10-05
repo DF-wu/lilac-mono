@@ -139,7 +139,9 @@ describe("native turn activity disclosure", () => {
         ),
       ),
     );
-    expect(html).toContain('<span class="working-text">Thinking</span>');
+    expect(html).toContain(
+      '>Thinking<span aria-hidden="true" class="working-text-shine">Thinking</span>',
+    );
   });
   it("marks failures on the icon without a badge", () => {
     const failed = {

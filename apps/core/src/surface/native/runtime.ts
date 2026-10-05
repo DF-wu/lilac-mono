@@ -294,6 +294,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       workflows: options.workflows,
       transcripts: options.transcript,
       live: options.runner,
+      streamingMode: () => deployment().outputStreaming,
     }),
     store,
     auth,

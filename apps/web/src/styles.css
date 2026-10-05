@@ -703,39 +703,46 @@
 }
 
 .working-text {
-  color: transparent;
-  background-image: linear-gradient(
+  position: relative;
+  color: var(--ui-muted-foreground);
+}
+.working-text-shine {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  text-overflow: inherit;
+  white-space: inherit;
+  color: var(--ui-foreground);
+  user-select: none;
+  pointer-events: none;
+  mask-image: linear-gradient(
     90deg,
-    var(--ui-muted-foreground) 35%,
-    color-mix(in srgb, var(--ui-muted-foreground) 80%, var(--ui-foreground)) 43%,
-    var(--ui-foreground) 50%,
-    color-mix(in srgb, var(--ui-muted-foreground) 80%, var(--ui-foreground)) 57%,
-    var(--ui-muted-foreground) 65%
+    transparent 35%,
+    color-mix(in srgb, black 20%, transparent) 43%,
+    black 50%,
+    color-mix(in srgb, black 20%, transparent) 57%,
+    transparent 65%
   );
-  background-size: 300% 100%;
-  background-clip: text;
+  mask-size: 300% 100%;
   animation: working-text-shine var(--ui-motion-shine-duration) linear infinite;
 }
 
-:root[data-animation] .working-text {
+:root[data-animation] .working-text-shine {
   animation-duration: var(--ui-motion-shine-duration) !important;
 }
 @keyframes working-text-shine {
   from {
-    background-position: 100% 0;
+    mask-position: 100% 0;
   }
   to {
-    background-position: 0% 0;
+    mask-position: 0% 0;
   }
 }
-:root[data-animation="off"] .working-text {
-  color: var(--ui-muted-foreground);
-  background-image: none;
+:root[data-animation="off"] .working-text-shine {
+  display: none;
 }
 @media (prefers-reduced-motion: reduce) {
-  .working-text {
-    color: var(--ui-muted-foreground);
-    background-image: none;
-    animation: none;
+  .working-text-shine {
+    display: none;
   }
 }
