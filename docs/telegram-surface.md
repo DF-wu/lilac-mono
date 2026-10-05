@@ -294,9 +294,10 @@ suppression hook are available, one reply resumes the workflow exactly once and
 does not also launch an unrelated agent request. Unmatched messages continue
 through normal routing. If the suppression hook itself fails, the Telegram
 router does not fail open: the routing failure parks the adapter event
-(`park-pending`), so the message is neither dropped nor routed until it is
-redelivered and re-evaluated. (The Discord router logs
-`router suppression hook failed; proceeding` and fails open instead.)
+(`park-pending`), which leaves it in the Redis pending-entry list, unrouted and
+excluded from automatic reclamation, until an operator intervenes. (The Discord
+router logs `router suppression hook failed; proceeding` and fails open
+instead.)
 
 For the full workflow definition and trigger schemas, load the built-in
 `workflow-authoring` skill.

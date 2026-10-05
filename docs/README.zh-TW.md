@@ -20,6 +20,7 @@
 | --- | --- |
 | [`docker-deployment.md`](./docker-deployment.md) | Docker/Compose、operator token、持久化、UID、安全邊界與診斷 |
 | [`native-surface.md`](./native-surface.md) | Native Web surface：認證、設定、操作與臨時 operator console |
+| [`native-surface-verification.md`](./native-surface-verification.md) | 舊版獨立 native client 的驗證紀錄（歷史文件）；目前的 console 設定見 `native-surface.md` |
 | [`telegram-surface.md`](./telegram-surface.md) | BotFather、allowlists、群組、forum topics、workflow、對話記憶、驗證與限制 |
 | [`telegram-feature-parity.zh-TW.md`](./telegram-feature-parity.zh-TW.md) | Telegram 與 Discord 的能力對照：router 重寫對齊了什麼、每個剩餘差異的原因與所需改動，以及 Telegram 獨有的優勢 |
 | [`github-reply-permalinks.md`](./github-reply-permalinks.md) | GitHub issue/PR body 與 comment reply permalink contract |
@@ -33,7 +34,7 @@
 | [`../PLUGIN_AUTHORING.md`](../PLUGIN_AUTHORING.md) | Level 1/Level 2 external plugin contract、lifecycle 與權限 |
 | [`../examples/plugins/custom-media/README.md`](../examples/plugins/custom-media/README.md) | 可部署的 OpenAI-compatible image/video plugin 範例 |
 | [`skill-authoring.md`](./skill-authoring.md) | Skill 格式、discovery 與撰寫指引 |
-| [`claude-code.md`](./claude-code.md) | Claude Code provider：認證、tools、continuation 與儲存 |
+| [`claude-code.md`](./claude-code.md) | Claude Code provider：認證歸屬、模型選擇、執行檔解析、native continuation 與儲存 |
 
 ## Applications
 
@@ -48,6 +49,7 @@
 | --- | --- |
 | [`../AGENTS.md`](../AGENTS.md) | Repo commands、測試規則與 TypeScript conventions |
 | [`../packages/remote-fs-runner/README.md`](../packages/remote-fs-runner/README.md) | Core SSH tools 使用的 remote filesystem helper |
+| [`agents/issue-tracker.md`](./agents/issue-tracker.md) | 以本地 Markdown 追蹤開放與延後工作的方式，以及何時移除 issue 文件 |
 
 > [!NOTE]
 > `plan/` 是設計與執行紀錄，`ref/` 是 read-only reference repositories。兩者都不是一般操作文件的入口。

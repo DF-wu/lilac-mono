@@ -226,9 +226,10 @@ New v2 fields:
 - `surface.discord.markdownMathRender`: Discord markdown math rendering policy. Defaults to
   `{ enabled: false, maxWidth: 50, fallbackMode: source }`; frozen v1 configs receive this disabled
   universal fallback but cannot configure it.
-- `surface.telegram`: opt-in Telegram surface; `enabled` defaults to `false` and the adapter is only
-  constructed when it is `true`. `token` holds the Bot API token; a `tokenEnv` key is rejected with
-  migration guidance, so copy the secret to `token`. `botName` defaults to `lilac` and must not contain
+- `surface.telegram`: opt-in Telegram surface; `enabled` defaults to `false`, and the adapter is
+  constructed only when it is `true` and `token` is set (otherwise startup logs a warning and skips the
+  surface). `token` holds the Bot API token; a `tokenEnv` key is rejected with migration guidance, so
+  copy the secret to `token`. `botName` defaults to `lilac` and must not contain
   spaces; `botUsername` is optional, must omit the leading `@`, and is resolved from `getMe` when unset.
   `allowedChatIds` fails closed when empty and `allowedUserIds` is an optional second gate; both hold
   string ids. `dbPath` and `apiRoot` (a full URL; the runtime defaults to `https://api.telegram.org`)

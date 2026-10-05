@@ -20,6 +20,7 @@ Language: [`English (primary / canonical)`](../README.md) · [`Traditional Chine
 | --- | --- |
 | [`docker-deployment.md`](./docker-deployment.md) | Docker/Compose, operator tokens, persistence, UID, security boundaries, and diagnostics |
 | [`native-surface.md`](./native-surface.md) | Native Web surface: authentication, configuration, operation, and the temporary operator console |
+| [`native-surface-verification.md`](./native-surface-verification.md) | Historical verification record for the former standalone native client; current console setup is in `native-surface.md` |
 | [`telegram-surface.md`](./telegram-surface.md) | BotFather, allowlists, groups, forum topics, workflows, conversation memory, verification, and limitations |
 | [`telegram-feature-parity.md`](./telegram-feature-parity.md) | Telegram versus Discord capability matrix: what the router rewrite aligned, every remaining gap with its reason and the change needed, and Telegram-only strengths |
 | [`github-reply-permalinks.md`](./github-reply-permalinks.md) | GitHub issue/PR body and comment reply permalink contract |
@@ -33,7 +34,7 @@ Language: [`English (primary / canonical)`](../README.md) · [`Traditional Chine
 | [`../PLUGIN_AUTHORING.md`](../PLUGIN_AUTHORING.md) | Level 1/Level 2 external plugin contract, lifecycle, and permissions |
 | [`../examples/plugins/custom-media/README.md`](../examples/plugins/custom-media/README.md) | Deployable OpenAI-compatible image/video plugin example |
 | [`skill-authoring.md`](./skill-authoring.md) | Skill format, discovery, and authoring guidance |
-| [`claude-code.md`](./claude-code.md) | Claude Code provider: authentication, tools, continuation, and storage |
+| [`claude-code.md`](./claude-code.md) | Claude Code provider: authentication ownership, model selection, executable resolution, native continuation, and storage |
 
 ## Applications
 
@@ -48,6 +49,7 @@ Language: [`English (primary / canonical)`](../README.md) · [`Traditional Chine
 | --- | --- |
 | [`../AGENTS.md`](../AGENTS.md) | Repository commands, test rules, and TypeScript conventions |
 | [`../packages/remote-fs-runner/README.md`](../packages/remote-fs-runner/README.md) | Remote filesystem helper used by Core SSH tools |
+| [`agents/issue-tracker.md`](./agents/issue-tracker.md) | How open and deferred work is tracked in local Markdown files and when issue documents are removed |
 
 > [!NOTE]
 > `plan/` contains design and execution records. `ref/` contains read-only reference repositories. Neither is an entry point for general operational documentation.
