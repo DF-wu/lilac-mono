@@ -97,6 +97,20 @@ export class TelegramRequestRoutingFailed extends TaggedError("TelegramRequestRo
   readonly message: string;
 }> {}
 
+/**
+ * A subscription failed to start and at least one already-running
+ * subscription refused to stop during rollback. `residual` carries the live
+ * handles so the host can still stop or supervise them.
+ */
+export class TelegramRequestRouterStartFailed extends TaggedError(
+  "TelegramRequestRouterStartFailed",
+)<{
+  readonly cause: AnyTaggedError;
+  readonly rollbackFailures: readonly EventDeliveryStopFailed[];
+  readonly residual: readonly RouterSubscription[];
+  readonly message: string;
+}> {}
+
 export type TelegramRequestRouter = {
   readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
   stop(): Promise<void>;
@@ -152,7 +166,8 @@ type PendingMentionReplyBatch = {
 type RouterState = {
   readonly activeBySession: Map<string, ActiveSessionState>;
   readonly buffers: Map<string, DebounceBuffer>;
-  readonly pendingMentionReplyBySession: Map<string, PendingMentionReplyBatch>;
+  /** Keyed by `pendingReplyKey`, so batches of different requests never collide. */
+  readonly pendingMentionRepliesByRequest: Map<string, PendingMentionReplyBatch>;
 };
 
 type RouterContext = {
@@ -692,6 +707,14 @@ async function evaluateActiveBatchGate(
 // Mention mode
 // ---------------------------------------------------------------------------
 
+/**
+ * One batch per (session, source request): a batch preserved across a parked
+ * settle event must survive a later request becoming active in the session.
+ */
+function pendingReplyKey(sessionId: string, sourceRequestId: string): string {
+  return `${sessionId}\n${sourceRequestId}`;
+}
+
 function enqueuePendingMentionReply(
   ctx: RouterContext,
   routed: RoutedMessage,
@@ -703,15 +726,16 @@ function enqueuePendingMentionReply(
     continueCount: routed.continueCount,
     botNames: routed.botNames,
   };
-  const pending = ctx.state.pendingMentionReplyBySession;
-  const existing = pending.get(routed.sessionId);
-  if (existing && existing.sourceRequestId === active.requestId) {
+  const pending = ctx.state.pendingMentionRepliesByRequest;
+  const key = pendingReplyKey(routed.sessionId, active.requestId);
+  const existing = pending.get(key);
+  if (existing) {
     if (!existing.items.some((i) => i.event.messageId === routed.msgRef.messageId)) {
       existing.items.push(item);
     }
     return;
   }
-  pending.set(routed.sessionId, {
+  pending.set(key, {
     sourceRequestId: active.requestId,
     sessionConfigId: routed.sessionConfigId,
     parentChannelId: routed.parentChannelId,
@@ -735,9 +759,10 @@ async function flushPendingMentionRepliesAsFollowUp(
   routed: RoutedMessage,
   active: ActiveSessionState,
 ): RoutingResult {
-  const pending = ctx.state.pendingMentionReplyBySession;
-  const batch = pending.get(routed.sessionId);
-  if (!batch || batch.sourceRequestId !== active.requestId) return Result.ok(undefined);
+  const pending = ctx.state.pendingMentionRepliesByRequest;
+  const key = pendingReplyKey(routed.sessionId, active.requestId);
+  const batch = pending.get(key);
+  if (!batch) return Result.ok(undefined);
   while (batch.items.length > 0) {
     const item = batch.items[0]!;
     const published = await publishToActiveRequest(
@@ -749,7 +774,7 @@ async function flushPendingMentionRepliesAsFollowUp(
     if (failure) return Result.err(failure);
     batch.items.shift();
   }
-  if (pending.get(routed.sessionId) === batch) pending.delete(routed.sessionId);
+  if (pending.get(key) === batch) pending.delete(key);
   return Result.ok(undefined);
 }
 
@@ -758,12 +783,13 @@ async function flushPendingMentionRepliesAsPrompt(
   ctx: RouterContext,
   input: { readonly sessionId: string; readonly sourceRequestId: string },
 ): RoutingResult {
-  const pending = ctx.state.pendingMentionReplyBySession;
-  const batch = pending.get(input.sessionId);
-  if (!batch || batch.sourceRequestId !== input.sourceRequestId) return Result.ok(undefined);
+  const pending = ctx.state.pendingMentionRepliesByRequest;
+  const key = pendingReplyKey(input.sessionId, input.sourceRequestId);
+  const batch = pending.get(key);
+  if (!batch) return Result.ok(undefined);
   const last = batch.items[batch.items.length - 1];
   if (!last) {
-    pending.delete(input.sessionId);
+    pending.delete(key);
     return Result.ok(undefined);
   }
 
@@ -807,7 +833,7 @@ async function flushPendingMentionRepliesAsPrompt(
     origin: { userId: last.event.userId, messageRef: messageRef(last.event) },
   });
   return published.map(() => {
-    if (pending.get(input.sessionId) === batch) pending.delete(input.sessionId);
+    if (pending.get(key) === batch) pending.delete(key);
     markActive(ctx, input.sessionId, requestId);
   });
 }
@@ -1083,11 +1109,13 @@ function rethrowPanic(cause: Error): void {
 
 /**
  * A subscription that fails to start must leave nothing behind, so the ones
- * already running are stopped before the failure reaches the host.
+ * already running are stopped before the failure reaches the host. A rollback
+ * stop that fails is reported with its live handle instead of being dropped.
  */
 async function adaptSubscriptionStartToHost<E extends AnyTaggedError>(
   started: ResultType<RouterSubscription, E>,
   rollback: readonly RouterSubscription[],
+  logger: Logger,
 ): Promise<RouterSubscription> {
   const outcome = started.match<
     | { readonly kind: "ok"; readonly subscription: RouterSubscription }
@@ -1097,8 +1125,32 @@ async function adaptSubscriptionStartToHost<E extends AnyTaggedError>(
     err: (error) => ({ kind: "err", error }),
   });
   if (outcome.kind === "ok") return outcome.subscription;
-  for (const subscription of rollback) await subscription.stop();
-  throw outcome.error;
+  const residual: RouterSubscription[] = [];
+  const rollbackFailures: EventDeliveryStopFailed[] = [];
+  for (const subscription of rollback) {
+    const stopped = await subscription.stop();
+    stopped.match({
+      ok: () => undefined,
+      err: (failure) => {
+        residual.push(subscription);
+        rollbackFailures.push(failure);
+      },
+    });
+  }
+  if (rollbackFailures.length === 0) throw outcome.error;
+  const failure = new TelegramRequestRouterStartFailed({
+    cause: outcome.error,
+    rollbackFailures,
+    residual,
+    message: "Telegram request router start failed and its rollback left subscriptions running",
+  });
+  logger.error(
+    "telegram request router rollback left subscriptions running",
+    formatBridgeTaggedErrorForLog(failure, {
+      residualTopics: rollbackFailures.map((rollbackFailure) => rollbackFailure.topic).join(","),
+    }),
+  );
+  throw failure;
 }
 
 function adaptSubscriptionStopToHost(stopped: ResultType<void, EventDeliveryStopFailed>): void {
@@ -1114,7 +1166,7 @@ export async function startTelegramRequestRouter(
   const state: RouterState = {
     activeBySession: new Map(),
     buffers: new Map(),
-    pendingMentionReplyBySession: new Map(),
+    pendingMentionRepliesByRequest: new Map(),
   };
   const debounceDefect = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
 
@@ -1193,8 +1245,9 @@ export async function startTelegramRequestRouter(
         message.data.state === "failed" ||
         message.data.state === "cancelled";
       if (!settled) return Result.ok(undefined);
-      const ownsPendingReplies =
-        state.pendingMentionReplyBySession.get(sessionId)?.sourceRequestId === requestId;
+      const ownsPendingReplies = state.pendingMentionRepliesByRequest.has(
+        pendingReplyKey(sessionId, requestId),
+      );
       if (current?.requestId !== requestId && !ownsPendingReplies) return Result.ok(undefined);
       // A failed flush parks this event; the active entry and the batch both
       // survive so the redelivery can retry.
@@ -1216,7 +1269,7 @@ export async function startTelegramRequestRouter(
     },
     deliveryPolicy,
   );
-  const lifecycleSubscription = await adaptSubscriptionStartToHost(lifecycle, []);
+  const lifecycleSubscription = await adaptSubscriptionStartToHost(lifecycle, [], logger);
 
   const surface = await input.bus.subscribeTopic(
     "evt.surface",
@@ -1243,7 +1296,11 @@ export async function startTelegramRequestRouter(
     },
     deliveryPolicy,
   );
-  const surfaceSubscription = await adaptSubscriptionStartToHost(surface, [lifecycleSubscription]);
+  const surfaceSubscription = await adaptSubscriptionStartToHost(
+    surface,
+    [lifecycleSubscription],
+    logger,
+  );
 
   const adapterEvents = await input.bus.subscribeTopic(
     "evt.adapter",
@@ -1274,10 +1331,11 @@ export async function startTelegramRequestRouter(
     },
     deliveryPolicy,
   );
-  const adapterSubscription = await adaptSubscriptionStartToHost(adapterEvents, [
-    surfaceSubscription,
-    lifecycleSubscription,
-  ]);
+  const adapterSubscription = await adaptSubscriptionStartToHost(
+    adapterEvents,
+    [surfaceSubscription, lifecycleSubscription],
+    logger,
+  );
 
   const subscriptions = [adapterSubscription, surfaceSubscription, lifecycleSubscription];
   return {
@@ -1292,7 +1350,7 @@ export async function startTelegramRequestRouter(
       // propagates, so a failed stop cannot leave the others running.
       const stopped: ResultType<void, EventDeliveryStopFailed>[] = [];
       for (const subscription of subscriptions) stopped.push(await subscription.stop());
-      state.pendingMentionReplyBySession.clear();
+      state.pendingMentionRepliesByRequest.clear();
       for (const result of stopped) adaptSubscriptionStopToHost(result);
     },
   };

@@ -5,6 +5,7 @@ import path from "node:path";
 import { Result } from "better-result";
 
 import {
+  EventDeliveryStartFailed,
   EventDeliveryStopFailed,
   createLilacBus,
   lilacEventTypes,
@@ -17,7 +18,10 @@ import type {
   RouterGateDecision,
   RouterGateInput,
 } from "../../../src/surface/telegram/telegram-request-router";
-import { startTelegramRequestRouter } from "../../../src/surface/telegram/telegram-request-router";
+import {
+  startTelegramRequestRouter,
+  TelegramRequestRouterStartFailed,
+} from "../../../src/surface/telegram/telegram-request-router";
 import type {
   SurfaceAdapter,
   SurfaceOperationResult,
@@ -1145,5 +1149,117 @@ describe("the Telegram request router when a subscription refuses to stop", () =
 
     await expect(router.stop()).rejects.toBeInstanceOf(EventDeliveryStopFailed);
     expect([...stoppedTopics].sort()).toEqual(["evt.adapter", "evt.request", "evt.surface"]);
+  });
+});
+
+describe("the Telegram request router with deferred replies for two requests", () => {
+  it("keeps each request's deferred replies apart until its own settle event flushes them", async () => {
+    const adapter = new FlakyReadAdapter("21");
+    const { bus, lifecycleDeliveries, published, router } = await startRouter(adapter, {
+      config: routerConfig({ defaultMode: "mention" }),
+    });
+
+    try {
+      await publishTelegramMessage(bus, {
+        messageId: "20",
+        text: `@${TELEGRAM_HANDLE} hello`,
+        raw: groupRaw("20", { mentionsBot: true }),
+      });
+      const first = await waitForPublish(published);
+      const requestA = String(first.headers?.request_id ?? "");
+      await publishLifecycle(bus, requestA, "running");
+      await publishOutputCreated(bus, requestA, "600");
+      await publishTelegramMessage(bus, {
+        messageId: "21",
+        text: "what about the edge cases?",
+        raw: groupRaw("21", { replyToBot: true, replyToMessageId: "600" }),
+      });
+
+      // Request A's settle is parked on the transient read failure...
+      await publishLifecycle(bus, requestA, "resolved");
+      await waitFor(() => lifecycleDeliveries.includes("park-pending"), "the parked settle event");
+
+      // ...and meanwhile request B starts in the same session and collects a
+      // deferred reply of its own.
+      const requestB = `telegram:${CHAT}:30`;
+      await publishLifecycle(bus, requestB, "running");
+      await publishOutputCreated(bus, requestB, "700");
+      await publishTelegramMessage(bus, {
+        messageId: "31",
+        text: "and the other thing?",
+        raw: groupRaw("31", { replyToBot: true, replyToMessageId: "700" }),
+      });
+      expect(published).toHaveLength(1);
+
+      // A's redelivered settle event still finds A's reply.
+      await publishLifecycle(bus, requestA, "resolved");
+      const [, flushedA] = await waitForPublishCount(published, 2);
+      expect(flushedA?.headers?.request_id).toBe(`telegram:${CHAT}:21`);
+      expect(JSON.stringify(requestData(flushedA!).messages)).toContain("edge cases");
+
+      // B's settle event flushes B's reply, untouched by A's recovery.
+      await publishLifecycle(bus, requestB, "resolved");
+      const [, , flushedB] = await waitForPublishCount(published, 3);
+      expect(flushedB?.headers?.request_id).toBe(`telegram:${CHAT}:31`);
+      expect(JSON.stringify(requestData(flushedB!).messages)).toContain("the other thing");
+    } finally {
+      await router.stop();
+    }
+  });
+});
+
+describe("the Telegram request router when startup rollback cannot stop a subscription", () => {
+  it("reports the rollback failure with the live handle instead of dropping it", async () => {
+    const inner = createLilacBus(createInMemoryDeliveryBus());
+    const stoppedTopics: string[] = [];
+    const subscribeTopic: LilacBus["subscribeTopic"] = async (topic, opts, handler, policy) => {
+      if (topic === "evt.adapter") {
+        return Result.err(
+          new EventDeliveryStartFailed({
+            topic,
+            cause: new Error("forced start failure"),
+            message: "Forced start failure",
+          }),
+        );
+      }
+      const started = await inner.subscribeTopic(topic, opts, handler, policy);
+      return started.map((subscription) => ({
+        done: subscription.done,
+        stop: async () => {
+          stoppedTopics.push(topic);
+          await subscription.stop();
+          if (topic !== "evt.surface") return Result.ok(undefined);
+          return Result.err(
+            new EventDeliveryStopFailed({
+              cause: new Error("forced stop failure"),
+              topic,
+              message: "Forced stop failure",
+            }),
+          );
+        },
+      }));
+    };
+    const bus: LilacBus = { ...inner, subscribeTopic };
+
+    const error: unknown = await startTelegramRequestRouter({
+      adapter: new FakeTelegramAdapter(),
+      bus,
+      blobStore: await getTestBlobStore(),
+      subscriptionId: "telegram-router-rollback-test",
+      config: routerConfig(),
+    }).then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+
+    expect(error).toBeInstanceOf(TelegramRequestRouterStartFailed);
+    const failure = error as TelegramRequestRouterStartFailed;
+    expect(failure.cause._tag).toBe("EventDeliveryStartFailed");
+    expect(failure.rollbackFailures.map((f) => f.topic)).toEqual(["evt.surface"]);
+    expect(failure.residual).toHaveLength(1);
+    // Every started subscription got its stop attempt, not just the first.
+    expect([...stoppedTopics].sort()).toEqual(["evt.request", "evt.surface"]);
+    // The residual handle is still usable for a later cleanup attempt.
+    expect(typeof failure.residual[0]?.stop).toBe("function");
   });
 });
