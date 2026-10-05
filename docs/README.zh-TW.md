@@ -24,7 +24,7 @@
 
 | 文件 | 內容 |
 | --- | --- |
-| [`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md) | 將 `generate.image` 路由到 OpenAI-compatible endpoint |
+| [`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md) | 結構化 `generate.image` 的內部結構與 per-alias provider 路由（含 OpenAI-compatible endpoint） |
 | [`web-search-openai.md`](./web-search-openai.md) | 以 OpenAI Responses `web_search` 工具執行 `web.search`：中介模型拿到什麼、對話模型收到什麼、設定與限制 |
 | [`../PLUGIN_AUTHORING.md`](../PLUGIN_AUTHORING.md) | Level 1/Level 2 external plugin contract、lifecycle 與權限 |
 | [`../examples/plugins/custom-media/README.md`](../examples/plugins/custom-media/README.md) | 可部署的 OpenAI-compatible image/video plugin 範例 |

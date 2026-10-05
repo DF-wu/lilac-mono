@@ -1,28 +1,50 @@
 // Fork-owned structured `generate.image`. Upstream replaced this contract with a
 // script runner; keeping the implementation here leaves `../generate.ts` a
 // thin registration hook so upstream merges stay mechanical.
+//
+// Module map:
+// - catalog.ts: one capability entry per alias (provider model IDs, ratios,
+//   size rule, edit support) plus the fallback order and dimension mapping.
+// - validation.ts: checks a request against the catalog before any HTTP call.
+// - input.ts: the zod input schema; its help text is derived from the catalog.
+// - routing.ts: plans a route per alias (explicit `routes`, the bulk `provider`,
+//   or the built-in preference), resolves it against the environment, and picks
+//   the alias for a call.
+// - prompt.ts: reads input images and masks into the AI SDK prompt shape.
+// - callable.ts: the Level 2 callable that ties the pieces together.
 export {
   createGenerateImageCallable,
-  generateImageWithModel,
   type GenerateImageCallableDefinition,
   type GenerateImageConfigSource,
   type GenerateImageResult,
 } from "./callable";
 export {
+  compatibleImageModelId,
+  DEFAULT_IMAGE_MODEL_FALLBACK_ORDER,
+  DEFAULT_IMAGE_PROVIDER_ORDER,
+  gptAspectRatioToSize,
+  IMAGE_MODEL_CATALOG,
+  IMAGE_MODEL_IDS,
+  imageModelCapabilities,
+  orderImageModelIds,
+  resolveImageDimensions,
+  type ImageModelCapabilities,
+  type ImageSizeRule,
+  type SupportedImageModelId,
+} from "./catalog";
+export {
   imageGenerateInputSchema,
   type ImageGenerateInput,
   type ImageGenerationPrompt,
 } from "./input";
-export {
-  DEFAULT_IMAGE_MODEL_FALLBACK_ORDER,
-  IMAGE_MODEL_DESCRIPTORS,
-  getAvailableImageModels,
-  gptAspectRatioToSize,
-  orderImageModelIds,
-  resolveImageDimensions,
-  validateImageGenerationInputForModel,
-  type ImageModelDescriptor,
-  type SupportedImageModelId,
-} from "./models";
 export { buildImageGenerationPrompt, resolveImageEditInputs } from "./prompt";
-export { resolveImageRouting } from "./routing";
+export {
+  advertisedImageModelIds,
+  imageRequestOptions,
+  pickImageModel,
+  resolveImageModels,
+  type PickedImageModel,
+  type ResolvedImageModel,
+  type ResolvedImageModels,
+} from "./routing";
+export { validateImageGenerationInputForModel } from "./validation";

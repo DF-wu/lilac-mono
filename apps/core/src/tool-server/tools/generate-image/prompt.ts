@@ -1,21 +1,36 @@
-import { errorMessage } from "@stanley2058/lilac-utils";
 import type { ServerToolFailure } from "@stanley2058/lilac-plugin-runtime";
-import { Panic, Result, type Result as ResultType } from "better-result";
+import { Result, type Result as ResultType } from "better-result";
 import type { DataContent } from "ai";
 
 import {
   formatToolPathForRequestContext,
   resolveToolPathForRequestContext,
 } from "../../../shared/attachment-utils";
-import { preserveToolPanic } from "../../../tools/tool-result-adapters";
 import type { RequestContext } from "../../types";
-import {
-  captureGenerateFailure,
-  generateFailure,
-  readImageDataFromPath,
-  settleCapturedError,
-} from "../generate";
+import { captureGenerateFailure, readImageDataFromPath, settleCapturedError } from "../generate";
+import { generateFailureFromCause } from "./failures";
 import type { ImageGenerationPrompt } from "./input";
+
+/** Resolves a caller path against the request context and reads it as image bytes. */
+function readImageInput(
+  cwd: string,
+  inputPath: string,
+  context: RequestContext | undefined,
+): Promise<ResultType<Buffer, ServerToolFailure>> {
+  return Result.gen(async function* () {
+    const resolved = yield* settleCapturedError(
+      Result.try({
+        try: () => resolveToolPathForRequestContext({ cwd, inputPath, context }),
+        catch: captureGenerateFailure,
+      }),
+      generateFailureFromCause("denied"),
+    );
+    return await readImageDataFromPath(
+      resolved,
+      formatToolPathForRequestContext({ path: resolved, context }),
+    );
+  });
+}
 
 export async function resolveImageEditInputs(
   cwd: string,
@@ -34,56 +49,18 @@ export async function resolveImageEditInputs(
     ServerToolFailure
   >
 > {
-  if (!input.inputImages || input.inputImages.length === 0) {
-    return Result.ok(undefined);
-  }
+  const inputImages = input.inputImages ?? [];
+  if (inputImages.length === 0) return Result.ok(undefined);
 
   return Result.gen(async function* () {
     const images: DataContent[] = [];
-    for (const imagePath of input.inputImages ?? []) {
-      const resolved = yield* settleCapturedError(
-        Result.try({
-          try: () => resolveToolPathForRequestContext({ cwd, inputPath: imagePath, context }),
-          catch: captureGenerateFailure,
-        }),
-        (cause) => {
-          if (Panic.is(cause)) return preserveToolPanic(cause);
-          return generateFailure("denied", errorMessage(cause));
-        },
-      );
-      images.push(
-        yield* Result.await(
-          readImageDataFromPath(
-            resolved,
-            formatToolPathForRequestContext({ path: resolved, context }),
-          ),
-        ),
-      );
+    for (const imagePath of inputImages) {
+      images.push(yield* Result.await(readImageInput(cwd, imagePath, context)));
     }
 
     if (!input.maskImage) return Result.ok({ images });
 
-    const resolvedMask = yield* settleCapturedError(
-      Result.try({
-        try: () =>
-          resolveToolPathForRequestContext({
-            cwd,
-            inputPath: input.maskImage!,
-            context,
-          }),
-        catch: captureGenerateFailure,
-      }),
-      (cause) => {
-        if (Panic.is(cause)) return preserveToolPanic(cause);
-        return generateFailure("denied", errorMessage(cause));
-      },
-    );
-    const mask = yield* Result.await(
-      readImageDataFromPath(
-        resolvedMask,
-        formatToolPathForRequestContext({ path: resolvedMask, context }),
-      ),
-    );
+    const mask = yield* Result.await(readImageInput(cwd, input.maskImage, context));
     return Result.ok({ images, mask });
   });
 }

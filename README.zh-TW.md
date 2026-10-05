@@ -36,7 +36,7 @@ Lilac 把平台訊息、路由、模型執行、工具、Skills 與可恢復工�
 | 領域 | 本 fork 提供的差異 | 重要限制 |
 | --- | --- | --- |
 | Telegram surface | DMs、群組、forum topics、串流 HTML 回覆、取消、reaction、command menu、inbound/outbound attachments、workflow cards、同 surface tools，以及納入跨 surface 對話記憶的 Telegram 歷史 | 預設停用；僅 long polling；記憶以每個聊天或 topic 為一個 thread |
-| OpenAI-compatible 圖像路由 | 將既有 `generate.image` aliases 統一路由到 operator 指定的 OpenAI-compatible endpoint | 僅 `configVersion: 2`；無自動 fallback 或自訂 alias mapping |
+| OpenAI-compatible 圖像路由 | 將既有 `generate.image` aliases 路由到 operator 指定的 OpenAI-compatible endpoint，並支援 per-alias `provider/model` routes | 僅 `configVersion: 2`；provider 之間無自動 fallback |
 | OpenAI `web.search` provider | `tools.web.extract.providers` 填入 `openai` 後，`web.search` 改走 OpenAI Responses 的 `web_search` 工具，回傳答案引用的來源 | 僅 `configVersion: 2`；只做搜尋（`web.extract` 會略過）；日期限制只是對模型的指示 |
 | GitHub 回覆 UX | `In reply to` 可直接連到 issue/PR body 或指定 comment 的 canonical permalink | GitHub comment self-loop 防護已被上游接收，不再列為 fork-only |
 | Custom media plugin | 可部署的 Level 2 image/video plugin 範例，示範嚴格設定與檔案安全處理 | Plugin 是 trusted in-process code；restricted caller 目前不能使用 external callables |
@@ -234,7 +234,7 @@ docker compose up -d --force-recreate --wait --wait-timeout 120 lilac
 
 從 source 執行時，改為 `export` 同名變數後再啟動 Core。
 
-Alias、`openaiCompatible.models` allowlist 與 `openaiCompatible.modelIds` overrides、generation/edit endpoints、無 fallback 行為與 colon-form `size` aspect-ratio 轉送見 [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md)。
+Alias、`models` allowlist 與 per-alias `routes`（`<provider>/<model id>`）、generation/edit endpoints、無 fallback 行為與 colon-form `size` aspect-ratio 轉送見 [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md)。
 
 ### 透過 OpenAI 搜尋網頁
 

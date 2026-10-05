@@ -77,6 +77,9 @@ export {
   defaultGenerateToolsConfig,
   type GenerateToolsConfig,
   type ImageGenerationModelAlias,
+  IMAGE_ROUTE_PROVIDERS,
+  type ImageModelRoute,
+  type ImageRouteProvider,
 } from "./core-config/generate-image";
 export {
   TELEGRAM_SURFACE_DEFAULTS,

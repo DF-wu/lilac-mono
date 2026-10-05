@@ -49,7 +49,7 @@ The table below lists only behavior that still differs from upstream. For the fu
 | Area                            | Difference provided by this fork                                                                                                                       | Important limitations                                                                             |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
 | Telegram surface                | DMs, groups, forum topics, streaming HTML replies, cancellation, reactions, command menu, inbound/outbound attachments, workflow cards, same-surface tools, and Telegram history in cross-surface conversation memory | Disabled by default; long polling only; memory indexes one thread per chat or topic |
-| OpenAI-compatible image routing | Routes the existing `generate.image` aliases through a single operator-specified OpenAI-compatible endpoint                                            | `configVersion: 2` only; no automatic fallback or custom alias mapping                            |
+| OpenAI-compatible image routing | Routes the existing `generate.image` aliases through an operator-specified OpenAI-compatible endpoint, with per-alias `provider/model` routes            | `configVersion: 2` only; no automatic fallback between providers                                  |
 | OpenAI `web.search` provider    | `openai` in `tools.web.extract.providers` runs `web.search` through the OpenAI Responses `web_search` tool and returns the answer's cited sources     | `configVersion: 2` only; search-only (`web.extract` skips it); date filters are model guidance only |
 | GitHub reply UX                 | `In reply to` can link directly to an issue/PR body or a specified comment's canonical permalink                                                       | GitHub comment self-loop protection has been accepted upstream and is no longer fork-only         |
 | Custom media plugin             | Deployable Level 2 image/video plugin example demonstrating strict configuration and file-safety handling                                              | The plugin is trusted in-process code; restricted callers currently cannot use external callables |
@@ -250,7 +250,7 @@ docker compose up -d --force-recreate --wait --wait-timeout 120 lilac
 
 When running from source, export the variables with the same names before starting Core.
 
-See [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md) for aliases, the `openaiCompatible.models` allowlist and `openaiCompatible.modelIds` overrides, generation/edit endpoints, the absence of fallback behavior, and colon-form `size` aspect-ratio forwarding.
+See [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md) for aliases, the `models` allowlist and per-alias `routes` (`<provider>/<model id>`), generation/edit endpoints, the absence of fallback behavior, and colon-form `size` aspect-ratio forwarding.
 
 ### Search the Web Through OpenAI
 

@@ -122,7 +122,7 @@ type VideoGenerateInput = z.infer<typeof videoGenerateInputSchema>;
 type VideoModelObject = Exclude<Parameters<typeof generateVideo>[0]["model"], string>;
 type GenerationProvider = "openai" | "openrouter" | "xai" | "vercel";
 
-export type ModelDescriptor<TId extends string, TModel, TInput> = {
+type ModelDescriptor<TId extends string, TModel, TInput> = {
   id: TId;
   createModel: (providers: ReturnType<typeof getModelProviders>) => TModel | undefined;
   validateInput: (input: TInput) => ResultType<void, ServerToolFailure>;
@@ -154,10 +154,7 @@ export function isConfiguredProvider(provider: GenerationProvider): boolean {
   }
 }
 
-export function isOneOf<const T extends readonly string[]>(
-  allowed: T,
-  value: string,
-): value is T[number] {
+function isOneOf<const T extends readonly string[]>(allowed: T, value: string): value is T[number] {
   return (allowed as readonly string[]).includes(value);
 }
 
@@ -206,7 +203,7 @@ const VIDEO_MODEL_DESCRIPTORS: readonly VideoModelDescriptor[] = [
   },
 ];
 
-export function resolveAvailableModels<TId extends string, TModel, TInput>(
+function resolveAvailableModels<TId extends string, TModel, TInput>(
   descriptors: readonly ModelDescriptor<TId, TModel, TInput>[],
   providers: ReturnType<typeof getModelProviders>,
 ): {
@@ -238,7 +235,7 @@ function getAvailableVideoModels() {
   return resolveAvailableModels(VIDEO_MODEL_DESCRIPTORS, providers);
 }
 
-export function pickModel<TId extends string, TModel>(
+function pickModel<TId extends string, TModel>(
   available: Partial<Record<TId, TModel>>,
   requested: string | undefined,
   fallbackOrder: readonly TId[],

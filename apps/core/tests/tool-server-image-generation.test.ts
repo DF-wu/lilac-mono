@@ -11,8 +11,11 @@ import {
 } from "../src/tool-server/tools/generate";
 import {
   buildImageGenerationPrompt,
+  compatibleImageModelId,
   DEFAULT_IMAGE_MODEL_FALLBACK_ORDER,
+  DEFAULT_IMAGE_PROVIDER_ORDER,
   gptAspectRatioToSize,
+  IMAGE_MODEL_CATALOG,
   imageGenerateInputSchema,
   orderImageModelIds,
   resolveImageEditInputs,
@@ -34,6 +37,49 @@ describe("tool-server image generation", () => {
     expect([...IMAGE_GENERATION_MODEL_ALIASES].sort()).toEqual(
       [...DEFAULT_IMAGE_MODEL_FALLBACK_ORDER].sort(),
     );
+  });
+
+  it("derives the compatible model ID from each alias's first provider ID", () => {
+    for (const alias of IMAGE_GENERATION_MODEL_ALIASES) {
+      const providerModelIds = IMAGE_MODEL_CATALOG[alias].providerModelIds;
+      const firstProvider = DEFAULT_IMAGE_PROVIDER_ORDER.find(
+        (provider) => providerModelIds[provider] !== undefined,
+      );
+      expect(firstProvider).toBeDefined();
+      expect(compatibleImageModelId(alias)).toBe(providerModelIds[firstProvider!]!);
+    }
+    expect(
+      Object.fromEntries(IMAGE_GENERATION_MODEL_ALIASES.map((a) => [a, compatibleImageModelId(a)])),
+    ).toEqual({
+      "gpt-image-2": "gpt-image-2",
+      "gpt-5-image": "gpt-image-1.5",
+      nanobanana: "google/gemini-2.5-flash-image",
+      "nanobanana-2": "google/gemini-3.1-flash-image-preview",
+      "nanobanana-2-lite": "google/gemini-3.1-flash-lite-image",
+      "nanobanana-pro": "google/gemini-3-pro-image-preview",
+      "grok-imagine-image": "grok-imagine-image",
+      "grok-imagine-image-pro": "grok-imagine-image-pro",
+    });
+  });
+
+  it("derives the size and aspectRatio help text from the catalog", () => {
+    const shape = imageGenerateInputSchema.shape;
+    const aspectRatioHelp = shape.aspectRatio.description ?? "";
+    const sizeHelp = shape.size.description ?? "";
+
+    for (const alias of IMAGE_GENERATION_MODEL_ALIASES) {
+      const ratios = IMAGE_MODEL_CATALOG[alias].aspectRatios.join(" | ");
+      expect(aspectRatioHelp).toMatch(
+        new RegExp(
+          `- For [^\\n]*\\b${alias}\\b[^\\n]*: ${ratios.replaceAll("|", "\\|").replaceAll(".", "\\.")}\\.`,
+        ),
+      );
+    }
+    expect(aspectRatioHelp).toContain("- For gpt-image-2/gpt-5-image: 1:1 | 3:2 | 2:3.");
+    expect(sizeHelp).toContain(
+      "- nanobanana-2-lite, grok-imagine-image, grok-imagine-image-pro: not supported; use --aspect-ratio instead.",
+    );
+    expect(sizeHelp).toContain("- For gpt-5-image: 1024x1024 | 1536x1024 | 1024x1536.");
   });
 
   it("uses gpt-image-2 as the recommended default", () => {

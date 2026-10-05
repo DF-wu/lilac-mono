@@ -117,7 +117,7 @@ packages/utils/core-config.ts  # re-exports fork config modules
 packages/utils/core-config/types.ts  # UniversalCoreConfig gains surface.telegram and tools.generate
 packages/utils/core-config/v1.ts  # v1 fallbacks for fork config keys
 packages/utils/core-config/v2.ts  # v2 schema includes fork config modules
-packages/utils/index.ts  # re-exports the custom-command menu module
+packages/utils/index.ts  # re-exports the custom-command menu and compatible image provider modules
 
 # --- Agent and event bus fixes carried by the fork
 packages/agent/adapters/ai-sdk/adapter.ts  # executes parsed local tool calls on nonstandard finish reasons

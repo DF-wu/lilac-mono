@@ -28,9 +28,10 @@ Call the tool with a prompt and optional structured fields:
 ```
 
 Use `inputImages` for edits or variations and `maskImage` for inpainting. `maskImage` requires at least
-one input image. Use only one of `size` or `aspectRatio`. The tool chooses a fresh output filename and
-returns its path, MIME type, model, warnings, and provider metadata.
+one input image. Use only one of `size` or `aspectRatio`. `tools --help generate.image` lists the
+accepted ratios and size rules per alias. The tool chooses a fresh output filename and returns its path,
+byte count, MIME type, model alias, provider warnings, and the provider's metadata for the call.
 
-With `tools.generate.image.provider: openai-compatible`, every enabled alias routes only through the
-configured compatible endpoint. There is no official-provider fallback or automatic retry. Inspect the
+Operators route aliases with `tools.generate.image.provider` (bulk) and `tools.generate.image.routes`
+(per-alias `<provider>/<model id>`). A route never falls back to another provider or retries. Inspect the
 saved image before attaching it, and do not blindly repeat a paid request after an uncertain outcome.
