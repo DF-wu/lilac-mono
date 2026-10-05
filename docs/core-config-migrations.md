@@ -55,6 +55,17 @@ model failures retain the current title. Existing conversations are not renamed.
 
 The field is optional; no config rewrite is required. Remove it before using an older parser.
 
+## Image routes
+
+`tools.generate.image.openaiCompatible` is replaced by two fields next to `provider`:
+`tools.generate.image.models` (the alias allowlist, formerly `openaiCompatible.models`) and
+`tools.generate.image.routes`, a map from alias to `<provider>/<model id>`. A former
+`openaiCompatible.modelIds` entry becomes `routes.<alias>: openai-compatible/<model id>`. Routes also
+accept `openai`, `openrouter`, and `xai`, so one alias can leave the compatible endpoint while the rest
+follow `provider`. Configs that still contain `openaiCompatible` fail to parse with a message that names
+the replacement; no config version bump is required. Older builds reject `models` and `routes` at this
+level, so move them back under `openaiCompatible` before downgrading.
+
 ## Image table style
 
 Table rendering now accepts `style: image`. The default remains `unicode`, so existing configurations
@@ -123,11 +134,12 @@ New v2 fields:
 - `agent.idleTimeoutMs`: primary agent inactivity timeout; defaults to `900000` (15 minutes). Active runs
   have no total runtime cap. Frozen v1 configs receive the same universal fallback but cannot override it.
 - `tools.inspect.model`: configurable Gemini model for `content.inspect`; must start with `google/`.
-- `tools.generate.image.provider`: selects the built-in default image routing or the
-  `openai-compatible` endpoint. The optional `tools.generate.image.openaiCompatible.models` allowlist
-  limits the aliases advertised and considered for fallback, while `modelIds` overrides the upstream
-  model ID for each alias. Frozen v1 configs cannot configure these fields and receive
-  `provider: default` with an empty `modelIds` map in the universal config.
+- `tools.generate.image.provider`: the route for aliases without an explicit route, either the
+  built-in provider preference (`default`) or the `openai-compatible` endpoint. The optional
+  `tools.generate.image.models` allowlist limits the aliases advertised and considered for fallback,
+  and `tools.generate.image.routes` maps an alias to `<provider>/<model id>` (`openai`, `openrouter`,
+  `xai`, or `openai-compatible`). Frozen v1 configs cannot configure these fields and receive
+  `provider: default` with an empty `routes` map in the universal config.
 - `tools.web.firecrawl`: optional process-local concurrency policy applied independently to Firecrawl
   fetch and search calls. When present, `maxConcurrency` defaults to `2` and `queueTtl` defaults to `3s`;
   when absent, Firecrawl calls remain unlimited.

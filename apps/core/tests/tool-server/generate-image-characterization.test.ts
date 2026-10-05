@@ -175,6 +175,7 @@ describe("Generate image upstream characterization", () => {
       mimeType: "image/png",
       model: "gpt-5-image",
       warnings: [],
+      providerMetadata: { openai: { images: [{}] } },
     });
     expect(await readFile(join(outputDir, "generated-image (1).png"))).toEqual(
       Buffer.from(PNG_BYTES),

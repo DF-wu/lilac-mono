@@ -26,20 +26,13 @@ const originalProviders = structuredClone(env.providers);
 const temporaryPaths: string[] = [];
 const servers: Bun.Server<unknown>[] = [];
 
-async function compatibleConfig(openaiCompatible?: {
-  models?: string[];
-  modelIds?: Record<string, string>;
-}): Promise<Pick<CoreConfig, "tools">> {
+/** `tools.generate.image` with `provider: openai-compatible` unless overridden. */
+async function compatibleConfig(
+  image: Record<string, unknown> = {},
+): Promise<Pick<CoreConfig, "tools">> {
   const config = await parseCoreConfig({
     configVersion: 2,
-    tools: {
-      generate: {
-        image: {
-          provider: "openai-compatible",
-          ...(openaiCompatible ? { openaiCompatible } : {}),
-        },
-      },
-    },
+    tools: { generate: { image: { provider: "openai-compatible", ...image } } },
   });
   return config;
 }
@@ -49,6 +42,12 @@ function configureCompatible(baseUrl: string | undefined): void {
     apiKey: baseUrl ? "compatible-key" : undefined,
     baseUrl,
   });
+}
+
+function clearOfficialProviders(): void {
+  for (const provider of [env.providers.openai, env.providers.openrouter, env.providers.xai]) {
+    Object.assign(provider, { apiKey: undefined, baseUrl: undefined });
+  }
 }
 
 function startServer(
@@ -174,7 +173,10 @@ describe("Generate OpenAI-compatible image routing", () => {
       },
     });
     expect(await readFile(join(outputDir, "generated-image.png"))).toEqual(PNG_BYTES);
-    expect(result.unwrap()).toMatchObject({ path: join(outputDir, "generated-image.png") });
+    expect(result.unwrap()).toMatchObject({
+      path: join(outputDir, "generated-image.png"),
+      providerMetadata: {},
+    });
   });
 
   it("uses the multipart edit path with named blobs", async () => {
@@ -381,7 +383,7 @@ describe("Generate OpenAI-compatible image routing", () => {
     expect(result.unwrap()).toMatchObject({ ok: true, warnings: [] });
   });
 
-  it("sends configured modelIds overrides as the upstream model id", async () => {
+  it("sends the model id of an explicit openai-compatible route", async () => {
     // Given
     let body: unknown;
     const server = startServer(async (request) => {
@@ -392,7 +394,9 @@ describe("Generate OpenAI-compatible image routing", () => {
     const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-model-ids-"));
     temporaryPaths.push(outputDir);
     const getConfig = () =>
-      compatibleConfig({ modelIds: { "nanobanana-2": "gemini-3.1-flash-image-preview" } });
+      compatibleConfig({
+        routes: { "nanobanana-2": "openai-compatible/gemini-3.1-flash-image-preview" },
+      });
 
     // When
     const result = await new Generate({ getConfig }).call("generate.image", {
@@ -404,6 +408,104 @@ describe("Generate OpenAI-compatible image routing", () => {
     // Then
     expect(body).toMatchObject({ model: "gemini-3.1-flash-image-preview" });
     expect(result.unwrap()).toMatchObject({ ok: true, model: "nanobanana-2" });
+  });
+
+  it("routes one alias to the official OpenAI endpoint while the rest stay compatible", async () => {
+    // Given
+    const requests: { server: string; model: unknown }[] = [];
+    const official = startServer(async (request) => {
+      const body = (await request.json()) as { model?: unknown };
+      requests.push({ server: "official", model: body.model });
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    const compatible = startServer(async (request) => {
+      const body = (await request.json()) as { model?: unknown };
+      requests.push({ server: "compatible", model: body.model });
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${compatible.port}/v1`);
+    Object.assign(env.providers.openai, {
+      apiKey: "official-key",
+      baseUrl: `http://127.0.0.1:${official.port}/v1`,
+    });
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-mixed-"));
+    temporaryPaths.push(outputDir);
+    const generate = new Generate({
+      getConfig: () => compatibleConfig({ routes: { "gpt-image-2": "openai/gpt-image-2" } }),
+    });
+
+    // When
+    const routed = await generate.call("generate.image", {
+      prompt: "official",
+      model: "gpt-image-2",
+      outputDir,
+    });
+    const bulk = await generate.call("generate.image", {
+      prompt: "compatible",
+      model: "nanobanana-2",
+      outputDir,
+    });
+
+    // Then
+    expect(routed.unwrap()).toMatchObject({
+      ok: true,
+      model: "gpt-image-2",
+      providerMetadata: { openai: { images: [{}] } },
+    });
+    expect(bulk.unwrap()).toMatchObject({ ok: true, model: "nanobanana-2" });
+    expect(requests).toEqual([
+      { server: "official", model: "gpt-image-2" },
+      { server: "compatible", model: "google/gemini-3.1-flash-image-preview" },
+    ]);
+  });
+
+  it("advertises an explicit route without credentials and names the missing variable", async () => {
+    // Given
+    configureCompatible(undefined);
+    clearOfficialProviders();
+    const generate = new Generate({
+      getConfig: () =>
+        compatibleConfig({
+          provider: "default",
+          routes: { "grok-imagine-image": "xai/grok-imagine-image" },
+        }),
+    });
+    const expectedError =
+      "Image route 'xai/grok-imagine-image' for 'grok-imagine-image' requires XAI_API_KEY or XAI_BASE_URL.";
+
+    // When / Then: the alias stays in the catalog so the gap is visible.
+    const entries = await generate.list();
+    expect(entries.find((entry) => entry.callableId === "generate.image")?.description).toEndWith(
+      "Available models: grok-imagine-image",
+    );
+
+    // When / Then: requesting it, or falling back onto it, reports the credential.
+    const requested = await generate.call("generate.image", {
+      prompt: "blocked",
+      model: "grok-imagine-image",
+    });
+    expect(
+      requested.match({ ok: () => "", err: (error) => `${error.kind}: ${error.message}` }),
+    ).toBe(`usage: ${expectedError}`);
+    const fallback = await generate.call("generate.image", { prompt: "blocked" });
+    expect(fallback.match({ ok: () => "", err: (error) => error.message })).toBe(expectedError);
+  });
+
+  it("hides default-route aliases without a configured provider", async () => {
+    // Given
+    configureCompatible(undefined);
+    clearOfficialProviders();
+    const generate = new Generate({ getConfig: () => compatibleConfig({ provider: "default" }) });
+
+    // When
+    const entries = await generate.list();
+    const result = await generate.call("generate.image", { prompt: "nothing configured" });
+
+    // Then
+    expect(entries.find((entry) => entry.callableId === "generate.image")).toBeUndefined();
+    expect(result.match({ ok: () => "", err: (error) => error.message })).toBe(
+      "No image generation models are configured. Configure at least one provider for image generation.",
+    );
   });
 
   it("restricts aliases to the configured models allowlist", async () => {

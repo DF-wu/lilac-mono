@@ -235,7 +235,7 @@ function getAvailableVideoModels() {
   return resolveAvailableModels(VIDEO_MODEL_DESCRIPTORS, providers);
 }
 
-export function pickModel<TId extends string, TModel>(
+function pickModel<TId extends string, TModel>(
   available: Partial<Record<TId, TModel>>,
   requested: string | undefined,
   fallbackOrder: readonly TId[],

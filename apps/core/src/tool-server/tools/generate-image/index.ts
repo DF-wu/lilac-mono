@@ -7,8 +7,9 @@
 //   size rule, edit support) plus the fallback order and dimension mapping.
 // - validation.ts: checks a request against the catalog before any HTTP call.
 // - input.ts: the zod input schema; its help text is derived from the catalog.
-// - routing.ts: resolves the default provider route or the OpenAI-compatible
-//   route from the live config and environment.
+// - routing.ts: plans a route per alias (explicit `routes`, the bulk `provider`,
+//   or the built-in preference), resolves it against the environment, and picks
+//   the alias for a call.
 // - prompt.ts: reads input images and masks into the AI SDK prompt shape.
 // - callable.ts: the Level 2 callable that ties the pieces together.
 export {
@@ -37,5 +38,13 @@ export {
   type ImageGenerationPrompt,
 } from "./input";
 export { buildImageGenerationPrompt, resolveImageEditInputs } from "./prompt";
-export { resolveImageRoute, type ImageRoute } from "./routing";
+export {
+  advertisedImageModelIds,
+  imageRequestOptions,
+  pickImageModel,
+  resolveImageModels,
+  type PickedImageModel,
+  type ResolvedImageModel,
+  type ResolvedImageModels,
+} from "./routing";
 export { validateImageGenerationInputForModel } from "./validation";

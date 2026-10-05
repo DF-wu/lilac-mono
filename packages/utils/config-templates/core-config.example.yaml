@@ -62,24 +62,22 @@ tools:
     maxInlineBytesTotal: 20MiB
   generate:
     image:
-      # Transport routing switch for generate.image.
-      # - default: use built-in provider-aware aliases.
-      # - openai-compatible: route all generate.image calls through the
-      #   OpenAI-compatible provider configured via OPENAI_COMPATIBLE_BASE_URL
-      #   and OPENAI_COMPATIBLE_API_KEY.
-      # Aliases and adapters remain unchanged; all aliases route together.
-      # Selecting third-party routing has no automatic fallback.
+      # Route for aliases without an entry in `routes`.
+      # - default: the first configured provider in openai, openrouter, xai
+      #   that serves the alias, with the alias's catalog model ID.
+      # - openai-compatible: every alias goes to OPENAI_COMPATIBLE_BASE_URL
+      #   (with OPENAI_COMPATIBLE_API_KEY) using its catalog model ID.
+      # No route falls back to another provider after a failure.
       provider: default
-      # OpenAI-compatible routing options. Only meaningful when provider is
-      # openai-compatible.
-      # openaiCompatible:
-      #   # Optional allowlist of Lilac aliases the endpoint serves. Omit to
-      #   # advertise and serve every alias. Catalog and fallback honor it.
-      #   models: [nanobanana-2, gpt-image-2]
-      #   # Optional per-alias upstream model-ID overrides. Unlisted aliases
-      #   # keep their canonical model IDs.
-      #   modelIds:
-      #     nanobanana-2: gemini-3.1-flash-image-preview
+      # Optional allowlist of Lilac aliases to advertise and serve. Omit to
+      # expose every alias. Catalog and fallback honor it.
+      # models: [nanobanana-2, gpt-image-2]
+      # Optional per-alias routes as "<provider>/<model id>" with provider
+      # openai, openrouter, xai, or openai-compatible. The model id may itself
+      # contain slashes (OpenRouter slugs). Unlisted aliases follow `provider`.
+      # routes:
+      #   nanobanana-2: openai-compatible/gemini-3.1-flash-image-preview
+      #   gpt-image-2: openrouter/openai/gpt-image-2
 
 plugins:
   disabled: []

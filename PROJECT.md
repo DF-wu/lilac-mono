@@ -185,9 +185,9 @@ and output-directory contract; upstream replaced it with a script runner, and th
 implementation lives in `apps/core/src/tool-server/tools/generate-image/` behind a small hook in
 `tools/generate.ts`. One alias capability catalog (`generate-image/catalog.ts`) drives input
 validation, default provider routing, OpenAI-compatible model IDs, and the schema help text. V2
-configuration can route enabled aliases exclusively through one OpenAI-compatible endpoint with
-per-alias model-ID overrides and no provider fallback; that route uses a fork-owned image client in
-`packages/utils` so multipart edit uploads carry filenames. The built-in `image-generation` skill
+configuration routes aliases with a bulk `provider`, an alias allowlist, and per-alias
+`<provider>/<model id>` routes, with no fallback between providers; the OpenAI-compatible route uses a
+fork-owned image client in `packages/utils` so multipart edit uploads carry filenames. The built-in `image-generation` skill
 documents this contract. `generate.video` retains its model-based interface.
 
 Request capabilities bind request context, cwd, profile, callable authority, and expiry. They constrain agent calls but are not general public HTTP authentication. The Core tool server belongs on a trusted host/network. Core also owns configured MCP clients process-wide; MCP tools join the run-scoped catalog only through the Core manager and profile policy.

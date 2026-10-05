@@ -17,8 +17,6 @@ import type { RegisteredSurfacePlatform } from "../../../surface/types";
 import type { ServerToolCallOptions } from "../../types";
 import {
   captureGenerateFailure,
-  generateFailure,
-  pickModel,
   settleCapturedError,
   settleCapturedPromise,
   writeFileWithUniqueName,
@@ -31,7 +29,13 @@ import {
 import { generateFailureFromCause } from "./failures";
 import { imageGenerateInputSchema, type ImageGenerateInput } from "./input";
 import { buildImageGenerationPrompt } from "./prompt";
-import { resolveImageRoute, type ImageRoute } from "./routing";
+import {
+  advertisedImageModelIds,
+  imageRequestOptions,
+  pickImageModel,
+  resolveImageModels,
+  type ResolvedImageModels,
+} from "./routing";
 import { validateImageGenerationInputForModel } from "./validation";
 
 const DEFAULT_IMAGE_OUTPUT_BASENAME = "generated-image";
@@ -50,13 +54,16 @@ export type GenerateImageConfigSource = () =>
   | undefined
   | Promise<Pick<CoreConfig, "tools"> | undefined>;
 
+type GenerateImageOutcome = Awaited<ReturnType<typeof generateImage>>;
+
 export type GenerateImageResult = {
   readonly ok: true;
   readonly path: string;
   readonly bytes: number;
   readonly mimeType: string;
   readonly model: SupportedImageModelId;
-  readonly warnings: Awaited<ReturnType<typeof generateImage>>["warnings"];
+  readonly warnings: GenerateImageOutcome["warnings"];
+  readonly providerMetadata: GenerateImageOutcome["providerMetadata"];
 };
 
 export type GenerateImageCallableDefinition = ServerToolCallableDefinition<
@@ -65,9 +72,11 @@ export type GenerateImageCallableDefinition = ServerToolCallableDefinition<
   RegisteredSurfacePlatform
 >;
 
-async function resolveRoute(getConfig: GenerateImageConfigSource | undefined): Promise<ImageRoute> {
+async function resolveModels(
+  getConfig: GenerateImageConfigSource | undefined,
+): Promise<ResolvedImageModels> {
   const config = await getConfig?.();
-  return resolveImageRoute(config?.tools.generate.image);
+  return resolveImageModels(config?.tools.generate.image);
 }
 
 async function runGenerateImage(
@@ -76,16 +85,7 @@ async function runGenerateImage(
   getConfig: GenerateImageConfigSource | undefined,
 ): Promise<ServerToolResult<GenerateImageResult>> {
   return Result.gen(async function* () {
-    const route = await resolveRoute(getConfig);
-    if (route.configurationError) {
-      return Result.err(generateFailure("usage", route.configurationError));
-    }
-    const picked = yield* pickModel(
-      route.resolveModels().models,
-      payload.model,
-      DEFAULT_IMAGE_MODEL_FALLBACK_ORDER,
-      "image",
-    );
+    const picked = yield* pickImageModel(await resolveModels(getConfig), payload.model);
     yield* validateImageGenerationInputForModel(picked.id, payload);
 
     const cwd = opts?.context?.cwd ?? process.cwd();
@@ -104,7 +104,10 @@ async function runGenerateImage(
     );
 
     const prompt = yield* Result.await(buildImageGenerationPrompt(cwd, payload, opts?.context));
-    const requestOptions = route.requestOptions(resolveImageDimensions(picked.id, payload));
+    const requestOptions = imageRequestOptions(
+      picked.route.provider,
+      resolveImageDimensions(picked.id, payload),
+    );
     const res = yield* Result.await(
       settleCapturedPromise(
         Result.tryPromise({
@@ -143,6 +146,7 @@ async function runGenerateImage(
       mimeType: image.mediaType,
       model: picked.id,
       warnings: res.warnings,
+      providerMetadata: res.providerMetadata,
     });
   });
 }
@@ -162,8 +166,7 @@ export function createGenerateImageCallable(input: {
     validation: "zod",
     primaryPositional: "prompt",
     catalog: async () => {
-      const route = await resolveRoute(input.getConfig);
-      const imageModels = route.catalogModelIds();
+      const imageModels = advertisedImageModelIds(await resolveModels(input.getConfig));
       if (imageModels.length === 0) return false;
       return {
         description: `${IMAGE_CALLABLE_DESCRIPTION} Available models: ${imageModels.join(", ")}`,
