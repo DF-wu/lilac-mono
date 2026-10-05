@@ -10401,7 +10401,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
         },
       },
     };
-    const statuses: Array<{ status: "start" | "end"; ok?: boolean }> = [];
+    const statuses: Array<{ status: "start" | "end"; ok?: boolean; output?: string }> = [];
     let searchCalls = 0;
     const errors: string[] = [];
     let plannerUsage: ConversationThreadAutoInjectUsageAccumulator | undefined;
@@ -10441,6 +10441,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
         statuses.push({
           status: status.status,
           ...(status.ok === undefined ? {} : { ok: status.ok }),
+          ...(status.output === undefined ? {} : { output: status.output }),
         });
       },
       onError: (message) => {
@@ -10451,7 +10452,10 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
 
     expect(messages).toEqual([]);
     expect(searchCalls).toBe(0);
-    expect(statuses).toEqual([{ status: "start" }, { status: "end", ok: true }]);
+    expect(statuses).toEqual([
+      { status: "start" },
+      { status: "end", ok: true, output: "No related threads injected." },
+    ]);
     expect(errors).toEqual([]);
     expect(plannerUsage).toBe(autoInjectUsage);
     expect(finishedUsage).toEqual([{ status: "abstained", searchCount: 0, queryCount: 0 }]);
@@ -11963,7 +11967,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
       candidate_1: 0.81,
     });
     const { usage, finished, jev } = usageRecorder();
-    const statuses: Array<{ status: "start" | "end"; ok?: boolean }> = [];
+    const statuses: Array<{ status: "start" | "end"; ok?: boolean; output?: string }> = [];
     const events: unknown[] = [];
 
     const messages = await maybeBuildAutoInjectedThreadSearchMessages({
@@ -11986,7 +11990,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
       createJevEvaluator: () => Result.ok(evaluator),
       autoInjectUsage: usage,
       publishToolStatus: async (update) => {
-        statuses.push({ status: update.status, ok: update.ok });
+        statuses.push({ status: update.status, ok: update.ok, output: update.output });
       },
       onJevEvaluated: (event) => events.push(event),
       onError: (message) => {
@@ -12032,7 +12036,10 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
         },
       ],
     });
-    expect(statuses).toEqual([{ status: "start" }, { status: "end", ok: true }]);
+    expect(statuses).toEqual([
+      { status: "start" },
+      { status: "end", ok: true, output: "Injected 1 related thread:\n- Router retries" },
+    ]);
     expect(events).toEqual([
       expect.objectContaining({
         model: "jev-test",

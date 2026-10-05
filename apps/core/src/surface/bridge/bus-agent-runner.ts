@@ -1115,6 +1115,8 @@ type AutoInjectToolStatusUpdate = {
   display: string;
   ok?: boolean;
   error?: string;
+  /** Shown only in native activity details; Discord tool status keeps the label alone. */
+  output?: string;
 };
 
 export function buildAutoInjectedThreadSearchMessages(params: {
@@ -1161,6 +1163,17 @@ export function buildAutoInjectedThreadSearchMessages(params: {
       ],
     },
   ];
+}
+
+function formatAutoInjectedThreadSearchOutput(
+  entries: readonly AutoInjectedThreadSearchEntry[],
+): string {
+  if (entries.length === 0) return "No related threads injected.";
+  const lines = entries.map((entry) =>
+    entry.timeRange ? `- ${entry.title} (${entry.timeRange})` : `- ${entry.title}`,
+  );
+  const noun = entries.length === 1 ? "thread" : "threads";
+  return [`Injected ${entries.length} related ${noun}:`, ...lines].join("\n");
 }
 
 function formatAutoInjectedThreadBrief(brief: string): string | undefined {
@@ -1354,13 +1367,18 @@ async function maybeBuildJevAutoInjectedThreadSearchMessages(
     createConversationThreadAutoInjectUsageAccumulator({ requestId: params.requestId });
   const toolCallId = buildAutoInjectedThreadSearchToolCallId(params.requestId);
   const display = `${AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME} auto-injected metadata`;
-  const endToolStatus = async (failure?: BusAgentRunnerErrorProjection) =>
+  const endToolStatus = async (
+    outcome:
+      | { failure: BusAgentRunnerErrorProjection }
+      | { entries: readonly AutoInjectedThreadSearchEntry[] },
+  ) =>
     await publishAutoInjectToolStatusBestEffort(params, {
       toolCallId,
       status: "end",
       display,
-      ok: !failure,
-      ...(failure ? { error: failure.message } : {}),
+      ...("failure" in outcome
+        ? { ok: false, error: outcome.failure.message }
+        : { ok: true, output: formatAutoInjectedThreadSearchOutput(outcome.entries) }),
     });
 
   const shortlistStartedAt = performance.now();
@@ -1412,7 +1430,7 @@ async function maybeBuildJevAutoInjectedThreadSearchMessages(
   });
   if (outcome.kind === "failed") {
     const failure = projectBusAgentRunnerError(new Error(outcome.message));
-    await endToolStatus(failure);
+    await endToolStatus({ failure });
     params.onError("Jev auto-inject evaluation failed; continuing without metadata", failure);
     autoInjectUsage.finish({ status: "failed" });
     return [];
@@ -1424,7 +1442,7 @@ async function maybeBuildJevAutoInjectedThreadSearchMessages(
   const entries = decision.selected.map((candidate) =>
     formatAutoInjectedThreadSearchResult(results[candidate.index]!),
   );
-  await endToolStatus();
+  await endToolStatus({ entries });
   notifyAutoInjectObserverBestEffort(params.onError, () =>
     params.onJevEvaluated?.({
       toolCallId,
@@ -1521,6 +1539,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(
             status: "end",
             display,
             ok: true,
+            output: formatAutoInjectedThreadSearchOutput([]),
           });
           return [];
         }
@@ -1602,6 +1621,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(
           status: "end",
           display,
           ok: true,
+          output: formatAutoInjectedThreadSearchOutput(entries),
         });
 
         if (entries.length === 0) return [];
@@ -5257,10 +5277,19 @@ export async function startBusAgentRunner(params: {
         ...outcome,
       });
     };
-    const publishNonAgentToolStatus = async (
-      update: Parameters<typeof outputPublisher.publishToolCall>[0],
-    ): Promise<void> => {
-      publishNativeToolActivity(update.toolCallId, update.status, update.display, update.ok);
+    const publishNonAgentToolStatus = async ({
+      output,
+      ...update
+    }: Parameters<typeof outputPublisher.publishToolCall>[0] & {
+      output?: string;
+    }): Promise<void> => {
+      publishNativeToolActivity(
+        update.toolCallId,
+        update.status,
+        update.display,
+        update.ok,
+        output ? { output } : undefined,
+      );
       await outputPublisher.publishToolCall(update);
     };
     const publishAuxiliaryOutput = async (
