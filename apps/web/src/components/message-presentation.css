@@ -196,8 +196,12 @@
 }
 
 @keyframes message-arrive {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 [data-message-arrival="ready"] {
   animation: message-arrive calc(var(--ui-motion-duration) * 2) ease both;
@@ -209,5 +213,7 @@
   animation: none;
 }
 @media (prefers-reduced-motion: reduce) {
-  [data-message-arrival] { animation: none; }
+  [data-message-arrival] {
+    animation: none;
+  }
 }
