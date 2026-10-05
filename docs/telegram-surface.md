@@ -131,9 +131,37 @@ the grammY client receives it when the adapter is constructed.
 | `inboundMedia.maxBytesPerAttachment` | `5MiB`                          | Decoded-byte cap per attachment. Larger media degrades to a metadata marker instead of being delivered.                                                                                                                                         |
 | `inboundMedia.maxBytesPerRequest`    | `10MiB`                         | One decoded-byte budget across every attachment in a composed request, including reply-chain history. The trigger message wins the budget over older history.                                                                                   |
 
-Routing behaviour (mention vs active mode, the ML gate, debounce) is configured
-under `surface.router` and applies to Telegram exactly as it does to Discord.
-Session ids are documented in §5.
+Routing is configured under `surface.router`, and the Telegram router
+(`apps/core/src/surface/telegram/telegram-request-router.ts`) mirrors the
+upstream Discord router, reusing its shared gate, decision, and directive
+helpers:
+
+- **Mention mode** (the default) forwards only messages that `@mention` the bot
+  or reply to one of its messages. **Active mode** considers every message. DMs
+  are always active and never gated.
+- In active mode, plain messages are buffered for `surface.router.activeDebounceMs`
+  and composed into one request. When the gate is enabled
+  (`surface.router.activeGate`, or `gate` per session), the LLM gate decides
+  whether that batch is addressed to the bot; a gate failure drops the batch. A
+  mention or reply bypasses the gate and discards the pending batch. The same
+  gate disambiguates a reply to the bot that also mentions someone else, and
+  fails open.
+- While a request is running: a reply to its output that mentions the bot
+  **steers** it (with `!interrupt`, interrupts it) and moves the output anchor
+  to that reply; a reply without a mention is a follow-up (active) or waits
+  until the request settles and then starts a new prompt (mention mode); a
+  plain active-mode group message is queued as a prompt behind the active
+  request, while in a DM it joins as a follow-up; a reply to an older bot
+  message forks a new request.
+- Leading directives: `!model:<alias>` overrides the model for that request,
+  `!continue` forwards a plain active-mode message immediately without the
+  buffer or the gate, and `!interrupt` turns a steer into an interrupt. They are
+  stripped before the model sees the text.
+- Custom commands (`/lilac:<name>`, `/lilac_<name>`) are routed before the mode
+  check, so they never need a mention.
+
+Session ids are documented in §5. The capability-by-capability comparison with
+Discord is in [`telegram-feature-parity.md`](./telegram-feature-parity.md).
 
 ---
 
@@ -518,7 +546,9 @@ The conversational path is complete: messages in, routing, streamed replies,
 chunking, HTML rendering, reply-chain context, cancellation, custom commands and
 their menu, outbound attachments, reactions, typing indicators, and history
 served from the local index. Everything below is a gap in something _else_ that
-Discord has, stated precisely so nobody has to infer it from silence.
+Discord has, stated precisely so nobody has to infer it from silence. For the
+full comparison, including why each gap exists and what closing it would take,
+see [`telegram-feature-parity.md`](./telegram-feature-parity.md).
 
 ### Not implemented
 
@@ -561,9 +591,11 @@ code that assumes Discord semantics will be surprised.
 - **`removeReaction()` clears every reaction, not the named one.**
   `setMessageReaction` replaces the bot's whole reaction set, and a bot may hold
   only one reaction, so removal is all-or-nothing.
-- **`sendMsg()` projects `content.actions`, but ignores `content.attachments`.**
-  Actions become inline-keyboard buttons. The streaming output path delivers
-  attachments normally; only the direct send path drops attachments.
+- **`sendMsg()` projects `content.actions`, but rejects `content.attachments`.**
+  Actions become inline-keyboard buttons. A direct send that carries attachments
+  fails with `SurfaceOperationUnsupported` ("Telegram direct sends do not
+  support attachments; use an output stream"); the streaming output path
+  delivers attachments normally.
 - **History comes from a local SQLite index, not the platform.** A freshly
   provisioned bot has no history of a chat it has just joined, however long that
   chat has existed. A successful `readMsg()` therefore means the message is in

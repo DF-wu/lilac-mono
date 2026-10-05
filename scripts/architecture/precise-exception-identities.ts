@@ -386,22 +386,10 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ["src/surface/telegram/telegram-operation-result.ts", "captureTelegramOperation", "signal"],
     ["src/surface/telegram/telegram-request-router-composition.ts", "readMessage.err", "signal"],
     ["src/surface/telegram/telegram-request-router.ts", "configFromOverride.err", "signal"],
-    [
-      "src/surface/telegram/telegram-request-router.ts",
-      "startTelegramRequestRouter.publishEvent",
-      "signal",
-    ],
-    [
-      "src/surface/telegram/telegram-request-router.ts",
-      "startTelegramRequestRouter.subscribeTopic.<callback@3>",
-      "signal",
-    ],
-    ["src/surface/telegram/telegram-request-router.ts", "startTelegramRequestRouter.err", "signal"],
-    [
-      "src/surface/telegram/telegram-request-router.ts",
-      "startTelegramRequestRouter.ok.stop.err",
-      "signal",
-    ],
+    ["src/surface/telegram/telegram-request-router.ts", "describeRouting", "signal"],
+    ["src/surface/telegram/telegram-request-router.ts", "rethrowPanic", "signal"],
+    ["src/surface/telegram/telegram-request-router.ts", "adaptSubscriptionStartToHost", "signal"],
+    ["src/surface/telegram/telegram-request-router.ts", "adaptSubscriptionStopToHost", "signal"],
     [
       "src/tool-server/create-tool-server.ts",
       "signalFatalToolCallDefectToProcess.queueMicrotask.<callback@1>",

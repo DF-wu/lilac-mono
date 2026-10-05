@@ -28,7 +28,7 @@
 Telegram 是目前最大的 fork-only product delta。已實作的主要路徑包括：
 
 - DMs、groups、supergroups 與 forum topics。
-- Mention/active routing、streamed edits、HTML rendering 與 4096-character chunking。
+- Mention/active routing 由一個對齊 upstream Discord router 的 router 處理（debounce 批次、共用的 LLM gate、steer/interrupt/follow-up、`!model:`/`!continue`/`!interrupt` 指令），加上 streamed edits、HTML rendering 與 4096-character chunking。
 - Reply context、cancel、typing indicators、reactions、custom commands 與 menu aliases。
 - Inbound photos/documents、outbound attachments、workflow progress/actions、`waitForReply` 與 allowlist-bound surface tools。
 - 對話記憶：Telegram 聊天透過共用的跨 surface thread store 被索引、摘要、搜尋與自動召回，並以 `allowedChatIds` 把關（見 [`telegram-surface.md`](./telegram-surface.md#conversation-memory)）。
@@ -39,8 +39,9 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 - 對話記憶以每個聊天或 topic 為一個 thread（長聊天室不分段）、沒有 run-in-progress 訊號、附件只保留 metadata；尚未辨識 Lilac 的 `/?ref=telegram:` 參照。
 - 沒有 inline queries、business accounts 或 voice/video transcription。
 - Message history 只包含 bot 實際觀察或送出的內容，不是 Telegram 既有完整歷史。
+- 向使用者提問的 question port、session divider、`/model` 與 `/context` 指令、reasoning 文字、略過輸出的清理，以及數個 Level 2 tool 操作仍是 Discord 專屬。
 
-精確 feature matrix 與平台差異以 [`telegram-surface.md`](./telegram-surface.md#10-what-works-and-what-does-not) 為準。
+面向操作者的 feature matrix 以 [`telegram-surface.md`](./telegram-surface.md#10-what-works-and-what-does-not) 為準；與 Discord 逐項對照的能力比較、每個差異的原因與所需改動，見 [`telegram-feature-parity.zh-TW.md`](./telegram-feature-parity.zh-TW.md)。
 
 ## 已被上游接收的貢獻
 
@@ -80,7 +81,7 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 
 | 功能 | Fork 自有模組 | Upstream 接縫 |
 | --- | --- | --- |
-| Telegram surface | `apps/core/src/surface/telegram/`（adapter、ingress、router、output、store、protocol）。`telegram-surface-runtime.ts` 是 Core 唯一呼叫的接線入口：啟動時的 adapter 解析、runtime descriptor entry、config hot-reload 與 workflow target 授權 | `runtime/create-core-runtime.ts`（四個單行呼叫點）、`runtime/compose-builtin-surface-runtimes.ts`（一個 descriptor entry）、`surface/types.ts` 的 closed platform unions、`builtin-surface-protocols.ts`、`bridge/request-ids.ts` 與 workflow target 型別 |
+| Telegram surface | `apps/core/src/surface/telegram/`（adapter、ingress、output、store、protocol，以及拆成 `telegram-request-router.ts`、`telegram-request-router-composition.ts` 與 `telegram-request-router-publish.ts` 的 router；router 對齊 upstream 的 Discord router，並原封不動地 import `surface/discord/discord-request-router/` 下的共用 helpers，見 [`telegram-feature-parity.zh-TW.md`](./telegram-feature-parity.zh-TW.md)）。`telegram-surface-runtime.ts` 是 Core 唯一呼叫的接線入口：啟動時的 adapter 解析、runtime descriptor entry、config hot-reload 與 workflow target 授權 | `runtime/create-core-runtime.ts`（四個單行呼叫點）、`runtime/compose-builtin-surface-runtimes.ts`（一個 descriptor entry）、`surface/types.ts` 的 closed platform unions、`builtin-surface-protocols.ts`、`bridge/request-ids.ts` 與 workflow target 型別 |
 | Telegram conversation memory | `apps/core/src/surface/telegram/telegram-conversation-source.ts`（覆蓋 `telegram-surface.db` 的 SQL views、projection decoders、attachment metadata）以及 `telegram-surface-runtime.ts` 裡的 `telegramConversationMemoryInput` / `hydrateTelegramConversationAttachments` | `conversation/thread-store.ts`（第三個 source 分支、`telegram_thread` kind、allowlist 子句）、`thread-service.ts`（surface 標籤與 allowlist 檢查）、summarization worker protocol、`bus-agent-runner.ts`（recall 的 surface 標籤）、`tool-server/tools/conversation-thread.ts`（enum） |
 | Telegram 設定 | `packages/utils/core-config/telegram-surface.ts`（型別、預設值、v2 schema）與 `telegram-runtime.ts`（token 與 database path helpers） | `core-config/types.ts`、`v1.ts`、`v2.ts`（各一個欄位）與 `core-config.ts` 的 re-export |
 | 結構化 `generate.image` | `apps/core/src/tool-server/tools/generate-image/`（`catalog`、`validation`、`input`、`routing`、`prompt`、`failures`、`callable`）與 `packages/utils/openai-compatible-image-provider.ts`（compatible image client） | `tool-server/tools/generate.ts`（callable hook 與 export 出來的共用 helpers）、`plugins/builtin/server-tools.ts`（傳入 core config）與 `packages/utils/index.ts`（re-export） |
