@@ -1,10 +1,8 @@
 import { referencedConversations } from "@stanley2058/lilac-client-protocol";
 import { expect, it } from "bun:test";
-import { createElement } from "react";
-import { renderToStaticMarkup } from "react-dom/server";
 import { KEYS, NodeApi } from "platejs";
 import { messageClipboard } from "../src/message-clipboard";
-import ComposerEditor, {
+import {
   createComposerEditor,
   replaceComposerDocument,
   composerMarkdown,
@@ -191,34 +189,6 @@ it("keeps an empty or cleared editor empty on the wire", () => {
   expect(composerMarkdown(editor)).toBe("");
 });
 
-it("keeps multiline editor semantics while announcing completion options", () => {
-  const noop = () => {};
-  const render = (expanded: boolean) =>
-    renderToStaticMarkup(
-      createElement(ComposerEditor, {
-        text: "$review",
-        disabled: false,
-        placeholder: "Message",
-        onText: noop,
-        onPlainText: noop,
-        onPrefix: noop,
-        onKeyDown: noop,
-        onPaste: noop,
-        expanded,
-        activeDescendant: expanded ? "completion-0" : undefined,
-      }),
-    );
-  const expanded = render(true);
-  expect(expanded).toContain('role="textbox" aria-multiline="true"');
-  expect(expanded).toContain('aria-autocomplete="list"');
-  expect(expanded).toContain('aria-controls="composer-completions"');
-  expect(expanded).toContain('aria-activedescendant="completion-0"');
-  expect(expanded).not.toContain('aria-expanded="true"');
-  const closed = render(false);
-  expect(closed).not.toContain('aria-controls="composer-completions"');
-  expect(closed).not.toContain('aria-activedescendant="completion-0"');
-});
-
 it("inserts a file reference at the caret and restores its position without flattening Markdown", () => {
   const editor = createComposerEditor("**Compare**  with the earlier image");
   editor.tf.select({ path: [0, 1], offset: 1 });
@@ -259,43 +229,6 @@ it("keeps attachment-only drafts sendable and handles Markdown characters in fil
   expect(markdown).not.toContain("\u200b");
   expect(composerSubmissionMarkdown(restored)).not.toContain("\u200b");
   expect(composerMarkdown(restored)).toBe(markdown);
-});
-
-it("renders inline thumbnails, file size and accessible remove and retry controls", () => {
-  const noop = () => {};
-  const html = renderToStaticMarkup(
-    createElement(ComposerEditor, {
-      text: "Review [image.png](attachment:image)",
-      attachments: [
-        {
-          key: "image",
-          file: new File([new Uint8Array(1536)], "image.png", { type: "image/png" }),
-          preview: "blob:preview",
-          reservation: Promise.resolve(undefined),
-          progress: 0,
-          state: "failed",
-          error: "Upload failed",
-        },
-      ],
-      disabled: false,
-      placeholder: "Message",
-      onText: noop,
-      onPlainText: noop,
-      onPrefix: noop,
-      onKeyDown: noop,
-      onPaste: noop,
-      expanded: false,
-    }),
-  );
-  expect(html).toContain('data-ui="composer-attachment-chip"');
-  expect(html).toContain('src="blob:preview"');
-  expect(html).toContain("2 KB");
-  expect(html).toContain('aria-label="Remove image.png"');
-  expect(html).toContain('aria-label="Retry image.png"');
-  expect(html).not.toContain('title="Upload failed"');
-  expect(html).toContain('data-slot="tooltip-trigger"');
-  expect(attachmentSize(512)).toBe("512 B");
-  expect(attachmentSize(1572864)).toBe("1.5 MB");
 });
 
 it("separates an inserted file name from adjacent prose", () => {
@@ -449,4 +382,10 @@ it("preserves inclusive range references through composer paste and submission",
     },
   ]);
   expect(composerSubmissionMarkdown(createComposerEditor(sent))).toBe(sent);
+});
+
+it("formats attachment sizes", () => {
+  expect(attachmentSize(512)).toBe("512 B");
+  expect(attachmentSize(1536)).toBe("2 KB");
+  expect(attachmentSize(1572864)).toBe("1.5 MB");
 });

@@ -3828,7 +3828,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             },
             {
               identity: {
-                module: "src/components/composer-editor.tsx",
+                module: "src/components/composer-document.ts",
                 exportName: "projectComposerNode",
               },
               category: "projection" as const,

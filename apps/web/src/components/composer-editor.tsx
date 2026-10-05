@@ -14,62 +14,9 @@ import {
   useLayoutEffect,
   useImperativeHandle,
   useRef,
+  useState,
   type Ref,
-  type KeyboardEvent,
-  type ClipboardEvent,
 } from "react";
-import {
-  Plate,
-  PlateContent,
-  PlateElement,
-  PlateLeaf,
-  ParagraphPlugin,
-  createPlateEditor,
-  createPlatePlugin,
-  usePlateEditor,
-  type PlateEditor,
-  type PlateElementProps,
-  type PlateLeafProps,
-  type RenderNodeWrapper,
-} from "platejs/react";
-import {
-  KEYS,
-  NodeApi,
-  TextApi,
-  type TElement,
-  type TListProps,
-  type Descendant,
-  type TNode,
-} from "platejs";
-import {
-  BoldRules,
-  ItalicRules,
-  StrikethroughRules,
-  CodeRules,
-  HeadingRules,
-  BlockquoteRules,
-} from "@platejs/basic-nodes";
-import {
-  BoldPlugin,
-  ItalicPlugin,
-  StrikethroughPlugin,
-  CodePlugin,
-  H1Plugin,
-  H2Plugin,
-  H3Plugin,
-  BlockquotePlugin,
-} from "@platejs/basic-nodes/react";
-import { CodeBlockRules } from "@platejs/code-block";
-import { CodeBlockPlugin, CodeLinePlugin } from "@platejs/code-block/react";
-import { BulletedListRules, OrderedListRules, toggleList } from "@platejs/list";
-import { ListPlugin } from "@platejs/list/react";
-import { IndentPlugin } from "@platejs/indent/react";
-import { MarkdownPlugin, defaultRules } from "@platejs/markdown";
-import remarkCjkFriendly from "remark-cjk-friendly/bidi";
-import remarkCjkFriendlyGfmStrikethrough from "remark-cjk-friendly-gfm-strikethrough/bidi";
-import remarkGfm from "remark-gfm";
-import { editableComposerLinks, protectComposerLinks } from "./composer-links";
-import { composerParagraphSpacing } from "./composer-line-breaks";
 import {
   Bold,
   Italic,
@@ -88,36 +35,44 @@ import { referenceChipStyles } from "./ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import type { Attachment } from "../types";
 
-function Paragraph(props: PlateElementProps) {
-  return <PlateElement {...props} as="p" />;
-}
-function HeadingOne(props: PlateElementProps) {
-  return <PlateElement {...props} as="h1" />;
-}
-function HeadingTwo(props: PlateElementProps) {
-  return <PlateElement {...props} as="h2" />;
-}
-function HeadingThree(props: PlateElementProps) {
-  return <PlateElement {...props} as="h3" />;
-}
-function QuoteElement(props: PlateElementProps) {
-  return <PlateElement {...props} as="blockquote" />;
-}
-function CodeBlock(props: PlateElementProps) {
-  return (
-    <PlateElement {...props} as="pre">
-      <code>{props.children}</code>
-    </PlateElement>
-  );
-}
-function CodeLine(props: PlateElementProps) {
-  return <PlateElement {...props} as="div" />;
-}
-function InlineCode(props: PlateLeafProps) {
-  return <PlateLeaf {...props} as="code" />;
-}
-
-const attachmentType = "composer_attachment";
+import {
+  EditorContent,
+  NodeViewWrapper,
+  ReactNodeViewRenderer,
+  useEditor,
+  type NodeViewProps,
+} from "@tiptap/react";
+import { type Editor } from "@tiptap/core";
+import { Slice } from "@tiptap/pm/model";
+import {
+  composerExtensions,
+  attachmentNode,
+  referenceNode,
+  readComposerDocument,
+  writeComposerDocument,
+  composerText,
+  composerCompletionPrefix,
+  insertEditorAttachment,
+  captureEditorPaste,
+  Placeholder,
+  editorAttachmentKeys,
+  completeEditor,
+  replaceEditorDocument,
+} from "./composer-tiptap";
+export {
+  createComposerEditor,
+  replaceComposerDocument,
+  composerMarkdown,
+  composerPrefix,
+  composerPlainText,
+  insertComposerCompletion,
+  insertComposerAttachment,
+  composerSubmissionMarkdown,
+  remapComposerAttachments,
+  resolveComposerAttachments,
+  restoreMessageAttachments,
+  captureComposerPaste,
+} from "./composer-document";
 const emptyAttachments: readonly Attachment[] = [];
 const AttachmentContext = createContext<{
   attachments: readonly Attachment[];
@@ -125,29 +80,18 @@ const AttachmentContext = createContext<{
   retry?: (key: string) => void;
 }>({ attachments: emptyAttachments, disabled: false });
 
-function projectComposerNode(node: TNode): {
-  key?: string;
-  name: string;
-  url?: string;
-  attachment: boolean;
-} {
-  return {
-    key: typeof node.attachmentKey === "string" ? node.attachmentKey : undefined,
-    name: typeof node.name === "string" ? node.name : "File",
-    url: typeof node.url === "string" ? node.url : undefined,
-    attachment: node.type === attachmentType,
-  };
-}
-
-function AttachmentElement(props: PlateElementProps) {
+function AttachmentElement(props: NodeViewProps) {
   const workspace = useOptionalWorkspace();
   const context = useContext(AttachmentContext);
-  const metadata = projectComposerNode(props.element);
+  const metadata = {
+    key: props.node.attrs.attachmentKey as string,
+    name: props.node.attrs.name as string,
+  };
   const key = metadata.key ?? "";
   const attachment = context.attachments.find((item) => item.key === key);
   const name = attachment?.file.name ?? metadata.name;
   return (
-    <PlateElement {...props} as="span" className="composer-attachment-node inline">
+    <NodeViewWrapper as="span" className="composer-attachment-node inline">
       <FileActions
         disabled={attachment?.state !== "ready" || !attachment.resourceId}
         target={{
@@ -200,9 +144,8 @@ function AttachmentElement(props: PlateElementProps) {
               label={`Remove ${name}`}
               disabled={context.disabled}
               onClick={() => {
-                const path = props.editor.api.findPath(props.element);
-                if (path) props.editor.tf.removeNodes({ at: path });
-                props.editor.tf.focus();
+                props.deleteNode();
+                props.editor.commands.focus();
               }}
             >
               <X />
@@ -211,8 +154,7 @@ function AttachmentElement(props: PlateElementProps) {
           <TooltipContent>{attachment?.error ?? name}</TooltipContent>
         </Tooltip>
       </FileActions>
-      {props.children}
-    </PlateElement>
+    </NodeViewWrapper>
   );
 }
 
@@ -222,406 +164,17 @@ export function attachmentSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-const referenceType = "composer_reference";
-function ReferenceElement(props: PlateElementProps) {
-  const href = projectComposerNode(props.element).url ?? "";
+function ReferenceElement(props: NodeViewProps) {
+  const href = props.node.attrs.url as string;
   const target = parseReferenceHref(href);
   return (
-    <PlateElement {...props} as="span">
+    <NodeViewWrapper as="span">
       <span contentEditable={false}>{target ? <ConversationBadge target={target} /> : href}</span>
-      {props.children}
-    </PlateElement>
+    </NodeViewWrapper>
   );
 }
-const ReferencePlugin = createPlatePlugin({
-  key: referenceType,
-  node: { isElement: true, isInline: true, isVoid: true, component: ReferenceElement },
-});
-
-const AttachmentPlugin = createPlatePlugin({
-  key: attachmentType,
-  node: { isElement: true, isInline: true, isVoid: true, component: AttachmentElement },
-});
-
-function mapComposerNodes(nodes: Descendant[], map: (node: TElement) => Descendant): Descendant[] {
-  return nodes.map((node) => {
-    if (TextApi.isText(node)) return node;
-    node.children = mapComposerNodes(node.children, map);
-    return map(node);
-  });
-}
-
-function mapComposerValue(value: TElement[], map: (node: TElement) => Descendant): TElement[] {
-  return structuredClone(value).map((node) => {
-    node.children = mapComposerNodes(node.children, map);
-    return node;
-  });
-}
-
-function attachmentKeys(editor: PlateEditor): Set<string> {
-  const keys = new Set<string>();
-  for (const [node] of editor.api.nodes({ at: [], match: { type: attachmentType } })) {
-    const key = projectComposerNode(node).key;
-    if (key) keys.add(key);
-  }
-  return keys;
-}
-
-export function insertComposerAttachment(
-  editor: PlateEditor,
-  attachment: Pick<Attachment, "key" | "file">,
-) {
-  if (!editor.selection) editor.tf.select(editor.api.end([])!);
-  const focus = editor.selection?.focus;
-  const previous = focus && editor.api.before(focus, { distance: 1, unit: "character" });
-  if (
-    focus &&
-    previous &&
-    editor.api.isCollapsed() &&
-    /\S/.test(editor.api.string({ anchor: previous, focus }))
-  )
-    editor.tf.insertText(" ");
-  editor.tf.insertNodes({
-    type: attachmentType,
-    attachmentKey: attachment.key,
-    name: attachment.file.name,
-    children: [{ text: "" }],
-  });
-  editor.tf.move({ distance: 1, unit: "offset" });
-  editor.tf.insertText(" ");
-}
-
-// Plate's flat list model wraps each block, preserving selection paths while rendering list markers.
-type ListElementProps = PlateElementProps<TElement & Partial<TListProps>>;
-const BlockList: RenderNodeWrapper = (props: ListElementProps) => {
-  if (!props.element.listStyleType) return;
-  return (props: ListElementProps) =>
-    props.element.listStyleType === "decimal" ? (
-      <ol start={typeof props.element.listStart === "number" ? props.element.listStart : 1}>
-        <li>{props.children}</li>
-      </ol>
-    ) : (
-      <ul>
-        <li>{props.children}</li>
-      </ul>
-    );
-};
-
-const composerMarkdownSyntax = [remarkGfm, remarkCjkFriendly, remarkCjkFriendlyGfmStrikethrough];
-
-export const composerPlugins = [
-  AttachmentPlugin,
-  ReferencePlugin,
-  ParagraphPlugin.withComponent(Paragraph),
-  BoldPlugin.configure({
-    inputRules: [BoldRules.markdown({ variant: "*" }), BoldRules.markdown({ variant: "_" })],
-  }),
-  ItalicPlugin.configure({
-    inputRules: [ItalicRules.markdown({ variant: "*" }), ItalicRules.markdown({ variant: "_" })],
-  }),
-  StrikethroughPlugin.configure({ inputRules: [StrikethroughRules.markdown()] }),
-  CodePlugin.configure({ inputRules: [CodeRules.markdown()], node: { component: InlineCode } }),
-  H1Plugin.configure({ inputRules: [HeadingRules.markdown()], node: { component: HeadingOne } }),
-  H2Plugin.configure({ inputRules: [HeadingRules.markdown()], node: { component: HeadingTwo } }),
-  H3Plugin.configure({ inputRules: [HeadingRules.markdown()], node: { component: HeadingThree } }),
-  BlockquotePlugin.configure({
-    inputRules: [BlockquoteRules.markdown()],
-    node: { component: QuoteElement },
-  }),
-  CodeBlockPlugin.configure({
-    inputRules: [CodeBlockRules.markdown({ on: "match" })],
-    node: { component: CodeBlock },
-  }),
-  CodeLinePlugin.withComponent(CodeLine),
-  createPlatePlugin({
-    key: KEYS.a,
-    node: { isElement: true, isInline: true },
-    parsers: {
-      html: {
-        deserializer: {
-          rules: [{ validNodeName: "A" }],
-          parse: ({ element }) => {
-            const url = element.getAttribute("href");
-            const label = element.textContent ?? "";
-            return { text: !url || label === url ? label : `[${label}](${url})` };
-          },
-        },
-      },
-    },
-  }),
-  IndentPlugin.configure({
-    inject: {
-      targetPlugins: [KEYS.p, ...KEYS.heading, KEYS.blockquote, KEYS.codeBlock],
-      nodeProps: {
-        transformNodeValue: ({
-          element,
-          getOptions,
-        }: {
-          element?: TElement & Partial<TListProps>;
-          getOptions: () => { offset?: number; unit?: string };
-        }) => {
-          const indent = typeof element?.indent === "number" ? element.indent : 0;
-          const depth = element?.listStyleType ? Math.max(0, indent - 1) : indent;
-          const { offset = 24, unit = "px" } = getOptions();
-          return `${depth * offset}${unit}`;
-        },
-      },
-    },
-  }),
-  ListPlugin.configure({
-    inputRules: [
-      BulletedListRules.markdown({ variant: "-" }),
-      BulletedListRules.markdown({ variant: "*" }),
-      OrderedListRules.markdown({ variant: "." }),
-    ],
-    render: { belowNodes: BlockList },
-  }),
-  MarkdownPlugin.configure({
-    options: {
-      remarkPlugins: [...composerMarkdownSyntax, editableComposerLinks, composerParagraphSpacing],
-      rules: {
-        text: { deserialize: (node, decoration) => ({ ...decoration, text: node.value }) },
-      },
-    },
-  }),
-];
-
-function deserializeComposer(editor: PlateEditor, text: string) {
-  const value = editor.getApi(MarkdownPlugin).markdown.deserialize(text);
-  const trailing = /[ \t]+$/.exec(text)?.[0];
-  if (trailing && value.length) {
-    const block = value[value.length - 1]!;
-    const child = block.children.at(-1);
-    if (child && !TextApi.isText(child) && editor.api.isInline(child))
-      block.children.push({ text: trailing });
-    else {
-      const last = NodeApi.last(block, [])?.[0];
-      if (TextApi.isText(last)) last.text += trailing;
-    }
-  }
-  return mapComposerValue(value, (node) => {
-    const target =
-      node.type === KEYS.a ? parseReferenceHref(projectComposerNode(node).url ?? "") : undefined;
-    if (target)
-      return { type: referenceType, url: referenceHref(target), children: [{ text: "" }] };
-    if (node.type !== KEYS.a || !projectComposerNode(node).url?.startsWith("attachment:"))
-      return node;
-    return {
-      type: attachmentType,
-      attachmentKey: projectComposerNode(node).url?.slice("attachment:".length),
-      name: NodeApi.string(node),
-      children: [{ text: "" }],
-    };
-  });
-}
-
-export function replaceComposerDocument(editor: PlateEditor, text: string) {
-  editor.tf.withoutSaving(() => {
-    editor.tf.deselect();
-    if (composerMarkdown(editor) !== text) editor.tf.setValue(deserializeComposer(editor, text));
-  });
-  editor.history = { undos: [], redos: [] };
-  editor.marks = null;
-}
-
-export function createComposerEditor(text = "") {
-  return createPlateEditor({
-    plugins: composerPlugins,
-    value: (editor) => deserializeComposer(editor, text),
-  });
-}
-
-function trimEmptyInlineText(nodes: Descendant[]): Descendant[] {
-  const visible = nodes.some((node) => NodeApi.string(node).length > 0);
-  return nodes.flatMap<Descendant>((node) => {
-    if (TextApi.isText(node)) return visible && node.text === "" ? [] : [node];
-    node.children = trimEmptyInlineText(node.children);
-    return [node];
-  });
-}
-
-function serializeComposer(editor: PlateEditor, references: boolean): string {
-  const value = mapComposerValue(editor.children, (node) => {
-    if (node.type === referenceType) {
-      const target = parseReferenceHref(projectComposerNode(node).url ?? "");
-      if (target)
-        return {
-          type: KEYS.a,
-          url: referenceHref(target),
-          children: [
-            {
-              text: `#${target.surface}:${target.sessionId}${target.messageId ? `/${target.messageId}` : ""}`,
-            },
-          ],
-        };
-    }
-    if (node.type !== attachmentType) return node;
-    const metadata = projectComposerNode(node);
-    const text = metadata.name;
-    if (!references) return { text };
-    return { type: KEYS.a, url: `attachment:${metadata.key}`, children: [{ text }] };
-  });
-  if (!value.some((node) => NodeApi.string(node))) return "";
-  for (const block of value) block.children = trimEmptyInlineText(block.children);
-  const restoreLinks = protectComposerLinks(editor, value);
-  const last: (TElement & Partial<TListProps>) | undefined = value.at(-1);
-  const endsWithEmptyParagraph =
-    last?.type === KEYS.p && !last.listStyleType && !NodeApi.string(last);
-  return restoreLinks(
-    editor.getApi(MarkdownPlugin).markdown.serialize({
-      value,
-      preserveEmptyParagraphs: false,
-      remarkStringifyOptions: {
-        handlers: { break: () => "\n" },
-        // Composer paragraphs are adjacent lines; an empty block supplies the blank line.
-        join: [
-          (left, right, parent) =>
-            parent.type === "root" && left.type === "paragraph" && right.type === "paragraph"
-              ? 0
-              : undefined,
-        ],
-      },
-    }),
-  )
-    .replace(/\n$/, endsWithEmptyParagraph ? "\n" : "")
-    .replace(/(?:&#x20;)+(?=\n|$)/g, (spaces) => " ".repeat(spaces.length / 6));
-}
-
-export function composerMarkdown(editor: PlateEditor): string {
-  return serializeComposer(editor, true);
-}
-
-export function composerSubmissionMarkdown(editor: PlateEditor): string {
-  return serializeComposer(editor, false);
-}
-
-export function resolveComposerAttachments(
-  text: string,
-  resourceIds: ReadonlyMap<string, string>,
-): string {
-  const editor = createComposerEditor(text);
-  editor.children = mapComposerValue(editor.children, (node) => {
-    const metadata = projectComposerNode(node);
-    if (!metadata.attachment) return node;
-    const id = metadata.key ? resourceIds.get(metadata.key) : undefined;
-    if (!id) return { text: metadata.name };
-    return {
-      type: KEYS.a,
-      url: `/api/resources/${encodeURIComponent(id)}`,
-      children: [{ text: metadata.name }],
-    };
-  });
-  return composerMarkdown(editor);
-}
-
-export function restoreMessageAttachments(
-  text: string,
-  attachments: ReadonlyMap<string, Attachment>,
-): string {
-  const editor = createComposerEditor(text);
-  const byUrl = new Map(
-    [...attachments].map(([id, attachment]) => [
-      `/api/resources/${encodeURIComponent(id)}`,
-      attachment,
-    ]),
-  );
-  const value = editor.getApi(MarkdownPlugin).markdown.deserialize(text, {
-    remarkPlugins: [
-      ...composerMarkdownSyntax,
-      () => editableComposerLinks(new Set(byUrl.keys())),
-      composerParagraphSpacing,
-    ],
-    rules: {
-      ...editor.getOptions(MarkdownPlugin).rules,
-      img: {
-        deserialize: (node, decoration, options) => {
-          const attachment = byUrl.get(node.url);
-          if (!attachment) return defaultRules.img!.deserialize!(node, decoration, options);
-          return { type: KEYS.a, url: node.url, children: [{ text: attachment.file.name }] };
-        },
-      },
-    },
-  });
-  if (value.length) editor.children = value;
-  const used = new Set<string>();
-  editor.children = mapComposerValue(editor.children, (node) => {
-    const attachment = byUrl.get(projectComposerNode(node).url ?? "");
-    if (!attachment) return node;
-    used.add(attachment.key);
-    return {
-      type: attachmentType,
-      attachmentKey: attachment.key,
-      name: attachment.file.name,
-      children: [{ text: "" }],
-    };
-  });
-  for (const attachment of attachments.values()) {
-    if (!used.has(attachment.key)) insertComposerAttachment(editor, attachment);
-  }
-  return composerMarkdown(editor);
-}
-
-export function captureComposerPaste(editor: PlateEditor) {
-  const end = editor.api.end([])!;
-  const range = editor.api.rangeRef(editor.selection ?? { anchor: end, focus: end });
-  return {
-    cancel: () => {
-      range.unref();
-    },
-    insert(text: string) {
-      const at = range.unref();
-      if (!at) return;
-      editor.tf.select(at);
-      editor.tf.insertFragment(deserializeComposer(editor, text));
-    },
-  };
-}
-
-export function remapComposerAttachments(text: string, keys: ReadonlyMap<string, string>): string {
-  const editor = createComposerEditor(text);
-  editor.children = mapComposerValue(editor.children, (node) => {
-    const metadata = projectComposerNode(node);
-    if (!metadata.attachment || !metadata.key) return node;
-    const key = keys.get(metadata.key);
-    if (!key) return node;
-    return {
-      type: attachmentType,
-      attachmentKey: key,
-      name: metadata.name,
-      children: [{ text: "" }],
-    };
-  });
-  return composerMarkdown(editor);
-}
-
-export function composerPlainText(editor: PlateEditor): string {
-  return mapComposerValue(editor.children, (node) => {
-    if (node.type === attachmentType) return { text: projectComposerNode(node).name };
-    if (node.type === referenceType) return { text: projectComposerNode(node).url ?? "" };
-    return node;
-  })
-    .map((node) => NodeApi.string(node))
-    .join("\n\n");
-}
-
-export function composerPrefix(editor: PlateEditor): string {
-  if (!editor.selection || !editor.api.isCollapsed()) return "";
-  const block = editor.api.block();
-  if (!block || block[0].type === KEYS.codeLine) return "";
-  const start = editor.api.start(block[1]);
-  return start ? editor.api.string({ anchor: start, focus: editor.selection.anchor }) : "";
-}
-
-export function insertComposerCompletion(editor: PlateEditor, text: string, replaceLength: number) {
-  if (!editor.selection) return;
-  const focus = editor.selection.anchor;
-  const anchor = editor.api.before(focus, { distance: replaceLength, unit: "character" });
-  if (!anchor) return;
-  editor.tf.insertText(`${text} `, { at: { anchor, focus } });
-}
-
 export type ComposerEditorHandle = {
-  capturePaste: () => ReturnType<typeof captureComposerPaste>;
+  capturePaste: () => ReturnType<typeof captureEditorPaste>;
   complete: (text: string, replaceLength: number) => void;
   submissionText: () => string;
   hasMissingAttachments: () => boolean;
@@ -640,76 +193,189 @@ export type ComposerEditorProps = {
   onText: (text: string, plainText: string) => void;
   onPlainText: (text: string, markdown: string) => void;
   onPrefix: (prefix: string) => void;
-  onKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
-  onPaste: (event: ClipboardEvent<HTMLDivElement>) => void;
+  onKeyDown: (event: globalThis.KeyboardEvent) => void;
+  onPaste: (event: ClipboardEvent) => void;
   expanded: boolean;
   activeDescendant?: string;
 };
-
 const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) {
+  const current = useRef(props);
+  current.current = props;
   const lastText = useRef(props.text);
   const documentKey = useRef(props.documentKey);
-  const attachments = props.attachments ?? emptyAttachments;
   const seenAttachments = useRef(new Set<string>());
   const referencedAttachments = useRef(new Set<string>());
-  const editor = usePlateEditor({
-    plugins: composerPlugins,
-    value: (editor) => deserializeComposer(editor, props.text),
+  const attachments = props.attachments ?? emptyAttachments;
+  const [initialDocument] = useState(() => readComposerDocument(props.text).toJSON());
+  const editor = useEditor({
+    immediatelyRender: false,
+    shouldRerenderOnTransaction: false,
+    extensions: [
+      ...composerExtensions,
+      Placeholder.configure({ placeholder: () => current.current.placeholder }),
+      attachmentNode.extend({ addNodeView: () => ReactNodeViewRenderer(AttachmentElement) }),
+      referenceNode.extend({ addNodeView: () => ReactNodeViewRenderer(ReferenceElement) }),
+    ],
+    content: initialDocument,
+    editable: !props.disabled,
+    editorProps: {
+      attributes: {
+        class: "composer-editor",
+        "data-ui": "composer-input",
+        "aria-label": "Message",
+        role: "textbox",
+        "aria-multiline": "true",
+        "aria-autocomplete": "list",
+        "aria-haspopup": "listbox",
+      },
+      handleDOMEvents: {
+        keydown: (_view, event) => {
+          current.current.onKeyDown(event);
+          return event.defaultPrevented;
+        },
+        paste: (_view, event) => {
+          current.current.onPaste(event);
+          return event.defaultPrevented;
+        },
+      },
+      handlePaste: (view, event) => {
+        const clipboard = event.clipboardData;
+        if (!clipboard) return false;
+        const text = clipboard.getData("text/plain");
+        const target = parseReferenceHref(text.trim(), location.origin);
+        if (target) {
+          const node = view.state.schema.nodes.composer_reference!.create({
+            url: referenceHref(target),
+          });
+          view.dispatch(view.state.tr.replaceSelectionWith(node).scrollIntoView());
+          return true;
+        }
+        if (clipboard.getData("text/html")) return false;
+        if (!text) return false;
+        view.dispatch(
+          view.state.tr
+            .replaceSelection(Slice.maxOpen(readComposerDocument(text, view.state.schema).content))
+            .scrollIntoView(),
+        );
+        return true;
+      },
+      transformPastedHTML: (html) => {
+        const root = new DOMParser().parseFromString(html, "text/html");
+        for (const link of root.querySelectorAll("a")) {
+          const url = link.getAttribute("href");
+          const label = link.textContent ?? "";
+          link.replaceWith(
+            root.createTextNode(!url || label === url ? label : `[${label}](${url})`),
+          );
+        }
+        return root.body.innerHTML;
+      },
+      clipboardTextSerializer: (slice) => {
+        const schema = readComposerDocument("").type.schema;
+        const content = slice.content;
+        const doc = schema.topNodeType.create(
+          null,
+          content.firstChild?.isInline ? schema.nodes.paragraph!.create(null, content) : content,
+        );
+        return writeComposerDocument(doc);
+      },
+    },
+    onUpdate: ({ editor }) => {
+      const p = current.current;
+      if (p.loadingDraft) return;
+      const references = editorAttachmentKeys(editor.state.doc);
+      for (const key of referencedAttachments.current) {
+        if (!references.has(key) && p.attachments?.some((attachment) => attachment.key === key))
+          p.onRemoveAttachment?.(key);
+      }
+      referencedAttachments.current = references;
+      const text = writeComposerDocument(editor.state.doc);
+      const plain = composerText(editor.state.doc);
+      lastText.current = text;
+      if (text !== p.text) p.onText(text, plain);
+      p.onPlainText(plain, text);
+      p.onPrefix(composerCompletionPrefix(editor));
+    },
+    onSelectionUpdate: ({ editor }) => current.current.onPrefix(composerCompletionPrefix(editor)),
   });
   useLayoutEffect(() => {
-    if (props.loadingDraft) return;
+    if (!editor || props.loadingDraft) return;
     const switched = documentKey.current !== props.documentKey;
+    lastText.current = switched ? props.text : lastText.current;
     if (switched) {
       documentKey.current = props.documentKey;
       seenAttachments.current.clear();
       referencedAttachments.current.clear();
-      replaceComposerDocument(editor, props.text);
+      replaceEditorDocument(editor, props.text);
     } else if (props.text !== lastText.current) {
-      editor.tf.setValue(deserializeComposer(editor, props.text));
-    }
-    lastText.current = props.text;
-    props.onPlainText(composerPlainText(editor), props.text);
-  }, [editor, props.documentKey, props.loadingDraft, props.text, props.onPlainText]);
-  useEffect(() => {
-    if (props.loadingDraft) return;
-    const currentKeys = new Set(attachments.map((attachment) => attachment.key));
-    const references = attachmentKeys(editor);
-    for (const key of seenAttachments.current) {
-      if (currentKeys.has(key)) continue;
-      editor.tf.removeNodes({
-        at: [],
-        match: (node) => {
-          const metadata = projectComposerNode(node);
-          return metadata.attachment && metadata.key === key;
-        },
+      lastText.current = props.text;
+      editor.commands.setContent(readComposerDocument(props.text, editor.schema).toJSON(), {
+        emitUpdate: false,
       });
     }
-    for (const attachment of attachments) {
-      if (seenAttachments.current.has(attachment.key) || references.has(attachment.key)) continue;
-      insertComposerAttachment(editor, attachment);
+    props.onPlainText(composerText(editor.state.doc), props.text);
+  }, [editor, props.documentKey, props.loadingDraft, props.text, props.onPlainText]);
+  useEffect(() => {
+    if (!editor) return;
+    editor.setEditable(!props.disabled, false);
+    const element = editor.view.dom;
+    for (const [name, value] of Object.entries({
+      "aria-controls": props.expanded ? "composer-completions" : undefined,
+      "aria-activedescendant": props.activeDescendant,
+    })) {
+      if (value) element.setAttribute(name, value);
+      else element.removeAttribute(name);
     }
-    seenAttachments.current = currentKeys;
-    referencedAttachments.current = attachmentKeys(editor);
+    editor.view.dispatch(editor.state.tr);
+  }, [editor, props.disabled, props.expanded, props.activeDescendant, props.placeholder]);
+  useEffect(() => {
+    if (!editor || props.loadingDraft) return;
+    const keys = new Set(attachments.map((attachment) => attachment.key));
+    const references = editorAttachmentKeys(editor.state.doc);
+    const transaction = editor.state.tr;
+    editor.state.doc.descendants((node, pos) => {
+      const key = node.attrs.attachmentKey;
+      if (
+        node.type.name === "composer_attachment" &&
+        seenAttachments.current.has(key) &&
+        !keys.has(key)
+      ) {
+        transaction.delete(
+          transaction.mapping.map(pos),
+          transaction.mapping.map(pos + node.nodeSize),
+        );
+      }
+    });
+    if (transaction.docChanged) editor.view.dispatch(transaction);
+    for (const attachment of attachments) {
+      if (!seenAttachments.current.has(attachment.key) && !references.has(attachment.key))
+        insertEditorAttachment(editor, attachment);
+    }
+    seenAttachments.current = keys;
+    referencedAttachments.current = editorAttachmentKeys(editor.state.doc);
   }, [editor, attachments, props.loadingDraft]);
   useImperativeHandle(
     props.ref,
     () => ({
-      capturePaste: () => captureComposerPaste(editor),
-      submissionText: () => composerSubmissionMarkdown(editor),
+      capturePaste: () => (editor ? captureEditorPaste(editor) : { cancel() {}, insert() {} }),
+      submissionText: () => (editor ? writeComposerDocument(editor.state.doc, false) : props.text),
       hasMissingAttachments: () =>
-        [...attachmentKeys(editor)].some(
+        !!editor &&
+        [...editorAttachmentKeys(editor.state.doc)].some(
           (key) => !attachments.some((attachment) => attachment.key === key),
         ),
       complete(text, length) {
-        insertComposerCompletion(editor, text, length);
-        editor.tf.focus();
+        if (!editor) return;
+        completeEditor(editor, text, length);
+        editor.commands.focus();
       },
     }),
-    [editor, attachments],
+    [editor, attachments, props.text],
   );
   const focusedDocument = useRef<string>(undefined);
   useEffect(() => {
     if (
+      !editor ||
       !props.documentKey ||
       props.loadingDraft ||
       props.disabled ||
@@ -722,104 +388,36 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
     const focused = document.activeElement;
     if (focused instanceof Element && focused.closest('input, textarea, [contenteditable="true"]'))
       return;
-    editor.tf.select(editor.api.end([]));
-    editor.tf.focus();
+    editor.commands.focus("end");
   }, [editor, props.documentKey, props.loadingDraft, props.disabled, props.autoFocus]);
-  function change() {
-    if (props.loadingDraft) return;
-    const references = attachmentKeys(editor);
-    for (const key of referencedAttachments.current) {
-      if (!references.has(key) && attachments.some((attachment) => attachment.key === key))
-        props.onRemoveAttachment?.(key);
-    }
-    referencedAttachments.current = references;
-    const text = composerMarkdown(editor);
-    lastText.current = text;
-    if (text !== props.text) props.onText(text, composerPlainText(editor));
-    props.onPlainText(composerPlainText(editor), text);
-    props.onPrefix(composerPrefix(editor));
-  }
   return (
     <AttachmentContext
       value={{ attachments, disabled: props.disabled, retry: props.onRetryAttachment }}
     >
-      <Plate
-        editor={editor}
-        readOnly={props.disabled}
-        onValueChange={change}
-        onSelectionChange={() => props.onPrefix(composerPrefix(editor))}
-      >
-        <ComposerFormatting editor={editor} disabled={props.disabled} />
-        <PlateContent
-          className="composer-editor"
-          data-ui="composer-input"
-          style={{
-            minHeight: "calc(1lh + calc(var(--ui-space-unit) * 3) * 2)",
-            overflowWrap: "anywhere",
-          }}
-          aria-label="Message"
-          role="textbox"
-          aria-multiline="true"
-          aria-autocomplete="list"
-          aria-haspopup="listbox"
-          aria-controls={props.expanded ? "composer-completions" : undefined}
-          aria-activedescendant={props.activeDescendant}
-          placeholder={props.placeholder}
-          onKeyDownCapture={(event) => {
-            props.onKeyDown(event);
-            // Completion must consume Tab before Plate's indentation handlers run.
-            if (event.defaultPrevented) event.stopPropagation();
-          }}
-          onKeyDown={(event) => {
-            if (event.defaultPrevented || event.nativeEvent.isComposing) return;
-            if (event.key === "Enter" && event.shiftKey) {
-              event.preventDefault();
-              editor.tf.insertBreak();
-            }
-          }}
-          onPaste={(event) => {
-            props.onPaste(event);
-            if (!event.defaultPrevented) {
-              const target = parseReferenceHref(
-                event.clipboardData.getData("text/plain").trim(),
-                location.origin,
-              );
-              if (target) {
-                event.preventDefault();
-                captureComposerPaste(editor).insert(
-                  `[#${target.surface}:${target.sessionId}](${referenceHref(target)})`,
-                );
-              }
-            }
-            // Plate requires a handled result to skip its HTML deserializer.
-            return event.defaultPrevented;
-          }}
-        />
-      </Plate>
+      <ComposerFormatting editor={editor} disabled={props.disabled} />
+      <EditorContent editor={editor} />
     </AttachmentContext>
   );
 });
-
 export default ComposerEditor;
-
 const ComposerFormatting = memo(function ComposerFormatting({
   editor,
   disabled,
 }: {
-  editor: PlateEditor;
+  editor: Editor | null;
   disabled: boolean;
 }) {
   function mark(key: string) {
-    editor.tf.toggleMark(key);
-    editor.tf.focus();
+    editor?.chain().focus().toggleMark(key).run();
   }
   function block(type: string) {
-    editor.tf.toggleBlock(type);
-    editor.tf.focus();
+    if (!editor) return;
+    if (type === "heading") editor.chain().focus().toggleHeading({ level: 2 }).run();
+    else editor.chain().focus().toggleBlockquote().run();
   }
-  function list(listStyleType: string) {
-    toggleList(editor, { listStyleType });
-    editor.tf.focus();
+  function list(style: string) {
+    if (style === "disc") editor?.chain().focus().toggleBulletList().run();
+    else editor?.chain().focus().toggleOrderedList().run();
   }
   return (
     <div
@@ -837,7 +435,7 @@ const ComposerFormatting = memo(function ComposerFormatting({
         aria-keyshortcuts={ariaBinding({ code: "KeyB", mod: true, alt: false, shift: false })}
         label="Bold"
         disabled={disabled}
-        onClick={() => mark(KEYS.bold)}
+        onClick={() => mark("bold")}
       >
         <Bold />
       </IconButton>
@@ -850,24 +448,20 @@ const ComposerFormatting = memo(function ComposerFormatting({
         aria-keyshortcuts={ariaBinding({ code: "KeyI", mod: true, alt: false, shift: false })}
         label="Italic"
         disabled={disabled}
-        onClick={() => mark(KEYS.italic)}
+        onClick={() => mark("italic")}
       >
         <Italic />
       </IconButton>
-      <IconButton
-        label="Strikethrough"
-        disabled={disabled}
-        onClick={() => mark(KEYS.strikethrough)}
-      >
+      <IconButton label="Strikethrough" disabled={disabled} onClick={() => mark("strike")}>
         <Strikethrough />
       </IconButton>
-      <IconButton label="Inline code" disabled={disabled} onClick={() => mark(KEYS.code)}>
+      <IconButton label="Inline code" disabled={disabled} onClick={() => mark("code")}>
         <Code />
       </IconButton>
-      <IconButton label="Heading" disabled={disabled} onClick={() => block(KEYS.h2)}>
+      <IconButton label="Heading" disabled={disabled} onClick={() => block("heading")}>
         <Heading2 />
       </IconButton>
-      <IconButton label="Quote" disabled={disabled} onClick={() => block(KEYS.blockquote)}>
+      <IconButton label="Quote" disabled={disabled} onClick={() => block("blockquote")}>
         <Quote />
       </IconButton>
       <IconButton label="Bulleted list" disabled={disabled} onClick={() => list("disc")}>
@@ -880,8 +474,7 @@ const ComposerFormatting = memo(function ComposerFormatting({
         label="Code block"
         disabled={disabled}
         onClick={() => {
-          editor.getTransforms(CodeBlockPlugin).code_block.toggle();
-          editor.tf.focus();
+          editor?.chain().focus().toggleCodeBlock().run();
         }}
       >
         <SquareCode />
