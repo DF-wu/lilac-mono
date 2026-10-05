@@ -348,12 +348,11 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       !visibleText.startsWith(`/${chosen.name} `)
     )
       setCommandId(undefined);
-    setSkills(
-      skillIds.filter((id) => {
-        const skill = catalog?.skills.find((item) => item.id === id);
-        return !!skill && hasSkillMention(visibleText, skill.name);
-      }),
-    );
+    const retainedSkills = skillIds.filter((id) => {
+      const skill = catalog?.skills.find((item) => item.id === id);
+      return !!skill && hasSkillMention(visibleText, skill.name);
+    });
+    if (retainedSkills.length !== skillIds.length) setSkills(retainedSkills);
     onText(value);
     setMenuHidden(false);
     setSelected(0);
