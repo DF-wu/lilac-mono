@@ -109,6 +109,7 @@ packages/plugin-runtime/types.ts  # originSessionId / requestInitiator in Reques
 apps/core/src/github/webhook/github-webhook-server.ts  # prompts forbid duplicate final publications and define NO_REPLY
 
 # --- Config layer seams
+packages/utils/model-provider.ts  # wires provider-local tool-image middleware; transformation lives in a fork-owned module
 packages/utils/core-config.ts  # re-exports fork config modules
 packages/utils/core-config/types.ts  # UniversalCoreConfig gains surface.telegram and tools.generate
 packages/utils/core-config/v1.ts  # v1 fallbacks for fork config keys
