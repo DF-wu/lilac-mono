@@ -2293,6 +2293,23 @@ export async function attachAutoCompaction(
     });
     if (!activeBudget) return;
 
+    const maximumCanonicalSuffixStart = (() => {
+      const currentStart = options.resolveCurrentInputCanonicalStart?.(canonicalMessages);
+      if (currentStart === null || currentStart === undefined) return undefined;
+      if (
+        !Number.isSafeInteger(currentStart) ||
+        currentStart < 0 ||
+        currentStart > canonicalMessages.length
+      ) {
+        return signalAutoCompactionHost(
+          autoCompactionFailure(
+            new RangeError("Current-input canonical start is outside the compaction transcript"),
+          ),
+        );
+      }
+      return Math.min(currentStart, compactableMessages.length);
+    })();
+
     if (pendingReason === "threshold") {
       const retainedTailTokenCap = resolveRetainedTailTokenCap(
         activeBudget.inputBudget,
@@ -2305,7 +2322,7 @@ export async function attachAutoCompaction(
         keepRecentTokens: retainedTailTokenCap,
         keepRecentTurns,
       });
-      if (boundary === 0) {
+      if (boundary === 0 || maximumCanonicalSuffixStart === 0) {
         pendingCompactionReason = null;
         return;
       }
@@ -2381,24 +2398,7 @@ export async function attachAutoCompaction(
           onProgress: options.onProgress,
           onSummaryDelta: options.onSummaryDelta,
           abortSignal: context.abortSignal,
-          maximumCanonicalSuffixStart: (() => {
-            const currentStart = options.resolveCurrentInputCanonicalStart?.(canonicalMessages);
-            if (currentStart === null || currentStart === undefined) return undefined;
-            if (
-              !Number.isSafeInteger(currentStart) ||
-              currentStart < 0 ||
-              currentStart > canonicalMessages.length
-            ) {
-              return signalAutoCompactionHost(
-                autoCompactionFailure(
-                  new RangeError(
-                    "Current-input canonical start is outside the compaction transcript",
-                  ),
-                ),
-              );
-            }
-            return Math.min(currentStart, compactableMessages.length);
-          })(),
+          maximumCanonicalSuffixStart,
         });
         const compactionResultOutcome = resultOutcome(compactionResult);
         if (!compactionResultOutcome.ok) {

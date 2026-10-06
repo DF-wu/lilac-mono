@@ -94,6 +94,165 @@ function serverCompactionArtifact(
 }
 
 describe("auto-compaction internals", () => {
+  it("continues a high-usage current request when no older prefix can be compacted", async () => {
+    let calls = 0;
+    const mainModel = new MockLanguageModelV4({
+      doStream: async () => {
+        calls += 1;
+        if (calls > 3) return summaryResponse("image analysis complete");
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "tool-call", toolCallId: `call-${calls}`, toolName: "read", input: "{}" },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                usage: {
+                  ...zeroUsage(),
+                  inputTokens: {
+                    total: calls === 3 ? 795_917 : 26_010,
+                    noCache: calls === 3 ? 795_917 : 26_010,
+                    cacheRead: 0,
+                    cacheWrite: 0,
+                  },
+                },
+              },
+            ],
+          }),
+        };
+      },
+    });
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        throw new Error("No older prefix may be summarized");
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      tools: {
+        read: tool({ inputSchema: jsonSchema({ type: "object" }), execute: () => "image read" }),
+      },
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      resolveContextLimit: async () => ({ context: 1_000_000, output: 393_216 }),
+      resolveCurrentInputCanonicalStart: () => 0,
+    });
+    try {
+      await agent.prompt("inspect the original image");
+    } finally {
+      detach();
+    }
+    expect(mainModel.doStreamCalls).toHaveLength(4);
+    expect(JSON.stringify(mainModel.doStreamCalls[3]!.prompt)).toContain(
+      "inspect the original image",
+    );
+    expect(agent.state.messages.filter((message) => message.role === "tool")).toHaveLength(3);
+    expect(JSON.stringify(agent.state.messages)).toContain("image analysis complete");
+    expect(JSON.stringify(agent.state.messages)).not.toContain("context-compaction");
+  });
+
+  it("compacts an older prefix while preserving the entire current request", async () => {
+    const mainModel = new MockLanguageModelV4({ doStream: summaryResponse("done") });
+    const summaryModel = new MockLanguageModelV4({
+      doStream: summaryResponse("older context summary"),
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: `older request ${"a".repeat(8_000)}` },
+        { role: "assistant", content: "older response" },
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      thresholdInputSource: "transcript-estimate",
+      keepRecentTokens: 100,
+      keepRecentTurns: 1,
+      resolveContextLimit: async () => ({ context: 3_000, output: 1_000 }),
+      resolveCurrentInputCanonicalStart: () => 2,
+    });
+    try {
+      await agent.prompt("current request must stay verbatim");
+    } finally {
+      detach();
+    }
+    const sentPrompt = JSON.stringify(mainModel.doStreamCalls[0]!.prompt);
+    expect(sentPrompt).toContain("older context summary");
+    expect(sentPrompt).toContain("current request must stay verbatim");
+    expect(sentPrompt).not.toContain("older request");
+    expect(JSON.stringify(summaryModel.doStreamCalls)).not.toContain(
+      "current request must stay verbatim",
+    );
+  });
+
+  it("still fails real overflow when the current request cannot be compacted", async () => {
+    const mainModel = new MockLanguageModelV4({
+      doStream: async () => ({
+        stream: simulateReadableStream({
+          chunks: [{ type: "error", error: new Error("maximum context length exceeded") }],
+        }),
+      }),
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel: new MockLanguageModelV4({ doStream: summaryResponse() }),
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+      resolveCurrentInputCanonicalStart: () => 0,
+    });
+    try {
+      await expect(agent.prompt("protected request")).rejects.toThrow(
+        "Compaction could not select transcript content",
+      );
+    } finally {
+      detach();
+    }
+    expect(mainModel.doStreamCalls).toHaveLength(1);
+    expect(JSON.stringify(agent.state.messages)).toContain("protected request");
+  });
+
+  it("rejects an invalid protected-current boundary instead of skipping compaction", async () => {
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: new MockLanguageModelV4({ doStream: summaryResponse() }),
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: "a".repeat(8_000) },
+        { role: "assistant", content: "prior answer" },
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      thresholdInputSource: "transcript-estimate",
+      keepRecentTokens: 100,
+      keepRecentTurns: 1,
+      resolveContextLimit: async () => ({ context: 3_000, output: 1_000 }),
+      resolveCurrentInputCanonicalStart: () => -1,
+    });
+    try {
+      await expect(agent.prompt("current request")).rejects.toThrow(
+        "Current-input canonical start is outside",
+      );
+    } finally {
+      detach();
+    }
+  });
+
   it("wraps summaries as stable prior context rather than a new request", () => {
     expect(__autoCompactionInternals.buildCompactionSummaryMessage("summary details")).toEqual({
       role: "user",
