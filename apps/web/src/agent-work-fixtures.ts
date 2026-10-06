@@ -3,21 +3,272 @@ import type {
   DisplayPart,
   ReadyTurnSlot,
   SubagentSummary,
+  WorkflowCard,
 } from "@stanley2058/lilac-client-protocol";
 import {
   subagentActivities,
   subagentTranscripts,
   toolActivities,
+  workflowProgress,
 } from "./generated/tool-activities";
 
 type Activity = Extract<DisplayPart, { type: "data-activity" }>;
+/** A turn frame, optionally followed by a workflow card that Core posts as its own slot. */
+export type AgentWorkFrame = ReadyTurnSlot & { following?: ReadyTurnSlot };
 export type AgentWorkStage = {
   id: string;
   label: string;
   description: string;
-  frames: ReadyTurnSlot[];
+  frames: AgentWorkFrame[];
 };
 export const demoTime = Date.parse("2026-09-19T09:00:00Z");
+
+export function workflowFrame(key: keyof typeof workflowProgress): ReadyTurnSlot {
+  return workflowCardFrame(workflowProgress[key]);
+}
+
+function workflowCardFrame(progress: {
+  readonly text: string;
+  readonly actions: readonly Extract<
+    DisplayPart,
+    { type: "data-actions" }
+  >["data"]["actions"][number][];
+  readonly workflow: WorkflowCard;
+}): ReadyTurnSlot {
+  // Matches the slot and parts Core's native adapter creates when it posts a workflow card.
+  return {
+    kind: "ready",
+    slotId: "demo_workflow",
+    turnId: "demo_workflow",
+    position: 1,
+    state: "complete",
+    messages: [
+      {
+        id: "demo_workflow",
+        role: "assistant",
+        metadata: { authorId: "demo_agent", createdAt: demoTime + 3000 },
+        parts: [
+          { type: "text", text: progress.text },
+          { type: "data-workflow", id: "workflow_demo_workflow", data: progress.workflow },
+          ...(progress.actions.length
+            ? [
+                {
+                  type: "data-actions" as const,
+                  id: "demo_workflow_actions",
+                  data: { requestId: "demo_request", revision: 0, actions: [...progress.actions] },
+                },
+              ]
+            : []),
+        ],
+      },
+    ],
+  };
+}
+
+/** Moves workflow card times so the sample's present is `at`, keeping live timers realistic. */
+export function rebaseWorkflowTimes(slot: ReadyTurnSlot, at: number): ReadyTurnSlot {
+  const shift = (value: number) => value + at - demoTime;
+  return {
+    ...slot,
+    messages: slot.messages.map((message) => ({
+      ...message,
+      parts: message.parts.map((part) => {
+        if (part.type !== "data-workflow") return part;
+        const card = part.data;
+        return {
+          ...part,
+          data: {
+            ...card,
+            startedAt: shift(card.startedAt),
+            ...(card.endedAt !== undefined ? { endedAt: shift(card.endedAt) } : {}),
+            ...(card.nextRunAt !== undefined ? { nextRunAt: shift(card.nextRunAt) } : {}),
+            ...(card.wait
+              ? {
+                  wait: {
+                    ...card.wait,
+                    ...(card.wait.dueAt !== undefined ? { dueAt: shift(card.wait.dueAt) } : {}),
+                    ...(card.wait.deadlineAt !== undefined
+                      ? { deadlineAt: shift(card.wait.deadlineAt) }
+                      : {}),
+                  },
+                }
+              : {}),
+          },
+        };
+      }),
+    })),
+  };
+}
+
+export function workflowActionFrame(
+  frame: AgentWorkFrame,
+  actionId: string,
+): AgentWorkFrame | undefined {
+  if (frame.following) {
+    const following = workflowActionFrame(frame.following, actionId);
+    return following && { ...frame, following };
+  }
+  const message = frame.messages.find((item) => item.id === "demo_workflow");
+  const text = message?.parts.find((part) => part.type === "text")?.text;
+  const sample = Object.values(workflowProgress).find(
+    (progress) =>
+      progress.text === text ||
+      Object.values(progress.transitions).some((transition) => transition.text === text),
+  );
+  if (!sample) return;
+  let transition: keyof typeof sample.transitions;
+  switch (actionId) {
+    case "demo_workflow_pause":
+      transition = "paused";
+      break;
+    case "demo_workflow_resume":
+      transition = "resumed";
+      break;
+    case "demo_workflow_cancel":
+      transition = "cancelled";
+      break;
+    default:
+      return;
+  }
+  return workflowCardFrame(sample.transitions[transition]);
+}
+
+const workflowExamples: {
+  key: keyof typeof workflowProgress;
+  label: string;
+  description: string;
+}[] = [
+  {
+    key: "queued",
+    label: "Queued",
+    description: "Accepted before any steps start. Try Pause or Cancel.",
+  },
+  {
+    key: "starting",
+    label: "Starting",
+    description: "One agent is starting; another step is queued.",
+  },
+  {
+    key: "parallel",
+    label: "Parallel steps",
+    description: "Weather and opening hours run together.",
+  },
+  {
+    key: "partial",
+    label: "Partial results",
+    description: "One step completes while another continues and an alternate step stops.",
+  },
+  {
+    key: "running",
+    label: "Phase progress",
+    description: "Research is complete. Route planning runs before the coffee-stop step.",
+  },
+  {
+    key: "blocked",
+    label: "Blocked",
+    description: "An agent operation is blocked. Pause and Cancel remain available.",
+  },
+  {
+    key: "waiting",
+    label: "Waiting",
+    description: "A timed wait shows when the workflow resumes.",
+  },
+  {
+    key: "reply",
+    label: "Waiting for reply · Discord only",
+    description:
+      "A Discord-origin workflow needs a reply in Discord. Native workflows cannot create reply waits.",
+  },
+  {
+    key: "paused",
+    label: "Paused",
+    description: "Try Resume to return to running, or Cancel to stop.",
+  },
+  {
+    key: "resumed",
+    label: "Resumed",
+    description: "After resuming, the card returns to Running with its existing progress.",
+  },
+  {
+    key: "succeeded",
+    label: "Succeeded",
+    description:
+      "All steps complete. The result replaces the recent-operation list and controls disappear.",
+  },
+  {
+    key: "failed",
+    label: "Failed",
+    description: "The failure reason and completed research remain visible.",
+  },
+  {
+    key: "timeout",
+    label: "Step timed out",
+    description: "A timed-out step stays visible while a fallback step runs.",
+  },
+  {
+    key: "stepFailed",
+    label: "Step failed",
+    description: "A failed step stays visible while a fallback step runs.",
+  },
+  {
+    key: "cancelled",
+    label: "Cancelled",
+    description: "Stopped steps and the cancellation reason remain visible.",
+  },
+  {
+    key: "attention",
+    label: "Needs attention",
+    description: "An operation's outcome is uncertain. Only Cancel is available.",
+  },
+  {
+    key: "scheduled",
+    label: "Scheduled next run",
+    description: "A recurring workflow shows its next run time.",
+  },
+  {
+    key: "largeResult",
+    label: "Result stored separately",
+    description: "A large result directs you to ask Lilac for the full output.",
+  },
+  {
+    key: "noResult",
+    label: "Succeeded without output",
+    description: "A successful run can finish without a result block.",
+  },
+  {
+    key: "shortenedResult",
+    label: "Shortened result",
+    description: "A long result is shortened with a prompt to ask for the full output.",
+  },
+  {
+    key: "sensitive",
+    label: "Sensitive result",
+    description: "Sensitive workflow output and phase names stay hidden.",
+  },
+  {
+    key: "manyPhases",
+    label: "Many phases",
+    description: "Every phase shows its own progress.",
+  },
+];
+
+export const workflowStages: AgentWorkStage[] = [
+  {
+    id: "workflow",
+    label: "Workflow · full run",
+    description:
+      "Play from queued to succeeded, or use the frame arrows. Pause, Resume, and Cancel update this demo locally.",
+    frames: (["queued", "starting", "parallel", "running", "succeeded"] as const).map(
+      workflowFrame,
+    ),
+  },
+  ...workflowExamples.map(({ key, label, description }) => ({
+    id: `workflow-${key}`,
+    label: `Workflow · ${label}`,
+    description,
+    frames: [workflowFrame(key)],
+  })),
+];
 const prompt: DisplayMessage = {
   id: "demo_prompt",
   role: "user",
@@ -401,25 +652,7 @@ export const agentWorkStages: AgentWorkStage[] = [
       },
     ],
   },
-  {
-    id: "workflow",
-    label: "Workflow",
-    description: "A child workflow running after the initial tools finish.",
-    frames: [
-      turn([
-        work,
-        message("demo_workflow", [
-          activity(
-            "demo_plan",
-            "workflow",
-            "Planning the route…",
-            "running",
-            "Route planner\n• Find a starting point\n• Check walking distances\n• Pick a coffee stop",
-          ),
-        ]),
-      ]),
-    ],
-  },
+  ...workflowStages,
   {
     id: "streaming",
     label: "Paragraph streaming",
@@ -575,11 +808,18 @@ const flowStages = [
   "tool-call",
   "parallel-tools",
   "tool-results",
+  "workflow",
   "streaming",
   "complete",
 ];
 export const conversationFrames = flowStages
-  .flatMap((id) => agentWorkStages.find((stage) => stage.id === id)!.frames)
+  .flatMap((id) => {
+    const frames = agentWorkStages.find((stage) => stage.id === id)!.frames;
+    if (id === "workflow") return frames.map((card) => ({ ...turn([work]), following: card }));
+    if (id === "streaming" || id === "complete")
+      return frames.map((frame) => ({ ...frame, following: workflowFrame("succeeded") }));
+    return frames;
+  })
   .map((frame) => ({
     ...frame,
     messages: frame.messages.map((message) => ({

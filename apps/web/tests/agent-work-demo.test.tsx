@@ -1,7 +1,23 @@
 import { expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import { readyTurnSlotSchema, type ReadyTurnSlot } from "@stanley2058/lilac-client-protocol";
-import { agentWorkStages, demoSubagents } from "../src/agent-work-fixtures";
+import {
+  readyTurnSlotSchema,
+  workflowCardSchema,
+  type ReadyTurnSlot,
+} from "@stanley2058/lilac-client-protocol";
+import {
+  agentWorkStages,
+  demoSubagents,
+  workflowActionFrame,
+  workflowFrame,
+  workflowStages,
+} from "../src/agent-work-fixtures";
+import { workflowProgress } from "../src/generated/tool-activities";
+import { designWorkflowViews } from "../../core/scripts/design-workflow-progress";
+import {
+  workflowRunStateSchema,
+  workflowOperationStateSchema,
+} from "../../core/src/workflow/workflow-domain";
 import { SubagentContext } from "../src/components/subagent-context";
 import { MessageIdentityContext } from "../src/components/message-identity";
 import { Turn } from "../src/components/Timeline";
@@ -10,7 +26,10 @@ import { MessageServicesContext } from "../src/components/message-services";
 test("every demo frame is a valid native turn rendered by the production turn component", () => {
   for (const stage of agentWorkStages) {
     expect(stage.frames.length).toBeGreaterThan(0);
-    for (const slot of stage.frames) expect(readyTurnSlotSchema.safeParse(slot).success).toBe(true);
+    for (const { following, ...slot } of stage.frames) {
+      expect(readyTurnSlotSchema.safeParse(slot).success).toBe(true);
+      if (following) expect(readyTurnSlotSchema.safeParse(following).success).toBe(true);
+    }
     const html = renderToStaticMarkup(
       <MessageServicesContext
         value={{ canEdit: false, resourceUrl: () => "", onAction: () => {}, onReaction: () => {} }}
@@ -18,7 +37,7 @@ test("every demo frame is a valid native turn rendered by the production turn co
         <Turn slot={stage.frames[0]!} onRewind={() => {}} onLoadMore={() => {}} />
       </MessageServicesContext>,
     );
-    expect(html).toContain('data-turn-id="demo_turn"');
+    expect(html).toContain(`data-turn-id="${stage.frames[0]!.turnId}"`);
     if (stage.id === "complete") expect(html).toContain("Worked for 12s");
     if (stage.id === "failed") expect(html).toContain("Run failed");
     if (stage.id === "canceled") expect(html).toContain("Stopped");
@@ -42,6 +61,54 @@ test("streaming frames preserve message identity and grow into the completed ans
     previous = text;
   }
   expect(previous).toBe(fullText);
+});
+
+test("workflow demos cover every run and operation state using Core progress messages", () => {
+  const views = Object.values(designWorkflowViews);
+  expect(new Set(views.map((view) => view.run.state))).toEqual(
+    new Set(workflowRunStateSchema.options),
+  );
+  expect(
+    new Set(views.flatMap((view) => view.recentOperations.map((operation) => operation.state))),
+  ).toEqual(new Set(workflowOperationStateSchema.options));
+  for (const stage of workflowStages) {
+    for (const slot of stage.frames) {
+      expect(slot.state).toBe("complete");
+      const card = slot.messages.find((message) => message.id === "demo_workflow")!;
+      const text = card.parts.find((part) => part.type === "text")!.text;
+      const progress = Object.values(workflowProgress).find((progress) => progress.text === text)!;
+      expect(progress).toBeDefined();
+      const controls = card.parts.find((part) => part.type === "data-actions");
+      expect(controls?.data.actions ?? []).toEqual(progress.actions);
+      const workflow = card.parts.find((part) => part.type === "data-workflow");
+      expect(workflow?.data).toEqual(progress.workflow);
+    }
+  }
+  const cards = Object.values(workflowProgress).flatMap((progress) => [
+    progress.workflow,
+    ...Object.values(progress.transitions).map((transition) => transition.workflow),
+  ]);
+  expect(new Set(cards.map((card) => card.status))).toEqual(
+    new Set(workflowCardSchema.shape.status.options),
+  );
+});
+
+test("workflow actions edit the same card and preserve progress through pause and resume", () => {
+  const initial = workflowFrame("parallel");
+  const paused = workflowActionFrame(initial, "demo_workflow_pause")!;
+  const resumed = workflowActionFrame(paused, "demo_workflow_resume")!;
+  const cancelled = workflowActionFrame(resumed, "demo_workflow_cancel")!;
+  for (const frame of [paused, resumed, cancelled]) {
+    expect(readyTurnSlotSchema.safeParse(frame).success).toBe(true);
+    expect(frame.messages[0]?.id).toBe(initial.messages[0]?.id);
+    expect(frame.slotId).toBe(initial.slotId);
+  }
+  expect(resumed).toEqual(initial);
+  expect(JSON.stringify(paused)).toContain("0/2 steps complete · 2 active");
+  expect(JSON.stringify(paused)).toContain("Paused");
+  expect(JSON.stringify(cancelled)).toContain("0/2 steps complete · 2 stopped");
+  expect(cancelled.messages[0]?.parts.some((part) => part.type === "data-actions")).toBe(false);
+  expect(workflowActionFrame(initial, "unrelated")).toBeUndefined();
 });
 
 function renderStage(id: string, override?: ReadyTurnSlot) {
@@ -117,6 +184,34 @@ test("completed turns collapse steering and work under the avatar above the fina
   expect(html.indexOf("Worked for 4m")).toBeLessThan(
     html.indexOf('data-message-id="demo_steered_final"'),
   );
+});
+
+test("workflow cards render as their own block from structured progress", () => {
+  const html = renderStage("workflow-running");
+  expect(html).toContain('data-ui="workflow-turn"');
+  expect(html).toContain('data-ui="workflow-card"');
+  expect(html).toContain('data-status="running"');
+  expect(html).not.toContain('aria-label="About Lilac"');
+  expect(html).not.toContain('data-ui="work-summary"');
+  expect(html).not.toContain("**Progress**");
+  expect(html).toContain("2 of 4 steps complete · 1 active · 1 queued");
+  expect(html).toContain("Choose the walking route");
+  expect(html).toContain('aria-label="Pause"');
+  expect(html).toContain('aria-label="Cancel"');
+});
+
+test("terminal workflow cards show results and reasons without controls", () => {
+  const succeeded = renderStage("workflow-succeeded");
+  expect(succeeded).toContain('data-ui="workflow-result"');
+  expect(succeeded).toContain("Walk the river loop for 45 minutes");
+  expect(succeeded).not.toContain('data-ui="workflow-actions"');
+  expect(renderStage("workflow-shortenedResult")).toContain("Shortened.");
+  expect(renderStage("workflow-largeResult")).toContain("too large to show here");
+  expect(renderStage("workflow-failed")).toContain("The route service returned an error.");
+  expect(renderStage("workflow-sensitive")).toContain("sensitive input");
+  expect(renderStage("workflow-sensitive")).not.toContain("Walk the river loop");
+  expect(renderStage("workflow-reply")).toContain("Discord channel");
+  expect(renderStage("workflow-attention")).toContain("Cancel this run");
 });
 
 test("streaming answers have no action row until the turn settles", () => {

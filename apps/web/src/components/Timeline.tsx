@@ -32,6 +32,7 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  type ComponentProps,
 } from "react";
 import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronDown, ChevronRight, RotateCcw, Copy, CopyCheck } from "lucide-react";
@@ -50,6 +51,7 @@ import { MessageResourcesContext } from "./message-resources";
 import { Bubble, BubbleContent } from "./ui/bubble";
 import "./message-presentation.css";
 import { Markdown } from "./Markdown";
+import { WorkflowCard } from "./WorkflowCard";
 import { readMotionDuration } from "../theme/motion";
 import { Button } from "./ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
@@ -425,14 +427,47 @@ const SlotRow = memo(function SlotRow(props: {
   );
 });
 
-export const Turn = memo(function Turn(props: {
+type TurnProps = {
   slot: ReadyTurnSlot;
   animateArrivals?: boolean;
   optimistic?: boolean;
   userRenderKey?: string;
   onRewind: (turnId: string) => void;
   onLoadMore: () => void;
-}) {
+};
+
+export const Turn = memo(function Turn(props: TurnProps) {
+  const workflow = workflowCardMessage(props.slot);
+  if (workflow) return <WorkflowTurn turnId={props.slot.turnId} {...workflow} />;
+  return <AgentTurn {...props} />;
+});
+
+/** Core posts each workflow progress card as its own slot, outside any agent turn. */
+function workflowCardMessage(slot: ReadyTurnSlot) {
+  const [message] = slot.messages;
+  if (slot.messages.length !== 1 || !message) return undefined;
+  const card = message.parts.find((part) => part.type === "data-workflow");
+  if (!card) return undefined;
+  const actions = message.parts.find((part) => part.type === "data-actions");
+  return { messageId: message.id, card: card.data, actions };
+}
+
+function WorkflowTurn({
+  turnId,
+  ...card
+}: { turnId: string } & ComponentProps<typeof WorkflowCard>) {
+  return (
+    <article
+      className="turn pt-4 px-6 pb-8 max-workspace:pt-3 max-workspace:px-4 max-workspace:pb-6"
+      data-turn-id={turnId}
+      data-ui="workflow-turn"
+    >
+      <WorkflowCard {...card} />
+    </article>
+  );
+}
+
+function AgentTurn(props: TurnProps) {
   const { onRewind, onLoadMore } = props;
   const { canEdit, rewindDisabled } = useMessageServices();
   const { slot } = props;
@@ -582,7 +617,7 @@ export const Turn = memo(function Turn(props: {
       ) : null}
     </article>
   );
-});
+}
 
 function recordActivityTimes(times: Map<string, number>, messages: readonly DisplayMessage[]) {
   for (const message of messages) {
@@ -772,6 +807,12 @@ type Group =
   | { kind: "text"; text: string }
   | { kind: "activity"; parts: Extract<DisplayPart, { type: "data-activity" }>[] }
   | { kind: "part"; part: Exclude<DisplayPart, { type: "text" | "data-activity" }> };
+/** A workflow card shows its own controls, and its text is a summary for other surfaces. */
+function visibleParts(parts: readonly DisplayPart[]): readonly DisplayPart[] {
+  if (!parts.some((part) => part.type === "data-workflow")) return parts;
+  return parts.filter((part) => part.type !== "text" && part.type !== "data-actions");
+}
+
 export function groupParts(parts: readonly DisplayPart[]): Group[] {
   const groups: Group[] = [];
   for (const part of parts) {
@@ -1028,7 +1069,7 @@ const MessageBody = memo(function MessageBody(
     return () => clearTimeout(timer);
   }, [copiedAt]);
   const copyText = props.copyText ?? messageText(message);
-  const groups = useMemo(() => groupParts(message.parts), [message.parts]);
+  const groups = useMemo(() => groupParts(visibleParts(message.parts)), [message.parts]);
   const cards = useMemo(() => groupMessageCards(groups), [groups]);
   const reactions = useMemo(
     () => message.parts.flatMap((part) => (part.type === "data-reactions" ? part.data.items : [])),
@@ -1178,6 +1219,15 @@ const MessageBody = memo(function MessageBody(
                         </Button>
                       ))}
                     </div>
+                  );
+                case "data-workflow":
+                  return (
+                    <WorkflowCard
+                      key={part.id}
+                      messageId={message.id}
+                      card={part.data}
+                      actions={message.parts.find((item) => item.type === "data-actions")}
+                    />
                   );
                 case "data-reactions":
                   return lastContent < 0 ? (
