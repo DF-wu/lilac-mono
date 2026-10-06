@@ -16,7 +16,7 @@ import {
   type KeyboardCoordinateGetter,
   type CollisionDetection,
 } from "@dnd-kit/core";
-import { CircleCheck, ChevronDown, Pin, PinOff, Undo2 } from "lucide-react";
+import { Check, ChevronDown, Pin, PinOff, Undo2 } from "lucide-react";
 import type { SidebarSection } from "@stanley2058/lilac-client-protocol";
 import {
   dropAction,
@@ -178,7 +178,7 @@ export function ThreadQueue({
     setDrag(next);
   }
   const action = drag?.move ? dropAction(drag.from, drag.move.section) : undefined;
-  const ActionIcon = { Pin, Unpin: PinOff, Settle: CircleCheck, Unsettle: Undo2 }[action ?? "Pin"];
+  const ActionIcon = { Pin, Unpin: PinOff, Settle: Check, Unsettle: Undo2 }[action ?? "Pin"];
   return (
     <DndContext
       sensors={sensors}
@@ -265,6 +265,7 @@ export function ThreadQueue({
             <div className="thread-drag-preview relative bg-surface-raised shadow-overlay rounded-md cursor-grabbing">
               <ThreadCard
                 pinned={(drag.move?.section ?? drag.from) === "pinned"}
+                settled={(drag.move?.section ?? drag.from) === "settled"}
                 title={drag.thread.source?.title ?? "Untitled"}
                 starterName={drag.thread.source?.starterDisplayName ?? ""}
                 starterAvatarUrl={drag.thread.source?.starterAvatarUrl}

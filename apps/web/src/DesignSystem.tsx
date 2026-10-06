@@ -96,6 +96,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { Markdown } from "./components/Markdown";
 import { Composer } from "./components/Composer";
 import { Message, ThinkingIndicator } from "./components/Timeline";
+import { ThreadSettleButton } from "./components/ThreadSettleButton";
 import { ThreadQueueDemo } from "./components/ThreadQueueDemo";
 import { DeploymentSettingsForm } from "./components/DeploymentSettings";
 import { AgentWorkDemo } from "./components/AgentWorkDemo";
@@ -388,24 +389,7 @@ function Specimen({
   );
 }
 function DemoThreadActions({ onAction }: { onAction: (label: string) => void }) {
-  return (
-    <>
-      <IconButton
-        label="Settle conversation"
-        tooltip="Settle"
-        onClick={() => onAction("Settle selected")}
-      >
-        <Check />
-      </IconButton>
-      <IconButton
-        label="Rename conversation"
-        tooltip="Rename"
-        onClick={() => onAction("Rename selected")}
-      >
-        <Pencil />
-      </IconButton>
-    </>
-  );
+  return <ThreadSettleButton onClick={() => onAction("Settle selected")} />;
 }
 function Foundations() {
   return (
