@@ -300,6 +300,7 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   ["src/surface/bridge/bus-agent-runner.ts", "getSubagentOkFromResult"],
   ["src/surface/bridge/bus-agent-runner.ts", "decodeDeferredSubagentAcceptedResult"],
   ["src/surface/bridge/bus-agent-runner.ts", "collectAutoInjectedThreadIds"],
+  ["src/surface/bridge/bus-agent-runner.ts", "closeLegacyDeferredSubagentCalls"],
   ["src/surface/bridge/bus-agent-runner.ts", "validateCorePrimaryLineageAtRunnerIntake"],
   ["src/surface/bridge/bus-agent-runner.ts", "appendAutoInjectedThreadSearchLineage"],
   ["src/surface/bridge/bus-agent-runner.ts", "collectBufferedPromptEntriesForActiveRequest"],
@@ -446,7 +447,6 @@ export const CORE_FINAL_CAPABILITY_IDENTITIES = [
   ["src/tools/tool-env.ts", "isMissingToolEnvFile"],
   ["src/plugins/builtin/local-tools.ts", "isDelegateHandler"],
   ["src/plugins/builtin/local-tools.ts", "isAgentActivityHandler"],
-  ["src/surface/bridge/bus-agent-runner.ts", "hasDeferredSubagentWorkflowCall"],
   ["src/surface/bridge/bus-agent-runner.ts", "isWorkflowAgentRecoveryEntry"],
   ["src/surface/bridge/bus-agent-runner.ts", "isCancelControlEntry"],
 ] as const;

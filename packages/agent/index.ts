@@ -14,3 +14,4 @@ export * from "./tool-call-id-normalization";
 export * from "./transient-model-retry";
 
 export { ToolCallScheduler } from "./tool-call-scheduling";
+export * from "./generated-message";

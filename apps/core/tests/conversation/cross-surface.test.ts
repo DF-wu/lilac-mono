@@ -342,7 +342,15 @@ test("automatic recall carries both surfaces and does not apply origin IDs to ot
       throw new Error(JSON.stringify(error));
     },
   });
-  const serialized = JSON.stringify(output);
+  expect(output).toHaveLength(1);
+  expect(output[0]?.role).toBe("user");
+  const serialized = output
+    .flatMap((message) =>
+      typeof message.content === "string"
+        ? [message.content]
+        : message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+    )
+    .join("\n");
   expect(serialized).toContain('"surface":"native"');
   expect(serialized).toContain('"surface":"discord"');
   expect(serialized).toContain(n.ref);

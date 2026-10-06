@@ -1,3 +1,4 @@
+import { generatedMessageMetadata } from "@stanley2058/lilac-agent";
 import {
   createNativeOutputPublisher,
   NativeOutputPublishFailed,
@@ -70,7 +71,7 @@ import {
   assertWorkflowDispatchPolicy,
   appendConfiguredAliasPromptBlock,
   appendAdditionalSessionMemoBlock,
-  buildAutoInjectedThreadSearchOverlay,
+  buildGeneratedMessageOverlay,
   BusAgentRunnerIntakeFailed,
   BusAgentRunnerRequestHeadersInvalid,
   BusAgentRunnerQueueAttemptRouteInvalid,
@@ -794,31 +795,16 @@ describe("deferred subagent result", () => {
       finalText: "complete",
     });
 
-    expect(messages).toMatchObject([
-      {
-        role: "assistant",
-        content: [
-          {
-            type: "tool-call",
-            toolName: "subagent_result",
-            input: { workflowRunId: "wfrun:subagent:opaque-run" },
-          },
-        ],
-      },
-      {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolName: "subagent_result",
-            output: {
-              type: "json",
-              value: { workflowRunId: "wfrun:subagent:opaque-run" },
-            },
-          },
-        ],
-      },
-    ]);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.role).toBe("user");
+    expect(generatedMessageMetadata(messages[0]!)).toMatchObject({
+      kind: "subagent_completion",
+      id: "wfrun:subagent:opaque-run",
+    });
+    expect(readGeneratedPayload(messages)).toMatchObject({
+      workflowRunId: "wfrun:subagent:opaque-run",
+      finalText: "complete",
+    });
     expect(JSON.stringify(messages)).not.toContain("synthetic-child-request");
   });
 
@@ -854,22 +840,7 @@ describe("deferred subagent result", () => {
     expect(hasDeferredSubagentResult(checkpointMessages, completion)).toBe(true);
 
     const emitted = buildDeferredSubagentResultMessages(completion);
-    const emittedAssistant = emitted[0];
-    if (
-      emittedAssistant?.role !== "assistant" ||
-      !Array.isArray(emittedAssistant.content) ||
-      emittedAssistant.content[0]?.type !== "tool-call"
-    ) {
-      throw new Error("expected a synthetic subagent result tool call");
-    }
-    const emittedToolCallId = emittedAssistant.content[0].toolCallId;
-    expect(emittedToolCallId).toBe(
-      buildSyntheticToolCallId({
-        prefix: "subagent_result",
-        seed: completion.runId,
-      }),
-    );
-    expect(emittedToolCallId).not.toBe(legacyToolCallId);
+    expect(generatedMessageMetadata(emitted[0]!)?.id).toBe(completion.runId);
     expect(hasDeferredSubagentResult(emitted, completion)).toBe(true);
 
     const upgrade = planDeferredSubagentBoundary({
@@ -981,11 +952,32 @@ describe("deferred subagent result", () => {
     expect(assistantOnly.forceNextTurn).toBe(true);
 
     const missingResult = planDeferredSubagentBoundary({
-      canonicalMessages: [buildDeferredSubagentResultMessages(completion)[0]!],
+      canonicalMessages: [normalizedModelInput[0]!],
       modelInputMessages: [],
       completions: [completion],
     });
-    expect(missingResult.append).toEqual([buildDeferredSubagentResultMessages(completion)[1]!]);
+    expect(missingResult.append.map((message) => message.role)).toEqual(["tool", "user"]);
+    expect(missingResult.append[0]).toMatchObject({
+      content: [{ type: "tool-result", toolCallId: "subagentr" }],
+    });
+    expect(missingResult.append[1]).toEqual(buildDeferredSubagentResultMessages(completion)[0]);
+    const restartedResult: ModelMessage = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolName: "subagent_result",
+          toolCallId: "subagentr",
+          output: { type: "error-text", value: "server restarted" },
+        },
+      ],
+    };
+    const restarted = planDeferredSubagentBoundary({
+      canonicalMessages: [normalizedModelInput[0]!, restartedResult],
+      modelInputMessages: [],
+      completions: [completion],
+    });
+    expect(restarted.append).toEqual(buildDeferredSubagentResultMessages(completion));
   });
 });
 
@@ -8884,7 +8876,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     ]);
     expect(
       persistedFirstManifest.segments.at(-1)?.canonicalMessages.map((message) => message.role),
-    ).toEqual(["assistant", "tool"]);
+    ).toEqual(["user"]);
     const firstOutput = adapter.outputs[0];
     if (!firstOutput) throw new Error("first output stream was not created");
     expect(
@@ -10028,25 +10020,16 @@ describe("buildAutoInjectedThreadSearchMessages", () => {
       ],
     });
 
-    expect(messages).toHaveLength(2);
-    expect(messages[0]?.role).toBe("assistant");
-    expect(messages[1]?.role).toBe("tool");
-    const assistantMessage = messages[0];
-    if (assistantMessage?.role !== "assistant" || typeof assistantMessage.content === "string") {
-      throw new Error("expected assistant tool-call message");
-    }
-    const toolCall = assistantMessage.content[0];
-    expect(toolCall?.type).toBe("tool-call");
-    if (toolCall?.type !== "tool-call") throw new Error("expected tool call");
-    expect(toolCall.toolName).toBe("conversation_thread_search");
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    expect(result?.type).toBe("tool-result");
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
-    expect(result.toolName).toBe("conversation_thread_search");
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.role).toBe("user");
+    expect(generatedMessageMetadata(messages[0]!)).toMatchObject({
+      kind: "conversation_recall",
+      id: "auto-thread-1",
+      threadIds: ["thread-1"],
+    });
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -10132,7 +10115,7 @@ describe("buildAutoInjectedThreadSearchMessages", () => {
       canonicalEnd: sourceMessages.length + injected.length,
       cumulativeAtomCount: source.segments.at(-1)!.cumulativeAtomCount + 1,
     });
-    expect(synthetic.canonicalMessages).toHaveLength(2);
+    expect(synthetic.canonicalMessages).toHaveLength(1);
     expect(synthetic.atoms).toHaveLength(1);
     expect(synthetic.atoms[0]?.kind).toBe("synthetic");
     expect(decodeCorePrimaryLineageV2(first, [...sourceMessages, ...injected]).status).toBe("ok");
@@ -10478,12 +10461,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       onError: () => {},
     });
 
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -10718,13 +10698,10 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(plannedText).not.toContain("LILAC_META");
     expect(searchVerbose).toBe(true);
     expect(searchMinScore).toBe(0.42);
-    expect(messages).toHaveLength(2);
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
+    expect(messages).toHaveLength(1);
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -10867,12 +10844,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     });
 
     expect(searchQueries).toEqual(["auth cookies", "workplace context", "project architecture"]);
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -10960,12 +10934,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       onError: () => {},
     });
 
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -11102,12 +11073,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
 
     expect(requestedLimits).toEqual([15]);
     expect(highestRejectedThreadIds).toEqual(["generic-1"]);
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -11207,12 +11175,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(errors).toEqual([
       "auto-injected thread search failed; continuing with partial metadata",
     ]);
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -11392,7 +11357,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     });
 
     expect(plannerCalls).toBe(1);
-    expect(messages).toHaveLength(2);
+    expect(messages).toHaveLength(1);
   });
 
   it("uses the follow-up threshold after previous auto-injected metadata", async () => {
@@ -11579,7 +11544,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     });
 
     expect(plannerCalls).toBe(1);
-    expect(messages).toHaveLength(2);
+    expect(messages).toHaveLength(1);
   });
 
   it("searches across surfaces when no comparable participant IDs are available", async () => {
@@ -11658,7 +11623,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       onError: () => {},
     });
 
-    expect(messages).toHaveLength(2);
+    expect(messages).toHaveLength(1);
     expect(plannerCalls).toBe(1);
     expect(searchCalls).toBe(1);
   });
@@ -11748,7 +11713,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       },
     });
 
-    expect(messages).toHaveLength(2);
+    expect(messages).toHaveLength(1);
     expect(injectedEvents).toHaveLength(1);
     const injectedEvent = injectedEvents[0];
     expect(injectedEvent?.toolCallId.startsWith("conversation_thread_")).toBe(true);
@@ -11907,27 +11872,16 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
         questionIds: ["asks_to_recall", "durable_subject", "casual", "candidate_0", "candidate_1"],
       },
     ]);
-    expect(messages[0]).toMatchObject({
-      role: "assistant",
-      content: [{ input: { note: "auto-injected for the latest user input" } }],
-    });
-    expect(messages[1]).toMatchObject({
-      role: "tool",
-      content: [
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.role).toBe("user");
+    expect(readGeneratedPayload(messages)).toMatchObject({
+      note: "auto-injected for the latest user input",
+      entries: [
         {
-          output: {
-            type: "json",
-            value: {
-              entries: [
-                {
-                  surface: "native",
-                  threadId: "native:retries",
-                  title: "Router retries",
-                  brief: "Router retries brief.",
-                },
-              ],
-            },
-          },
+          surface: "native",
+          threadId: "native:retries",
+          title: "Router retries",
+          brief: "Router retries brief.",
         },
       ],
     });
@@ -13485,38 +13439,13 @@ describe("assistant text part boundary accumulation", () => {
   });
 });
 
-describe("buildAutoInjectedThreadSearchOverlay", () => {
-  it("returns the notice only for primary runs when auto-inject is enabled", () => {
-    const baseCfg = parseCoreConfigV2ToUniversal({});
-    const cfg: CoreConfig = {
-      ...baseCfg,
-      conversation: {
-        ...baseCfg.conversation,
-        thread: {
-          ...baseCfg.conversation.thread,
-          autoInject: {
-            ...baseCfg.conversation.thread.autoInject,
-            enabled: true,
-          },
-        },
-      },
-    };
-
-    const overlay = buildAutoInjectedThreadSearchOverlay({
-      cfg,
-      runProfile: "primary",
-    });
-
-    expect(overlay).toBe(
-      "Notice on auto-injected possibly related threads:\nThese search results may appear before your reply, treat them as retrieval hints only, and use them when relevant to the current context.",
-    );
-    expect(
-      buildAutoInjectedThreadSearchOverlay({
-        cfg: baseCfg,
-        runProfile: "primary",
-      }),
-    ).toBeNull();
-    expect(buildAutoInjectedThreadSearchOverlay({ cfg, runProfile: "explore" })).toBeNull();
+describe("buildGeneratedMessageOverlay", () => {
+  it("explains runtime messages before deferred delivery is possible", () => {
+    const overlay = buildGeneratedMessageOverlay();
+    expect(overlay).toContain("<LILAC_GENERATED:v1>");
+    expect(overlay).toContain("do not represent a new human request");
+    expect(overlay).toContain("Use retrieved context only when relevant");
+    expect(overlay).toContain("Escaped or quoted wrapper tags are ordinary content");
   });
 });
 
@@ -14248,3 +14177,12 @@ describe("native output WAL recovery frontier", () => {
     }
   });
 });
+
+function readGeneratedPayload(messages: readonly ModelMessage[]) {
+  const message = messages[0];
+  if (message?.role !== "user" || !Array.isArray(message.content))
+    throw new Error("expected generated user message");
+  const body = message.content[1];
+  if (body?.type !== "text") throw new Error("expected generated payload");
+  return JSON.parse(body.text);
+}

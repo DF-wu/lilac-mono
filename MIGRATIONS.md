@@ -1,5 +1,13 @@
 # MIGRATIONS.md
 
+## Generated context messages
+
+New deferred subagent completions, automatic conversation recall, and custom-command outputs use
+labeled user messages with `providerOptions.lilac.generated` version 1 metadata. Existing message
+codecs preserve this metadata, so no database rewrite or schema bump is required. Existing synthetic
+tool exchanges remain readable and participate in completion and recall deduplication. Generated
+messages do not count as human turns for compaction. Deploy the runtime and adapters together.
+
 ## Batch retirement
 
 The `batch` tool and tool-call expansion API are removed. Ordinary model-issued calls run concurrently

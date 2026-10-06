@@ -1,3 +1,4 @@
+import { isGeneratedMessage } from "./generated-message";
 import { streamText, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
@@ -564,7 +565,8 @@ function hasCompletedAssistantToolTurn(messages: readonly ModelMessage[], start:
 
 function isContinuableTurnStart(messages: readonly ModelMessage[], index: number): boolean {
   const message = messages[index];
-  if (message?.role === "user") return !isAutoContinueMessage(message);
+  if (message?.role === "user")
+    return !isAutoContinueMessage(message) && !isGeneratedMessage(message);
   return hasCompletedAssistantToolTurn(messages, index);
 }
 
@@ -620,7 +622,7 @@ function renderMessageForSummary(message: ModelMessage): string {
   if (message.role === "user") {
     const content =
       typeof message.content === "string" ? message.content : stringifyTextOnly(message.content, 2);
-    return `USER:\n${content}`;
+    return `${isGeneratedMessage(message) ? "GENERATED CONTEXT" : "USER"}:\n${content}`;
   }
 
   if (message.role === "assistant") {

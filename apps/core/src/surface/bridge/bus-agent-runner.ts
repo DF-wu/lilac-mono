@@ -1,3 +1,9 @@
+import {
+  buildGeneratedMessage,
+  generatedMessageMetadata,
+  isGeneratedMessage,
+} from "@stanley2058/lilac-agent";
+import { customCommandUserContent } from "./bus-agent-runner/generated-command-content";
 import { expandConversationReferencesForModel } from "./conversation-references";
 import type { NativeOutputFrontier } from "@stanley2058/lilac-event-bus";
 import {
@@ -299,7 +305,7 @@ export {
 export {
   appendAdditionalSessionMemoBlock,
   appendConfiguredAliasPromptBlock,
-  buildAutoInjectedThreadSearchOverlay,
+  buildGeneratedMessageOverlay,
   buildHeartbeatOverlayForRequest,
   buildRestrictedSessionOverlay,
   buildSurfaceMetadataOverlay,
@@ -825,7 +831,7 @@ export function maybeMarkOldToolOutputsCompacted(params: {
   // This mirrors OpenCode's "turns < 2" behavior.
   outer: for (let msgIndex = params.messages.length - 1; msgIndex >= 0; msgIndex--) {
     const msg = params.messages[msgIndex]!;
-    if (msg.role === "user") turns++;
+    if (msg.role === "user" && !isGeneratedMessage(msg)) turns++;
     if (turns < 2) continue;
 
     if (msg.role !== "tool") continue;
@@ -991,36 +997,26 @@ function buildCustomCommandMessages(params: {
   text: string;
   source: "text" | "discord-slash";
   output: CustomCommandResult;
+  provider: string;
 }): ModelMessage[] {
   return [
-    {
-      role: "assistant",
+    buildGeneratedMessage({
+      kind: "custom_command_result",
+      id: params.toolCallId,
       content: [
         {
-          type: "tool-call",
-          toolCallId: params.toolCallId,
-          toolName: CUSTOM_COMMAND_TOOL_NAME,
-          input: {
+          type: "text",
+          text: JSON.stringify({
             name: params.name,
             args: params.args,
-            ...(params.prompt ? { prompt: params.prompt } : {}),
+            prompt: params.prompt,
             text: params.text,
             source: params.source,
-          },
+          }),
         },
+        ...customCommandUserContent(params.output, params.provider),
       ],
-    },
-    {
-      role: "tool",
-      content: [
-        {
-          type: "tool-result",
-          toolCallId: params.toolCallId,
-          toolName: CUSTOM_COMMAND_TOOL_NAME,
-          output: params.output,
-        },
-      ],
-    },
+    }),
   ];
 }
 
@@ -1128,33 +1124,15 @@ export function buildAutoInjectedThreadSearchMessages(params: {
   };
 
   return [
-    {
-      role: "assistant",
-      content: [
-        {
-          type: "tool-call",
-          toolCallId: params.toolCallId,
-          toolName: AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME,
-          input: {
-            note: params.note ?? "auto-injected after long user input",
-          },
-        },
-      ],
-    },
-    {
-      role: "tool",
-      content: [
-        {
-          type: "tool-result",
-          toolCallId: params.toolCallId,
-          toolName: AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME,
-          output: {
-            type: "json",
-            value: payload,
-          },
-        },
-      ],
-    },
+    buildGeneratedMessage({
+      kind: "conversation_recall",
+      id: params.toolCallId,
+      threadIds: payload.entries.map((entry) => entry.threadId),
+      content: JSON.stringify({
+        note: params.note ?? "auto-injected after long user input",
+        ...payload,
+      }),
+    }),
   ];
 }
 
@@ -1195,6 +1173,13 @@ function collectAutoInjectedThreadIds(messages: readonly ModelMessage[]): Set<st
   const threadIds = new Set<string>();
 
   for (const message of messages) {
+    const generated = generatedMessageMetadata(message);
+    if (generated?.kind === "conversation_recall" && Array.isArray(generated.threadIds)) {
+      for (const id of generated.threadIds) {
+        if (typeof id === "string") threadIds.add(id);
+      }
+      continue;
+    }
     const content: unknown = message.content;
     if (message.role !== "tool" || !Array.isArray(content)) continue;
 
@@ -1698,7 +1683,6 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(
 export function buildDeferredSubagentResultMessages(
   completion: WorkflowLiveParentCompletion,
 ): ModelMessage[] {
-  const toolCallId = buildSubagentResultToolCallId(completion.runId);
   const payload = {
     ok: completion.ok,
     mode: "deferred" as const,
@@ -1711,36 +1695,11 @@ export function buildDeferredSubagentResultMessages(
   };
 
   return [
-    {
-      role: "assistant",
-      content: [
-        {
-          type: "tool-call",
-          toolCallId,
-          toolName: "subagent_result",
-          input: {
-            profile: completion.profile,
-            sessionName: completion.sessionName,
-            status: completion.status,
-            workflowRunId: completion.runId,
-          },
-        },
-      ],
-    },
-    {
-      role: "tool",
-      content: [
-        {
-          type: "tool-result",
-          toolCallId,
-          toolName: "subagent_result",
-          output: {
-            type: "json",
-            value: payload,
-          },
-        },
-      ],
-    },
+    buildGeneratedMessage({
+      kind: "subagent_completion",
+      id: completion.runId,
+      content: JSON.stringify(payload),
+    }),
   ];
 }
 
@@ -1756,31 +1715,13 @@ function hasToolResult(messages: readonly ModelMessage[], toolCallId: string): b
   );
 }
 
-function hasDeferredSubagentWorkflowCall(
-  messages: readonly ModelMessage[],
-  workflowRunId: string,
-): boolean {
-  for (const message of messages) {
-    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
-    for (const part of message.content) {
-      if (
-        part.type === "tool-call" &&
-        part.toolName === "subagent_result" &&
-        isRecord(part.input) &&
-        part.input["workflowRunId"] === workflowRunId
-      ) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 function hasDeferredSubagentWorkflowResult(
   messages: readonly ModelMessage[],
   workflowRunId: string,
 ): boolean {
   for (const message of messages) {
+    const generated = generatedMessageMetadata(message);
+    if (generated?.kind === "subagent_completion" && generated.id === workflowRunId) return true;
     if (message.role !== "tool") continue;
     for (const part of message.content) {
       if (
@@ -1801,20 +1742,7 @@ function hasConsumedDeferredSubagentResult(
   messages: readonly ModelMessage[],
   completion: Pick<WorkflowLiveParentCompletion, "runId">,
 ): boolean {
-  for (const message of messages) {
-    if (message.role !== "tool") continue;
-    for (const part of message.content) {
-      if (part.type !== "tool-result" || part.toolName !== "subagent_result") continue;
-      if (
-        part.output.type === "json" &&
-        isRecord(part.output.value) &&
-        part.output.value["workflowRunId"] === completion.runId
-      ) {
-        return true;
-      }
-    }
-  }
-  return false;
+  return hasDeferredSubagentWorkflowResult(messages, completion.runId);
 }
 
 export function hasDeferredSubagentResult(
@@ -1828,14 +1756,34 @@ export function hasDeferredSubagentResult(
   );
 }
 
-function hasCurrentDeferredSubagentResult(
+function closeLegacyDeferredSubagentCalls(
   messages: readonly ModelMessage[],
-  completion: Pick<WorkflowLiveParentCompletion, "runId">,
-): boolean {
-  return (
-    hasDeferredSubagentWorkflowResult(messages, completion.runId) ||
-    hasToolResult(messages, buildSubagentResultToolCallId(completion.runId))
-  );
+  runId: string,
+): ModelMessage[] {
+  const closures: ModelMessage[] = [];
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type !== "tool-call" || part.toolName !== "subagent_result") continue;
+      if (!isRecord(part.input) || part.input["workflowRunId"] !== runId) continue;
+      if (hasToolResult(messages, part.toolCallId)) continue;
+      closures.push({
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolName: part.toolName,
+            toolCallId: part.toolCallId,
+            output: {
+              type: "text",
+              value: "Completion delivered in the following generated user message.",
+            },
+          },
+        ],
+      });
+    }
+  }
+  return closures;
 }
 
 export function planDeferredSubagentBoundary(input: {
@@ -1853,11 +1801,11 @@ export function planDeferredSubagentBoundary(input: {
   const consumed = new Set(consumedRunIds);
   const unconsumed = input.completions.filter((completion) => !consumed.has(completion.runId));
   const append = unconsumed.flatMap((completion) => {
-    if (hasCurrentDeferredSubagentResult(input.canonicalMessages, completion)) return [];
-    const messages = buildDeferredSubagentResultMessages(completion);
-    return hasDeferredSubagentWorkflowCall(input.canonicalMessages, completion.runId)
-      ? messages.slice(1)
-      : messages;
+    if (hasDeferredSubagentWorkflowResult(input.canonicalMessages, completion.runId)) return [];
+    return [
+      ...closeLegacyDeferredSubagentCalls(input.canonicalMessages, completion.runId),
+      ...buildDeferredSubagentResultMessages(completion),
+    ];
   });
 
   return {
@@ -2063,7 +2011,9 @@ export function validateCorePrimaryLineageAtRunnerIntake(input: {
   if (input.requestClient !== "discord" || input.runProfile !== "primary") return undefined;
   const fallbackCurrentCanonicalStart = Math.max(
     0,
-    input.messages.findLastIndex((message) => message.role === "user"),
+    input.messages.findLastIndex(
+      (message) => message.role === "user" && !isGeneratedMessage(message),
+    ),
   );
   if (input.corePrimaryLineage === undefined) {
     return createFreshOnlyLineage("missing-manifest", fallbackCurrentCanonicalStart);
@@ -2128,7 +2078,9 @@ export function appendAutoInjectedThreadSearchLineage(input: {
     ? parsedShape.data.currentCanonicalStart
     : Math.max(
         0,
-        input.canonicalMessages.findLastIndex((message) => message.role === "user"),
+        input.canonicalMessages.findLastIndex(
+          (message) => message.role === "user" && !isGeneratedMessage(message),
+        ),
       );
   const failClosed = () =>
     degradeCorePrimaryLineageForMutation(
@@ -5583,8 +5535,11 @@ export async function startBusAgentRunner(params: {
 
     let initialMessages: ModelMessage[] = [];
     const parsedCustomCommand = next.recovery ? null : parseCustomCommandFromRaw(next.raw);
-    let customCommandMessages: ModelMessage[] = [];
-    let initialMessagesEndWithInjectedTool = false;
+    let customCommandInput: Omit<
+      Parameters<typeof buildCustomCommandMessages>[0],
+      "provider"
+    > | null = null;
+    let initialMessagesEndWithGeneratedContext = false;
     let responseStartIndex = 0;
     let transcriptHasCompactionCheckpoint = corePrimaryLineageHasCompactionCheckpoint(
       next.corePrimaryLineage,
@@ -5950,7 +5905,7 @@ export async function startBusAgentRunner(params: {
               ),
             );
 
-            customCommandMessages = buildCustomCommandMessages({
+            customCommandInput = {
               toolCallId,
               name: parsedCustomCommand.name,
               args: parsedCustomCommand.args,
@@ -5958,7 +5913,7 @@ export async function startBusAgentRunner(params: {
               text: parsedCustomCommand.text,
               source: parsedCustomCommand.source,
               output,
-            });
+            };
 
             await publishNonAgentToolStatus({
               toolCallId,
@@ -5978,7 +5933,7 @@ export async function startBusAgentRunner(params: {
 
               if (params.transcriptStore) {
                 const storedCustomMessages = projectStoredMessagesV1([
-                  ...customCommandMessages,
+                  ...buildCustomCommandMessages({ ...customCommandInput, provider: "" }),
                   {
                     role: "assistant",
                     content: finalText,
@@ -7958,7 +7913,17 @@ export async function startBusAgentRunner(params: {
             initialMessages = [...next.messages];
             agent.appendMessages(initialMessages);
             responseStartIndex = agent.state.messages.length;
-            agent.appendMessages(customCommandMessages);
+            const commandModel = activeBinding.resolved.model;
+            const commandProvider =
+              typeof commandModel === "string" ? "gateway" : commandModel.provider.split(".")[0]!;
+            if (customCommandInput)
+              agent.appendMessages(
+                buildCustomCommandMessages({
+                  ...customCommandInput,
+                  provider:
+                    activeBinding.resolved.provider === "codex" ? "openai" : commandProvider,
+                }),
+              );
           } else {
             // First message should be a prompt.
             // If additional messages for the same request id were queued before the run started,
@@ -8092,7 +8057,7 @@ export async function startBusAgentRunner(params: {
               });
               if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
             }
-            initialMessagesEndWithInjectedTool = autoInjectedThreadSearchMessages.length > 0;
+            initialMessagesEndWithGeneratedContext = autoInjectedThreadSearchMessages.length > 0;
             responseStartIndex = agent.state.messages.length + initialMessages.length;
           }
 
@@ -8113,7 +8078,7 @@ export async function startBusAgentRunner(params: {
 
           if (parsedCustomCommand) {
             await waitForRunAtHost(agent.continue());
-          } else if (initialMessagesEndWithInjectedTool) {
+          } else if (initialMessagesEndWithGeneratedContext) {
             agent.appendMessages(initialMessages);
             await waitForRunAtHost(agent.continue());
           } else {
