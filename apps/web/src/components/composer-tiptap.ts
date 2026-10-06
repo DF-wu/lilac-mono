@@ -1,8 +1,10 @@
 import { Extension, Node, getSchema, type Editor, type JSONContent } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
-import { Slice, type Node as DocumentNode, type Schema } from "@tiptap/pm/model";
+import { Slice, type Node as DocumentNode, type ResolvedPos, type Schema } from "@tiptap/pm/model";
 import { EditorState, TextSelection } from "@tiptap/pm/state";
+import type { EditorView } from "@tiptap/pm/view";
+import { parseReferenceHref, referenceHref } from "@stanley2058/lilac-client-protocol";
 import { KEYS, NodeApi } from "platejs";
 import {
   createComposerEditor,
@@ -17,6 +19,7 @@ export const attachmentNode = Node.create({
   group: "inline",
   inline: true,
   atom: true,
+  selectable: false,
   addAttributes: () => ({ attachmentKey: { default: "" }, name: { default: "File" } }),
   parseHTML: () => [{ tag: "span[data-composer-attachment]" }],
   renderHTML: ({ HTMLAttributes }) => [
@@ -30,6 +33,7 @@ export const referenceNode = Node.create({
   group: "inline",
   inline: true,
   atom: true,
+  selectable: false,
   addAttributes: () => ({ url: { default: "" } }),
   parseHTML: () => [{ tag: "span[data-composer-reference]" }],
   renderHTML: ({ HTMLAttributes }) => [
@@ -38,6 +42,44 @@ export const referenceNode = Node.create({
     HTMLAttributes.url,
   ],
 });
+
+export function insertEditorReference(
+  view: EditorView,
+  from: number,
+  to: number,
+  text: string,
+  origin: string,
+): boolean {
+  const target = parseReferenceHref(text.trim(), origin);
+  if (!target) return false;
+  const node = view.state.schema.nodes.composer_reference!.create({ url: referenceHref(target) });
+  const transaction = view.state.tr;
+  if (transaction.selection.from !== from || transaction.selection.to !== to)
+    transaction.setSelection(TextSelection.create(transaction.doc, from, to));
+  view.dispatch(transaction.replaceSelectionWith(node).scrollIntoView());
+  return true;
+}
+
+export function composerBadgeSelection(
+  view: EditorView,
+  anchor: ResolvedPos,
+): TextSelection | null {
+  // Native edits can request a selection in a document the view has not applied yet.
+  if (anchor.doc !== view.state.doc) return null;
+  const selection = view.dom.ownerDocument.getSelection();
+  if (!selection?.isCollapsed || !selection.focusNode) return null;
+  const focus = selection.focusNode;
+  const element = focus.nodeType === 1 ? (focus as Element) : focus.parentElement;
+  const badge = element?.closest("[data-composer-badge]");
+  if (!badge || !view.dom.contains(badge)) return null;
+  const from = view.posAtDOM(badge, 0);
+  const node = view.state.doc.nodeAt(from);
+  if (!node?.isAtom) return null;
+  const to = from + node.nodeSize;
+  // Android drops its IME connection at non-editable spans. Keep the DOM editable,
+  // then move native caret positions inside a badge across the atomic model node.
+  return TextSelection.create(view.state.doc, view.state.selection.head >= to ? from : to);
+}
 
 const indentation = Extension.create({
   name: "composerIndentation",

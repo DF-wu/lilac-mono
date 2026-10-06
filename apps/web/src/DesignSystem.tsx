@@ -870,7 +870,7 @@ function ComposerSpecimen() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(false);
   const [text, setText] = useState(
-    "Help me turn these **notes** into a weekend plan.\n\nKeep Sunday free.\nhttps://example.com/weekend",
+    "Help me turn these **notes** into a weekend plan.\n\nCompare [the discussion](/?ref=discord%3Aweekend). Keep Sunday free.\nhttps://example.com/weekend",
   );
   const [disabled, setDisabled] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>(() => [

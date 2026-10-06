@@ -1,7 +1,7 @@
 import { Kbd } from "./ui/kbd";
 import { shortcutOverlayOpen } from "../shortcuts";
 import { formatBinding, ariaBinding } from "../keybindings";
-import { parseReferenceHref, referenceHref } from "@stanley2058/lilac-client-protocol";
+import { parseReferenceHref } from "@stanley2058/lilac-client-protocol";
 import { ConversationBadge } from "./ConversationReference";
 import { FileIcon } from "./FileIcon";
 import { FileActions } from "./FileActions";
@@ -58,6 +58,8 @@ import {
   editorAttachmentKeys,
   completeEditor,
   replaceEditorDocument,
+  insertEditorReference,
+  composerBadgeSelection,
 } from "./composer-tiptap";
 export {
   createComposerEditor,
@@ -111,7 +113,6 @@ function AttachmentElement(props: NodeViewProps) {
               <span
                 data-ui="composer-attachment-chip"
                 className={`composer-attachment-chip relative inline-flex items-center gap-1 max-w-full px-2 rounded-sm whitespace-nowrap ${referenceChipStyles}`}
-                contentEditable={false}
                 data-state={attachment?.state ?? "missing"}
               />
             }
@@ -169,7 +170,7 @@ function ReferenceElement(props: NodeViewProps) {
   const target = parseReferenceHref(href);
   return (
     <NodeViewWrapper as="span">
-      <span contentEditable={false}>{target ? <ConversationBadge target={target} /> : href}</span>
+      {target ? <ConversationBadge target={target} /> : href}
     </NodeViewWrapper>
   );
 }
@@ -213,12 +214,25 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
     extensions: [
       ...composerExtensions,
       Placeholder.configure({ placeholder: () => current.current.placeholder }),
-      attachmentNode.extend({ addNodeView: () => ReactNodeViewRenderer(AttachmentElement) }),
-      referenceNode.extend({ addNodeView: () => ReactNodeViewRenderer(ReferenceElement) }),
+      attachmentNode.extend({
+        addNodeView: () =>
+          ReactNodeViewRenderer(AttachmentElement, {
+            attrs: { contenteditable: "inherit", "data-composer-badge": "" },
+          }),
+      }),
+      referenceNode.extend({
+        addNodeView: () =>
+          ReactNodeViewRenderer(ReferenceElement, {
+            attrs: { contenteditable: "inherit", "data-composer-badge": "" },
+          }),
+      }),
     ],
     content: initialDocument,
     editable: !props.disabled,
     editorProps: {
+      createSelectionBetween: composerBadgeSelection,
+      handleTextInput: (view, from, to, text) =>
+        insertEditorReference(view, from, to, text, location.origin),
       attributes: {
         class: "composer-editor",
         "data-ui": "composer-input",
@@ -242,14 +256,8 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
         const clipboard = event.clipboardData;
         if (!clipboard) return false;
         const text = clipboard.getData("text/plain");
-        const target = parseReferenceHref(text.trim(), location.origin);
-        if (target) {
-          const node = view.state.schema.nodes.composer_reference!.create({
-            url: referenceHref(target),
-          });
-          view.dispatch(view.state.tr.replaceSelectionWith(node).scrollIntoView());
-          return true;
-        }
+        const { from, to } = view.state.selection;
+        if (insertEditorReference(view, from, to, text, location.origin)) return true;
         if (clipboard.getData("text/html")) return false;
         if (!text) return false;
         view.dispatch(

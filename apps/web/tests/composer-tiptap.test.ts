@@ -14,6 +14,8 @@ import {
   captureEditorPaste,
   composerCompletionPrefix,
   completeEditor,
+  insertEditorReference,
+  composerBadgeSelection,
 } from "../src/components/composer-tiptap";
 import { createComposerEditor, composerMarkdown } from "../src/components/composer-document";
 
@@ -27,6 +29,79 @@ function headlessEditor(text: string) {
   Object.defineProperty(editor, "isDestroyed", { get: () => false });
   return editor;
 }
+
+it("converts a keyboard-inserted reference at its replacement range and supports undo", () => {
+  const editor = headlessEditor("before replace after");
+  editor.registerPlugin(history());
+  const url = "https://lilac.stw.tw/?ref=discord%3A1556290807915610183&range=first..last";
+  expect(insertEditorReference(editor.view, 8, 15, url, "https://lilac.stw.tw")).toBe(true);
+  expect(editor.state.doc.firstChild?.child(1).type.name).toBe("composer_reference");
+  expect(editor.state.doc.firstChild?.child(1).attrs.url).toBe(
+    "/?ref=discord%3A1556290807915610183&range=first..last",
+  );
+  expect(editor.state.selection.from).toBe(9);
+  expect(composerText(editor.state.doc)).toContain("before ");
+  expect(composerText(editor.state.doc)).toEndWith(" after");
+  undo(editor.state, editor.view.dispatch);
+  expect(composerText(editor.state.doc)).toBe("before replace after");
+  editor.destroy();
+});
+
+it("leaves ordinary keyboard text and foreign-origin references unchanged", () => {
+  const editor = headlessEditor("before after");
+  for (const text of [
+    "hello",
+    "h",
+    "https://example.com/?ref=discord%3Atest",
+    "https://lilac.stw.tw/",
+  ]) {
+    expect(insertEditorReference(editor.view, 8, 8, text, "https://lilac.stw.tw")).toBe(false);
+    expect(composerText(editor.state.doc)).toBe("before after");
+  }
+  editor.destroy();
+});
+
+it("keeps reference insertion selections valid after fitting the document", () => {
+  const editor = headlessEditor("before\n\nafter");
+  editor.view.dispatch(editor.state.tr.setSelection(new AllSelection(editor.state.doc)));
+  insertEditorReference(
+    editor.view,
+    0,
+    editor.state.doc.content.size,
+    "/?ref=discord%3Atest",
+    "https://lilac.stw.tw",
+  );
+  expect(editor.state.selection.from).toBe(2);
+  expect(editor.state.selection.$from.nodeBefore?.type.name).toBe("composer_reference");
+  editor.destroy();
+
+  const code = headlessEditor("```\nabc\n```");
+  insertEditorReference(code.view, 2, 2, "/?ref=discord%3Atest", "https://lilac.stw.tw");
+  expect(code.state.selection.$from.parent.inlineContent).toBe(true);
+  expect(code.state.selection.$from.nodeBefore?.type.name).toBe("composer_reference");
+  expect(code.state.selection.$from.nodeAfter?.text).toBe("bc");
+  code.destroy();
+});
+
+it("preserves active marks when inserting a reference", () => {
+  const editor = headlessEditor("**abc**");
+  insertEditorReference(editor.view, 2, 2, "/?ref=discord%3Atest", "https://lilac.stw.tw");
+  expect(editor.state.selection.$from.nodeBefore?.marks.map((mark) => mark.type.name)).toEqual([
+    "bold",
+  ]);
+  editor.view.dispatch(editor.state.tr.insertText("next"));
+  expect(editor.state.selection.$from.nodeBefore?.marks.map((mark) => mark.type.name)).toEqual([
+    "bold",
+  ]);
+  editor.destroy();
+});
+
+it("leaves native mutation selections to ProseMirror's updated document", () => {
+  const editor = headlessEditor("before");
+  const transaction = editor.state.tr.insertText("x", 1);
+  expect(composerBadgeSelection(editor.view, transaction.doc.resolve(2))).toBeNull();
+  editor.destroy();
+});
 
 it("pastes copied message fragments inline at a tracked position", () => {
   const editor = headlessEditor("before after");
