@@ -109,6 +109,7 @@ packages/plugin-runtime/types.ts  # originSessionId / requestInitiator in Reques
 apps/core/src/github/webhook/github-webhook-server.ts  # prompts forbid duplicate final publications and define NO_REPLY
 
 # --- Config layer seams
+packages/utils/model-provider.ts  # wires provider-local tool-image middleware; transformation lives in a fork-owned module
 packages/utils/core-config.ts  # re-exports fork config modules
 packages/utils/core-config/types.ts  # UniversalCoreConfig gains surface.telegram and tools.generate
 packages/utils/core-config/v1.ts  # v1 fallbacks for fork config keys
@@ -116,6 +117,7 @@ packages/utils/core-config/v2.ts  # v2 schema includes fork config modules
 packages/utils/index.ts  # re-exports the custom-command menu and compatible image provider modules
 
 # --- Agent and event bus fixes carried by the fork
+packages/agent/auto-compaction.ts  # applies the existing current-input boundary in compaction preflight; selection policy is owned by this upstream module
 packages/agent/adapters/ai-sdk/adapter.ts  # executes parsed local tool calls on nonstandard finish reasons
 packages/agent/agent-run-idle-watchdog.ts  # idle watchdog restart gap fix
 packages/event-bus/redis-streams-bus.ts  # single-flight subscription cleanup
@@ -140,5 +142,6 @@ apps/core/tests/workflow/workflow-trigger-scheduler.test.ts  # target rechecks
 apps/core/tests/workflow/workflow-wait-resolver.test.ts  # Telegram reply waits
 apps/tool-bridge/client.test.ts  # origin session header
 packages/agent/tests/ai-sdk-pi-agent.test.ts  # nonstandard finish reason tool calls
+packages/agent/tests/auto-compaction.test.ts  # regression coverage for protected-current-input threshold compaction and overflow in the existing agent harness
 packages/event-bus/tests/redis-streams-bus.test.ts  # single-flight cleanup
 packages/utils/tests/core-config.versioning.test.ts  # v1/v2 drift test for fork keys
