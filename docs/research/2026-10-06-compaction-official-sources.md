@@ -22,6 +22,10 @@ Skipping this trigger does not reduce context size. If the next request exceeds 
 
 - `packages/agent/auto-compaction.ts` validates the existing maximum suffix boundary before threshold preflight and checks zero before starting compaction. The overflow branch does not use that threshold-only skip.
 - `packages/agent/tests/auto-compaction.test.ts` covers high usage/start=0 completion, historical-prefix summarization without current input in the summary, true overflow failure and invalid boundary rejection.
-- Independent branch verification: 59 focused compaction tests and all 531 agent tests pass on Bun 1.4.2. Typecheck, static and architecture checks pass; overall repo check is blocked by separately reproduced baseline failures documented in #80.
+- Independent branch verification: 59 focused compaction tests and all 531 agent tests pass on Bun 1.4.2. Typecheck, static and architecture checks pass; local overall repo check exposes separately reproduced baseline failures documented in #80. GitHub CI on `ecc1d764` passed all five jobs, including Source checks and Upstream footprint.
 
 These tests establish local behavior, not a provider guarantee about requests that exceed its context limit.
+
+## Integration status
+
+[PR #82](https://github.com/DF-wu/lilac-mono/pull/82) merged on 2026-10-06 as `9a3d93d4789e973ce20d60785604846112234435`, closing [issue #80](https://github.com/DF-wu/lilac-mono/issues/80). Codex reviewed the final PR head `ecc1d764` without major findings. This establishes repository integration; no production deployment or provider-overflow recovery guarantee is asserted.

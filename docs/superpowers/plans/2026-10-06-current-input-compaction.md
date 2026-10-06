@@ -14,10 +14,19 @@
 - [x] Rerun focused agent tests: all 59 pass.
 - [x] Request read-only independent review of protected input, overflow and continuation semantics; no blocking findings.
 - [x] Run `bun run check` on this isolated branch. Typechecks, static and architecture lanes pass; overall check fails on three baseline failures independently reproduced on clean origin/main (bash-safety codes, host skill discovery, native operator gateway).
-- [x] Update #80 with final scope and evidence. Agent: 531 pass, 0 fail. Changes remain undeployed; final commit and PR verification follows.
+- [x] Update #80 with final scope and evidence. Agent: 531 pass, 0 fail. Implementation merged through PR #82; deployment remains unverified.
 
 ## PR preparation (2026-10-06)
 
 - User authorized separate commits, pushes, PRs, and Codex review requests.
 - Fresh workspace suite: 531 pass / 0 fail using Bun 1.4.2.
 - Independent pre-PR review found no blocking issues.
+
+## Completion (2026-10-06)
+
+- [x] Commit and push the independent fix; complete footprint records after syncing main.
+- [x] GitHub CI on `ecc1d764e0e2d137c9bbdba2a80045cdb9df9062`: Source checks, Upstream footprint, and all three Docker smoke variants passed (5/5). Strict local footprint: 112 allowed, 0 unlisted, 0 stale.
+- [x] Codex reviewed that commit and reported no major issues.
+- [x] [PR #82](https://github.com/DF-wu/lilac-mono/pull/82) merged into main as `9a3d93d4789e973ce20d60785604846112234435`; [issue #80](https://github.com/DF-wu/lilac-mono/issues/80) closed automatically.
+- Local `bun run check` still exposes the documented host/baseline test failures; this differs from the successful GitHub CI environment.
+- No production deployment or restart was performed. Skipping a soft trigger does not make an irreducibly large current request fit the provider context limit.

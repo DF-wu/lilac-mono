@@ -325,6 +325,12 @@ stateless request normalization, backend event repairs, and its SSE fallback. Co
 turn boundaries. The OpenAI adapter gates native steering to exactly `gpt-6-astra` in compatible
 single-agent settings. Conversation binding and automatic compaction use boundary delivery.
 
+`packages/agent/auto-compaction.ts` owns local compaction selection. It validates the protected
+current-input boundary before threshold preflight and skips the soft trigger when no older prefix
+can be summarized. Existing history can still compact while current input remains verbatim; actual
+context overflow continues through the existing recovery/failure path. A skipped trigger does not
+reduce input size or guarantee that the next model request fits.
+
 Native tool discovery uses client-executed OpenAI `tool_search` on the official OpenAI API and
 Codex native paths for the supported GPT-5.4, GPT-5.5, GPT-5.6, and GPT-6 Astra model families.
 The runner supplies deferred catalog declarations through the agent context; local execution still
