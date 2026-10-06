@@ -40,12 +40,6 @@ function getStringField(value: unknown, key: string): string | undefined {
   return typeof v === "string" && v.length > 0 ? v : undefined;
 }
 
-function getNumberField(value: unknown, key: string): number | undefined {
-  if (!isRecord(value)) return undefined;
-  const v = value[key];
-  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
-}
-
 function getBooleanField(value: unknown, key: string): boolean | undefined {
   if (!isRecord(value)) return undefined;
   const v = value[key];
@@ -207,22 +201,6 @@ export function summarizeApplyPatchFailure(result: unknown): ToolFailureSummary 
       ok: false,
       failureKind: "soft",
       error: output ?? "patch failed",
-    };
-  }
-  return { ok: true };
-}
-
-export function summarizeBatchFailure(result: unknown): ToolFailureSummary {
-  const ok = getBooleanField(result, "ok");
-  if (ok === false) {
-    const failed = getNumberField(result, "failed");
-    const total = getNumberField(result, "total");
-    const suffix =
-      typeof failed === "number" && typeof total === "number" ? ` (${failed}/${total} failed)` : "";
-    return {
-      ok: false,
-      failureKind: "soft",
-      error: `batch failed${suffix}`,
     };
   }
   return { ok: true };

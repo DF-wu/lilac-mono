@@ -435,7 +435,6 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
   "packages/agent": [
     ["adapters/openai-responses/socket.ts", "signalSocketCloseFailure", "signal"],
     ["agent-tool-host.ts", "signalExternalToolCallHost", "signal"],
-    ["agent-tool-host.ts", "AgentToolHost.executeExternalToolCall.map.<callback@1>", "signal"],
     ["message-clone.ts", "snapshotAgentMessage", "signal"],
     ["agent-executor.ts", "AgentExecutor.finishIdleRecovery", "signal"],
     ["agent-executor.ts", "AgentExecutor.runLoop.<callback>", "signal"],
@@ -497,7 +496,7 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ["claude-code-run.ts", "materializeClaudeCodeRunResult.finalizeResult.<callback>", "signal"],
     [
       "claude-code-tools.ts",
-      "createClaudeCodeToolBridgeResult.setRequestHandler.<callback@2>@2",
+      "createClaudeCodeToolBridgeResult.setRequestHandler.<callback@2>@2.run.<callback@2>",
       "signal",
     ],
     ["claude-code-tools.ts", "createClaudeCodeToolBridge", "signal"],
@@ -509,8 +508,6 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ["claude-code-tools.ts", "validateClaudeCodeBuiltInTools", "signal"],
   ],
   "packages/coding-tools": [
-    ["src/batch.ts", "resolveBatchEditTargets", "signal"],
-    ["src/batch.ts", "validateInput", "signal"],
     ["src/buffered-file-sink.ts", "BufferedFileSink.open", "signal"],
     ["src/buffered-file-sink.ts", "continueBufferedSinkQueue", "signal"],
     ["src/host-compatibility.ts", "adaptCodingToolResultToHost", "signal"],

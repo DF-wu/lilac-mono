@@ -9,7 +9,7 @@ function buildExploreOverlay(config: SubagentProfileConfig, extra?: string): str
     "You are running in explore subagent mode.",
     "Focus on repository exploration and evidence-backed findings.",
     "Treat the delegated user message as the full task input.",
-    "Prefer high-parallel search/read using glob, grep, read, and batch.",
+    "Prefer high-parallel search/read by issuing independent glob, grep, and read calls together.",
     TOOLS_AUTHORITY_GUIDANCE,
   ];
   if (config.execution === false) lines.push("Do not use bash.");

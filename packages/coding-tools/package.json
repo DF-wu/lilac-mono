@@ -17,10 +17,6 @@
       "import": "./src/apply-patch.ts",
       "types": "./src/apply-patch.ts"
     },
-    "./batch": {
-      "import": "./src/batch.ts",
-      "types": "./src/batch.ts"
-    },
     "./instructions": {
       "import": "./src/instructions.ts",
       "types": "./src/instructions.ts"

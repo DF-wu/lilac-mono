@@ -1,5 +1,16 @@
 # MIGRATIONS.md
 
+## Batch retirement
+
+The `batch` tool and tool-call expansion API are removed. Ordinary model-issued calls run concurrently
+in received-order groups separated by `write`, `edit`, and `patch` calls, including their legacy
+aliases. Each mutation waits for the preceding group and finishes before the following group starts.
+Bash calls may race. The Claude MCP bridge applies barriers in request-receipt order; Claude owns when
+it submits those requests. Existing `tools.batch.maxCalls`, `supportsBatch`, and `editTargets` fields
+remain accepted for configuration/plugin compatibility but no longer control execution. Remove them
+from maintained configurations and plugins. Old transcripts remain replayable; a newly attempted
+`batch` call receives the ordinary unknown-tool error.
+
 ## Native activity details
 
 Native output activity payloads and `data-activity` display parts add optional `output`,

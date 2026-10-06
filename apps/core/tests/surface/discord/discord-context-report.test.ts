@@ -72,7 +72,6 @@ describe("createDiscordContextReportProvider", () => {
         },
       ],
       catalogMetadata: {},
-      updateActiveBatchTools: () => undefined,
       contributionInfo: new Map(),
       genericOutputNormalizerBypassTools: new Set(),
       aggregateOutputBudgetExemptTools: new Set(),

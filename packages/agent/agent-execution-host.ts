@@ -17,7 +17,7 @@ import type {
   TurnErrorPhase,
 } from "./agent-runtime-support";
 import type { AgentToolHost, ToolBatchExecutionFailed } from "./agent-tool-host";
-import type { ExpandedToolCall } from "./tool-call-expansion";
+import type { AgentToolCall } from "./tool-call";
 import type { OpaqueAgentValue } from "./failure-adapters";
 
 export type ExecutionRequestSelection = {
@@ -36,7 +36,7 @@ export type PreparedExecutionRequest = {
 export type ExecutionTurn = {
   finishReason: FinishReason;
   newMessages: ModelMessage[];
-  toolCalls: ExpandedToolCall[];
+  toolCalls: AgentToolCall[];
   usage: LanguageModelUsage;
   totalUsage: LanguageModelUsage;
   modelInputMessages: ModelMessage[];
@@ -84,7 +84,7 @@ export interface AgentExecutionHost<TOOLS extends ToolSet = ToolSet> extends Age
     context: ExecutionFailureContext,
   ): Promise<"continue" | "break">;
   executeToolBatch(
-    calls: ExpandedToolCall[],
+    calls: AgentToolCall[],
     scopeId: string,
   ): Promise<ResultType<number, ToolBatchExecutionFailed>>;
   readState(): AgentExecutionState<TOOLS>;

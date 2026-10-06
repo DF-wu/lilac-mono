@@ -39,7 +39,6 @@ import { createMemoryBlobStore, type BlobStore } from "@stanley2058/lilac-blob-s
 import {
   AiSdkPiAgent,
   attachAutoCompaction,
-  ToolExpansion,
   buildSyntheticToolCallId,
   createAgentRunIdleWatchdog,
   hashCanonicalMessagesV1,
@@ -408,7 +407,6 @@ function level1TestToolset(params?: {
         description: "Deferred metadata",
       },
     },
-    updateActiveBatchTools: (activeToolNames) => params?.onBatchUpdate?.(activeToolNames),
     genericOutputNormalizerBypassTools: new Set(["builtin"]),
     aggregateOutputBudgetExemptTools: new Set(),
     release: async () => Result.ok(undefined),
@@ -691,101 +689,6 @@ describe("runner Level 1 catalog selection", () => {
     ]);
   });
 
-  it("executes selected expansion children and denies hidden children under the same step authority", async () => {
-    let selectedExecutions = 0;
-    let hiddenExecutions = 0;
-    const selectedTool = level1TestTool(() => {
-      selectedExecutions += 1;
-      return "selected";
-    });
-    const hiddenTool = level1TestTool(() => {
-      hiddenExecutions += 1;
-      return "hidden";
-    });
-    const tools = {
-      batch: level1TestTool(
-        () =>
-          new ToolExpansion("expanded", [
-            {
-              toolCallId: "selected-child",
-              toolName: "selected_tool",
-              input: {},
-            },
-            { toolCallId: "hidden-child", toolName: "hidden_tool", input: {} },
-          ]),
-      ),
-      selected_tool: selectedTool,
-      hidden_tool: hiddenTool,
-    } satisfies ToolSet;
-    const toolset: BuiltLevel1Toolset = {
-      tools,
-      specs: new Map(),
-      contributionInfo: new Map(),
-      directToolNames: new Set(["batch"]),
-      catalog: [
-        {
-          source: "plugin",
-          sourceId: "selected-plugin",
-          rawName: "selected",
-          modelName: "selected_tool",
-          identity: {
-            source: "plugin",
-            sourceId: "selected-plugin",
-            rawToolName: "selected",
-          },
-          stableId: "selected-id",
-          tool: selectedTool,
-        },
-        {
-          source: "plugin",
-          sourceId: "hidden-plugin",
-          rawName: "hidden",
-          modelName: "hidden_tool",
-          identity: {
-            source: "plugin",
-            sourceId: "hidden-plugin",
-            rawToolName: "hidden",
-          },
-          stableId: "hidden-id",
-          tool: hiddenTool,
-        },
-      ],
-      catalogMetadata: {},
-      updateActiveBatchTools: () => {},
-      genericOutputNormalizerBypassTools: new Set(),
-      aggregateOutputBudgetExemptTools: new Set(),
-      release: async () => Result.ok(undefined),
-    };
-    let calls = 0;
-    const model = new MockLanguageModelV4({
-      doStream: async () => {
-        calls += 1;
-        return calls === 1
-          ? level1ToolCallStep([{ toolCallId: "batch", toolName: "batch" }])
-          : level1TextStep("done");
-      },
-    });
-    let agent: AiSdkPiAgent<ToolSet> | null = null;
-    agent = new AiSdkPiAgent({
-      system: "test",
-      model,
-      tools,
-      beforeStep: async () => {
-        if (!agent) throw new Error("agent not ready");
-        await refreshSelectedLevel1Tools({
-          target: agent,
-          toolset,
-          listSelectedCatalogIds: () => ["selected-id"],
-        });
-      },
-    });
-
-    await agent.prompt("batch it");
-
-    expect(selectedExecutions).toBe(1);
-    expect(hiddenExecutions).toBe(0);
-  });
-
   it("passes Claude the exact complete tools and deferred metadata with complete authority", () => {
     const toolset = level1TestToolset();
     const mapping = completeLevel1ToolMapping(toolset);
@@ -810,16 +713,12 @@ describe("runner Level 1 catalog selection", () => {
     expect([...(applied.names ?? [])]).toEqual(["builtin", "find_tools", "deferred_tool"]);
   });
 
-  it("refreshes selection and batch authority without rebuilding the catalog", async () => {
+  it("refreshes selection without rebuilding the catalog", async () => {
     let catalogCreates = 0;
-    let batchUpdates = 0;
     let appliedNames: ReadonlySet<string> = new Set();
     const toolset = level1TestToolset({
       onCatalogCreate: () => {
         catalogCreates += 1;
-      },
-      onBatchUpdate: () => {
-        batchUpdates += 1;
       },
     });
 
@@ -834,7 +733,6 @@ describe("runner Level 1 catalog selection", () => {
     });
 
     expect(catalogCreates).toBe(1);
-    expect(batchUpdates).toBe(1);
     expect([...appliedNames]).toEqual(["builtin", "find_tools"]);
   });
 });
@@ -3538,7 +3436,6 @@ describe("durable accepted runner recovery", () => {
           }),
           beforeStep: undefined,
           normalizeToolResultOutput: undefined,
-          normalizeSettledToolResultOutputs: undefined,
           tools: {
             retry_checkpoint: tool({
               inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
@@ -3757,7 +3654,6 @@ describe("durable accepted runner recovery", () => {
           }),
           beforeStep: undefined,
           normalizeToolResultOutput: undefined,
-          normalizeSettledToolResultOutputs: undefined,
           tools: {
             read: tool({
               inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
@@ -3972,7 +3868,6 @@ describe("durable accepted runner recovery", () => {
           }),
           beforeStep: undefined,
           normalizeToolResultOutput: undefined,
-          normalizeSettledToolResultOutputs: undefined,
           tools: {
             read: tool({
               inputSchema: jsonSchema({ type: "object", additionalProperties: false }),

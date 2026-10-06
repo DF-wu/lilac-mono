@@ -911,13 +911,6 @@ export function scrubLargeBinaryForModelView(
   return boundToolResultMediaForModelView(messages, limits);
 }
 
-function getBatchOkFromResult(event: { readonly result: unknown }): boolean | null {
-  const { result } = event;
-  if (!result || typeof result !== "object" || Array.isArray(result)) return null;
-  const v = (result as Record<string, unknown>)["ok"];
-  return typeof v === "boolean" ? v : null;
-}
-
 function getSubagentOkFromResult(event: { readonly result: unknown }): boolean | null {
   const { result } = event;
   if (!result || typeof result !== "object" || Array.isArray(result)) return null;
@@ -2720,7 +2713,6 @@ export async function refreshSelectedLevel1Tools(params: {
 }): Promise<BuiltLevel1Toolset> {
   const toolset = params.toolset;
   const activeToolNames = selectedLevel1ToolNames(toolset, params.listSelectedCatalogIds());
-  toolset.updateActiveBatchTools(activeToolNames);
   params.target.setActiveTools(activeToolNames);
   return toolset;
 }
@@ -6423,7 +6415,7 @@ export async function startBusAgentRunner(params: {
                   onMcpImageMaterialized: (reference) => mcpImages.remember(reference),
                   onSelectCatalogIds: (catalogIds) => toolAuthority.select(catalogIds),
                   reportToolStatus: (update) => {
-                    void publishAuxiliaryOutput("failed to publish batch tool status", () =>
+                    void publishAuxiliaryOutput("failed to publish tool status", () =>
                       outputPublisher.publishToolCall(update),
                     );
                   },
@@ -6565,7 +6557,6 @@ export async function startBusAgentRunner(params: {
               nextBinding,
             );
             agent.replaceMessages(reboundMessages);
-            nextBinding.toolset.updateActiveBatchTools(nextBinding.activeToolNames);
             agent.setModel(
               nextBinding.resolved.model,
               nextBinding.providerOptionsForAgent,
@@ -6716,7 +6707,6 @@ export async function startBusAgentRunner(params: {
                 enqueueRunCheckpoint(activeRun, messages, canonicalInputIds, storedMessageIdentity);
               },
               normalizeToolResultOutput,
-              normalizeSettledToolResultOutputs: normalizeToolResultOutput.normalizeSettled,
               genericOutputNormalizerBypassTools:
                 activeBinding.toolset.genericOutputNormalizerBypassTools,
               aggregateOutputBudgetExemptTools:
@@ -7797,7 +7787,7 @@ export async function startBusAgentRunner(params: {
             }
 
             if (event.type === "tool_execution_start") {
-              if (nativeOutput && event.toolName !== "batch")
+              if (nativeOutput)
                 publishNativeToolActivity(
                   event.toolCallId,
                   "start",
@@ -7813,7 +7803,7 @@ export async function startBusAgentRunner(params: {
                 startedAt,
               });
 
-              if (event.toolName !== "batch") {
+              {
                 void publishAuxiliaryOutput("failed to publish tool start", () =>
                   outputPublisher.publishToolCall({
                     toolCallId: event.toolCallId,
@@ -7840,9 +7830,6 @@ export async function startBusAgentRunner(params: {
 
               let ok: boolean;
               switch (event.toolName) {
-                case "batch":
-                  ok = getBatchOkFromResult(event) ?? toolFailure.ok;
-                  break;
                 case "subagent_delegate":
                   ok = getSubagentOkFromResult(event) ?? toolFailure.ok;
                   break;
@@ -7850,7 +7837,7 @@ export async function startBusAgentRunner(params: {
                   ok = toolFailure.ok;
                   break;
               }
-              if (nativeOutput && event.toolName !== "batch")
+              if (nativeOutput)
                 publishNativeToolActivity(
                   event.toolCallId,
                   "end",
@@ -7916,7 +7903,7 @@ export async function startBusAgentRunner(params: {
                 logger.debug("tool finished", toolCompletionLogContext);
               }
 
-              if (event.toolName === "batch" || deferredAccepted) {
+              if (deferredAccepted) {
                 return;
               }
 

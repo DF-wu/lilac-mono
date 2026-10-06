@@ -96,7 +96,7 @@ cover. Rewind fences the discarded generation, waits for runner cancellation, re
 transcript references and finishes its persisted mutation before admitting new work. Startup resumes
 unfinished mutations before recovering native requests. See [native migrations](MIGRATIONS.md#native-output-recovery-frontier).
 
-- `packages/coding-tools`: shared coding-tool schemas and implementations, patch/edit behavior, batching, instruction discovery, and tool guardrails.
+- `packages/coding-tools`: shared coding-tool schemas and implementations, patch/edit behavior, instruction discovery, and tool guardrails.
 - `packages/computer-use-runner`: pinned CUA desktop image, Chromium seccomp profile, persistent Python runtime, and runner checks.
 - `packages/event-bus`: event catalog, codecs, typed bus, delivery policy, dead letters, and Redis Streams transport.
 - `packages/fs`: local filesystem operations, search backends, edit/hashline primitives, and the remote filesystem protocol.

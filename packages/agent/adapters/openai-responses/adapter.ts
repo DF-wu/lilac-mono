@@ -829,10 +829,7 @@ class OpenAIResponsesExecution implements AgentExecution {
       const inheritedMessages = [
         ...parent.prepared.messages,
         ...parent.complete!.messages,
-        ...(parent.results ?? []).flatMap((result) => [
-          result.message,
-          ...(result.expansionMessages ?? []),
-        ]),
+        ...(parent.results ?? []).map((result) => result.message),
         ...pending.input.messages,
       ];
       prepared = {
@@ -935,10 +932,7 @@ class OpenAIResponsesExecution implements AgentExecution {
         ),
       };
     });
-    const results = parent.settledResults.flatMap((entry) => [
-      entry.message,
-      ...(entry.expansionMessages ?? []),
-    ]);
+    const results = parent.settledResults.map((entry) => entry.message);
     this.emit({ type: "history-checkpoint", messages: [...this.history, ...messages, ...results] });
   }
   private async executeParentTools(parent: ParentResponse, signal: AbortSignal): Promise<void> {
@@ -1017,9 +1011,7 @@ class OpenAIResponsesExecution implements AgentExecution {
     if (!parent.committed) {
       this.history.push(...parent.complete.messages.map(snapshotAgentMessage));
       for (const result of parent.results ?? [])
-        this.history.push(
-          ...[result.message, ...(result.expansionMessages ?? [])].map(snapshotAgentMessage),
-        );
+        this.history.push(snapshotAgentMessage(result.message));
       const committed = resultOutcome(await this.commit([]));
       if (!committed.ok) return Result.err(committed.error);
       parent.committed = true;
@@ -1062,10 +1054,7 @@ class OpenAIResponsesExecution implements AgentExecution {
       if (!refreshed.ok) return Result.err(refreshed.error);
       this.submitting = { ...this.submitting!, prepared: refreshed.value };
     }
-    const results = (parent.results ?? []).flatMap((result) => [
-      result.message,
-      ...(result.expansionMessages ?? []),
-    ]);
+    const results = (parent.results ?? []).map((result) => result.message);
     const encoded = resultOutcome(
       await (this.options.requestCodec ?? openAIRequestCodec).messages(results, {
         nativeToolSearch: parent.prepared.nativeToolSearch,

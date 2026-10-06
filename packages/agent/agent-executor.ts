@@ -1,3 +1,4 @@
+import { groupToolCalls } from "./tool-call-scheduling";
 import { projectAgentOutput } from "./agent-output-projection";
 import { snapshotAgentMessage } from "./message-clone";
 import { asSchema } from "ai";
@@ -25,7 +26,6 @@ import {
 } from "./failure-adapters";
 import {
   AgentToolHost,
-  projectExternalToolOutcome,
   ToolBatchExecutionFailed,
   type StepToolSnapshot,
   type ExternalToolExecutionOutcome,
@@ -257,7 +257,6 @@ export class AgentExecutor<TOOLS extends ToolSet = ToolSet> {
         this.recoveryCheckpoint = recoveryCheckpointForMessages(messages ?? this.state.messages);
       },
       normalizeToolResultOutput: options.normalizeToolResultOutput,
-      normalizeSettledToolResultOutputs: options.normalizeSettledToolResultOutputs,
       genericOutputNormalizerBypassTools: options.genericOutputNormalizerBypassTools,
       aggregateOutputBudgetExemptTools: options.aggregateOutputBudgetExemptTools,
       exclusiveToolNames: options.exclusiveToolNames,
@@ -2408,35 +2407,54 @@ export class AgentExecutor<TOOLS extends ToolSet = ToolSet> {
               }),
             );
           const results = [];
-          for (const call of context.calls) {
-            const outcome = await this.toolHost.executeExternalToolCall(
-              {
-                toolCallId: call.callId,
-                toolName: call.name,
-                input: normalizeToolCallInputValue(call.inputJson),
-                abortSignal: context.signal,
-              },
-              snapshot,
-              context.calls.map((request) => request.name),
+          for (const group of groupToolCalls(context.calls, (call) => call.name)) {
+            const completed = await Promise.all(
+              group.map((call) =>
+                captureAgentPromise(async () => {
+                  const outcome = await this.toolHost.executeExternalToolCall(
+                    {
+                      toolCallId: call.callId,
+                      toolName: call.name,
+                      input: normalizeToolCallInputValue(call.inputJson),
+                      abortSignal: context.signal,
+                    },
+                    snapshot,
+                    context.calls.map((request) => request.name),
+                  );
+                  active();
+                  const settled = {
+                    callId: call.callId,
+                    executedCallCount: 1,
+                    message: {
+                      role: "tool" as const,
+                      content: [
+                        {
+                          type: "tool-result" as const,
+                          toolCallId: call.callId,
+                          toolName: call.name,
+                          output: outcome.toolOutput,
+                        },
+                      ],
+                    },
+                  };
+                  await context.onSettled?.(settled, outcome);
+                  return settled;
+                }),
+              ),
             );
-            active();
-            const settled = {
-              callId: call.callId,
-              ...projectExternalToolOutcome(outcome),
-              message: {
-                role: "tool" as const,
-                content: [
-                  {
-                    type: "tool-result" as const,
-                    toolCallId: call.callId,
-                    toolName: call.name,
-                    output: outcome.toolOutput,
-                  },
-                ],
-              },
-            };
-            results.push(settled);
-            await context.onSettled?.(settled, outcome);
+            for (const captured of completed) {
+              const outcome = resultOutcome(captured);
+              if (!outcome.ok)
+                this.failAdapter(
+                  new AgentAdapterFailure({
+                    reason: "unavailable",
+                    message: errorMessage(outcome.error),
+                    replaySafety: "reconcile",
+                    cause: outcome.error,
+                  }),
+                );
+              results.push(outcome.value);
+            }
           }
           return results;
         }),

@@ -131,7 +131,7 @@ async function execute(registry: McpRegistry) {
     context: {},
     pendingToolCalls: new Set(),
     inputValidation: { type: "validate" },
-    expansionHandling: { type: "reject" },
+
     onEvent: (event) => events.push(event),
   });
   return { outcome, events };

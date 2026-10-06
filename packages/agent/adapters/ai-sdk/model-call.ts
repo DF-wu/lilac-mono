@@ -1,6 +1,5 @@
 import {
   streamText,
-  InvalidToolInputError,
   NoSuchToolError,
   type AssistantContent,
   type AssistantModelMessage,
@@ -19,7 +18,6 @@ import {
 } from "@stanley2058/lilac-utils/tool-call-input-normalization";
 import {
   canonicalToolName,
-  repairLegacyBatchInput,
   projectAiSdkTextStreamPart,
   extractToolCallsFromMessages,
 } from "./support";
@@ -85,10 +83,6 @@ export async function executeAiSdkModelCall(
       if (NoSuchToolError.isInstance(error)) {
         const toolName = canonicalToolName(toolCall.toolName);
         return toolName !== toolCall.toolName && tools[toolName] ? { ...toolCall, toolName } : null;
-      }
-      if (InvalidToolInputError.isInstance(error) && toolCall.toolName === "batch") {
-        const input = repairLegacyBatchInput(toolCall.input, tools);
-        return input === null ? null : { ...toolCall, input };
       }
       return null;
     },

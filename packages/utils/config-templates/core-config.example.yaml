@@ -46,8 +46,6 @@ tools:
     enabled: false
     protectTokens: 40000
     minimumTokens: 20000
-  batch:
-    maxCalls: 8
   media:
     maxInlineBytesPerPart: 10MiB
     maxInlineBytesTotal: 20MiB
