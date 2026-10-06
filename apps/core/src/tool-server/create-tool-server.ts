@@ -2,6 +2,7 @@ import { captureError } from "../shared/error-capture";
 import Elysia, { NotFoundError } from "elysia";
 import {
   createLogger,
+  errorCode,
   formatTaggedErrorForLog,
   getBuildInfo,
   isPanic,
@@ -31,8 +32,9 @@ import {
 import type { Logger } from "@stanley2058/simple-module-logger";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, unlinkSync } from "node:fs";
-import { dirname } from "node:path";
+import { chmodSync, linkSync, lstatSync, mkdtempSync, rmdirSync, unlinkSync } from "node:fs";
+import { createConnection } from "node:net";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
@@ -86,13 +88,33 @@ type ToolServerCleanupFailure = {
   readonly cause: Error;
 };
 
-function removeOwnedUnixSocket(socketPath: string): ResultType<void, Error> {
-  if (!existsSync(socketPath)) return Result.ok(undefined);
-  const statResult = Result.try({
-    try: () => lstatSync(socketPath),
+type UnixSocketIdentity = { dev: number; ino: number };
+
+function inspectUnixSocket(socketPath: string) {
+  return Result.try({
+    try: () => lstatSync(socketPath, { throwIfNoEntry: false }),
     catch: captureError,
   }).mapError((error) => error.cause);
-  return statResult.andThen((stat) => {
+}
+
+function removeOwnedUnixSocket(
+  socketPath: string,
+  identity: UnixSocketIdentity,
+): ResultType<void, Error> {
+  return inspectUnixSocket(socketPath).andThen((stat) => {
+    if (!stat || stat.dev !== identity.dev || stat.ino !== identity.ino)
+      return Result.ok(undefined);
+    return Result.try({
+      try: () => unlinkSync(socketPath),
+      catch: captureError,
+    }).mapError((error) => error.cause);
+  });
+}
+
+async function prepareUnixSocket(socketPath: string): Promise<ResultType<void, Error>> {
+  return Result.gen(async function* () {
+    const stat = yield* inspectUnixSocket(socketPath);
+    if (!stat) return Result.ok(undefined);
     if (!stat.isSocket()) {
       return Result.err(new Error(`Refusing to remove non-socket tool server path: ${socketPath}`));
     }
@@ -102,10 +124,26 @@ function removeOwnedUnixSocket(socketPath: string): ResultType<void, Error> {
         new Error(`Refusing to remove tool server socket owned by another user: ${socketPath}`),
       );
     }
-    return Result.try({
-      try: () => unlinkSync(socketPath),
+    const probe = await Result.tryPromise({
+      try: () =>
+        new Promise<void>((resolve, reject) => {
+          const socket = createConnection({ path: socketPath, signal: AbortSignal.timeout(1_000) });
+          socket.once("connect", () => {
+            socket.destroy();
+            resolve();
+          });
+          socket.once("error", reject);
+        }),
       catch: captureError,
-    }).mapError((error) => error.cause);
+    });
+    yield* probe.match({
+      ok: () => Result.err(new Error(`Tool server socket is already in use: ${socketPath}`)),
+      err: ({ cause }) => {
+        if (errorCode(cause) === "ECONNREFUSED") return Result.ok(undefined);
+        return Result.err(cause);
+      },
+    });
+    return removeOwnedUnixSocket(socketPath, stat);
   });
 }
 
@@ -662,6 +700,7 @@ export function createToolServer(options: ToolServerOptions) {
   let toolCallsDrained: ReturnType<typeof Promise.withResolvers<void>> | null = null;
   const healthState = createToolServerHealthState({
     logger,
+    listeningProbe: probeUnixServer,
     pluginManager: options.pluginManager,
     externalHealthProvider: options.healthProvider,
     activeLevel1WorkProvider: options.activeLevel1WorkProvider,
@@ -1723,8 +1762,32 @@ export function createToolServer(options: ToolServerOptions) {
   );
 
   let started = false;
+  let pendingStart: Promise<ResultType<void, Error>> | undefined;
   let unixServer: ReturnType<typeof Bun.serve> | undefined;
   let unixSocketPath: string | undefined;
+  let unixSocketIdentity: UnixSocketIdentity | undefined;
+  let unixSocketDirectory: string | undefined;
+
+  async function probeUnixServer(): Promise<boolean> {
+    if (!unixSocketPath) return true;
+    const socketPath = unixSocketPath;
+    const identity = unixSocketIdentity;
+    const probe = await Result.tryPromise({
+      try: async () => {
+        const stat = lstatSync(socketPath);
+        if (!identity || stat.dev !== identity.dev || stat.ino !== identity.ino) return false;
+        const response = await fetch("http://localhost/versionz", {
+          unix: socketPath,
+          keepalive: false,
+          signal: AbortSignal.timeout(1_000),
+        });
+        await response.arrayBuffer();
+        return response.ok;
+      },
+      catch: captureError,
+    });
+    return probe.match({ ok: (ok) => ok, err: () => false });
+  }
 
   function recordCleanupResult(
     label: string,
@@ -1765,17 +1828,21 @@ export function createToolServer(options: ToolServerOptions) {
     if (cleanupFailure) adaptResultToHost(Result.err(cleanupFailure.cause), (error) => error);
   }
 
-  function startUnixServer(socketPath: string): ResultType<void, Error> {
-    return removeOwnedUnixSocket(socketPath).andThen(() =>
+  async function startUnixServer(socketPath: string): Promise<ResultType<void, Error>> {
+    const prepared = await prepareUnixSocket(socketPath);
+    return prepared.andThen(() =>
       Result.try({
         try: () => {
-          const server = Bun.serve({
-            unix: socketPath,
-            fetch: (request) => app.fetch(request),
-          });
-          unixServer = server;
+          // Bun.stop unlinks its bind path without checking who owns it now.
+          unixSocketDirectory = mkdtempSync(join(dirname(socketPath), ".tools-"));
+          const privatePath = join(unixSocketDirectory, "socket");
+          unixServer = Bun.serve({ unix: privatePath, fetch: (request) => app.fetch(request) });
+          chmodSync(privatePath, 0o600);
+          const identity = lstatSync(privatePath);
+          // Publishing with link fails if another startup has already claimed the public path.
+          linkSync(privatePath, socketPath);
           unixSocketPath = socketPath;
-          chmodSync(socketPath, 0o600);
+          unixSocketIdentity = identity;
         },
         catch: captureError,
       }).mapError((error) => error.cause),
@@ -1786,9 +1853,13 @@ export function createToolServer(options: ToolServerOptions) {
     const appWasStarted = started;
     const capturedUnixServer = unixServer;
     const capturedUnixSocketPath = unixSocketPath;
+    const capturedIdentity = unixSocketIdentity;
+    const capturedDirectory = unixSocketDirectory;
     started = false;
     unixServer = undefined;
     unixSocketPath = undefined;
+    unixSocketIdentity = undefined;
+    unixSocketDirectory = undefined;
 
     const failures: ToolServerCleanupFailure[] = [];
     if (appWasStarted) {
@@ -1799,10 +1870,16 @@ export function createToolServer(options: ToolServerOptions) {
       const failure = captureCleanupOperation("unix.stop", () => capturedUnixServer.stop(true));
       if (failure) failures.push(failure);
     }
-    if (capturedUnixSocketPath) {
+    if (capturedUnixSocketPath && capturedIdentity) {
       const failure = recordCleanupResult(
         "unix.remove",
-        removeOwnedUnixSocket(capturedUnixSocketPath),
+        removeOwnedUnixSocket(capturedUnixSocketPath, capturedIdentity),
+      );
+      if (failure) failures.push(failure);
+    }
+    if (capturedDirectory) {
+      const failure = captureCleanupOperation("unix.directory.remove", () =>
+        rmdirSync(capturedDirectory),
       );
       if (failure) failures.push(failure);
     }
@@ -1820,6 +1897,33 @@ export function createToolServer(options: ToolServerOptions) {
     });
     if (monitoringFailure) failures.push(monitoringFailure);
     settleLifecycleFailure(priorFailure, failures);
+  }
+
+  async function startServers(port: number): Promise<ResultType<void, Error>> {
+    const configuredSocket = process.env.TOOL_SERVER_BACKEND_SOCKET;
+    const startConfiguredUnixServer = async () =>
+      configuredSocket ? startUnixServer(configuredSocket) : Result.ok(undefined);
+    return (
+      await Result.try({
+        try: () => {
+          healthState.startMonitoring();
+          // Elysia listen is sync-ish, but server becomes available shortly after.
+          app.listen(port);
+        },
+        catch: captureError,
+      })
+        .mapError((error) => error.cause)
+        .andThenAsync(startConfiguredUnixServer)
+    ).andThen(() =>
+      Result.try({
+        try: () => {
+          healthState.markListening(true);
+          logger.info(`Tool server listening on port ${app.server?.hostname}:${app.server?.port}`);
+          if (unixSocketPath) logger.info(`Tool server listening on unix socket ${unixSocketPath}`);
+        },
+        catch: captureError,
+      }).mapError((error) => error.cause),
+    );
   }
 
   function recordUnhandledRejectionAtBoundary(reason: unknown): void {
@@ -1844,38 +1948,16 @@ export function createToolServer(options: ToolServerOptions) {
     start: async (port: number) => {
       if (started) return;
       started = true;
-      const configuredSocket = process.env.TOOL_SERVER_BACKEND_SOCKET;
-      const startup = Result.try({
-        try: () => {
-          healthState.startMonitoring();
-          // Elysia listen is sync-ish, but server becomes available shortly after.
-          app.listen(port);
-        },
-        catch: captureError,
-      })
-        .mapError((error) => error.cause)
-        .andThen(() =>
-          configuredSocket ? startUnixServer(configuredSocket) : Result.ok(undefined),
-        )
-        .andThen(() =>
-          Result.try({
-            try: () => {
-              healthState.markListening(true);
-              logger.info(
-                `Tool server listening on port ${app.server?.hostname}:${app.server?.port}`,
-              );
-              if (unixSocketPath)
-                logger.info(`Tool server listening on unix socket ${unixSocketPath}`);
-            },
-            catch: captureError,
-          }).mapError((error) => error.cause),
-        );
+      pendingStart = startServers(port);
+      const startup = await pendingStart;
+      pendingStart = undefined;
       startup.match<() => void>({
         ok: () => () => undefined,
         err: (error) => () => rollbackServerStart(error),
       })();
     },
     stop: async () => {
+      await pendingStart;
       const destroy = async () => {
         if (options.pluginManager) {
           const destroyed = await options.pluginManager.destroy();
