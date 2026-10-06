@@ -4,7 +4,7 @@
 
 本文件描述 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) 相對於 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的現行差異。
 
-比較基準為 2026-10-04 時與 upstream `main` 的 merge base：（sync merge [`b0eea918`](https://github.com/DF-wu/lilac-mono/commit/b0eea918)，接續 fork PR [#71](https://github.com/DF-wu/lilac-mono/pull/71)）本 fork 已包含 upstream commit [`a4932645`](https://github.com/stanley2058/lilac-mono/commit/a4932645)，並在其上保留下列功能與維運修改。
+比較基準為 2026-10-06 時與 upstream `main` 的 merge base（sync merge [`ca808ccb`](https://github.com/DF-wu/lilac-mono/commit/ca808ccb)）：本 fork 已包含 upstream commit [`bde35937`](https://github.com/stanley2058/lilac-mono/commit/bde35937)，並在其上保留下列功能與維運修改。
 
 > [!IMPORTANT]
 > 這是維護文件，不是永久相容性承諾。Upstream sync 後，已被上游接收或不再存在的差異必須從本表移除或重新分類。
@@ -17,7 +17,7 @@
 | 結構化 `generate.image` | Upstream commit [`05115838`](https://github.com/stanley2058/lilac-mono/commit/05115838) 將 `generate.image` 改成 JavaScript script runner（`image-script.ts`、`providers` global 與 `image-generation` skill 內的 per-provider recipes）。本 fork 保留結構化的 prompt / model alias / size / mask / `outputDir` 工具、其測試，以及描述該 contract 的 skill；單一 alias capability catalog 驅動驗證與路由，結果附帶 `providerMetadata` | [`apps/core/src/tool-server/tools/generate-image/`](../apps/core/src/tool-server/tools/generate-image/)、[`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md)、fork PR [#76](https://github.com/DF-wu/lilac-mono/pull/76) | 無法使用 upstream 的 script recipes；agent 不能透過 `generate.image` 執行任意 image script。這是最大的 tool contract 分歧，每次 sync 碰到 `tools/generate.ts` 時都要重新評估 |
 | OpenAI-compatible image routing | 以 v2 config 路由 `generate.image` aliases：全體 aliases 的 bulk `provider`、可選的 alias allowlist，以及 per-alias `routes`（`<provider>/<model id>`，provider 可為 `openai`、`openrouter`、`xai`、`openai-compatible`）；ratio-driven aliases 會把 `aspectRatio` 以 colon-form `size` 轉送；fork 自有的 image client 會為 multipart edit 上傳加上檔名 | [`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md)、fork PR [#47](https://github.com/DF-wu/lilac-mono/pull/47)、[#76](https://github.com/DF-wu/lilac-mono/pull/76) | 無 official-provider fallback 或 cross-provider retry |
 | OpenAI `web.search` provider | `tools.web.extract.providers` 可填 `openai`：`web.search` 會改走 OpenAI Responses 的 `web_search` 工具（以 `tool_choice: required` 強制搜尋），回傳答案的 URL citations，再附上未被引用的檢索來源；`tools.web.openai.{model,searchContextSize}` 可調整，`model` 填 `openai` / `openai-compatible` provider 的 `provider/model`。只做搜尋：`web.extract` 會略過它 | [`web-search-openai.md`](./web-search-openai.md)、[`core-config-migrations.md`](./core-config-migrations.md)、`apps/core/src/tool-server/tools/web-search/openai-web-search-provider.ts` | 準備回饋 upstream（尚未送出）；需要直連 `api.openai.com` 或有實作 Responses `web_search` 的 gateway；發布日期限制只能靠對模型的指示 |
-| GitHub reply permalinks | `In reply to` 連結會指向被引用的 issue/PR body 或 comment anchor，並使用設定的 GitHub host（支援 GHES）；agent 回覆與 workflow progress 訊息都適用 | [`github-reply-permalinks.md`](./github-reply-permalinks.md)、fork PR [#49](https://github.com/DF-wu/lilac-mono/pull/49) | 連結直接由既有 reference 組成，不會額外呼叫 API；body target 連到 thread URL |
+| GitHub final-publication policy | Issue 與 PR review 的 prompt 告知 agent 由 Lilac 自行發布最終回覆：agent 不得再透過 `gh`、GitHub API 或 `surface.messages.send` 重複發布；若已直接發布，或 `gh pr review` 送出成功，則回傳 `NO_REPLY` | `apps/core/src/github/webhook/github-webhook-server.ts`、fork PR [#56](https://github.com/DF-wu/lilac-mono/pull/56) | 只是 prompt 指引；模型若忽略仍可能重複發文 |
 | Custom media plugin example | 提供 external Level 2 image/video plugin，使用 OpenAI-compatible image API 與 QuantumNous/new-api-compatible video flow | [`custom-media/README.md`](../examples/plugins/custom-media/README.md)、fork PR [#30](https://github.com/DF-wu/lilac-mono/pull/30) | Plugin 是 trusted in-process code；restricted callers 目前不能直接使用 external callables |
 | Compatible-provider tool calls | Compatible provider 即使回傳 `other` 等非標準 finish reason，只要已解析出 local tool calls 仍會執行並保存結果 | Commit [`1c58e532`](https://github.com/DF-wu/lilac-mono/commit/1c58e532201ee51782c98c1d8b16086f6bf45c34) | 只信任已通過 parser 的 local tool calls；不會把任意 provider text 當成 tool invocation |
 | Container delivery | Build workflow 發布經驗證的 `catalina`、`claudia` 與 SHA tags，`latest` 指向 `catalina`；每個 variant 都有各自的帳號與 home directory，image 另加入 `rsync` | [`build-image.yml`](../.github/workflows/build-image.yml)、[`Dockerfile`](../Dockerfile) | 兩個發布 variant 都使用 UID/GID 3000；host bind mounts 必須允許該數字身分存取 |
@@ -43,15 +43,32 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 
 面向操作者的 feature matrix 以 [`telegram-surface.md`](./telegram-surface.md#10-what-works-and-what-does-not) 為準；與 Discord 逐項對照的能力比較、每個差異的原因與所需改動，見 [`telegram-feature-parity.zh-TW.md`](./telegram-feature-parity.zh-TW.md)。
 
-## 已被上游接收的貢獻
+## 回饋上游的貢獻
 
-以下能力目前存在於本 fork，但已不再構成 fork divergence：
+截至 2026-10-06，本 fork 向 upstream 開過的所有 pull request。已 merge 的貢獻兩邊都有，不再構成 fork divergence；已關閉的則說明某項 fork 差異為何仍存在或被放棄。
+
+### 已被上游接收的貢獻
 
 | 原始貢獻 | Upstream 狀態 | 分類方式 |
 | --- | --- | --- |
-| Configurable Exa web search provider | Upstream PR [#1](https://github.com/stanley2058/lilac-mono/pull/1) 已 merge | 視為 inherited upstream capability |
-| `TAVILY_API_BASE_URL` 與相關 normalization/docs | Upstream PR [#4](https://github.com/stanley2058/lilac-mono/pull/4)、[#5](https://github.com/stanley2058/lilac-mono/pull/5) 已 merge | 視為 inherited upstream capability |
-| GitHub agent-comment marker、safe trigger parsing 與 self-trigger loop prevention | Upstream PR [#13](https://github.com/stanley2058/lilac-mono/pull/13) 已 merge | 不列入 fork-only GitHub 差異 |
+| Configurable Exa web search provider | Upstream PR [#1](https://github.com/stanley2058/lilac-mono/pull/1) 於 2026-02-19 merge | 視為 inherited upstream capability |
+| `TAVILY_API_BASE_URL` 與相關 normalization/docs | Upstream PR [#4](https://github.com/stanley2058/lilac-mono/pull/4)、[#5](https://github.com/stanley2058/lilac-mono/pull/5) 於 2026-02-20、2026-02-21 merge | 視為 inherited upstream capability |
+| GitHub agent-comment marker、safe trigger parsing 與 self-trigger loop prevention | Upstream PR [#13](https://github.com/stanley2058/lilac-mono/pull/13) 於 2026-06-08 merge | 不列入 fork-only GitHub 差異 |
+| GitHub reply permalinks：`In reply to` 連結指向被引用的 issue/PR body 或 comment anchor，並使用設定的 GitHub host（支援 GHES）；agent 回覆與 workflow progress 訊息都適用（[`github-reply-permalinks.md`](./github-reply-permalinks.md)） | Upstream PR [#35](https://github.com/stanley2058/lilac-mono/pull/35) 於 2026-10-05 merge，源自 fork PR [#49](https://github.com/DF-wu/lilac-mono/pull/49) 與 [#78](https://github.com/DF-wu/lilac-mono/pull/78)；已於 [`ca808ccb`](https://github.com/DF-wu/lilac-mono/commit/ca808ccb) sync 回來 | 視為 inherited upstream capability；fork 的六個 permalink 接縫與兩個測試已與 upstream 相同，並已移出 footprint allowlist |
+
+### 未 merge 即關閉
+
+| Pull request | 結果 | Fork 現況 |
+| --- | --- | --- |
+| Upstream PR [#22](https://github.com/stanley2058/lilac-mono/pull/22)，GitHub reply comment links | 作者於 2026-07-30 自行關閉，先在 fork 重做（原本寫死 `github.com` host） | 已由 upstream PR [#35](https://github.com/stanley2058/lilac-mono/pull/35) 取代 |
+| Upstream PR [#15](https://github.com/stanley2058/lilac-mono/pull/15)，`generate.image` 的 custom image generation providers | 2026-07-12 未 merge 即關閉；upstream 之後把 `generate.image` 改成 script runner（commit [`05115838`](https://github.com/stanley2058/lilac-mono/commit/05115838)） | 保留為上方 fork-only 的結構化 `generate.image` 與 OpenAI-compatible image routing |
+| Upstream PR [#14](https://github.com/stanley2058/lilac-mono/pull/14)，Discord plain preview final reply 的 stats-for-nerds | 誤開的 draft；維護者提出設計意見後於 2026-06-15 關閉 | Fork 未保留 |
+| Upstream PR [#6](https://github.com/stanley2058/lilac-mono/pull/6)，README 改寫 | 誤開後關閉 | 不適用 |
+
+### 尚未送出
+
+- **OpenAI `web.search` provider**：準備回饋 upstream；其接縫在 footprint allowlist 中集中一組，被接收後即可移除。
+- **Origin-session authority**：第一個應回饋 upstream 的候選，因為它沒有 fork 自有模組，改動全在 upstream 檔案裡。
 
 ## 不應列為現行差異
 
@@ -89,7 +106,7 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 | OpenAI `web.search` provider | `apps/core/src/tool-server/tools/web-search/openai-web-search-provider.ts`（Responses 請求、citation 解碼、摘要標示）、`openai-web-search-model.ts`（`tools.web.openai.model` 的端點解析）與 `apps/core/tests/tools/web-search-openai*.test.ts` | `tools/web-search.ts`（export）、`web-search/default-web-search-providers.ts`（註冊）、`resolve-provider.ts`（缺少 key 的訊息）、`web-search/types.ts`（provider id）、`tools/web.ts` 與 `web/provider-page-extraction.ts`（環境變數與 search-only 略過）、`core-config/types.ts` 與 `v2.ts`（`openai` provider id 與 `tools.web.openai`） |
 | Command menu aliases | `packages/utils/custom-commands-menu.ts`（alias 文法、會檢查 `@target` 的 token parsing）與 `apps/core/src/custom-commands/menu-aliases.ts`（確定性的 alias 指派） | `custom-commands/manager.ts`（alias index 與 parse options）與 `packages/utils/index.ts` |
 | Origin-session authority | 尚無；改動仍在 upstream 檔案裡 | `tool-server/create-tool-server.ts`、`request-control-authority.ts`、`tools/surface.ts`、`tools/bash-impl.ts`、`apps/tool-bridge/client.ts`、`packages/plugin-runtime/types.ts`。這是第一個應回饋 upstream 的候選 |
-| GitHub reply permalinks | 尚無；改動仍在 upstream 檔案裡 | `github/github-api.ts` 與 `github-ids.ts`（issue 與 comment permalink 的解析）、`github/webhook/github-webhook-server.ts`（重複 final publication 與 self-trigger 的防護）、`surface/github/github-adapter.ts`（單一 publisher）、`surface/github/output/github-output-stream.ts`（reply permalinks） |
+| GitHub final-publication policy | 尚無；改動仍在 upstream 檔案裡 | `github/webhook/github-webhook-server.ts`（issue 與 PR review prompt 的發布政策）。Reply permalinks 已改由 upstream PR #35 提供，不再占用任何接縫 |
 | Agent 與 event bus 修正 | 尚無；改動仍在 upstream 檔案裡 | `packages/agent/adapters/ai-sdk/adapter.ts`（非標準 finish reason 下的 tool calls）、`packages/agent/agent-run-idle-watchdog.ts`（restart gap）、`packages/event-bus/redis-streams-bus.ts`（single-flight subscription cleanup） |
 | 啟動時的 legacy blob migration | 尚無；改動仍在 upstream 檔案裡 | `runtime/main.ts`（透過 `startCoreRuntime` 執行 migration）、`apps/core/scripts/legacy-transcript-blob-migration.ts`、`docker/direct-entrypoint.sh` |
 | Architecture gate | 無 | `scripts/architecture/manifest.ts`、`precise-exception-identities.ts` 與 `core-final-boundary-identities.ts` 註冊 fork 模組；`architecture.test.ts` 預期 Telegram request router 的 event consumer |
@@ -143,6 +160,7 @@ flowchart TD
 git fetch origin
 git fetch upstream
 git log --no-merges upstream/main..origin/main
+gh pr list -R stanley2058/lilac-mono --author DF-wu --state all
 git diff --stat upstream/main..origin/main
 bun run fork:footprint
 ```

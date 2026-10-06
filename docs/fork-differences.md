@@ -4,7 +4,7 @@ Language: [`English (primary / canonical)`](./fork-differences.md) · [`Traditio
 
 This document describes the current differences between [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) and [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono).
 
-The comparison baseline is the merge base with upstream `main` as of 2026-10-04 (sync merge [`b0eea918`](https://github.com/DF-wu/lilac-mono/commit/b0eea918), following fork PR [#71](https://github.com/DF-wu/lilac-mono/pull/71)): this fork includes upstream commit [`a4932645`](https://github.com/stanley2058/lilac-mono/commit/a4932645) and retains the following feature and operational changes on top of it.
+The comparison baseline is the merge base with upstream `main` as of 2026-10-06 (sync merge [`ca808ccb`](https://github.com/DF-wu/lilac-mono/commit/ca808ccb)): this fork includes upstream commit [`bde35937`](https://github.com/stanley2058/lilac-mono/commit/bde35937) and retains the following feature and operational changes on top of it.
 
 > [!IMPORTANT]
 > This is a maintenance document, not a permanent compatibility commitment. After an upstream sync, differences that have been accepted upstream or no longer exist must be removed from this table or reclassified.
@@ -17,7 +17,7 @@ The comparison baseline is the merge base with upstream `main` as of 2026-10-04 
 | Structured `generate.image` | Upstream commit [`05115838`](https://github.com/stanley2058/lilac-mono/commit/05115838) replaced `generate.image` with a JavaScript script runner (`image-script.ts`, a `providers` global, and per-provider recipes in the `image-generation` skill). The fork keeps the structured prompt / model-alias / size / mask / `outputDir` tool, its tests, and a skill that documents that contract; one alias capability catalog drives validation and routing, and results carry `providerMetadata` | [`apps/core/src/tool-server/tools/generate-image/`](../apps/core/src/tool-server/tools/generate-image/), [`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md), fork PR [#76](https://github.com/DF-wu/lilac-mono/pull/76) | Upstream's script recipes are unavailable; agents cannot run arbitrary image scripts through `generate.image`. This is the largest tool-contract divergence and must be re-evaluated on every sync that touches `tools/generate.ts` |
 | OpenAI-compatible image routing | Uses v2 config to route `generate.image` aliases: a bulk `provider` for all aliases, an optional alias allowlist, and per-alias `routes` as `<provider>/<model id>` (`openai`, `openrouter`, `xai`, `openai-compatible`); ratio-driven aliases forward `aspectRatio` as a colon-form `size`; a fork-owned image client names multipart edit uploads | [`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md), fork PRs [#47](https://github.com/DF-wu/lilac-mono/pull/47) and [#76](https://github.com/DF-wu/lilac-mono/pull/76) | No official-provider fallback or cross-provider retry |
 | OpenAI `web.search` provider | `tools.web.extract.providers` accepts `openai`: `web.search` runs the OpenAI Responses `web_search` tool (forced via `tool_choice: required`) and returns the answer's URL citations followed by uncited retrieved sources; `tools.web.openai.{model,searchContextSize}` tune it, and `model` is a `provider/model` spec on the `openai` or `openai-compatible` provider. Search-only: `web.extract` skips it | [`web-search-openai.md`](./web-search-openai.md), [`core-config-migrations.md`](./core-config-migrations.md), `apps/core/src/tool-server/tools/web-search/openai-web-search-provider.ts` | Staged for an upstream contribution (not yet submitted); needs direct `api.openai.com` or a gateway that implements Responses `web_search`; no publish-date filter beyond model instructions |
-| GitHub reply permalinks | `In reply to` links point to the referenced issue/PR body or comment anchor on the configured GitHub host (GHES aware), in agent replies and workflow progress messages | [`github-reply-permalinks.md`](./github-reply-permalinks.md), fork PR [#49](https://github.com/DF-wu/lilac-mono/pull/49) | Links are built from the stored reference without extra API requests; body targets link to the thread URL |
+| GitHub final-publication policy | Issue and PR-review prompts tell the agent that Lilac publishes the final response itself: the agent must not repost it through `gh`, the GitHub API, or `surface.messages.send`, and returns `NO_REPLY` after publishing directly or after a successful `gh pr review` submission | `apps/core/src/github/webhook/github-webhook-server.ts`, fork PR [#56](https://github.com/DF-wu/lilac-mono/pull/56) | Prompt guidance only; a model that ignores it can still post a duplicate. |
 | Custom media plugin example | Provides an external Level 2 image/video plugin using an OpenAI-compatible image API and a QuantumNous/new-api-compatible video flow | [`custom-media/README.md`](../examples/plugins/custom-media/README.md), fork PR [#30](https://github.com/DF-wu/lilac-mono/pull/30) | Plugins are trusted in-process code; restricted callers currently cannot use external callables directly |
 | Compatible-provider tool calls | When a compatible provider returns a nonstandard finish reason such as `other`, parsed local tool calls are still executed and their results preserved | Commit [`1c58e532`](https://github.com/DF-wu/lilac-mono/commit/1c58e532201ee51782c98c1d8b16086f6bf45c34) | Trusts only local tool calls that passed the parser; arbitrary provider text is not treated as a tool invocation |
 | Container delivery | The build workflow publishes verified `catalina`, `claudia`, and SHA tags, with `latest` pointing to `catalina`; each variant has its own account and home directory, and the image also includes `rsync` | [`build-image.yml`](../.github/workflows/build-image.yml), [`Dockerfile`](../Dockerfile) | Both published variants use UID/GID 3000; host bind mounts must grant that numeric identity access |
@@ -43,15 +43,32 @@ Items that remain unimplemented or are constrained by the platform:
 
 See [`telegram-surface.md`](./telegram-surface.md#10-what-works-and-what-does-not) for the operator-facing feature matrix, and [`telegram-feature-parity.md`](./telegram-feature-parity.md) for the capability-by-capability comparison with Discord, including why each gap exists and what closing it would take.
 
-## Accepted Upstream Contributions
+## Upstream Contributions
 
-The following capabilities currently exist in this fork but no longer constitute fork divergence:
+Every pull request this fork has opened against upstream, as of 2026-10-06. Merged contributions exist in both repositories and are no longer fork divergence; closed ones explain why a fork difference still exists or was dropped.
+
+### Accepted Upstream Contributions
 
 | Original contribution | Upstream status | Classification |
 | --- | --- | --- |
-| Configurable Exa web search provider | Upstream PR [#1](https://github.com/stanley2058/lilac-mono/pull/1) has been merged | Treated as an inherited upstream capability |
-| `TAVILY_API_BASE_URL` and related normalization/docs | Upstream PRs [#4](https://github.com/stanley2058/lilac-mono/pull/4) and [#5](https://github.com/stanley2058/lilac-mono/pull/5) have been merged | Treated as an inherited upstream capability |
-| GitHub agent-comment marker, safe trigger parsing, and self-trigger loop prevention | Upstream PR [#13](https://github.com/stanley2058/lilac-mono/pull/13) has been merged | Not listed as a fork-only GitHub difference |
+| Configurable Exa web search provider | Upstream PR [#1](https://github.com/stanley2058/lilac-mono/pull/1) merged 2026-02-19 | Treated as an inherited upstream capability |
+| `TAVILY_API_BASE_URL` and related normalization/docs | Upstream PRs [#4](https://github.com/stanley2058/lilac-mono/pull/4) and [#5](https://github.com/stanley2058/lilac-mono/pull/5) merged 2026-02-20 and 2026-02-21 | Treated as an inherited upstream capability |
+| GitHub agent-comment marker, safe trigger parsing, and self-trigger loop prevention | Upstream PR [#13](https://github.com/stanley2058/lilac-mono/pull/13) merged 2026-06-08 | Not listed as a fork-only GitHub difference |
+| GitHub reply permalinks: `In reply to` links to the referenced issue/PR body or comment anchor on the configured GitHub host (GHES aware), in agent replies and workflow progress messages ([`github-reply-permalinks.md`](./github-reply-permalinks.md)) | Upstream PR [#35](https://github.com/stanley2058/lilac-mono/pull/35) merged 2026-10-05, from fork PRs [#49](https://github.com/DF-wu/lilac-mono/pull/49) and [#78](https://github.com/DF-wu/lilac-mono/pull/78); synced in [`ca808ccb`](https://github.com/DF-wu/lilac-mono/commit/ca808ccb) | Inherited upstream capability; the fork's six permalink seams and two tests now match upstream and left the footprint allowlist |
+
+### Closed Without Merge
+
+| Pull request | Outcome | Fork status |
+| --- | --- | --- |
+| Upstream PR [#22](https://github.com/stanley2058/lilac-mono/pull/22), GitHub reply comment links | Closed by the author on 2026-07-30 to rework on the fork first (hard-coded `github.com` host) | Superseded by upstream PR [#35](https://github.com/stanley2058/lilac-mono/pull/35) |
+| Upstream PR [#15](https://github.com/stanley2058/lilac-mono/pull/15), custom image generation providers for `generate.image` | Closed on 2026-07-12 without merge; upstream later replaced `generate.image` with a script runner (commit [`05115838`](https://github.com/stanley2058/lilac-mono/commit/05115838)) | Kept as the fork-only structured `generate.image` and OpenAI-compatible image routing above |
+| Upstream PR [#14](https://github.com/stanley2058/lilac-mono/pull/14), Discord stats-for-nerds in the plain preview final reply | Draft opened by accident; closed on 2026-06-15 after maintainer design feedback | Not carried by the fork |
+| Upstream PR [#6](https://github.com/stanley2058/lilac-mono/pull/6), README refresh | Opened by mistake and closed | Not applicable |
+
+### Not Yet Submitted
+
+- **OpenAI `web.search` provider**: staged for an upstream contribution; its seams are grouped in the footprint allowlist so they can be removed once accepted.
+- **Origin-session authority**: the first candidate for an upstream contribution, because it has no fork-owned module and lives entirely in upstream files.
 
 ## Items That Should Not Be Listed as Current Differences
 
@@ -89,7 +106,7 @@ The fork keeps behavior in fork-owned modules and touches upstream files only at
 | OpenAI `web.search` provider | `apps/core/src/tool-server/tools/web-search/openai-web-search-provider.ts` (Responses request, citation decoding, snippet labeling), `openai-web-search-model.ts` (endpoint resolution for `tools.web.openai.model`), and `apps/core/tests/tools/web-search-openai*.test.ts` | `tools/web-search.ts` (export), `web-search/default-web-search-providers.ts` (registration), `resolve-provider.ts` (missing-key message), `web-search/types.ts` (provider id), `tools/web.ts` and `web/provider-page-extraction.ts` (environment and search-only skip), `core-config/types.ts` and `v2.ts` (`openai` provider id and `tools.web.openai`) |
 | Command menu aliases | `packages/utils/custom-commands-menu.ts` (alias grammar, `@target`-aware token parsing) and `apps/core/src/custom-commands/menu-aliases.ts` (deterministic alias assignment) | `custom-commands/manager.ts` (alias index and parse options) and `packages/utils/index.ts` |
 | Origin-session authority | None yet; the change lives in upstream files | `tool-server/create-tool-server.ts`, `request-control-authority.ts`, `tools/surface.ts`, `tools/bash-impl.ts`, `apps/tool-bridge/client.ts`, `packages/plugin-runtime/types.ts`. This is the first candidate for an upstream contribution |
-| GitHub reply permalinks | None; the change lives in upstream files | `github/github-api.ts` and `github-ids.ts` (issue versus comment permalink resolution), `github/webhook/github-webhook-server.ts` (duplicate final publication and self-trigger guards), `surface/github/github-adapter.ts` (single publisher), `surface/github/output/github-output-stream.ts` (reply permalinks) |
+| GitHub final-publication policy | None; the change lives in an upstream file | `github/webhook/github-webhook-server.ts` (issue and PR-review prompt publication policy). Reply permalinks now come from upstream PR #35 and no longer touch any seam |
 | Agent and event bus fixes | None; the change lives in upstream files | `packages/agent/adapters/ai-sdk/adapter.ts` (tool calls on nonstandard finish reasons), `packages/agent/agent-run-idle-watchdog.ts` (restart gap), `packages/event-bus/redis-streams-bus.ts` (single-flight subscription cleanup) |
 | Startup legacy blob migration | None; the change lives in upstream files | `runtime/main.ts` (runs the migration through `startCoreRuntime`), `apps/core/scripts/legacy-transcript-blob-migration.ts`, `docker/direct-entrypoint.sh` |
 | Architecture gate | None | `scripts/architecture/manifest.ts`, `precise-exception-identities.ts`, and `core-final-boundary-identities.ts` register the fork modules; `architecture.test.ts` expects the Telegram request router event consumer |
@@ -143,6 +160,7 @@ Whenever a fork-only feature is added or a major upstream sync is completed, run
 git fetch origin
 git fetch upstream
 git log --no-merges upstream/main..origin/main
+gh pr list -R stanley2058/lilac-mono --author DF-wu --state all
 git diff --stat upstream/main..origin/main
 bun run fork:footprint
 ```

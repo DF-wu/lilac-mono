@@ -23,7 +23,7 @@
 | [`native-surface-verification.md`](./native-surface-verification.md) | 舊版獨立 native client 的驗證紀錄（歷史文件）；目前的 console 設定見 `native-surface.md` |
 | [`telegram-surface.md`](./telegram-surface.md) | BotFather、allowlists、群組、forum topics、workflow、對話記憶、驗證與限制 |
 | [`telegram-feature-parity.zh-TW.md`](./telegram-feature-parity.zh-TW.md) | Telegram 與 Discord 的能力對照：router 重寫對齊了什麼、每個剩餘差異的原因與所需改動，以及 Telegram 獨有的優勢 |
-| [`github-reply-permalinks.md`](./github-reply-permalinks.md) | GitHub issue/PR body 與 comment reply permalink contract |
+| [`github-reply-permalinks.md`](./github-reply-permalinks.md) | GitHub issue/PR body 與 comment reply permalink contract（已於 upstream PR #35 被接收） |
 
 ## Generation 與 Extensions
 

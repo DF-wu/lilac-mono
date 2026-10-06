@@ -37,21 +37,20 @@ server.
 Architecture and ownership are documented in [`PROJECT.md`](./PROJECT.md). Repository rules for coding agents are in [`AGENTS.md`](./AGENTS.md).
 
 > [!IMPORTANT]
-> This is a downstream fork that continuously tracks [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) through Git history and the `upstream` remote. It is not an official upstream release. This project regularly merges upstream updates while maintaining independent Telegram, OpenAI-compatible image routing, OpenAI `web.search`, GitHub reply permalink, and deployment automation features.
+> This is a downstream fork that continuously tracks [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) through Git history and the `upstream` remote. It is not an official upstream release. This project regularly merges upstream updates while maintaining independent Telegram, OpenAI-compatible image routing, OpenAI `web.search`, and deployment automation features.
 
 Lilac brings platform messaging, routing, model execution, tools, Skills, and recoverable workflows
 into one runtime.
 
 ## Fork Differences
 
-The table below lists only behavior that still differs from upstream. For the full rationale, limitations, and items reported back upstream, see [`docs/fork-differences.md`](./docs/fork-differences.md).
+The table below lists only behavior that still differs from upstream. GitHub reply permalinks and comment self-loop protection were accepted upstream and are no longer listed. For the full rationale, limitations, and every pull request opened against upstream, see [`docs/fork-differences.md`](./docs/fork-differences.md).
 
 | Area                            | Difference provided by this fork                                                                                                                       | Important limitations                                                                             |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
 | Telegram surface                | DMs, groups, forum topics, streaming HTML replies, cancellation, reactions, command menu, inbound/outbound attachments, workflow cards, same-surface tools, and Telegram history in cross-surface conversation memory | Disabled by default; long polling only; memory indexes one thread per chat or topic |
 | OpenAI-compatible image routing | Routes the existing `generate.image` aliases through an operator-specified OpenAI-compatible endpoint, with per-alias `provider/model` routes            | `configVersion: 2` only; no automatic fallback between providers                                  |
 | OpenAI `web.search` provider    | `openai` in `tools.web.extract.providers` runs `web.search` through the OpenAI Responses `web_search` tool and returns the answer's cited sources     | `configVersion: 2` only; search-only (`web.extract` skips it); date filters are model guidance only |
-| GitHub reply UX                 | `In reply to` links to the referenced issue/PR thread or the specified comment's permalink on the configured GitHub host (GHES aware), with no extra API request | GitHub comment self-loop protection has been accepted upstream and is no longer fork-only         |
 | Custom media plugin             | Deployable Level 2 image/video plugin example demonstrating strict configuration and file-safety handling                                              | The plugin is trusted in-process code; restricted callers currently cannot use external callables |
 | Operations and delivery         | Upstream checks every 6 hours, GHCR publishes verified `catalina`/`claudia` tags, and CI enforces the upstream-footprint allowlist                     | Automatic merges still require manual handling when conflicts occur                               |
 

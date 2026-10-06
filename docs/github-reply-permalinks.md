@@ -1,5 +1,11 @@
 # GitHub Reply Permalinks
 
+> [!NOTE]
+> Upstream accepted this feature in
+> [stanley2058/lilac-mono#35](https://github.com/stanley2058/lilac-mono/pull/35)
+> on 2026-10-05. It is an inherited upstream capability, not a fork
+> difference; this document remains as its contract reference.
+
 ## Purpose
 
 GitHub issue comments have no native reply target, so relay replies carry an

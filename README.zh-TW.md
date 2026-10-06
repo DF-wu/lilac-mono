@@ -24,20 +24,19 @@
 </p>
 
 > [!IMPORTANT]
-> 這是以 Git history 與 `upstream` remote 持續追蹤 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的 downstream fork，不是上游官方發行版。本專案定期合併上游更新，同時維護 Telegram、相容式圖像路由、OpenAI `web.search`、GitHub 回覆連結與部署自動化等獨立功能。
+> 這是以 Git history 與 `upstream` remote 持續追蹤 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的 downstream fork，不是上游官方發行版。本專案定期合併上游更新，同時維護 Telegram、相容式圖像路由、OpenAI `web.search` 與部署自動化等獨立功能。
 
 Lilac 把平台訊息、路由、模型執行、工具、Skills 與可恢復工作流程放在同一套 Core runtime 中。
 
 ## 本 Fork 的主要差異
 
-以下只列出目前仍與上游不同的行為。完整依據、限制與已回饋上游的項目見 [`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md)。
+以下只列出目前仍與上游不同的行為。GitHub reply permalinks 與 comment self-loop 防護已被上游接收，不再列出。完整依據、限制與所有向上游開過的 pull request 見 [`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md)。
 
 | 領域 | 本 fork 提供的差異 | 重要限制 |
 | --- | --- | --- |
 | Telegram surface | DMs、群組、forum topics、串流 HTML 回覆、取消、reaction、command menu、inbound/outbound attachments、workflow cards、同 surface tools，以及納入跨 surface 對話記憶的 Telegram 歷史 | 預設停用；僅 long polling；記憶以每個聊天或 topic 為一個 thread |
 | OpenAI-compatible 圖像路由 | 將既有 `generate.image` aliases 路由到 operator 指定的 OpenAI-compatible endpoint，並支援 per-alias `provider/model` routes | 僅 `configVersion: 2`；provider 之間無自動 fallback |
 | OpenAI `web.search` provider | `tools.web.extract.providers` 填入 `openai` 後，`web.search` 改走 OpenAI Responses 的 `web_search` 工具，回傳答案引用的來源 | 僅 `configVersion: 2`；只做搜尋（`web.extract` 會略過）；日期限制只是對模型的指示 |
-| GitHub 回覆 UX | `In reply to` 會連到被引用的 issue/PR thread 或指定 comment 的 permalink，使用設定的 GitHub host（支援 GHES），不額外呼叫 API | GitHub comment self-loop 防護已被上游接收，不再列為 fork-only |
 | Custom media plugin | 可部署的 Level 2 image/video plugin 範例，示範嚴格設定與檔案安全處理 | Plugin 是 trusted in-process code；restricted caller 目前不能使用 external callables |
 | 維運與交付 | 每 6 小時檢查 upstream、發布經驗證的 GHCR `catalina`/`claudia` tags，CI 並強制執行 upstream-footprint allowlist | 自動合併發生衝突時仍需人工處理 |
 
