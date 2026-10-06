@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { readyTurnSlotSchema, type ReadyTurnSlot } from "@stanley2058/lilac-client-protocol";
-import { agentWorkStages } from "../src/agent-work-fixtures";
+import { agentWorkStages, demoSubagents } from "../src/agent-work-fixtures";
+import { SubagentContext } from "../src/components/subagent-context";
 import { MessageIdentityContext } from "../src/components/message-identity";
 import { Turn } from "../src/components/Timeline";
 import { MessageServicesContext } from "../src/components/message-services";
@@ -59,7 +60,14 @@ function renderStage(id: string, override?: ReadyTurnSlot) {
       <MessageServicesContext
         value={{ canEdit: true, resourceUrl: () => "", onAction: () => {}, onReaction: () => {} }}
       >
-        <Turn slot={slot} onRewind={() => {}} onLoadMore={() => {}} />
+        <SubagentContext
+          value={{
+            agents: new Map(demoSubagents(slot).map((agent) => [agent.activityId, agent])),
+            open: () => {},
+          }}
+        >
+          <Turn slot={slot} onRewind={() => {}} onLoadMore={() => {}} />
+        </SubagentContext>
       </MessageServicesContext>
     </MessageIdentityContext>,
   );
@@ -140,7 +148,7 @@ test("subagents retain activity identity as results arrive and settle under the 
     expect(activities.map((part) => part.data.state)).toEqual(expectedStates[index]!);
     for (const part of activities) {
       expect(part.data.kind).toBe("tool");
-      expect(part.data.detail).toBeUndefined();
+      expect(part.data.detail).toBe(part.data.label);
       expect(part.data.label.length).toBeLessThanOrEqual(256);
     }
     const html = renderStage(id);
@@ -260,7 +268,7 @@ test("only the last folded section and sections with running agents shine", () =
   expect(html.match(/class="working-text[ "]/gu)).toHaveLength(2);
   expect(html).toContain(">Compared both options.</span>");
   expect(html).toContain(
-    '>General Agent - Thinking…<span aria-hidden="true" class="working-text-shine">General Agent - Thinking…</span>',
+    '>General Agent - bash<span aria-hidden="true" class="working-text-shine">General Agent - bash</span>',
   );
   expect(html).toContain(
     '>Thinking<span aria-hidden="true" class="working-text-shine">Thinking</span>',

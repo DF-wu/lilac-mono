@@ -33,6 +33,8 @@ import {
   formatActivityOutput,
   formatDuration,
   liveActivityLabel,
+  parseToolLabel,
+  subagentLabelProfile,
   type ActivityPart,
   type ActivityRowKind,
 } from "../activity-presentation";
@@ -118,9 +120,7 @@ export function subagentActivity(
 ): (Pick<SubagentSummary, "profile" | "title" | "state"> & { id?: string }) | undefined {
   const agent = agents.get(part.id);
   if (agent) return agent;
-  const profile = /^subagent(?:_delegate)? \((explore|general|self)(?:;|\))/.exec(
-    part.data.label,
-  )?.[1];
+  const profile = subagentLabelProfile(part);
   if (profile !== "explore" && profile !== "general" && profile !== "self") return;
   const current = part.data.label
     .split("\n")
@@ -326,6 +326,8 @@ function ActivityDetails({ part }: { part: ActivityPart }) {
 
 function detailInput(part: ActivityPart, kind: ActivityRowKind): string | undefined {
   if (kind === "command") return activityCommand(part);
+  if (kind === "web" && parseToolLabel(part.data.label).name === "bash")
+    return activityCommand(part);
   if (kind === "edit" && part.data.detail) return activityEditedPaths(part).paths.join("\n");
   return part.data.detail;
 }

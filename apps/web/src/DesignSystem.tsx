@@ -104,6 +104,7 @@ import { AgentDiscordLink } from "./components/AgentIdentity";
 import { ExternalMessages } from "./components/ExternalMessages";
 import { ExternalSkeleton } from "./components/ExternalSidebar";
 import { ThreadCard } from "./components/ThreadSelect";
+import { toolActivities } from "./generated/tool-activities";
 import "./design-system.css";
 
 const sections = [
@@ -282,17 +283,7 @@ const messageFixtures: DisplayMessage[] = [
           durationMs: 2100,
         },
       },
-      {
-        type: "data-activity",
-        id: "gallery-search",
-        data: {
-          kind: "tool",
-          label: "Searched nearby places",
-          state: "complete",
-          detail: "Found three cafés and two independent bookstores.",
-          durationMs: 900,
-        },
-      },
+      { type: "data-activity", id: "gallery-search", data: toolActivities.nearby.settled },
       {
         type: "text",
         text: "The café opens earlier than the bookstore, so that order works well.",

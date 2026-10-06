@@ -223,6 +223,7 @@ import { type AnthropicFallbackBlobStore } from "./bus-agent-runner/anthropic-fa
 import { formatUnknownErrorForDisplay } from "./bus-agent-runner/error-display";
 import {
   nativeToolActivityDetail,
+  nativeToolActivityLabel,
   nativeToolActivityResult,
   type NativeToolActivityResult,
 } from "./bus-agent-runner/native-activity-result";
@@ -7746,7 +7747,7 @@ export async function startBusAgentRunner(params: {
                 publishNativeToolActivity(
                   event.toolCallId,
                   "start",
-                  `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event, 8192)}`,
+                  nativeToolActivityLabel({ toolName: event.toolName, event }),
                   undefined,
                   nativeToolActivityDetail({ toolName: event.toolName, event }),
                 );
@@ -7796,7 +7797,7 @@ export async function startBusAgentRunner(params: {
                 publishNativeToolActivity(
                   event.toolCallId,
                   "end",
-                  `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event, 8192)}`,
+                  nativeToolActivityLabel({ toolName: event.toolName, event }),
                   ok,
                   {
                     ...nativeToolActivityDetail({ toolName: event.toolName, event }),

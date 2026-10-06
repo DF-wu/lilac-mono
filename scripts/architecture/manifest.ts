@@ -3760,6 +3760,13 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               category: "wire" as const,
             },
             {
+              identity: {
+                module: "src/activity-presentation.ts",
+                exportName: "decodeToolLabelArgs",
+              },
+              category: "wire" as const,
+            },
+            {
               identity: { module: "src/keybindings.ts", exportName: "recordedBinding" },
               category: "projection" as const,
             },
