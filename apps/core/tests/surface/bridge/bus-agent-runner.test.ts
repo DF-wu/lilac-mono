@@ -9657,322 +9657,329 @@ describe("Core-primary local compaction replacement", () => {
     expect(compatibilityCalls).toBe(0);
   });
 
-  it("maps the current boundary and text-lowers retained mixed history in the fresh payload", async () => {
-    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-primary-compaction-"));
-    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
-    const oldPrefix = [
-      { role: "user", content: `old question ${"x".repeat(20_000)}` },
-      { role: "assistant", content: "old answer" },
-    ] satisfies ModelMessage[];
-    const retainedHistorical = [
-      { role: "user", content: "retained historical question" },
-      {
-        role: "assistant",
-        content: [
-          {
-            type: "tool-call",
-            toolCallId: "old-tool",
-            toolName: "builtin",
-            input: {},
-          },
-        ],
-      },
-      {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "old-tool",
-            toolName: "builtin",
-            output: { type: "text", value: "historical tool output" },
-          },
-        ],
-      },
-      { role: "assistant", content: "retained historical answer" },
-    ] satisfies ModelMessage[];
-    const current = [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: "current question" },
-          {
-            type: "file",
-            data: new Uint8Array([1, 2, 3]),
-            mediaType: "image/png",
-          },
-        ],
-      },
-    ] satisfies ModelMessage[];
-    const oldPrefixStored = transcriptResultValue(projectStoredMessagesV1(oldPrefix));
-    const retainedHistoricalStored = transcriptResultValue(
-      projectStoredMessagesV1(retainedHistorical),
-    );
-    const currentStored = transcriptResultValue(
-      projectStoredMessagesV1([
+  it.each([0, 2])(
+    "maps current segment %i and prepares retained mixed history in the fresh payload",
+    async (currentSegmentIndex) => {
+      const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-primary-compaction-"));
+      const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+      const oldPrefix = [
+        { role: "user", content: `old question ${"x".repeat(20_000)}` },
+        { role: "assistant", content: "old answer" },
+      ] satisfies ModelMessage[];
+      const retainedHistorical = [
+        { role: "user", content: "retained historical question" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "old-tool",
+              toolName: "builtin",
+              input: {},
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "old-tool",
+              toolName: "builtin",
+              output: { type: "text", value: "historical tool output" },
+            },
+          ],
+        },
+        { role: "assistant", content: "retained historical answer" },
+      ] satisfies ModelMessage[];
+      const current = [
         {
           role: "user",
           content: [
             { type: "text", text: "current question" },
             {
-              type: "blob",
-              blob: {
-                version: 1,
-                objectId: `b1_${"11".repeat(16)}`,
-                sha256: "22".repeat(32),
-                byteLength: 3,
-              },
+              type: "file",
+              data: new Uint8Array([1, 2, 3]),
               mediaType: "image/png",
             },
           ],
         },
-      ]),
-    );
-    const originalMessages = [...oldPrefix, ...retainedHistorical, ...current];
-    let lineage: CorePrimaryLineageV2 = buildCoreLineageManifestV2(
-      [
-        {
-          atoms: [
-            {
-              kind: "synthetic",
-              source: "old-prefix",
-              messageDigest: transcriptResultValue(hashCanonicalStoredMessagesV2(oldPrefixStored))
-                .hash,
-            },
-          ],
-          canonicalMessages: oldPrefixStored,
+      ] satisfies ModelMessage[];
+      const oldPrefixStored = transcriptResultValue(projectStoredMessagesV1(oldPrefix));
+      const retainedHistoricalStored = transcriptResultValue(
+        projectStoredMessagesV1(retainedHistorical),
+      );
+      const currentStored = transcriptResultValue(
+        projectStoredMessagesV1([
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "current question" },
+              {
+                type: "blob",
+                blob: {
+                  version: 1,
+                  objectId: `b1_${"11".repeat(16)}`,
+                  sha256: "22".repeat(32),
+                  byteLength: 3,
+                },
+                mediaType: "image/png",
+              },
+            ],
+          },
+        ]),
+      );
+      const originalMessages = [...oldPrefix, ...retainedHistorical, ...current];
+      let lineage: CorePrimaryLineageV2 = buildCoreLineageManifestV2(
+        [
+          {
+            atoms: [
+              {
+                kind: "synthetic",
+                source: "old-prefix",
+                messageDigest: transcriptResultValue(hashCanonicalStoredMessagesV2(oldPrefixStored))
+                  .hash,
+              },
+            ],
+            canonicalMessages: oldPrefixStored,
+          },
+          {
+            atoms: [
+              {
+                kind: "synthetic",
+                source: "retained-history",
+                messageDigest: transcriptResultValue(
+                  hashCanonicalStoredMessagesV2(retainedHistoricalStored),
+                ).hash,
+              },
+            ],
+            canonicalMessages: retainedHistoricalStored,
+          },
+          {
+            atoms: [
+              {
+                kind: "synthetic",
+                source: "current-media",
+                messageDigest: transcriptResultValue(hashCanonicalStoredMessagesV2(currentStored))
+                  .hash,
+              },
+            ],
+            canonicalMessages: currentStored,
+          },
+        ],
+        { currentSegmentIndex },
+      );
+      const mainPayloads: ModelMessage[][] = [];
+      const mainModel = new MockLanguageModelV4({
+        modelId: "sonnet",
+        doStream: async (call) => {
+          mainPayloads.push([...call.prompt]);
+          return level1TextStep("fresh response");
         },
-        {
-          atoms: [
-            {
-              kind: "synthetic",
-              source: "retained-history",
-              messageDigest: transcriptResultValue(
-                hashCanonicalStoredMessagesV2(retainedHistoricalStored),
-              ).hash,
+      });
+      const summaryModel = new MockLanguageModelV4({
+        modelId: "summary",
+        doStream: async () => level1TextStep("## Objective\n- Preserve current input."),
+      });
+      const materializedStarts: ClaudeNativeSessionStart[] = [];
+      const disposedSessionIds: string[] = [];
+      const observation: ClaudeNativeAttemptObservation = {
+        requestedSessionId: null,
+        sourceSessionId: null,
+        initSessionId: null,
+        resultSessionId: null,
+        contextTokens: null,
+        contextMaxTokens: null,
+        requestedModel: "sonnet",
+        initializedModel: null,
+        requestedReasoning: null,
+        providerWarnings: [],
+        invoked: false,
+        requiredObservabilityError: null,
+        callbackError: null,
+      };
+      const runtime = createCorePrimaryClaudeRuntime({
+        store,
+        sessionId: "compaction-session",
+        requestId: "compaction-request",
+        providerId: "claude-code",
+        modelSpecifier: "claude-code/sonnet",
+        reasoning: "provider-default",
+        executionScopeHash: "scope",
+        executionCwd: dataDir,
+        getLineage: () => lineage,
+        materialize: async (start) => {
+          materializedStarts.push(start);
+          return {
+            agentModel: mainModel,
+            continuationModel: mainModel,
+            createUtilityModelResult: () => Result.ok(summaryModel),
+            createUtilityModel: () => summaryModel,
+            control: {
+              inject: () => false,
+              interrupt: async () => false,
+              async interruptResult() {
+                return Result.ok(await this.interrupt());
+              },
+              clear: () => {},
+              clearResult() {
+                this.clear();
+                return Result.ok();
+              },
             },
-          ],
-          canonicalMessages: retainedHistoricalStored,
-        },
-        {
-          atoms: [
-            {
-              kind: "synthetic",
-              source: "current-media",
-              messageDigest: transcriptResultValue(hashCanonicalStoredMessagesV2(currentStored))
-                .hash,
+            nativeSession: {
+              getObservation: () => ({
+                ...observation,
+                requestedSessionId: start.mode === "ephemeral" ? null : start.sessionId,
+                initSessionId: start.mode === "ephemeral" ? null : start.sessionId,
+                resultSessionId: start.mode === "ephemeral" ? null : start.sessionId,
+                invoked: true,
+              }),
+              waitForObservation: async () => observation,
+              recordWarning: () => {},
+              finalize: async () => ({
+                status: "unpromotable" as const,
+                issues: [
+                  {
+                    code: "candidate-missing" as const,
+                    message: "not finalized in this test",
+                  },
+                ],
+                observations: observation,
+                candidate: null,
+                sourcePreflight: null,
+                sourceFinal: null,
+              }),
+              async finalizeResult() {
+                return Result.ok(await this.finalize());
+              },
             },
-          ],
-          canonicalMessages: currentStored,
-        },
-      ],
-      { currentSegmentIndex: 2 },
-    );
-    const mainPayloads: ModelMessage[][] = [];
-    const mainModel = new MockLanguageModelV4({
-      modelId: "sonnet",
-      doStream: async (call) => {
-        mainPayloads.push([...call.prompt]);
-        return level1TextStep("fresh response");
-      },
-    });
-    const summaryModel = new MockLanguageModelV4({
-      modelId: "summary",
-      doStream: async () => level1TextStep("## Objective\n- Preserve current input."),
-    });
-    const materializedStarts: ClaudeNativeSessionStart[] = [];
-    const disposedSessionIds: string[] = [];
-    const observation: ClaudeNativeAttemptObservation = {
-      requestedSessionId: null,
-      sourceSessionId: null,
-      initSessionId: null,
-      resultSessionId: null,
-      contextTokens: null,
-      contextMaxTokens: null,
-      requestedModel: "sonnet",
-      initializedModel: null,
-      requestedReasoning: null,
-      providerWarnings: [],
-      invoked: false,
-      requiredObservabilityError: null,
-      callbackError: null,
-    };
-    const runtime = createCorePrimaryClaudeRuntime({
-      store,
-      sessionId: "compaction-session",
-      requestId: "compaction-request",
-      providerId: "claude-code",
-      modelSpecifier: "claude-code/sonnet",
-      reasoning: "provider-default",
-      executionScopeHash: "scope",
-      executionCwd: dataDir,
-      getLineage: () => lineage,
-      materialize: async (start) => {
-        materializedStarts.push(start);
-        return {
-          agentModel: mainModel,
-          continuationModel: mainModel,
-          createUtilityModelResult: () => Result.ok(summaryModel),
-          createUtilityModel: () => summaryModel,
-          control: {
-            inject: () => false,
-            interrupt: async () => false,
-            async interruptResult() {
-              return Result.ok(await this.interrupt());
+            dispose: async () => {
+              if (start.mode !== "ephemeral") disposedSessionIds.push(start.sessionId);
             },
-            clear: () => {},
-            clearResult() {
-              this.clear();
+            async disposeResult() {
+              if (start.mode !== "ephemeral") disposedSessionIds.push(start.sessionId);
               return Result.ok();
             },
-          },
-          nativeSession: {
-            getObservation: () => ({
-              ...observation,
-              requestedSessionId: start.mode === "ephemeral" ? null : start.sessionId,
-              initSessionId: start.mode === "ephemeral" ? null : start.sessionId,
-              resultSessionId: start.mode === "ephemeral" ? null : start.sessionId,
-              invoked: true,
-            }),
-            waitForObservation: async () => observation,
-            recordWarning: () => {},
-            finalize: async () => ({
-              status: "unpromotable" as const,
-              issues: [
-                {
-                  code: "candidate-missing" as const,
-                  message: "not finalized in this test",
-                },
-              ],
-              observations: observation,
-              candidate: null,
-              sourcePreflight: null,
-              sourceFinal: null,
-            }),
-            async finalizeResult() {
-              return Result.ok(await this.finalize());
-            },
-          },
-          dispose: async () => {
-            if (start.mode !== "ephemeral") disposedSessionIds.push(start.sessionId);
-          },
-          async disposeResult() {
-            if (start.mode !== "ephemeral") disposedSessionIds.push(start.sessionId);
-            return Result.ok();
-          },
-        };
-      },
-    });
-    await runtime.prepareModelCall({
-      canonicalMessages: originalMessages,
-      fullBudgetView: originalMessages,
-      runtime: {
+          };
+        },
+      });
+      await runtime.prepareModelCall({
+        canonicalMessages: originalMessages,
+        fullBudgetView: originalMessages,
+        runtime: {
+          model: mainModel,
+          modelSpecifier: "claude-code/sonnet",
+          executionMode: "provider-tools",
+        },
+        payload: { mode: "full" },
+        transformContext: { system: "test", tools: level1TestToolset().tools },
+      });
+      const agent = new AiSdkPiAgent({
+        system: "test",
         model: mainModel,
         modelSpecifier: "claude-code/sonnet",
-        executionMode: "provider-tools",
-      },
-      payload: { mode: "full" },
-      transformContext: { system: "test", tools: level1TestToolset().tools },
-    });
-    const agent = new AiSdkPiAgent({
-      system: "test",
-      model: mainModel,
-      modelSpecifier: "claude-code/sonnet",
-      messages: originalMessages,
-      tools: level1TestToolset().tools,
-      sendToolsToModel: false,
-      prepareModelCall: runtime.prepareModelCall,
-    });
-    let replacement:
-      | {
-          originalSuffixStart: number;
-          replacementSuffixStart: number;
-          replacementMessageCount: number;
-        }
-      | undefined;
-    const detach = await attachAutoCompaction(agent, {
-      model: "claude-code/sonnet",
-      modelCapability: new ModelCapability({ fetch: globalThis.fetch }),
-      summaryModel,
-      resolveContextLimit: async () => ({ context: 2_000, output: 200 }),
-      resolveSummaryContextLimit: () => 2_000,
-      thresholdInputSource: "transcript-estimate",
-      keepRecentTurns: 2,
-      keepRecentTokens: 1_000,
-      prepareFullModelView: (messages) => runtime.prepareHistoryView(messages),
-      prepareFullBudgetView: (messages, context) =>
-        runtime.prepareFullBudgetView(messages, context.canonicalStartIndex),
-      resolveCurrentInputCanonicalStart: () => lineage.currentCanonicalStart,
-      onCompactionEnd: (event) => {
-        if (event.status !== "completed" || !event.canonicalReplacement) return;
-        replacement = event.canonicalReplacement;
-        lineage = degradeCorePrimaryLineageForMutation(
-          "compaction-checkpoint-transform",
-          mapCorePrimaryCompactionCurrentCanonicalStart({
-            previousCurrentCanonicalStart: lineage.currentCanonicalStart,
-            replacement: event.canonicalReplacement,
-          }),
-        );
-      },
-    });
+        messages: originalMessages,
+        tools: level1TestToolset().tools,
+        sendToolsToModel: false,
+        prepareModelCall: runtime.prepareModelCall,
+      });
+      let replacement:
+        | {
+            originalSuffixStart: number;
+            replacementSuffixStart: number;
+            replacementMessageCount: number;
+          }
+        | undefined;
+      const detach = await attachAutoCompaction(agent, {
+        model: "claude-code/sonnet",
+        modelCapability: new ModelCapability({ fetch: globalThis.fetch }),
+        summaryModel,
+        resolveContextLimit: async () => ({ context: 2_000, output: 200 }),
+        resolveSummaryContextLimit: () => 2_000,
+        thresholdInputSource: "transcript-estimate",
+        keepRecentTurns: 2,
+        keepRecentTokens: 1_000,
+        prepareFullModelView: (messages) => runtime.prepareHistoryView(messages),
+        prepareFullBudgetView: (messages, context) =>
+          runtime.prepareFullBudgetView(messages, context.canonicalStartIndex),
+        onCompactionEnd: (event) => {
+          if (event.status !== "completed" || !event.canonicalReplacement) return;
+          replacement = event.canonicalReplacement;
+          lineage = degradeCorePrimaryLineageForMutation(
+            "compaction-checkpoint-transform",
+            mapCorePrimaryCompactionCurrentCanonicalStart({
+              previousCurrentCanonicalStart: lineage.currentCanonicalStart,
+              replacement: event.canonicalReplacement,
+            }),
+          );
+        },
+      });
 
-    try {
-      await agent.continue();
-    } finally {
-      detach();
-      await runtime.retireAtRunEnd();
-    }
+      try {
+        await agent.continue();
+      } finally {
+        detach();
+        await runtime.retireAtRunEnd();
+      }
 
-    expect(replacement).toMatchObject({
-      originalSuffixStart: 3,
-      replacementSuffixStart: 1,
-      replacementMessageCount: 5,
-    });
-    expect(String(lineage.state)).toBe("fresh-only");
-    expect(lineage.currentCanonicalStart).toBe(4);
-    expect("reason" in lineage ? lineage.reason : null).toBe("compaction-checkpoint-transform");
-    expect(materializedStarts).toHaveLength(2);
-    expect(materializedStarts[0]).toMatchObject({ mode: "fresh" });
-    expect(materializedStarts[1]).toMatchObject({ mode: "fresh" });
-    const firstStart = materializedStarts[0];
-    const replacementStart = materializedStarts[1];
-    if (
-      !firstStart ||
-      !replacementStart ||
-      firstStart.mode === "ephemeral" ||
-      replacementStart.mode === "ephemeral"
-    ) {
-      throw new Error("expected persisted compaction candidates");
-    }
-    expect(replacementStart.sessionId).not.toBe(firstStart.sessionId);
-    expect(disposedSessionIds).toContain(firstStart.sessionId);
-    expect(agent.state.messages.slice(1, 5)).toEqual([...retainedHistorical.slice(1), ...current]);
-    expect(mainPayloads).toHaveLength(1);
-    const actualPayload = mainPayloads[0]!;
-    const serializedPayload = JSON.stringify(actualPayload);
-    expect(serializedPayload).not.toContain('"type":"tool-call"');
-    expect(serializedPayload).not.toContain('"type":"tool-result"');
-    expect(serializedPayload).toContain("historical tool output");
-    const payloadCurrent = actualPayload.find(
-      (message) =>
-        message.role === "user" &&
-        Array.isArray(message.content) &&
-        message.content.some((part) => part.type === "file"),
-    );
-    if (!payloadCurrent || !Array.isArray(payloadCurrent.content)) {
-      throw new Error("current media payload is missing");
-    }
-    expect(
-      payloadCurrent.content.some(
-        (part) => part.type === "text" && part.text === "current question",
-      ),
-    ).toBe(true);
-    expect(
-      payloadCurrent.content.some((part) => part.type === "file" && part.mediaType === "image/png"),
-    ).toBe(true);
+      expect(replacement).toMatchObject({
+        originalSuffixStart: 3,
+        replacementSuffixStart: 1,
+        replacementMessageCount: 5,
+      });
+      expect(String(lineage.state)).toBe("fresh-only");
+      expect(lineage.currentCanonicalStart).toBe(currentSegmentIndex === 0 ? 0 : 4);
+      expect("reason" in lineage ? lineage.reason : null).toBe("compaction-checkpoint-transform");
+      expect(materializedStarts).toHaveLength(2);
+      expect(materializedStarts[0]).toMatchObject({ mode: "fresh" });
+      expect(materializedStarts[1]).toMatchObject({ mode: "fresh" });
+      const firstStart = materializedStarts[0];
+      const replacementStart = materializedStarts[1];
+      if (
+        !firstStart ||
+        !replacementStart ||
+        firstStart.mode === "ephemeral" ||
+        replacementStart.mode === "ephemeral"
+      ) {
+        throw new Error("expected persisted compaction candidates");
+      }
+      expect(replacementStart.sessionId).not.toBe(firstStart.sessionId);
+      expect(disposedSessionIds).toContain(firstStart.sessionId);
+      expect(agent.state.messages.slice(1, 5)).toEqual([
+        ...retainedHistorical.slice(1),
+        ...current,
+      ]);
+      expect(mainPayloads).toHaveLength(1);
+      const actualPayload = mainPayloads[0]!;
+      const serializedPayload = JSON.stringify(actualPayload);
+      expect(serializedPayload.includes('"type":"tool-call"')).toBe(currentSegmentIndex === 0);
+      expect(serializedPayload.includes('"type":"tool-result"')).toBe(currentSegmentIndex === 0);
+      expect(serializedPayload).toContain("historical tool output");
+      const payloadCurrent = actualPayload.find(
+        (message) =>
+          message.role === "user" &&
+          Array.isArray(message.content) &&
+          message.content.some((part) => part.type === "file"),
+      );
+      if (!payloadCurrent || !Array.isArray(payloadCurrent.content)) {
+        throw new Error("current media payload is missing");
+      }
+      expect(
+        payloadCurrent.content.some(
+          (part) => part.type === "text" && part.text === "current question",
+        ),
+      ).toBe(true);
+      expect(
+        payloadCurrent.content.some(
+          (part) => part.type === "file" && part.mediaType === "image/png",
+        ),
+      ).toBe(true);
 
-    store.close();
-    await rm(dataDir, { recursive: true, force: true });
-  });
+      store.close();
+      await rm(dataDir, { recursive: true, force: true });
+    },
+  );
 });
 
 describe("formatAutoCompactionToolDisplay", () => {

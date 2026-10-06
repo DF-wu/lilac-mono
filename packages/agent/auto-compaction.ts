@@ -1370,9 +1370,6 @@ export type AutoCompactionOptions = {
   /** Optional conservative floor for provider-native input occupancy. */
   inputEstimateFloor?: AutoCompactionInputEstimateFloor;
 
-  /** Earliest current-input offset that compaction must retain canonically. */
-  resolveCurrentInputCanonicalStart?: (canonicalMessages: readonly ModelMessage[]) => number | null;
-
   /** Applies provider-specific metadata only to the final selected request payload. */
   decorateRequestPayload?: DecorateRequestPayload;
 
@@ -1803,7 +1800,6 @@ async function compactCanonicalMessages(options: {
   abortSignal?: AbortSignal;
   onProgress?: CompactionStreamHooks["onProgress"];
   onSummaryDelta?: CompactionStreamHooks["onSummaryDelta"];
-  maximumCanonicalSuffixStart?: number;
 }): Promise<ResultType<CompactCanonicalMessagesResult | null, AutoCompactionFailed>> {
   const overlayTokens = estimateMessagesTokens(options.overlay);
   if (overlayTokens >= options.budget.inputBudget) {
@@ -1834,12 +1830,6 @@ async function compactCanonicalMessages(options: {
         keepRecentTurns: options.keepRecentTurns,
         minimumStart: 1,
       });
-    }
-    if (
-      options.maximumCanonicalSuffixStart !== undefined &&
-      suffixStart > options.maximumCanonicalSuffixStart
-    ) {
-      suffixStart = options.maximumCanonicalSuffixStart;
     }
     if (suffixStart === 0) return Result.ok(null);
 
@@ -2383,24 +2373,6 @@ export async function attachAutoCompaction(
           onProgress: options.onProgress,
           onSummaryDelta: options.onSummaryDelta,
           abortSignal: context.abortSignal,
-          maximumCanonicalSuffixStart: (() => {
-            const currentStart = options.resolveCurrentInputCanonicalStart?.(canonicalMessages);
-            if (currentStart === null || currentStart === undefined) return undefined;
-            if (
-              !Number.isSafeInteger(currentStart) ||
-              currentStart < 0 ||
-              currentStart > canonicalMessages.length
-            ) {
-              return signalAutoCompactionHost(
-                autoCompactionFailure(
-                  new RangeError(
-                    "Current-input canonical start is outside the compaction transcript",
-                  ),
-                ),
-              );
-            }
-            return Math.min(currentStart, compactableMessages.length);
-          })(),
         });
         const compactionResultOutcome = resultOutcome(compactionResult);
         if (!compactionResultOutcome.ok) {

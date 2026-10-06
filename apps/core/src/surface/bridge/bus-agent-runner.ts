@@ -6808,9 +6808,6 @@ export async function startBusAgentRunner(params: {
                 agent.state.modelSpecifier ?? activeBinding.resolved.spec,
               prepareFullModelView: toolPruneTransform,
               prepareFullBudgetView: fullBudgetTransform,
-              resolveCurrentInputCanonicalStart: () =>
-                (state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage)
-                  ?.currentCanonicalStart ?? null,
               baseTurnErrorHandler: turnErrorHandler,
               onServerCompactionError: reportServerCompactionError,
               onUnknownCapability: ({ spec, reason }) => {
