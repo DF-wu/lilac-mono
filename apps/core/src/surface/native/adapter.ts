@@ -1,6 +1,10 @@
 import { isNativeServiceMessage } from "./message-ownership";
 import { randomUUID } from "node:crypto";
-import { displayMessageSchema, type DisplayMessage } from "@stanley2058/lilac-client-protocol";
+import {
+  displayMessageSchema,
+  type DisplayMessage,
+  type WorkflowCard,
+} from "@stanley2058/lilac-client-protocol";
 import { Result } from "better-result";
 import type { DurableResolvedModelRequest } from "@stanley2058/lilac-utils";
 import {
@@ -132,6 +136,9 @@ function invalid(
 ): SurfaceOperationError {
   return new SurfaceInvalidInput({ platform: "native", operation, field, message });
 }
+/** Native messages may carry a structured workflow card that the web renders in place of the text. */
+export type NativeContentOpts = ContentOpts & { readonly workflow?: WorkflowCard };
+
 export function isValidNativeDisplayMessage(message: DisplayMessage): boolean {
   return displayMessageSchema.safeParse(message).success;
 }
@@ -329,14 +336,14 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
   }
   async sendMsg(
     sessionRef: SessionRef,
-    content: ContentOpts,
+    content: NativeContentOpts,
     opts?: SendOpts,
   ): Promise<SurfaceOperationResult<MsgRef>> {
     return this.post(sessionRef, content, opts, true);
   }
   private async post(
     sessionRef: SessionRef,
-    content: ContentOpts,
+    content: NativeContentOpts,
     opts: SendOpts | undefined,
     trigger: boolean,
   ): Promise<SurfaceOperationResult<MsgRef>> {
@@ -357,6 +364,8 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
       const id = randomUUID();
       const parts: DisplayMessage["parts"] =
         content.text === undefined ? [] : [{ type: "text", text: content.text }];
+      if (content.workflow)
+        parts.push({ type: "data-workflow", id: `workflow_${id}`, data: content.workflow });
       const attachmentIds: string[] = [];
       for (const attachment of content.attachments ?? []) {
         const resources = this.dependencies.resources;
@@ -482,7 +491,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
       );
     }, this);
   }
-  async editMsg(msgRef: MsgRef, content: ContentOpts): Promise<SurfaceOperationResult<void>> {
+  async editMsg(msgRef: MsgRef, content: NativeContentOpts): Promise<SurfaceOperationResult<void>> {
     return Result.gen(function* () {
       const ref = yield* nativeMessage("edit-message", msgRef);
       const request = yield* this.principal("edit-message");
@@ -516,8 +525,15 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
       const parts = found.message.parts.filter(
         (part) =>
           (content.text === undefined || part.type !== "text") &&
+          (content.workflow === undefined || part.type !== "data-workflow") &&
           (content.actions === undefined || part.type !== "data-actions"),
       );
+      if (content.workflow)
+        parts.unshift({
+          type: "data-workflow",
+          id: `workflow_${ref.messageId}`,
+          data: content.workflow,
+        });
       if (content.text !== undefined) parts.unshift({ type: "text", text: content.text });
       if (content.actions?.length)
         parts.push({

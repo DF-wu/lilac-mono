@@ -1,3 +1,4 @@
+import { MAX_WORKFLOW_RESULT_LENGTH, type WorkflowCard } from "@stanley2058/lilac-client-protocol";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { SurfaceAction, SurfacePlatform } from "../surface/types";
@@ -338,23 +339,29 @@ function formatTimestamp(platform: SurfacePlatform, value: number): string {
   return date.toISOString();
 }
 
-function presentationState(view: WorkflowProgressView): string {
-  if (view.manualReconciliationRequired) return "Needs attention";
-  if (view.run.state === "paused") return "Paused";
+function presentationStatus(view: WorkflowProgressView): WorkflowCard["status"] {
+  if (view.manualReconciliationRequired) return "needs-attention";
   if (["running", "blocked"].includes(view.run.state)) {
-    if (view.waits.some((wait) => wait.kind === "reply")) return "Waiting for your reply";
-    if (view.waits.some((wait) => wait.kind === "sleep")) return "Waiting";
+    if (view.waits.some((wait) => wait.kind === "reply")) return "waiting-reply";
+    if (view.waits.some((wait) => wait.kind === "sleep")) return "waiting";
   }
+  return view.run.state;
+}
+
+function presentationState(view: WorkflowProgressView): string {
   const labels = {
     queued: "Queued",
     running: "Running",
     blocked: "Blocked",
+    waiting: "Waiting",
+    "waiting-reply": "Waiting for your reply",
     paused: "Paused",
+    "needs-attention": "Needs attention",
     succeeded: "Succeeded",
     failed: "Failed",
     cancelled: "Cancelled",
-  } satisfies Record<WorkflowRun["state"], string>;
-  return labels[view.run.state];
+  } satisfies Record<WorkflowCard["status"], string>;
+  return labels[presentationStatus(view)];
 }
 
 function progressSummary(counts: WorkflowProgressCounts): string | null {
@@ -493,12 +500,7 @@ export function renderWorkflowProgressView(input: {
   }
 
   if (!terminal) {
-    const waitVisible = view.waits.length > 0;
-    const operations = view.recentOperations
-      .filter(
-        (operation) => !(waitVisible && operation.kind === "wait" && operation.state === "blocked"),
-      )
-      .slice(0, 3);
+    const operations = visibleOperations(view).slice(0, 3);
     if (operations.length > 0) {
       const hasActive = operations.some((operation) =>
         ["queued", "dispatched", "running", "blocked"].includes(operation.state),
@@ -530,5 +532,88 @@ export function renderWorkflowProgressView(input: {
     text: bounded(lines.join("\n"), 4_000),
     actions: input.actions,
     attachments: [],
+  };
+}
+
+function visibleOperations(view: WorkflowProgressView) {
+  const waitVisible = view.waits.length > 0;
+  return view.recentOperations.filter(
+    (operation) => !(waitVisible && operation.kind === "wait" && operation.state === "blocked"),
+  );
+}
+
+function cardWait(view: WorkflowProgressView): WorkflowCard["wait"] {
+  if (view.manualReconciliationRequired || !["running", "blocked"].includes(view.run.state))
+    return undefined;
+  const wait =
+    view.waits.find((item) => item.kind === "reply") ??
+    view.waits.find((item) => item.kind === "sleep");
+  if (!wait) return undefined;
+  return {
+    kind: wait.kind,
+    prompt: bounded(wait.prompt, 512),
+    ...(wait.dueAt !== null ? { dueAt: wait.dueAt } : {}),
+    ...(wait.deadlineAt !== null ? { deadlineAt: wait.deadlineAt } : {}),
+    replyToMessage: wait.requiresReplyToMessage,
+    elsewhere: wait.kind === "reply" && !wait.isCurrentChannel,
+  };
+}
+
+function cardResult(view: WorkflowProgressView): Pick<WorkflowCard, "result" | "reason"> {
+  if (view.sensitive || !["succeeded", "failed", "cancelled"].includes(view.run.state)) return {};
+  if (view.run.state === "succeeded" && view.run.result !== null) {
+    const result = view.run.result;
+    const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+    return {
+      result: {
+        kind: typeof result === "string" ? "text" : "json",
+        text: bounded(text, MAX_WORKFLOW_RESULT_LENGTH),
+        truncated: text.length > MAX_WORKFLOW_RESULT_LENGTH,
+      },
+    };
+  }
+  if (view.run.state === "succeeded" && view.run.resultArtifact)
+    return { result: { kind: "stored" } };
+  if (view.run.terminalDetail) return { reason: bounded(view.run.terminalDetail, 4_096) };
+  return {};
+}
+
+/** Structured progress for surfaces that render workflow cards themselves instead of markdown. */
+export function buildWorkflowProgressCard(view: WorkflowProgressView): WorkflowCard {
+  const terminal = ["succeeded", "failed", "cancelled"].includes(view.run.state);
+  const counts = (value: WorkflowProgressCounts) => ({
+    completed: value.completed,
+    queued: value.queued,
+    active: value.active,
+    waiting: value.waiting,
+    failed: value.failed,
+    cancelled: value.cancelled,
+    total: value.total,
+  });
+  const wait = cardWait(view);
+  return {
+    name: bounded(view.revision.name, 256),
+    description: bounded(view.revision.metadata.description.replaceAll(/\s+/gu, " ").trim(), 1_024),
+    status: presentationStatus(view),
+    startedAt: view.run.startedAt ?? view.run.createdAt,
+    ...(view.run.terminalAt !== null ? { endedAt: view.run.terminalAt } : {}),
+    progress: counts(view.progress),
+    phases: view.phases
+      .slice(0, 64)
+      .map((phase) => ({ name: bounded(phase.name, 256), ...counts(phase) })),
+    steps: terminal
+      ? []
+      : visibleOperations(view)
+          .slice(0, 8)
+          .map((operation) => ({
+            ...(operation.label ? { label: bounded(operation.label, 512) } : {}),
+            kind: operation.kind === "wait" ? "wait" : "agent",
+            state: operation.state,
+          })),
+    ...(wait ? { wait } : {}),
+    ...cardResult(view),
+    agents: { ...view.agents },
+    ...(view.nextTriggerAt !== null ? { nextRunAt: view.nextTriggerAt } : {}),
+    sensitive: view.sensitive,
   };
 }

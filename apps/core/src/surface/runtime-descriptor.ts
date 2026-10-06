@@ -1,4 +1,5 @@
 import type { AdapterPlatform, SurfaceMsgRef } from "@stanley2058/lilac-event-bus";
+import type { WorkflowCard } from "@stanley2058/lilac-client-protocol";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { SurfaceAdapter } from "./adapter";
@@ -239,9 +240,12 @@ export type WorkflowProgressMessageTarget = {
   readonly messageId: string;
 };
 
+/** Workflow card content. Surfaces that render structured cards use `workflow`; others use the text. */
+export type WorkflowProgressContent = ContentOpts & { readonly workflow?: WorkflowCard };
+
 export type WorkflowProgressSendInput = {
   readonly channelId: string;
-  readonly content: ContentOpts;
+  readonly content: WorkflowProgressContent;
   readonly replyToMessageId?: string;
   readonly silent?: boolean;
 };
@@ -256,7 +260,7 @@ export type SurfaceWorkflowProgressPort<P extends RegisteredSurfacePlatform> = {
   ): Promise<ResultType<MsgRefFor<P>, WorkflowProgressSendFailure<P>>>;
   edit(
     target: WorkflowProgressMessageTarget,
-    content: ContentOpts,
+    content: WorkflowProgressContent,
   ): Promise<ResultType<void, WorkflowProgressEditFailure>>;
 };
 

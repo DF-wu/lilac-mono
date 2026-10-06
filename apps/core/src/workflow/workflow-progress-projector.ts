@@ -10,10 +10,11 @@ import {
 import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
 import { createLogger, formatTaggedErrorForLog, isPanic } from "@stanley2058/lilac-utils";
 
-import type { ContentOpts, MsgRef } from "../surface/types";
+import type { MsgRef } from "../surface/types";
 import type {
   RegisteredSurfacePlatform,
   RegisteredSurfaceWorkflowProgressRegistration,
+  WorkflowProgressContent,
   WorkflowProgressOperationFailed,
   WorkflowProgressSendFailure,
 } from "../surface/runtime-descriptor";
@@ -35,6 +36,7 @@ import {
 import { formatWorkflowErrorForLog } from "./workflow-error-log";
 import { workflowConsumerId } from "./workflow-consumer-id";
 import {
+  buildWorkflowProgressCard,
   buildWorkflowProgressViewResult,
   renderWorkflowProgressView,
   toSurfaceActions,
@@ -192,17 +194,21 @@ function correlateWorkflowProgressMessageRef(input: {
   });
 }
 
-function limitContentText(content: ContentOpts): ContentOpts {
+function limitContentText(content: WorkflowProgressContent): WorkflowProgressContent {
   return content.text && content.text.length > WORKFLOW_CARD_TEXT_LIMIT
     ? { ...content, text: content.text.slice(0, WORKFLOW_CARD_TEXT_LIMIT) }
     : content;
 }
 
-function workflowProgressRenderSha256(content: ContentOpts, revisionSha256: string): string {
+function workflowProgressRenderSha256(
+  content: WorkflowProgressContent,
+  revisionSha256: string,
+): string {
   return sha256(
     JSON.stringify({
       text: content.text,
       actions: content.actions,
+      workflow: content.workflow,
       revision: revisionSha256,
     }),
   );
@@ -1007,13 +1013,14 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     }
 
     const issued = this.issueActions(runId, view, messageRef, now);
-    const content = limitContentText(
-      renderWorkflowProgressView({
+    const content = limitContentText({
+      ...renderWorkflowProgressView({
         view,
         platform,
         actions: toSurfaceActions({ view, actionIds: issued.ids }),
       }),
-    );
+      workflow: buildWorkflowProgressCard(view),
+    });
     const renderedSha256 = workflowProgressRenderSha256(content, view.revision.sourceSha256);
     if (messageRef && existing.lastRenderedSha256 === renderedSha256) {
       return Result.ok(messageRef);

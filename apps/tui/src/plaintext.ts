@@ -17,7 +17,7 @@ export function safeText(value: string): string {
 }
 
 export function messageText(message: DisplayMessage): string {
-  const parts = message.parts.map((part) => {
+  const parts = message.parts.flatMap((part) => {
     switch (part.type) {
       case "text":
         return part.text;
@@ -33,6 +33,9 @@ export function messageText(message: DisplayMessage): string {
         return `[Actions available in web: ${part.data.actions.map((action) => action.label).join(", ")}]`;
       case "data-reactions":
         return part.data.items.map((reaction) => `${reaction.emoji} ${reaction.count}`).join(" ");
+      case "data-workflow":
+        // Workflow cards also carry a text summary, which the text part already shows.
+        return [];
     }
   });
   return safeText(`${message.metadata?.authorId ?? message.role}:\n${parts.join("\n")}`);
