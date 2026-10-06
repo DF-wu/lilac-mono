@@ -5,6 +5,7 @@ import type { NativeClient } from "@stanley2058/lilac-client";
 import type { NativeRpcOutputs } from "@stanley2058/lilac-client-protocol";
 import { queryNativeRPC, useNativeOnline } from "../queries";
 import { useOptionalWorkspace } from "../workspace-context";
+import { remoteImageUrl } from "../remote-image";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "./ui/hover-card";
 
 type LinkPreview = NativeRpcOutputs["links"]["preview"];
@@ -56,7 +57,7 @@ function FaviconImage({
 }) {
   return (
     <img
-      src={src}
+      src={remoteImageUrl(src)}
       alt=""
       className={theme && themeVisibility[theme]}
       data-favicon-theme={theme}
@@ -131,7 +132,7 @@ export function LinkPreviewBody({
       ) : null}
       {preview?.image && failedImage !== preview.image ? (
         <img
-          src={preview.image}
+          src={remoteImageUrl(preview.image)}
           alt=""
           referrerPolicy="no-referrer"
           decoding="async"

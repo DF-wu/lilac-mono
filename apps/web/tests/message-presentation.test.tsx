@@ -335,7 +335,7 @@ describe("message presentation", () => {
         preview={{ image: "https://example.com/share.png" }}
       />,
     );
-    expect(image).toContain('src="https://example.com/share.png"');
+    expect(image).toContain('src="/api/remote-image?url=https%3A%2F%2Fexample.com%2Fshare.png"');
     expect(image).toContain('referrerPolicy="no-referrer"');
   });
   test("favicon URLs use only HTTP origins and drop paths, query and credentials", () => {
@@ -360,8 +360,14 @@ describe("message presentation", () => {
       image.match(/src="([^"]*)"/)?.[1],
     ]);
     expect(themed).toEqual([
-      ["light", "https://github.githubassets.com/favicons/favicon.png"],
-      ["dark", "https://github.githubassets.com/favicons/favicon-dark.png"],
+      [
+        "light",
+        "/api/remote-image?url=https%3A%2F%2Fgithub.githubassets.com%2Ffavicons%2Ffavicon.png",
+      ],
+      [
+        "dark",
+        "/api/remote-image?url=https%3A%2F%2Fgithub.githubassets.com%2Ffavicons%2Ffavicon-dark.png",
+      ],
     ]);
     expect(html).not.toContain("github.com/favicon.ico");
   });

@@ -16,6 +16,7 @@ import { ConnectionLoading } from "./components/ui/connection-loading";
 import { ReconnectionDemo } from "./components/ReconnectionDemo";
 import { ConversationBadge, ConversationIcon } from "./components/ConversationReference";
 import lilacLogo from "./assets/logo.svg";
+import { ActivityItem } from "./components/ActivityLog";
 import { LinkPreviewAnchor } from "./components/LinkWithFavicon";
 import { SidebarEmptyState } from "./components/SidebarEmptyState";
 import { ConversationStatus } from "./components/ConversationStatus";
@@ -1722,6 +1723,34 @@ export default function DesignSystem() {
                       Loading preview
                     </LinkPreviewAnchor>
                   </div>
+                  <Specimen title="Remote images">
+                    <LinkPreviewAnchor
+                      href="https://claude.dev/blog/how-we-made-claude-ai-faster/"
+                      preview={{
+                        title: "How we made claude.ai 3x faster in two weeks",
+                        icon: "https://claude.dev/shared/img/favicon.svg",
+                        image: "https://claude.dev/blog/how-we-made-claude-ai-faster/og.png",
+                      }}
+                    >
+                      claude.dev
+                    </LinkPreviewAnchor>
+                    <ActivityItem
+                      part={{
+                        type: "data-activity",
+                        id: "remote-image-preview",
+                        data: {
+                          kind: "tool",
+                          label: "read",
+                          state: "complete",
+                          detail: 'read {"path":"https://claude.dev/shared/img/favicon.svg"}',
+                          file: {
+                            path: "https://claude.dev/shared/img/favicon.svg",
+                            mediaType: "image/svg+xml",
+                          },
+                        },
+                      }}
+                    />
+                  </Specimen>
                   <Markdown text={richText} />
                   <Specimen title="Table with long descriptions">
                     <Markdown text={tableExample} />

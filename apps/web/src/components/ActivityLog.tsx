@@ -42,7 +42,7 @@ import { AgentAvatar } from "./AgentAvatar";
 import { Markdown } from "./Markdown";
 import { useMessageArrival } from "./message-arrivals";
 import { subagentProfileName, useSubagents } from "./subagent-context";
-import type { FileTarget } from "../file-target";
+import { activityFileTarget, type FileTarget } from "../file-target";
 import { useFileResolution, useFileViewer } from "./file-viewer-context";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
 import { Skeleton } from "./ui/skeleton";
@@ -340,10 +340,8 @@ function hasDetails(part: ActivityPart): boolean {
 /** Resolved on expand so collapsed rows never fetch files. */
 function ActivityFile({ path, mediaType }: { path: string; mediaType: string }) {
   const viewer = useFileViewer();
-  const target = useMemo<FileTarget>(
-    () => ({ type: "path", path, name: path.slice(path.lastIndexOf("/") + 1) || path }),
-    [path],
-  );
+  const [failedHref, setFailedHref] = useState<string>();
+  const target = useMemo<FileTarget>(() => activityFileTarget(path, mediaType), [path, mediaType]);
   const { file, error } = useFileResolution(target, mediaType.startsWith("image/"));
   const open = viewer ? () => viewer.openFile(target) : undefined;
   if (!mediaType.startsWith("image/"))
@@ -358,6 +356,8 @@ function ActivityFile({ path, mediaType }: { path: string; mediaType: string }) 
     ) : null;
   if (error) return <span className="text-xs text-muted-foreground">{error}</span>;
   if (!file) return <Skeleton className="h-32 w-48 rounded-md" />;
+  if (failedHref === file.href)
+    return <span className="text-xs text-muted-foreground">Image unavailable</span>;
   return (
     <button
       type="button"
@@ -370,6 +370,7 @@ function ActivityFile({ path, mediaType }: { path: string; mediaType: string }) 
         src={file.href}
         alt={target.name}
         loading="lazy"
+        onError={() => setFailedHref(file.href)}
         className="activity-image max-h-80 max-w-full rounded-md object-contain"
       />
     </button>
