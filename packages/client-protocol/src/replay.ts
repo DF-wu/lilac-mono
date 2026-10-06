@@ -39,6 +39,80 @@ export const messageMetadataSchema = z.strictObject({
   replyToMessageId: identitySchema.optional(),
   inputMode: z.enum(["prompt", "steer", "followup"]).optional(),
 });
+const workflowCountsSchema = {
+  completed: revisionSchema,
+  queued: revisionSchema,
+  active: revisionSchema,
+  waiting: revisionSchema,
+  failed: revisionSchema,
+  cancelled: revisionSchema,
+  total: revisionSchema,
+};
+export const MAX_WORKFLOW_RESULT_LENGTH = 16_384;
+export const workflowCardSchema = z.strictObject({
+  name: z.string().min(1).max(256),
+  description: z.string().max(1024),
+  status: z.enum([
+    "queued",
+    "running",
+    "blocked",
+    "waiting",
+    "waiting-reply",
+    "paused",
+    "needs-attention",
+    "succeeded",
+    "failed",
+    "cancelled",
+  ]),
+  startedAt: revisionSchema,
+  endedAt: revisionSchema.optional(),
+  progress: z.strictObject(workflowCountsSchema),
+  phases: z
+    .array(z.strictObject({ name: z.string().min(1).max(256), ...workflowCountsSchema }))
+    .max(64),
+  steps: z
+    .array(
+      z.strictObject({
+        label: z.string().max(512).optional(),
+        kind: z.enum(["agent", "wait"]),
+        state: z.enum([
+          "queued",
+          "dispatched",
+          "running",
+          "blocked",
+          "succeeded",
+          "failed",
+          "cancelled",
+          "timed_out",
+        ]),
+      }),
+    )
+    .max(8),
+  wait: z
+    .strictObject({
+      kind: z.enum(["reply", "sleep"]),
+      prompt: z.string().max(512),
+      dueAt: revisionSchema.optional(),
+      deadlineAt: revisionSchema.optional(),
+      replyToMessage: z.boolean(),
+      elsewhere: z.boolean(),
+    })
+    .optional(),
+  result: z
+    .discriminatedUnion("kind", [
+      z.strictObject({
+        kind: z.enum(["text", "json"]),
+        text: z.string().max(MAX_WORKFLOW_RESULT_LENGTH),
+        truncated: z.boolean(),
+      }),
+      z.strictObject({ kind: z.literal("stored") }),
+    ])
+    .optional(),
+  reason: z.string().max(4096).optional(),
+  agents: z.strictObject({ used: revisionSchema, active: revisionSchema, queued: revisionSchema }),
+  nextRunAt: revisionSchema.optional(),
+  sensitive: z.boolean(),
+});
 export const displayPartSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("text"), text: z.string().max(MAX_REPLAY_TEXT_LENGTH) }),
   z.strictObject({
@@ -116,6 +190,11 @@ export const displayPartSchema = z.discriminatedUnion("type", [
         )
         .max(64),
     }),
+  }),
+  z.strictObject({
+    type: z.literal("data-workflow"),
+    id: identitySchema,
+    data: workflowCardSchema,
   }),
   z.strictObject({
     type: z.literal("data-input-state"),
@@ -303,4 +382,5 @@ export type Hydration = z.infer<typeof hydrationSchema>;
 export type LiveUpdate = z.infer<typeof liveUpdateSchema>;
 
 export type DisplayPart = z.infer<typeof displayPartSchema>;
+export type WorkflowCard = z.infer<typeof workflowCardSchema>;
 export type MessageMetadata = z.infer<typeof messageMetadataSchema>;

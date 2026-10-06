@@ -1,5 +1,15 @@
 # MIGRATIONS.md
 
+## Native workflow cards
+
+Native display messages accept a `data-workflow` part that carries a structured workflow progress
+card: status, start and end times, step counts, phases, current steps, waits, the result or failure
+reason, agent counts, and the next scheduled run. Core adds it to native workflow progress messages
+next to the existing markdown text and `data-actions` controls, and replaces it on each edit. The web
+app renders the card as its own block in place of the text. Discord and GitHub cards are unchanged.
+Existing progress messages keep their text-only form until their next edit. Stored data needs no
+backfill. Update Core, web, and TUI together because older strict validators reject the new part.
+
 ## Generated context messages
 
 New deferred subagent completions, automatic conversation recall, and custom-command outputs use
