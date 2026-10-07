@@ -207,17 +207,10 @@ jobs:
           # max 用 CLI 傳入，不能持久化為 effortLevel 設定。
           # 已驗證 CLI 送出 output_config.effort=max；實際映射由 gateway 決定。
           # 僅提供讀取工具與 Git 查詢，不授權修改、測試執行或 GitHub 發布。
-          # bare 停用自動 CLAUDE.md／plugins／hooks；只載入 runner 的 user settings。
-          # 再明確關閉 hooks、固定空 MCP 設定，避免 incoming repository 設定在分析前執行。
           claude_args: >-
             --model deepseek-v4.1-flash
             --effort max
             --max-turns 30
-            --bare
-            --setting-sources user
-            --settings '{"disableAllHooks":true}'
-            --strict-mcp-config
-            --mcp-config '{"mcpServers":{}}'
             --tools "Read,Glob,Grep,Bash"
             --allowedTools "Read,Glob,Grep,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git merge-base:*),Bash(git rev-parse:*),Bash(git ls-files:*),Bash(rg:*)"
             --disallowedTools "Edit,Write,NotebookEdit,Bash(git add:*),Bash(git commit:*),Bash(git merge:*),Bash(git push:*),Bash(gh:*)"
@@ -265,8 +258,6 @@ jobs:
             project code or weaken checks. Do not read credentials or print environment
             dumps/private transcripts. If machine-local instruction paths or wrappers
             are unavailable, use the allowed native read-only commands.
-            Automatic instruction discovery is disabled; read applicable downstream
-            baseline instructions explicitly with the allowed queries.
             </principles>
 
             <analysis>
