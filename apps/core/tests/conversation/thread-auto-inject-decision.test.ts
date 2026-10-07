@@ -2,24 +2,25 @@ import { describe, expect, it } from "bun:test";
 import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
 
 import {
-  buildJevAutoInjectCall,
-  createJevAutoInjectEvaluator,
-  createJevAutoInjectEvaluatorForModel,
-  decideJevAutoInject,
-  type JevAutoInjectAnswers,
-  type JevAutoInjectCandidate,
-} from "../../src/conversation/thread-auto-inject-jev";
+  buildDecisionAutoInjectCall,
+  createDecisionAutoInjectEvaluator,
+  createDecisionAutoInjectEvaluatorForModel,
+  decideDecisionAutoInject,
+  type DecisionAutoInjectAnswers,
+  type DecisionAutoInjectCandidate,
+} from "../../src/conversation/thread-auto-inject-decision";
 
-const options = parseCoreConfigV2ToUniversal({ configVersion: 2 }).conversation.thread
-  .jevAutoInject;
+const config = parseCoreConfigV2ToUniversal({ configVersion: 2 }).conversation.thread
+  .decisionAutoInject;
+const options = { ...config.jev, limit: config.limit };
 
-const candidates: JevAutoInjectCandidate[] = [
+const candidates: DecisionAutoInjectCandidate[] = [
   { threadId: "t0", title: "Router retries", brief: "Retry policy for the router." },
   { threadId: "t1", title: "Garden plan", brief: "Planting schedule." },
   { threadId: "t2", title: "Router outage", brief: "Postmortem for the router outage." },
 ];
 
-function answers(input: Partial<JevAutoInjectAnswers>): JevAutoInjectAnswers {
+function answers(input: Partial<DecisionAutoInjectAnswers>): DecisionAutoInjectAnswers {
   return {
     asksToRecall: 0,
     durableSubject: 0,
@@ -38,20 +39,21 @@ function booleanAnswers(probabilities: Record<string, number>) {
   );
 }
 
-describe("Jev auto-inject", () => {
+describe("Decision auto-inject", () => {
   it("opens the gate on recall requests or durable non-casual subjects", () => {
     expect(
-      decideJevAutoInject({ answers: answers({ asksToRecall: 0.7 }), candidates, options }).gate,
+      decideDecisionAutoInject({ answers: answers({ asksToRecall: 0.7 }), candidates, options })
+        .gate,
     ).toBe("recall");
     expect(
-      decideJevAutoInject({
+      decideDecisionAutoInject({
         answers: answers({ durableSubject: 0.6, casual: 0.59 }),
         candidates,
         options,
       }).gate,
     ).toBe("durable-subject");
     expect(
-      decideJevAutoInject({
+      decideDecisionAutoInject({
         answers: answers({ durableSubject: 0.9, casual: 0.6 }),
         candidates,
         options,
@@ -64,7 +66,7 @@ describe("Jev auto-inject", () => {
   });
 
   it("selects relevant candidates by probability up to the limit", () => {
-    const decision = decideJevAutoInject({
+    const decision = decideDecisionAutoInject({
       answers: answers({ asksToRecall: 0.95 }),
       candidates,
       options: { ...options, limit: 1 },
@@ -73,7 +75,7 @@ describe("Jev auto-inject", () => {
     expect(decision.selected).toEqual([{ index: 0, threadId: "t0", probability: 0.9 }]);
     expect(decision.highestRejected).toEqual({ index: 2, threadId: "t2", probability: 0.7 });
     expect(
-      decideJevAutoInject({ answers: answers({ asksToRecall: 0.95 }), candidates, options })
+      decideDecisionAutoInject({ answers: answers({ asksToRecall: 0.95 }), candidates, options })
         .selected,
     ).toEqual([
       { index: 0, threadId: "t0", probability: 0.9 },
@@ -82,7 +84,7 @@ describe("Jev auto-inject", () => {
   });
 
   it("asks gate and per-candidate questions in one call", () => {
-    const call = buildJevAutoInjectCall({ message: "x".repeat(5000), candidates });
+    const call = buildDecisionAutoInjectCall({ message: "x".repeat(5000), candidates });
 
     expect(call.state).toEqual({ message: "x".repeat(4000) });
     expect(Object.keys(call.questions)).toEqual([
@@ -103,7 +105,7 @@ describe("Jev auto-inject", () => {
   });
 
   it("decodes boolean answers aligned with candidates", async () => {
-    const evaluator = createJevAutoInjectEvaluatorForModel({
+    const evaluator = createDecisionAutoInjectEvaluatorForModel({
       modelId: "jev-test",
       doDecide: async () => ({
         answers: booleanAnswers({
@@ -132,14 +134,14 @@ describe("Jev auto-inject", () => {
   });
 
   it("reports missing answers and provider failures as evaluation errors", async () => {
-    const incomplete = createJevAutoInjectEvaluatorForModel({
+    const incomplete = createDecisionAutoInjectEvaluatorForModel({
       modelId: "jev-test",
       doDecide: async () => ({
         answers: booleanAnswers({ asks_to_recall: 0.8, durable_subject: 0.4, casual: 0.1 }),
         warnings: [],
       }),
     });
-    const rejected = createJevAutoInjectEvaluatorForModel({
+    const rejected = createDecisionAutoInjectEvaluatorForModel({
       modelId: "jev-test",
       doDecide: async () => {
         throw new Error("401 Unauthorized");
@@ -153,20 +155,53 @@ describe("Jev auto-inject", () => {
     const failed = await rejected.evaluate({ message: "hi", candidates });
 
     expect(missing.isErr() ? missing.error.message : "ok").toBe(
-      "Jev response is missing boolean answers for candidate_0",
+      "Decision must return exactly one answer for every question.",
     );
     expect(failed.isErr() ? failed.error.message : "ok").toBe("401 Unauthorized");
   });
 
   it("requires a TypeSafe API key", () => {
-    const missing = createJevAutoInjectEvaluator({ apiKey: " ", model: "jev-1.13.0" });
-    const configured = createJevAutoInjectEvaluator({
+    const missing = createDecisionAutoInjectEvaluator({ apiKey: " ", model: "jev-1.13.0" });
+    const configured = createDecisionAutoInjectEvaluator({
       apiKey: "test-key",
       baseUrl: "https://jev.example.test/v1",
       model: "jev-1.13.0",
     });
 
-    expect(missing.isErr() ? missing.error._tag : "ok").toBe("JevAutoInjectUnavailable");
+    expect(missing.isErr() ? missing.error._tag : "ok").toBe("DecisionAutoInjectUnavailable");
     expect(configured.isOk() ? configured.value.model : "err").toBe("jev-1.13.0");
+  });
+
+  it("resolves OpenAI separately and rejects unsupported providers", () => {
+    const missing = createDecisionAutoInjectEvaluator({ model: "openai/gpt-6-luna" });
+    expect(missing.isErr() ? missing.error.message : "ok").toContain("OPENAI_API_KEY");
+    const configured = createDecisionAutoInjectEvaluator({
+      apiKey: "test",
+      model: "openai/gpt-6-luna",
+    });
+    expect(configured.isOk() ? configured.value.supportsImages : false).toBe(true);
+    expect(
+      createDecisionAutoInjectEvaluator({ apiKey: "test", model: "codex/gpt-6-luna" }).isErr(),
+    ).toBe(true);
+  });
+
+  it("reports refusals and invalid probabilities as evaluation failures", async () => {
+    for (const answer of [
+      { type: "refusal" as const },
+      { type: "boolean" as const, probability: 1.1 },
+    ]) {
+      const evaluator = createDecisionAutoInjectEvaluatorForModel({
+        modelId: "test",
+        doDecide: async () => ({
+          answers: {
+            ...booleanAnswers({ asks_to_recall: 0, durable_subject: 0, casual: 0 }),
+            asks_to_recall: answer,
+          },
+          warnings: [],
+        }),
+      });
+      const result = await evaluator.evaluate({ message: "hi", candidates: [] });
+      expect(result.isErr() ? result.error._tag : "ok").toBe("DecisionAutoInjectEvaluationFailed");
+    }
   });
 });

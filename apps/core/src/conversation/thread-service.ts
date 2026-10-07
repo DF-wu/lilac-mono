@@ -497,7 +497,7 @@ type AutoInjectTimingStage =
   | "corpus"
   | "ranking"
   | "shortlist"
-  | "jev";
+  | "decision";
 type AutoInjectTiming = { calls: number; totalMs: number; maxMs: number };
 
 export type ConversationThreadAutoInjectUsageAccumulator = {
@@ -516,7 +516,7 @@ export type ConversationThreadAutoInjectUsageAccumulator = {
     tokens: number;
     warnings: number;
   }): void;
-  recordJevUsage(usage: { model: string; inputTokens?: number; outputTokens?: number }): void;
+  recordDecisionUsage(usage: { model: string; inputTokens?: number; outputTokens?: number }): void;
   finish(input: {
     status: "completed" | "abstained" | "partial" | "failed";
     searchCount?: number;
@@ -546,7 +546,7 @@ type AutoInjectUsageLogRecord = {
     tokens: number;
     warnings: number;
   };
-  jev?: {
+  decision?: {
     model: string;
     calls: number;
     inputTokens: number;
@@ -712,10 +712,10 @@ export function createConversationThreadAutoInjectUsageAccumulator(input: {
   let embeddingInputChars = 0;
   let embeddingTokens = 0;
   let embeddingWarnings = 0;
-  let jevModel: string | undefined;
-  let jevCalls = 0;
-  let jevInputTokens = 0;
-  let jevOutputTokens = 0;
+  let decisionModel: string | undefined;
+  let decisionCalls = 0;
+  let decisionInputTokens = 0;
+  let decisionOutputTokens = 0;
   const timings: Record<AutoInjectTimingStage, AutoInjectTiming> = {
     planning: { calls: 0, totalMs: 0, maxMs: 0 },
     plannerModel: { calls: 0, totalMs: 0, maxMs: 0 },
@@ -724,7 +724,7 @@ export function createConversationThreadAutoInjectUsageAccumulator(input: {
     corpus: { calls: 0, totalMs: 0, maxMs: 0 },
     ranking: { calls: 0, totalMs: 0, maxMs: 0 },
     shortlist: { calls: 0, totalMs: 0, maxMs: 0 },
-    jev: { calls: 0, totalMs: 0, maxMs: 0 },
+    decision: { calls: 0, totalMs: 0, maxMs: 0 },
   };
 
   return {
@@ -749,11 +749,11 @@ export function createConversationThreadAutoInjectUsageAccumulator(input: {
       embeddingTokens += usage.tokens;
       embeddingWarnings += usage.warnings;
     },
-    recordJevUsage(usage) {
-      jevModel ??= usage.model;
-      jevCalls += 1;
-      jevInputTokens += usage.inputTokens ?? 0;
-      jevOutputTokens += usage.outputTokens ?? 0;
+    recordDecisionUsage(usage) {
+      decisionModel ??= usage.model;
+      decisionCalls += 1;
+      decisionInputTokens += usage.inputTokens ?? 0;
+      decisionOutputTokens += usage.outputTokens ?? 0;
     },
     finish(finishInput) {
       if (finished) return;
@@ -799,13 +799,13 @@ export function createConversationThreadAutoInjectUsageAccumulator(input: {
               },
             }
           : {}),
-        ...(jevCalls > 0 && jevModel
+        ...(decisionCalls > 0 && decisionModel
           ? {
-              jev: {
-                model: jevModel,
-                calls: jevCalls,
-                inputTokens: jevInputTokens,
-                outputTokens: jevOutputTokens,
+              decision: {
+                model: decisionModel,
+                calls: decisionCalls,
+                inputTokens: decisionInputTokens,
+                outputTokens: decisionOutputTokens,
               },
             }
           : {}),

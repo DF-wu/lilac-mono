@@ -59,10 +59,10 @@ import type {
   ConversationThreadToolService,
 } from "../../../src/conversation/thread-service";
 import {
-  createJevAutoInjectEvaluator,
-  createJevAutoInjectEvaluatorForModel,
-  type JevAutoInjectEvaluator,
-} from "../../../src/conversation/thread-auto-inject-jev";
+  createDecisionAutoInjectEvaluator,
+  createDecisionAutoInjectEvaluatorForModel,
+  type DecisionAutoInjectEvaluator,
+} from "../../../src/conversation/thread-auto-inject-decision";
 
 import {
   AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH,
@@ -10296,7 +10296,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       recordTiming: () => {},
       recordPlannerUsage: () => {},
       recordEmbeddingUsage: () => {},
-      recordJevUsage: () => {},
+      recordDecisionUsage: () => {},
       finish: (usage) => finishedUsage.push(usage),
     };
 
@@ -11738,7 +11738,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
   });
 });
 
-describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
+describe("maybeBuildAutoInjectedThreadSearchMessages with the Decision lane", () => {
   type ShortlistInput = Parameters<
     NonNullable<ConversationThreadToolService["shortlistAutoInjectCandidates"]>
   >[0];
@@ -11751,7 +11751,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
       configVersion: 2,
       surface: { discord: { botName: "lilac", allowedChannelIds: ["c1"] } },
       conversation: {
-        thread: { autoInject: { enabled: true }, autoInjectMode: "jev" },
+        thread: { autoInject: { enabled: true }, autoInjectMode: "decision" },
       },
     });
     return cfg;
@@ -11773,7 +11773,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
 
   function jevModel(probabilities: Record<string, number>) {
     const calls: Array<{ state: unknown; questionIds: string[] }> = [];
-    const evaluator: JevAutoInjectEvaluator = createJevAutoInjectEvaluatorForModel({
+    const evaluator: DecisionAutoInjectEvaluator = createDecisionAutoInjectEvaluatorForModel({
       modelId: "jev-test",
       doDecide: async (options) => {
         calls.push({ state: options.state, questionIds: Object.keys(options.questions) });
@@ -11797,10 +11797,10 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
   ): ConversationThreadToolService {
     return {
       planAutoInjectSearch: async () => {
-        throw new Error("the Jev lane must not call the planner");
+        throw new Error("the Decision lane must not call the planner");
       },
       search: async () => {
-        throw new Error("the Jev lane must not call planned search");
+        throw new Error("the Decision lane must not call planned search");
       },
       metadata: async () => ({ threads: [], missing: [] }),
       read: async () => {
@@ -11815,18 +11815,172 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
 
   function usageRecorder() {
     const finished: Parameters<ConversationThreadAutoInjectUsageAccumulator["finish"]>[0][] = [];
-    const jev: Parameters<ConversationThreadAutoInjectUsageAccumulator["recordJevUsage"]>[0][] = [];
+    const jev: Parameters<
+      ConversationThreadAutoInjectUsageAccumulator["recordDecisionUsage"]
+    >[0][] = [];
     const usage: ConversationThreadAutoInjectUsageAccumulator = {
       recordTiming: () => {},
       recordPlannerUsage: () => {},
       recordEmbeddingUsage: () => {},
-      recordJevUsage: (input) => jev.push(input),
+      recordDecisionUsage: (input) => jev.push(input),
       finish: (input) => finished.push(input),
     };
     return { usage, finished, jev };
   }
 
-  it("injects Jev-selected candidates without the length gate or planner", async () => {
+  it("routes actual images to Luna and applies only the selected model's thresholds", async () => {
+    const cfg = jevCfg();
+    cfg.conversation.thread.decisionAutoInject.model = ["typesafe/jev-1.13.0", "openai/gpt-6-luna"];
+    cfg.conversation.thread.decisionAutoInject.jev.relevanceMinProbability = 0.7;
+    cfg.conversation.thread.decisionAutoInject.luna.relevanceMinProbability = 0.8;
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NMQEAAAjDMMC/ZzDBvlRA01vZJvwHAAAAAAAAAAAAbx2jxAE/i2AjOgAAAABJRU5ErkJggg==";
+    const models: string[] = [];
+    const cases: ModelMessage[][] = [
+      [{ role: "user", content: "recall the router diagram" }],
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "recall the router diagram" },
+            { type: "file", mediaType: "application/pdf", data: "ignored" },
+          ],
+        },
+      ],
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "recall the router diagram" },
+            { type: "file", mediaType: "image/png", data: Buffer.from(png, "base64") },
+          ],
+        },
+      ],
+      [
+        {
+          role: "user",
+          content: [{ type: "file", mediaType: "image/png", data: Buffer.from(png, "base64") }],
+        },
+        { role: "user", content: "recall the router diagram" },
+      ],
+    ];
+    const lengths: number[] = [];
+    for (const userMessages of cases) {
+      const result = await maybeBuildAutoInjectedThreadSearchMessages({
+        cfg,
+        requestId: "model-routing",
+        userMessages,
+        conversationThreads: threadService(async () =>
+          shortlistResult({ threadId: "prior", title: "Router diagram" }),
+        ),
+        createDecisionEvaluator: (model) => {
+          models.push(model);
+          return Result.ok({
+            model,
+            supportsImages: model.startsWith("openai/"),
+            evaluate: async () =>
+              Result.ok({ asksToRecall: 1, durableSubject: 0, casual: 1, relevance: [0.75] }),
+          });
+        },
+        publishToolStatus: async () => {},
+        onError: (message) => {
+          throw new Error(message);
+        },
+      });
+      lengths.push(result.length);
+    }
+    expect(models).toEqual([
+      "typesafe/jev-1.13.0",
+      "typesafe/jev-1.13.0",
+      "openai/gpt-6-luna",
+      "typesafe/jev-1.13.0",
+    ]);
+    expect(lengths).toEqual([1, 1, 0, 1]);
+  });
+
+  it("loads attached images for Luna even when the primary model received text markers", async () => {
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NMQEAAAjDMMC/ZzDBvlRA01vZJvwHAAAAAAAAAAAAbx2jxAE/i2AjOgAAAABJRU5ErkJggg==";
+    const cfg = jevCfg();
+    cfg.conversation.thread.decisionAutoInject.model = ["typesafe/jev-1.13.0", "openai/gpt-6-luna"];
+    const models: string[] = [];
+    let received: readonly string[] | undefined;
+    let loaded = 0;
+    const evaluator: DecisionAutoInjectEvaluator = {
+      model: "openai/gpt-6-luna",
+      supportsImages: true,
+      evaluate: async (input) => {
+        received = input.images;
+        return Result.ok({ asksToRecall: 1, durableSubject: 1, casual: 0, relevance: [0.9] });
+      },
+    };
+    const result = await maybeBuildAutoInjectedThreadSearchMessages({
+      cfg,
+      requestId: "decision-image",
+      userMessages: [{ role: "user", content: "remember the router diagram?" }],
+      loadDecisionUserMessages: async () => {
+        loaded++;
+        return [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "remember the router diagram?" },
+              { type: "file", mediaType: "image/png", data: Buffer.from(png, "base64") },
+            ],
+          },
+        ];
+      },
+      conversationThreads: threadService(async () =>
+        shortlistResult({ threadId: "prior", title: "Router diagram" }),
+      ),
+      createDecisionEvaluator: (model) => {
+        models.push(model);
+        return Result.ok(evaluator);
+      },
+      publishToolStatus: async () => {},
+      onError: () => {},
+    });
+    expect(models).toEqual(["openai/gpt-6-luna"]);
+    expect(loaded).toBe(1);
+    expect(received).toEqual([`data:image/png;base64,${png}`]);
+    expect(result).toHaveLength(1);
+  });
+
+  it("does not load images for Jev and skips injection when Luna image loading fails", async () => {
+    const { evaluator } = jevModel({ asks_to_recall: 1, candidate_0: 0.9 });
+    let loaded = 0;
+    const errors: string[] = [];
+    const input = {
+      cfg: jevCfg(),
+      requestId: "decision-image-failure",
+      userMessages: [{ role: "user" as const, content: "remember the router diagram?" }],
+      loadDecisionUserMessages: async () => {
+        loaded++;
+        throw new Error("image unavailable");
+      },
+      conversationThreads: threadService(async () =>
+        shortlistResult({ threadId: "prior", title: "Router diagram" }),
+      ),
+      publishToolStatus: async () => {},
+      onError: (message: string) => errors.push(message),
+    };
+    const jevResult = await maybeBuildAutoInjectedThreadSearchMessages({
+      ...input,
+      createDecisionEvaluator: () => Result.ok(evaluator),
+    });
+    expect(jevResult).toHaveLength(1);
+    expect(loaded).toBe(0);
+    input.cfg.conversation.thread.decisionAutoInject.model = ["openai/gpt-6-luna"];
+    const lunaResult = await maybeBuildAutoInjectedThreadSearchMessages({
+      ...input,
+      createDecisionEvaluator: () => Result.ok({ ...evaluator, supportsImages: true }),
+    });
+    expect(lunaResult).toEqual([]);
+    expect(loaded).toBe(1);
+    expect(errors).toEqual(["Decision image preparation failed; continuing without metadata"]);
+  });
+
+  it("injects Decision-selected candidates without the length gate or planner", async () => {
     const shortlistInputs: ShortlistInput[] = [];
     const { evaluator, calls } = jevModel({
       asks_to_recall: 0.92,
@@ -11854,12 +12008,12 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
           { threadId: "native:retries", title: "Router retries" },
         );
       }),
-      createJevEvaluator: () => Result.ok(evaluator),
+      createDecisionEvaluator: () => Result.ok(evaluator),
       autoInjectUsage: usage,
       publishToolStatus: async (update) => {
         statuses.push({ status: update.status, ok: update.ok, output: update.output });
       },
-      onJevEvaluated: (event) => events.push(event),
+      onDecisionEvaluated: (event) => events.push(event),
       onError: (message) => {
         throw new Error(message);
       },
@@ -11935,7 +12089,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
         shortlistTexts.push(input.text);
         return { source: "none", results: [] };
       }),
-      createJevEvaluator: () => Result.ok(evaluator),
+      createDecisionEvaluator: () => Result.ok(evaluator),
       autoInjectUsage: usage,
       publishToolStatus: async () => {
         statusCount += 1;
@@ -11952,7 +12106,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
     expect(finished).toEqual([{ status: "abstained" }]);
   });
 
-  it("abstains when the Jev gate stays closed", async () => {
+  it("abstains when the Decision gate stays closed", async () => {
     const { evaluator } = jevModel({ casual: 0.95, durable_subject: 0.9, candidate_0: 0.99 });
     const { usage, finished } = usageRecorder();
     const events: Array<{ gate: string | null; entries: readonly unknown[] }> = [];
@@ -11964,10 +12118,10 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
       conversationThreads: threadService(async () =>
         shortlistResult({ threadId: "native:garden", title: "Garden plan" }),
       ),
-      createJevEvaluator: () => Result.ok(evaluator),
+      createDecisionEvaluator: () => Result.ok(evaluator),
       autoInjectUsage: usage,
       publishToolStatus: async () => {},
-      onJevEvaluated: (event) => events.push({ gate: event.gate, entries: event.entries }),
+      onDecisionEvaluated: (event) => events.push({ gate: event.gate, entries: event.entries }),
       onError: (message) => {
         throw new Error(message);
       },
@@ -11978,8 +12132,8 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
     expect(finished).toEqual([{ status: "abstained" }]);
   });
 
-  it("reports Jev failures and continues without metadata", async () => {
-    const evaluator = createJevAutoInjectEvaluatorForModel({
+  it("reports Decision failures and continues without metadata", async () => {
+    const evaluator = createDecisionAutoInjectEvaluatorForModel({
       modelId: "jev-test",
       doDecide: async () => {
         throw new Error("503 Service Unavailable");
@@ -11996,7 +12150,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
       conversationThreads: threadService(async () =>
         shortlistResult({ threadId: "native:retries", title: "Router retries" }),
       ),
-      createJevEvaluator: () => Result.ok(evaluator),
+      createDecisionEvaluator: () => Result.ok(evaluator),
       autoInjectUsage: usage,
       publishToolStatus: async (update) => {
         statuses.push({ status: update.status, ok: update.ok, error: update.error });
@@ -12012,7 +12166,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
     });
     expect(errors).toEqual([
       {
-        message: "Jev auto-inject evaluation failed; continuing without metadata",
+        message: "Decision auto-inject evaluation failed; continuing without metadata",
         error: "503 Service Unavailable",
       },
     ]);
@@ -12029,19 +12183,19 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
       userMessages: [{ role: "user", content: "what did we decide about the router?" }],
       conversationThreads: threadService(async () => {
         shortlistCalls += 1;
-        return { source: "none", results: [] };
+        return shortlistResult({ threadId: "prior", title: "Router" });
       }),
       publishToolStatus: async () => {
         throw new Error("status must not be published");
       },
       onError: (message, error) => errors.push(`${message}: ${error.message}`),
-      createJevEvaluator: (model) => createJevAutoInjectEvaluator({ model }),
+      createDecisionEvaluator: (model) => createDecisionAutoInjectEvaluator({ model }),
     });
 
     expect(messages).toEqual([]);
-    expect(shortlistCalls).toBe(0);
+    expect(shortlistCalls).toBe(1);
     expect(errors).toEqual([
-      "Jev auto-inject is unavailable; continuing without metadata: TYPESAFE_AI_API_KEY is required when conversation.thread.autoInjectMode is jev",
+      "Decision auto-inject is unavailable; continuing without metadata: TYPESAFE_AI_API_KEY is required for typesafe decision auto-inject",
     ]);
   });
 });

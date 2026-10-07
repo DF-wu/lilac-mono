@@ -105,28 +105,55 @@ describe("coreConfigSchema models.capability", () => {
     ).toThrow();
   });
 
-  it("defaults conversation thread auto inject to the LLM lane with Jev options", () => {
+  it("defaults conversation thread auto inject to the LLM lane with Decision options", () => {
     const v2 = coreConfigInputSchemaV2.parse({ configVersion: 2 });
     const v1 = parseCoreConfigV1ToUniversal({ configVersion: 1 });
-    const expectedJev = {
-      model: "jev-1.13.0",
+    const expectedDecision = {
+      model: ["typesafe/jev-1.13.0"],
       limit: 3,
       candidateLimit: 30,
       semanticFallback: true,
-      recallMinProbability: 0.7,
-      durableSubjectMinProbability: 0.6,
-      casualMaxProbability: 0.6,
-      relevanceMinProbability: 0.6,
+      jev: {
+        recallMinProbability: 0.7,
+        durableSubjectMinProbability: 0.6,
+        casualMaxProbability: 0.6,
+        relevanceMinProbability: 0.6,
+      },
+      luna: {
+        recallMinProbability: 0.5,
+        durableSubjectMinProbability: 0.6,
+        casualMaxProbability: 0.3,
+        relevanceMinProbability: 0.8,
+      },
     };
 
     expect(v2.conversation.thread.autoInjectMode).toBe("llm");
-    expect(v2.conversation.thread.jevAutoInject).toEqual(expectedJev);
+    expect(v2.conversation.thread.decisionAutoInject).toEqual(expectedDecision);
     expect(v1.conversation.thread.autoInjectMode).toBe("llm");
-    expect(v1.conversation.thread.jevAutoInject).toEqual(expectedJev);
+    expect(v1.conversation.thread.decisionAutoInject).toEqual(expectedDecision);
   });
 
-  it("accepts Jev auto inject mode and partial option overrides", () => {
+  it("accepts Decision auto inject mode and partial option overrides", () => {
     const parsed = coreConfigInputSchemaV2.parse({
+      configVersion: 2,
+      conversation: {
+        thread: {
+          autoInjectMode: "decision",
+          decisionAutoInject: { candidateLimit: 12, relevanceMinProbability: 0.75 },
+        },
+      },
+    });
+
+    expect(parsed.conversation.thread.autoInjectMode).toBe("decision");
+    expect(parsed.conversation.thread.decisionAutoInject).toMatchObject({
+      model: ["typesafe/jev-1.13.0"],
+      candidateLimit: 12,
+      jev: { relevanceMinProbability: 0.75 },
+    });
+  });
+
+  it("normalizes legacy Jev settings and gives explicit decision settings precedence", () => {
+    const legacy = coreConfigInputSchemaV2.parse({
       configVersion: 2,
       conversation: {
         thread: {
@@ -135,16 +162,63 @@ describe("coreConfigSchema models.capability", () => {
         },
       },
     });
-
-    expect(parsed.conversation.thread.autoInjectMode).toBe("jev");
-    expect(parsed.conversation.thread.jevAutoInject).toMatchObject({
-      model: "jev-1.13.0",
+    expect(legacy.conversation.thread.autoInjectMode).toBe("decision");
+    expect(legacy.conversation.thread.decisionAutoInject).toMatchObject({
       candidateLimit: 12,
-      relevanceMinProbability: 0.75,
+      jev: { relevanceMinProbability: 0.75 },
+    });
+    expect("jevAutoInject" in legacy.conversation.thread).toBe(false);
+    const both = coreConfigInputSchemaV2.parse({
+      configVersion: 2,
+      conversation: {
+        thread: {
+          jevAutoInject: { candidateLimit: 12 },
+          decisionAutoInject: { model: "openai/gpt-6-luna", candidateLimit: 20 },
+        },
+      },
+    });
+    expect(both.conversation.thread.decisionAutoInject).toMatchObject({
+      model: ["openai/gpt-6-luna"],
+      candidateLimit: 20,
     });
   });
 
-  it("rejects unknown auto inject modes and Jev probabilities outside zero through one", () => {
+  it("keeps model order and independent scoped thresholds, overriding legacy fields", () => {
+    const parsed = coreConfigInputSchemaV2.parse({
+      configVersion: 2,
+      conversation: {
+        thread: {
+          decisionAutoInject: {
+            model: ["typesafe/jev-1.13.0", "openai/gpt-6-luna"],
+            recallMinProbability: 0.8,
+            jev: { relevanceMinProbability: 0.72 },
+            luna: { recallMinProbability: 0.55, relevanceMinProbability: 0.92 },
+          },
+        },
+      },
+    });
+    expect(parsed.conversation.thread.decisionAutoInject).toMatchObject({
+      model: ["typesafe/jev-1.13.0", "openai/gpt-6-luna"],
+      jev: { recallMinProbability: 0.8, relevanceMinProbability: 0.72 },
+      luna: { recallMinProbability: 0.55, relevanceMinProbability: 0.92 },
+    });
+    expect("recallMinProbability" in parsed.conversation.thread.decisionAutoInject).toBe(false);
+    for (const value of [
+      { model: [] },
+      { model: [""] },
+      { jev: { recallMinProbability: -0.1 } },
+      { luna: { relevanceMinProbability: 1.1 } },
+    ]) {
+      expect(() =>
+        coreConfigInputSchemaV2.parse({
+          configVersion: 2,
+          conversation: { thread: { decisionAutoInject: value } },
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("rejects unknown auto inject modes and Decision probabilities outside zero through one", () => {
     expect(() =>
       coreConfigInputSchemaV2.parse({
         configVersion: 2,
@@ -154,7 +228,7 @@ describe("coreConfigSchema models.capability", () => {
     expect(() =>
       coreConfigInputSchemaV2.parse({
         configVersion: 2,
-        conversation: { thread: { jevAutoInject: { casualMaxProbability: 1.2 } } },
+        conversation: { thread: { decisionAutoInject: { casualMaxProbability: 1.2 } } },
       }),
     ).toThrow();
   });

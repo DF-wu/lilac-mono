@@ -167,14 +167,18 @@ import {
   rankAutoInjectedThreadSearchResults,
   type RankedAutoInjectThread,
 } from "../../conversation/thread-auto-inject-ranking";
+import { collectDecisionAutoInjectImages } from "../../conversation/thread-auto-inject-images";
 import {
-  createJevAutoInjectEvaluator,
-  decideJevAutoInject,
-  type JevAutoInjectAnswers,
-  type JevAutoInjectDecision,
-  type JevAutoInjectEvaluator,
-  type JevAutoInjectUnavailable,
-} from "../../conversation/thread-auto-inject-jev";
+  createDecisionAutoInjectEvaluator,
+  decideDecisionAutoInject,
+  decisionAutoInjectOptionsForModel,
+  selectDecisionAutoInjectModel,
+  DecisionAutoInjectEvaluationFailed,
+  type DecisionAutoInjectAnswers,
+  type DecisionAutoInjectDecision,
+  type DecisionAutoInjectEvaluator,
+  type DecisionAutoInjectUnavailable,
+} from "../../conversation/thread-auto-inject-decision";
 import {
   createStoredMessageIdentityProjectionV1,
   materializeStoredMessagesV1,
@@ -1086,16 +1090,16 @@ type AutoInjectedThreadSearchAppendedEvent = {
   corpusDocumentCount: number;
 };
 
-type JevAutoInjectedThreadSearchEvent = {
+type DecisionAutoInjectedThreadSearchEvent = {
   toolCallId: string;
   model: string;
   source: "lexical" | "semantic";
   candidateCount: number;
   participantFilterUserCount: number;
-  gate: JevAutoInjectDecision["gate"];
-  gateProbabilities: Pick<JevAutoInjectAnswers, "asksToRecall" | "durableSubject" | "casual">;
-  selected: JevAutoInjectDecision["selected"];
-  highestRejected: JevAutoInjectDecision["highestRejected"];
+  gate: DecisionAutoInjectDecision["gate"];
+  gateProbabilities: Pick<DecisionAutoInjectAnswers, "asksToRecall" | "durableSubject" | "casual">;
+  selected: DecisionAutoInjectDecision["selected"];
+  highestRejected: DecisionAutoInjectDecision["highestRejected"];
   entries: readonly AutoInjectedThreadSearchEntry[];
 };
 
@@ -1277,47 +1281,86 @@ type AutoInjectedThreadSearchParams = {
   userMessages: readonly ModelMessage[];
   publishToolStatus: (update: AutoInjectToolStatusUpdate) => Promise<void>;
   onInjected?: (event: AutoInjectedThreadSearchAppendedEvent) => void;
-  onJevEvaluated?: (event: JevAutoInjectedThreadSearchEvent) => void;
+  onDecisionEvaluated?: (event: DecisionAutoInjectedThreadSearchEvent) => void;
   onError: (message: string, error: BusAgentRunnerErrorProjection) => void;
   autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
-  /** Overrides the env-configured TypeSafe evaluator; used by tests. */
-  createJevEvaluator?: (
+  loadDecisionUserMessages?: () => Promise<readonly ModelMessage[]>;
+  /** Overrides the configured decision evaluator; used by tests. */
+  createDecisionEvaluator?: (
     model: string,
-  ) => ResultType<JevAutoInjectEvaluator, JevAutoInjectUnavailable>;
+  ) => ResultType<DecisionAutoInjectEvaluator, DecisionAutoInjectUnavailable>;
 };
 
-type JevEvaluatorResolution =
-  | { kind: "ready"; evaluator: JevAutoInjectEvaluator }
+type DecisionEvaluatorResolution =
+  | { kind: "ready"; model: string; evaluator: DecisionAutoInjectEvaluator }
   | { kind: "unavailable"; message: string };
 
-type JevEvaluationOutcome =
-  | { kind: "answered"; answers: JevAutoInjectAnswers }
+type DecisionEvaluationOutcome =
+  | { kind: "answered"; answers: DecisionAutoInjectAnswers }
   | { kind: "failed"; message: string };
 
-function createEnvJevAutoInjectEvaluator(
+function createEnvDecisionAutoInjectEvaluator(
   model: string,
-): ResultType<JevAutoInjectEvaluator, JevAutoInjectUnavailable> {
-  return createJevAutoInjectEvaluator({
-    apiKey: env.providers.typesafe.apiKey,
-    baseUrl: env.providers.typesafe.baseUrl,
+): ResultType<DecisionAutoInjectEvaluator, DecisionAutoInjectUnavailable> {
+  const settings = model.startsWith("openai/") ? env.providers.openai : env.providers.typesafe;
+  return createDecisionAutoInjectEvaluator({
+    apiKey: settings.apiKey,
+    baseUrl: settings.baseUrl,
     model,
   });
 }
 
-function resolveJevAutoInjectEvaluator(
+function resolveDecisionAutoInjectEvaluator(
   params: AutoInjectedThreadSearchParams,
-): JevEvaluatorResolution {
-  const create = params.createJevEvaluator ?? createEnvJevAutoInjectEvaluator;
-  return create(params.cfg.conversation.thread.jevAutoInject.model).match<JevEvaluatorResolution>({
-    ok: (evaluator) => ({ kind: "ready", evaluator }),
+  hasImages: boolean,
+): DecisionEvaluatorResolution {
+  const model = selectDecisionAutoInjectModel(
+    params.cfg.conversation.thread.decisionAutoInject.model,
+    hasImages,
+  );
+  const create = params.createDecisionEvaluator ?? createEnvDecisionAutoInjectEvaluator;
+  return create(model).match<DecisionEvaluatorResolution>({
+    ok: (evaluator) => ({ kind: "ready", model, evaluator }),
     err: (error) => ({ kind: "unavailable", message: error.message }),
   });
 }
 
-async function maybeBuildJevAutoInjectedThreadSearchMessages(
+async function prepareDecisionAutoInjectImages(
+  params: AutoInjectedThreadSearchParams,
+): Promise<ResultType<string[], DecisionAutoInjectEvaluationFailed>> {
+  const latest = latestUserInput(params.userMessages);
+  const supportsImages = params.cfg.conversation.thread.decisionAutoInject.model.some((model) =>
+    model.startsWith("openai/"),
+  );
+  if (!supportsImages || (!latest.hasAttachment && !params.loadDecisionUserMessages))
+    return Result.ok([]);
+  const prepared = await Result.tryPromise({
+    try: async () =>
+      latestUserInput(
+        await (params.loadDecisionUserMessages?.() ?? Promise.resolve(params.userMessages)),
+      ).content,
+    catch: (cause) =>
+      new DecisionAutoInjectEvaluationFailed({
+        message: opaqueErrorMessage(cause, "Decision image materialization failed"),
+      }),
+  });
+  return Result.gen(async function* () {
+    const content = yield* prepared;
+    const images = yield* Result.await(
+      collectDecisionAutoInjectImages({
+        content,
+        maxBytesPerPart: params.cfg.tools.media.maxInlineBytesPerPart,
+        maxBytesTotal: params.cfg.tools.media.maxInlineBytesTotal,
+      }),
+    );
+    return Result.ok(images);
+  });
+}
+
+async function maybeBuildDecisionAutoInjectedThreadSearchMessages(
   params: AutoInjectedThreadSearchParams & { conversationThreads: ConversationThreadToolService },
 ): Promise<ModelMessage[]> {
-  const jev = params.cfg.conversation.thread.jevAutoInject;
+  const options = params.cfg.conversation.thread.decisionAutoInject;
   const autoInject = params.cfg.conversation.thread.autoInject;
   const shortlist = params.conversationThreads.shortlistAutoInjectCandidates;
   if (!shortlist) return [];
@@ -1325,15 +1368,6 @@ async function maybeBuildJevAutoInjectedThreadSearchMessages(
   // Attachment marker lines would add filename and MIME words to the shortlist query.
   const message = latestUserInput(params.userMessages).authoredText;
   if (measureMeaningfulTextUnits(message) === 0) return [];
-
-  const resolution = resolveJevAutoInjectEvaluator(params);
-  if (resolution.kind === "unavailable") {
-    params.onError(
-      "Jev auto-inject is unavailable; continuing without metadata",
-      projectBusAgentRunnerError(new Error(resolution.message)),
-    );
-    return [];
-  }
 
   const excludeThreadIds = [...collectAutoInjectedThreadIds(params.previousMessages ?? [])];
   if (params.surface === "native" && params.sessionId) excludeThreadIds.push(params.sessionId);
@@ -1365,8 +1399,8 @@ async function maybeBuildJevAutoInjectedThreadSearchMessages(
     try: async () =>
       await shortlist({
         text: message,
-        limit: jev.candidateLimit,
-        semanticFallback: jev.semanticFallback,
+        limit: options.candidateLimit,
+        semanticFallback: options.semanticFallback,
         excludeThreadIds,
         autoInjectUsage,
         ...(participantIds.length > 0
@@ -1390,40 +1424,69 @@ async function maybeBuildJevAutoInjectedThreadSearchMessages(
     return [];
   }
 
-  // Without a length gate most messages end here, so status is shown only once Jev has work.
+  const prepared = (await prepareDecisionAutoInjectImages(params)).match<
+    { kind: "prepared"; images: string[] } | { kind: "failed"; message: string }
+  >({
+    ok: (images) => ({ kind: "prepared", images }),
+    err: (error) => ({ kind: "failed", message: error.message }),
+  });
+  if (prepared.kind === "failed") {
+    params.onError(
+      "Decision image preparation failed; continuing without metadata",
+      projectBusAgentRunnerError(new Error(prepared.message)),
+    );
+    autoInjectUsage.finish({ status: "failed" });
+    return [];
+  }
+  const resolution = resolveDecisionAutoInjectEvaluator(params, prepared.images.length > 0);
+  if (resolution.kind === "unavailable") {
+    params.onError(
+      "Decision auto-inject is unavailable; continuing without metadata",
+      projectBusAgentRunnerError(new Error(resolution.message)),
+    );
+    autoInjectUsage.finish({ status: "failed" });
+    return [];
+  }
+
+  // Without a length gate most messages end here, so status is shown only once the evaluator has work.
   await publishAutoInjectToolStatusBestEffort(params, { toolCallId, status: "start", display });
   const evaluator = resolution.evaluator;
-  const jevStartedAt = performance.now();
+  const decisionStartedAt = performance.now();
   const evaluated = await evaluator.evaluate({
     message,
+    images: evaluator.supportsImages ? prepared.images : undefined,
     candidates: results.map((result) => ({
       threadId: result.threadId,
       title: result.title,
       brief: result.brief,
     })),
   });
-  autoInjectUsage.recordTiming("jev", performance.now() - jevStartedAt);
-  const outcome = evaluated.match<JevEvaluationOutcome>({
+  autoInjectUsage.recordTiming("decision", performance.now() - decisionStartedAt);
+  const outcome = evaluated.match<DecisionEvaluationOutcome>({
     ok: (answers) => ({ kind: "answered", answers }),
     err: (error) => ({ kind: "failed", message: error.message }),
   });
   if (outcome.kind === "failed") {
     const failure = projectBusAgentRunnerError(new Error(outcome.message));
     await endToolStatus({ failure });
-    params.onError("Jev auto-inject evaluation failed; continuing without metadata", failure);
+    params.onError("Decision auto-inject evaluation failed; continuing without metadata", failure);
     autoInjectUsage.finish({ status: "failed" });
     return [];
   }
 
   const { answers } = outcome;
-  autoInjectUsage.recordJevUsage({ model: evaluator.model, ...answers.usage });
-  const decision = decideJevAutoInject({ answers, candidates: results, options: jev });
+  autoInjectUsage.recordDecisionUsage({ model: evaluator.model, ...answers.usage });
+  const decision = decideDecisionAutoInject({
+    answers,
+    candidates: results,
+    options: decisionAutoInjectOptionsForModel(options, resolution.model),
+  });
   const entries = decision.selected.map((candidate) =>
     formatAutoInjectedThreadSearchResult(results[candidate.index]!),
   );
   await endToolStatus({ entries });
   notifyAutoInjectObserverBestEffort(params.onError, () =>
-    params.onJevEvaluated?.({
+    params.onDecisionEvaluated?.({
       toolCallId,
       model: evaluator.model,
       source,
@@ -1456,8 +1519,11 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(
   if (!autoInject.enabled) return [];
   if (!params.conversationThreads) return [];
   const conversationThreads = params.conversationThreads;
-  if (params.cfg.conversation.thread.autoInjectMode === "jev") {
-    return await maybeBuildJevAutoInjectedThreadSearchMessages({ ...params, conversationThreads });
+  if (params.cfg.conversation.thread.autoInjectMode === "decision") {
+    return await maybeBuildDecisionAutoInjectedThreadSearchMessages({
+      ...params,
+      conversationThreads,
+    });
   }
 
   const latestInput = latestUserInput(params.userMessages);
@@ -6413,6 +6479,7 @@ export async function startBusAgentRunner(params: {
             storedMessages: readonly StoredMessageV1[],
             binding: BuiltModelBinding,
             imageReferences?: readonly McpImageCheckpointReference[],
+            resourceTarget?: Parameters<typeof materializeStoredMessagesV1>[0]["resourceTarget"],
           ): Promise<ModelMessage[]> =>
             await materializeMcpImageCheckpoint({
               imageRegistry: mcpImages,
@@ -6429,10 +6496,12 @@ export async function startBusAgentRunner(params: {
                       raw: next.raw,
                     })
                   : params.resourceAccess,
-              resourceTarget: resolveStoredResourceProviderTarget({
-                provider: binding.resolved.provider,
-                capability: binding.capabilityInfo,
-              }),
+              resourceTarget:
+                resourceTarget ??
+                resolveStoredResourceProviderTarget({
+                  provider: binding.resolved.provider,
+                  capability: binding.capabilityInfo,
+                }),
             }).then((materialized) =>
               materialized.match({
                 ok: (messages) => () => messages,
@@ -7997,10 +8066,26 @@ export async function startBusAgentRunner(params: {
                       raw: next.raw,
                       previousMessages: agent.state.messages,
                       userMessages: mergedInitial,
+                      loadDecisionUserMessages: coalesced.storedMessages.some(
+                        (message) =>
+                          message.role === "user" &&
+                          Array.isArray(message.content) &&
+                          message.content.some(
+                            (part) => part.type === "resource" || part.type === "blob",
+                          ),
+                      )
+                        ? () =>
+                            materializeForBinding(
+                              coalesced.storedMessages,
+                              activeBinding,
+                              undefined,
+                              { family: "ai-sdk", supportsImage: true, supportsPdf: false },
+                            )
+                        : undefined,
                       publishToolStatus: publishNonAgentToolStatus,
                       onError: reportAutoInjectedThreadSearchError,
-                      onJevEvaluated: (event) => {
-                        logger.info("conversation.thread.auto_inject.jev", {
+                      onDecisionEvaluated: (event) => {
+                        logger.info("conversation.thread.auto_inject.decision", {
                           requestId: headers.request_id,
                           sessionId: headers.session_id,
                           toolCallId: event.toolCallId,

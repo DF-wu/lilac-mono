@@ -1,5 +1,19 @@
 # MIGRATIONS.md
 
+## Decision auto-inject configuration
+
+Rename version-2 `conversation.thread.autoInjectMode: jev` to `decision` and the `jevAutoInject`
+section to `decisionAutoInject`. Old settings normalize to the new runtime shape, preserving thresholds;
+the new section wins if both are present. No config-version or database migration is required.
+`decisionAutoInject.model` is now an ordered array. Single strings still parse. Move the four
+`*Probability` fields into `decisionAutoInject.jev` or `decisionAutoInject.luna`; old flat fields
+apply to both scopes, with explicit scoped fields taking precedence. Configure
+`[typesafe/jev-1.13.0, openai/gpt-6-luna]` to select Jev for text and Luna for attached images.
+The array controls routing, without retrying another model on failure. Log queries must also change:
+the `conversation.thread.auto_inject.jev` event is now `conversation.thread.auto_inject.decision`,
+and the usage record's `jev` field and timing stage are now `decision`. OpenAI can evaluate
+attached images through existing scoped resource access. See [config migration guidance](docs/core-config-migrations.md#decision-auto-inject-lane).
+
 ## Native workflow cards
 
 Native display messages accept a `data-workflow` part that carries a structured workflow progress
@@ -52,7 +66,6 @@ Viewer credentials are fetched under the native thread edit permission, kept in 
 the viewer frame using origin-checked messages. They are not included in URLs or the conversation
 cache. Existing direct noVNC links and provisioning responses remain unchanged.
 
-
 ## Native web keybindings
 
 Keyboard shortcuts are stored only in the browser under `lilac-keybindings-v1`, scoped to the
@@ -60,13 +73,11 @@ installation and principal. The version 1 payload contains physical key codes an
 each action; null disables an action. Missing, invalid, duplicate, or unsupported payloads use
 default bindings without rewriting storage. No Core configuration or server-data migration is needed.
 
-
 ## Native reaction names
 
 Reaction responses add optional `userNames` (at most five display names) and `overflowCount`.
 Core projects these fields from current users when personalizing messages; stored messages need no
 backfill. Update Core and web together because older strict response validators reject these fields.
-
 
 ## Native deployment settings
 
@@ -169,7 +180,6 @@ old credential/cache directories are not automatically deleted. Stop using those
 those local files if no longer needed. Web authentication and retained conversations are unchanged.
 Operator-only Core startup is enabled by the existing container operator-token hash without enabling
 the public native listener or requiring Discord. The native owner ID is reused if web is enabled later.
-
 
 This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
 documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).
