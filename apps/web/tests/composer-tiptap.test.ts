@@ -11,6 +11,9 @@ import {
   composerExtensions,
   attachmentNode,
   referenceNode,
+  skillNode,
+  markEditorSkills,
+  editorSkillIds,
   captureEditorPaste,
   composerCompletionPrefix,
   completeEditor,
@@ -22,7 +25,7 @@ import { createComposerEditor, composerMarkdown } from "../src/components/compos
 function headlessEditor(text: string) {
   const editor = new Editor({
     element: null,
-    extensions: [...composerExtensions, attachmentNode, referenceNode],
+    extensions: [...composerExtensions, attachmentNode, referenceNode, skillNode],
     content: readComposerDocument(text).toJSON(),
   });
   // Tiptap treats an unmounted editor as destroyed even though its transactions work headlessly.
@@ -126,6 +129,39 @@ it("completes a mention after a soft line break without deleting preceding text"
   expect(composerCompletionPrefix(editor)).toBe("hello\n$sk");
   completeEditor(editor, "$skill", 3);
   expect(writeComposerDocument(editor.state.doc)).toBe("hello\n$skill ");
+  editor.destroy();
+});
+
+it("completes a skill as a badge that keeps its mention syntax", () => {
+  const editor = headlessEditor("use $ag");
+  editor.commands.setTextSelection(editor.state.doc.content.size - 1);
+  completeEditor(editor, "$my_skill", 3, { id: "skill-1", name: "my_skill" });
+  const badge = editor.state.doc.firstChild?.child(1);
+  expect(badge?.type.name).toBe("composer_skill");
+  expect(badge?.attrs).toMatchObject({ id: "skill-1", name: "my_skill" });
+  expect(composerText(editor.state.doc)).toBe("use $my_skill ");
+  expect(writeComposerDocument(editor.state.doc)).toBe("use $my\\_skill ");
+  expect(editor.state.selection.from).toBe(editor.state.doc.content.size - 1);
+  editor.destroy();
+});
+
+it("restores badges only for exact selected skill mentions outside code", () => {
+  const text =
+    "$review /skill:review $reviewer $review-next `$review` **x**$review $Better Result, $a+b\n\n```\n$review\n```";
+  const editor = headlessEditor(text);
+  const before = writeComposerDocument(editor.state.doc);
+  markEditorSkills(editor, [
+    { id: "r", name: "review" },
+    { id: "b", name: "Better Result" },
+    { id: "a", name: "a+b" },
+  ]);
+  const badges: string[] = [];
+  editor.state.doc.descendants((node) => {
+    if (node.type.name === "composer_skill") badges.push(node.attrs.text);
+  });
+  expect(badges).toEqual(["$review", "/skill:review", "$Better Result", "$a+b"]);
+  expect(editorSkillIds(editor.state.doc)).toEqual(["r", "b", "a"]);
+  expect(writeComposerDocument(editor.state.doc)).toBe(before);
   editor.destroy();
 });
 

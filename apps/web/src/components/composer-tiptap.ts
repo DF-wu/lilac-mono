@@ -13,6 +13,7 @@ import {
   composerPlainText,
 } from "./composer-document";
 import type { Attachment } from "../types";
+import { skillMentionPattern } from "./skill-mentions";
 
 export const attachmentNode = Node.create({
   name: "composer_attachment",
@@ -40,6 +41,20 @@ export const referenceNode = Node.create({
     "span",
     { ...HTMLAttributes, "data-composer-reference": "", contenteditable: "false" },
     HTMLAttributes.url,
+  ],
+});
+export const skillNode = Node.create({
+  name: "composer_skill",
+  group: "inline",
+  inline: true,
+  atom: true,
+  selectable: false,
+  addAttributes: () => ({ id: { default: "" }, name: { default: "" }, text: { default: "" } }),
+  parseHTML: () => [{ tag: "span[data-composer-skill]" }],
+  renderHTML: ({ HTMLAttributes }) => [
+    "span",
+    { ...HTMLAttributes, "data-composer-skill": "", contenteditable: "false" },
+    HTMLAttributes.text,
   ],
 });
 
@@ -145,7 +160,12 @@ export const composerExtensions = [
   indentation,
   horizontalRule,
 ];
-export const composerSchema = getSchema([...composerExtensions, attachmentNode, referenceNode]);
+export const composerSchema = getSchema([
+  ...composerExtensions,
+  attachmentNode,
+  referenceNode,
+  skillNode,
+]);
 export { Placeholder };
 
 type ComposerLeaf = {
@@ -281,6 +301,10 @@ function leaves(node: DocumentNode): ComposerNode[] {
       result.push({ text: "\n" });
       return;
     }
+    if (child.type.name === "composer_skill") {
+      result.push({ text: child.attrs.text });
+      return;
+    }
     result.push({ type: child.type.name, ...child.attrs, children: [{ text: "" }] });
   });
   const merged: ComposerNode[] = [];
@@ -385,6 +409,14 @@ export function editorAttachmentKeys(doc: DocumentNode): Set<string> {
   });
   return keys;
 }
+export type ComposerSkill = { id: string; name: string };
+export function editorSkillIds(doc: DocumentNode): string[] {
+  const ids = new Set<string>();
+  doc.descendants((node) => {
+    if (node.type.name === "composer_skill") ids.add(node.attrs.id);
+  });
+  return [...ids];
+}
 export function insertEditorAttachment(
   editor: Editor,
   attachment: Pick<Attachment, "key" | "file">,
@@ -432,11 +464,53 @@ export function captureEditorPaste(editor: Editor) {
     },
   };
 }
-export function completeEditor(editor: Editor, text: string, length: number) {
+export function completeEditor(
+  editor: Editor,
+  text: string,
+  length: number,
+  skill?: ComposerSkill,
+) {
   const { from } = editor.state.selection;
+  const start = Math.max(1, from - length);
+  const { schema, tr } = editor.state;
+  if (!skill) {
+    editor.view.dispatch(tr.insertText(`${text} `, start, from).scrollIntoView());
+    return;
+  }
   editor.view.dispatch(
-    editor.state.tr.insertText(`${text} `, Math.max(1, from - length), from).scrollIntoView(),
+    tr
+      .replaceWith(start, from, [
+        schema.nodes.composer_skill!.create({ ...skill, text }),
+        schema.text(" "),
+      ])
+      .scrollIntoView(),
   );
+}
+// Drafts store skill mentions as text. Restore badges for mentions of skills the draft selected.
+export function markEditorSkills(editor: Editor, skills: readonly ComposerSkill[]) {
+  if (!skills.length) return;
+  const pattern = skillMentionPattern(skills.map((skill) => skill.name));
+  const { schema, tr } = editor.state;
+  editor.state.doc.descendants((node, pos) => {
+    if (node.type.name === "codeBlock") return false;
+    if (!node.isText || node.marks.some((mark) => mark.type.name === "code")) return;
+    const before = editor.state.doc.resolve(pos).nodeBefore;
+    const boundary = !before || before.type.name === "hardBreak";
+    for (const match of node.text!.matchAll(pattern)) {
+      if (match.index === 0 && !match[1] && !boundary) continue;
+      const from = pos + match.index + match[1]!.length;
+      tr.replaceWith(
+        tr.mapping.map(from),
+        tr.mapping.map(from + match[2]!.length),
+        schema.nodes.composer_skill!.create({
+          id: skills.find((skill) => skill.name === match[3])!.id,
+          name: match[3],
+          text: match[2],
+        }),
+      );
+    }
+  });
+  if (tr.docChanged) editor.view.dispatch(tr.setMeta("addToHistory", false));
 }
 export function replaceEditorDocument(editor: Editor, text: string) {
   const doc = readComposerDocument(text, editor.schema);

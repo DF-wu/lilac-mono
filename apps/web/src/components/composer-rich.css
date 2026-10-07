@@ -87,14 +87,16 @@
   font-size: var(--ui-text-xs);
   flex-shrink: 0;
 }
-.composer-attachment-chip .icon-button {
+.composer-attachment-chip .icon-button,
+[data-ui="skill-badge"] .icon-button {
   width: 1lh;
   height: 1lh;
   font-size: inherit;
   line-height: inherit;
   flex-shrink: 0;
 }
-.composer-attachment-chip .icon-button svg {
+.composer-attachment-chip .icon-button svg,
+[data-ui="skill-badge"] .icon-button svg {
   width: calc(var(--ui-space-unit) * 3);
   height: calc(var(--ui-space-unit) * 3);
 }
@@ -109,13 +111,4 @@
 .composer-attachment-chip[data-state="failed"],
 .composer-attachment-chip[data-state="missing"] {
   color: var(--ui-danger);
-}
-
-.composer .skill-chips .badge {
-  max-width: 100%;
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
-.composer .skill-chips .badge svg {
-  flex: none;
 }

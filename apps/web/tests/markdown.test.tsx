@@ -8,8 +8,36 @@ import MathExpression, { sanitizeMathTree } from "../src/components/rich-math";
 import { highlightCode } from "../src/components/rich-code";
 import { remarkChatMath } from "../src/components/remark-chat-math";
 import { diagramSourceAllowed, markdownUrl } from "../src/components/markdown-policy";
+import { SkillCatalogContext } from "../src/components/skill-mentions";
 
 describe("markdown", () => {
+  test("renders exact catalog skill mentions in user messages as badges", () => {
+    const skills = [
+      { id: "browser", name: "agent-browser", description: "Browser automation", source: "user" },
+    ];
+    const render = (text: string, preserveLineBreaks = true) =>
+      renderToStaticMarkup(
+        <SkillCatalogContext value={skills}>
+          <MarkdownContent text={text} preserveLineBreaks={preserveLineBreaks} />
+        </SkillCatalogContext>,
+      );
+    const html = render("Use $agent-browser, then /skill:agent-browser **now**");
+    expect(html.match(/data-ui="skill-badge"/g)).toHaveLength(2);
+    expect(html).not.toContain("$agent-browser");
+    expect(html).toContain("<strong>now</strong>");
+    for (const text of [
+      "Use $agent-browser-next or $agent-browsers",
+      "Use `$agent-browser`",
+      "[$agent-browser](https://example.com)",
+      "```\n$agent-browser\n```",
+      "Pay$agent-browser",
+      "**Pay**$agent-browser",
+    ])
+      expect(render(text)).not.toContain("skill-badge");
+    expect(render("Use $agent-browser", false)).not.toContain("skill-badge");
+    expect(render("**Use** $agent-browser\n$agent-browser").match(/skill-badge/g)).toHaveLength(2);
+  });
+
   test("retains extra blank lines between user paragraphs", () => {
     for (const count of [2, 3, 4]) {
       const text = `First${"\n".repeat(count)}Last`;

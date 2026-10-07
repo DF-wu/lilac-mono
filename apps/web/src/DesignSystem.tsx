@@ -50,6 +50,8 @@ import motion from "./assets/design-system/motion.mp4";
 import tone from "./assets/design-system/tone.wav";
 import weekendPdf from "./assets/design-system/weekend.pdf";
 import type { Attachment } from "./types";
+import type { DisplayCatalog } from "@stanley2058/lilac-client-protocol";
+import { SkillCatalogContext } from "./components/skill-mentions";
 import { AttachmentPreviewBody, ReadyAttachment } from "./components/ResourcePreview";
 import { MessageIdentityContext } from "./components/message-identity";
 import { toast } from "./components/ui/toast";
@@ -867,12 +869,26 @@ function Messages() {
     </Section>
   );
 }
+const composerCatalog: DisplayCatalog = {
+  revision: "design-system",
+  models: [],
+  skills: [
+    {
+      id: "agent-browser",
+      name: "agent-browser",
+      description: "Browser automation",
+      source: "user",
+    },
+  ],
+  commands: [],
+};
 function ComposerSpecimen() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(false);
   const [text, setText] = useState(
-    "Help me turn these **notes** into a weekend plan.\n\nCompare [the discussion](/?ref=discord%3Aweekend). Keep Sunday free.\nhttps://example.com/weekend",
+    "Help me turn these **notes** into a weekend plan with $agent-browser.\n\nCompare [the discussion](/?ref=discord%3Aweekend). Keep Sunday free.\nhttps://example.com/weekend",
   );
+  const [skillIds, setSkillIds] = useState(["agent-browser"]);
   const [disabled, setDisabled] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>(() => [
     {
@@ -920,8 +936,9 @@ function ComposerSpecimen() {
             setAttachments((items) => items.filter((item) => item.key !== key))
           }
           disabled={disabled}
-          skillIds={[]}
-          onSkills={noop}
+          catalog={composerCatalog}
+          skillIds={skillIds}
+          onSkills={setSkillIds}
           onCommand={noop}
           onAttach={noop}
           onRetryAttachment={noop}
@@ -933,7 +950,9 @@ function ComposerSpecimen() {
         />
       </div>
       <Specimen title="Message preview">
-        <Markdown text={text} preserveLineBreaks />
+        <SkillCatalogContext value={composerCatalog.skills}>
+          <Markdown text={text} preserveLineBreaks />
+        </SkillCatalogContext>
       </Specimen>
       <Collapsible>
         <CollapsibleTrigger render={<Button variant="ghost" />}>
