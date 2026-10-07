@@ -110,7 +110,7 @@ test("publication replaces stale schemas, preserves unchanged files, and leaves 
   await writeFile(schemaPath, '{"title":"another build"}\n');
   await publishConfigSchemas(directory);
   expect(JSON.parse(await readFile(schemaPath, "utf8"))).toEqual(coreSchema);
-  expect(await readdir(path.join(directory, ".schemas"))).toEqual([
+  expect((await readdir(path.join(directory, ".schemas"))).sort()).toEqual([
     "core-config.schema.json",
     "mcp-config.schema.json",
   ]);
