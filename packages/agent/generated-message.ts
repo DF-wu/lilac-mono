@@ -1,4 +1,5 @@
 import type { ModelMessage, UserContent, UserModelMessage } from "ai";
+import { isRecord } from "@stanley2058/lilac-utils/runtime-utils";
 
 export type GeneratedMessageKind =
   | "subagent_completion"
@@ -44,8 +45,7 @@ export function buildGeneratedMessage(input: {
 
 export function generatedMessageMetadata(message: Pick<ModelMessage, "role" | "providerOptions">) {
   const marker = message.providerOptions?.lilac?.generated;
-  if (message.role !== "user" || !marker || typeof marker !== "object" || Array.isArray(marker))
-    return null;
+  if (message.role !== "user" || !isRecord(marker)) return null;
   if (marker.version !== 1 || typeof marker.id !== "string") return null;
   if (
     marker.kind !== "subagent_completion" &&

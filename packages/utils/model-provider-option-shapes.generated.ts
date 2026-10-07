@@ -14,6 +14,13 @@ export const MODEL_PROVIDER_OPTION_SHAPES = {
           type: null,
         },
       },
+      compaction: {
+        kind: "object",
+        properties: {
+          instructions: null,
+          type: null,
+        },
+      },
       container: {
         kind: "object",
         properties: {
@@ -118,7 +125,18 @@ export const MODEL_PROVIDER_OPTION_SHAPES = {
           userId: null,
         },
       },
+      safeguards: {
+        kind: "array",
+        element: {
+          kind: "object",
+          properties: {
+            classifierContext: null,
+            type: null,
+          },
+        },
+      },
       sendReasoning: null,
+      serviceTier: null,
       speed: null,
       structuredOutputMode: null,
       taskBudget: {
@@ -132,6 +150,12 @@ export const MODEL_PROVIDER_OPTION_SHAPES = {
       thinking: {
         kind: "object",
         properties: {
+          blockBinding: {
+            kind: "object",
+            properties: {
+              prefixMismatchBehavior: null,
+            },
+          },
           budgetTokens: null,
           display: null,
           type: null,
@@ -182,6 +206,7 @@ export const MODEL_PROVIDER_OPTION_SHAPES = {
         kind: "array",
         element: null,
       },
+      includeWebSearchSources: null,
       instructions: null,
       logprobs: null,
       maxToolCalls: null,
@@ -200,6 +225,7 @@ export const MODEL_PROVIDER_OPTION_SHAPES = {
       promptCacheRetention: null,
       reasoningContext: null,
       reasoningEffort: null,
+      reasoningEffortUpdate: null,
       reasoningMode: null,
       reasoningSummary: null,
       safetyIdentifier: null,
@@ -229,11 +255,18 @@ export const MODEL_PROVIDER_OPTION_SHAPES = {
         element: null,
       },
       logprobs: null,
+      maxTurns: null,
+      minP: null,
+      parallelToolCalls: null,
       previousResponseId: null,
+      promptCacheKey: null,
       reasoningEffort: null,
       reasoningSummary: null,
+      safetyIdentifier: null,
+      serviceTier: null,
       store: null,
       topLogprobs: null,
+      user: null,
     },
   },
 } as const;

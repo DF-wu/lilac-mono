@@ -1,5 +1,5 @@
-export type JSONValue = null | string | number | boolean | JSONObject | JSONArray;
-export type JSONArray = JSONValue[];
+export type JSONValue = null | string | number | boolean | Readonly<JSONObject> | JSONArray;
+export type JSONArray = readonly JSONValue[];
 export type JSONObject = {
   [key: string]: JSONValue | undefined;
 };

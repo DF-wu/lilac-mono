@@ -105,7 +105,7 @@ describe("Jev auto-inject", () => {
   it("decodes boolean answers aligned with candidates", async () => {
     const evaluator = createJevAutoInjectEvaluatorForModel({
       modelId: "jev-test",
-      doEvaluate: async () => ({
+      doDecide: async () => ({
         answers: booleanAnswers({
           asks_to_recall: 0.8,
           durable_subject: 0.4,
@@ -134,14 +134,14 @@ describe("Jev auto-inject", () => {
   it("reports missing answers and provider failures as evaluation errors", async () => {
     const incomplete = createJevAutoInjectEvaluatorForModel({
       modelId: "jev-test",
-      doEvaluate: async () => ({
+      doDecide: async () => ({
         answers: booleanAnswers({ asks_to_recall: 0.8, durable_subject: 0.4, casual: 0.1 }),
         warnings: [],
       }),
     });
     const rejected = createJevAutoInjectEvaluatorForModel({
       modelId: "jev-test",
-      doEvaluate: async () => {
+      doDecide: async () => {
         throw new Error("401 Unauthorized");
       },
     });

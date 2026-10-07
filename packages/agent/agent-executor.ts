@@ -1422,7 +1422,8 @@ export class AgentExecutor<TOOLS extends ToolSet = ToolSet> {
       ? await this.prepareFullModelView(selectedCanonical, preparationContext)
       : selectedCanonical;
     messagesForModel = normalizeReplayMessages(messagesForModel);
-    if (messagesForModel.at(-1)?.role === "assistant") {
+    const preparedLastMessage = messagesForModel.at(-1);
+    if (preparedLastMessage?.role === "assistant" && !hasInlineToolResult(preparedLastMessage)) {
       signalAgentStateHost(
         new AgentStateTransitionFailed({
           operation: "prepare model view",
@@ -1451,7 +1452,7 @@ export class AgentExecutor<TOOLS extends ToolSet = ToolSet> {
 
     const lastMessage =
       messagesForModel.length > 0 ? messagesForModel[messagesForModel.length - 1] : undefined;
-    if (lastMessage?.role === "assistant") {
+    if (lastMessage?.role === "assistant" && !hasInlineToolResult(lastMessage)) {
       signalAgentStateHost(
         new AgentStateTransitionFailed({
           operation: "prepare outbound context",

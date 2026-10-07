@@ -3538,7 +3538,19 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     await agent.prompt("read");
 
     expect(model.doStreamCalls).toHaveLength(2);
-    expect(normalized).toEqual(["mcp__lilac__read", "mcp__lilac__read"]);
+    expect(normalized).toEqual(["mcp__lilac__read"]);
+    expect(agent.state.messages).toHaveLength(3);
+    expect(model.doStreamCalls[1]?.prompt.at(-1)).toMatchObject({
+      role: "assistant",
+      content: [
+        { type: "tool-call", toolCallId: "provider-call", providerExecuted: true },
+        {
+          type: "tool-result",
+          toolCallId: "provider-call",
+          output: { type: "text", value: "normalized result" },
+        },
+      ],
+    });
     expect(agent.state.messages[1]).toMatchObject({
       role: "assistant",
       content: [

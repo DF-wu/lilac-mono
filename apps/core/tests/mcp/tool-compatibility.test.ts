@@ -336,18 +336,18 @@ describe("MCP tool compatibility through registry and executor", () => {
     expect(transport.lastArguments).toEqual({ extra: "preserved" });
   });
 
-  for (const content of [[], [{ type: "text" as const, text: "summary" }]]) {
-    it(`preserves structured output alongside ${content.length} text blocks`, async () => {
+  for (const content of [undefined, [], [{ type: "text" as const, text: "summary" }]]) {
+    it(`preserves structured output alongside ${content?.length ?? "omitted"} text blocks`, async () => {
       const transport = new ToolTransport(true);
       transport.result = {
-        content,
+        ...(content === undefined ? {} : { content }),
         structuredContent: { count: 42 },
         _meta: { private: "not model context" },
       };
       const { outcome } = await execute(await connect(transport));
       expect(outcome.toolOutput).toEqual({
         type: "content",
-        value: [...content, { type: "text", text: '{"count":42}' }],
+        value: [...(content ?? []), { type: "text", text: '{"count":42}' }],
       });
     });
   }

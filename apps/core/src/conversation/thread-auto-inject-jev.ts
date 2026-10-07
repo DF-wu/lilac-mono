@@ -2,9 +2,9 @@ import { createTypeSafeAi, type TypeSafeAiProvider } from "@ai-sdk/typesafe-ai";
 import { opaqueErrorMessage, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-type JevEvaluationModel = ReturnType<TypeSafeAiProvider["evaluationModel"]>;
-type JevEvaluationCall = Parameters<JevEvaluationModel["doEvaluate"]>[0];
-type JevEvaluationResult = Awaited<ReturnType<JevEvaluationModel["doEvaluate"]>>;
+type JevDecisionModel = ReturnType<TypeSafeAiProvider["decisionModel"]>;
+type JevDecisionCall = Parameters<JevDecisionModel["doDecide"]>[0];
+type JevDecisionResult = Awaited<ReturnType<JevDecisionModel["doDecide"]>>;
 
 export type JevAutoInjectOptions = CoreConfig["conversation"]["thread"]["jevAutoInject"];
 
@@ -72,8 +72,8 @@ function candidateQuestionId(index: number): string {
 export function buildJevAutoInjectCall(input: {
   message: string;
   candidates: readonly JevAutoInjectCandidate[];
-}): Pick<JevEvaluationCall, "state" | "questions"> {
-  const questions: Record<string, JevEvaluationCall["questions"][string]> = {
+}): Pick<JevDecisionCall, "state" | "questions"> {
+  const questions: Record<string, JevDecisionCall["questions"][string]> = {
     asks_to_recall: { type: "boolean", instructions: GATE_QUESTIONS.asks_to_recall },
     durable_subject: { type: "boolean", instructions: GATE_QUESTIONS.durable_subject },
     casual: { type: "boolean", instructions: GATE_QUESTIONS.casual },
@@ -93,14 +93,14 @@ export function buildJevAutoInjectCall(input: {
   };
 }
 
-function booleanProbability(result: JevEvaluationResult, questionId: string): number | null {
+function booleanProbability(result: JevDecisionResult, questionId: string): number | null {
   const answer = result.answers[questionId];
   if (answer?.type !== "boolean") return null;
   return Number.isFinite(answer.probability) ? answer.probability : null;
 }
 
 export function decodeJevAutoInjectAnswers(
-  result: JevEvaluationResult,
+  result: JevDecisionResult,
   candidateCount: number,
 ): ResultType<JevAutoInjectAnswers, JevAutoInjectEvaluationFailed> {
   const questionIds = ["asks_to_recall", "durable_subject", "casual"];
@@ -177,20 +177,20 @@ export function createJevAutoInjectEvaluator(input: {
     );
   }
   const baseURL = input.baseUrl?.trim() || undefined;
-  const model = createTypeSafeAi({ apiKey, ...(baseURL ? { baseURL } : {}) }).evaluationModel(
+  const model = createTypeSafeAi({ apiKey, ...(baseURL ? { baseURL } : {}) }).decisionModel(
     input.model,
   );
   return Result.ok(createJevAutoInjectEvaluatorForModel(model));
 }
 
 export function createJevAutoInjectEvaluatorForModel(
-  model: Pick<JevEvaluationModel, "modelId" | "doEvaluate">,
+  model: Pick<JevDecisionModel, "modelId" | "doDecide">,
 ): JevAutoInjectEvaluator {
   return {
     model: model.modelId,
     async evaluate(evaluateInput) {
       const evaluated = await Result.tryPromise({
-        try: async () => await model.doEvaluate(buildJevAutoInjectCall(evaluateInput)),
+        try: async () => await model.doDecide(buildJevAutoInjectCall(evaluateInput)),
         catch: (cause) =>
           new JevAutoInjectEvaluationFailed({
             message: opaqueErrorMessage(cause, "Jev evaluation failed"),

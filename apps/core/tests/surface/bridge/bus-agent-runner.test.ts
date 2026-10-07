@@ -11775,7 +11775,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
     const calls: Array<{ state: unknown; questionIds: string[] }> = [];
     const evaluator: JevAutoInjectEvaluator = createJevAutoInjectEvaluatorForModel({
       modelId: "jev-test",
-      doEvaluate: async (options) => {
+      doDecide: async (options) => {
         calls.push({ state: options.state, questionIds: Object.keys(options.questions) });
         return {
           answers: Object.fromEntries(
@@ -11981,7 +11981,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
   it("reports Jev failures and continues without metadata", async () => {
     const evaluator = createJevAutoInjectEvaluatorForModel({
       modelId: "jev-test",
-      doEvaluate: async () => {
+      doDecide: async () => {
         throw new Error("503 Service Unavailable");
       },
     });

@@ -74,7 +74,7 @@
     "packages/*"
   ],
   "patchedDependencies": {
-    "@ai-sdk/mcp@2.0.39": "patches/@ai-sdk%2Fmcp@2.0.39.patch",
+    "@ai-sdk/mcp@2.0.69": "patches/@ai-sdk%2Fmcp@2.0.69.patch",
     "bun-types@1.4.1": "patches/bun-types@1.4.1.patch",
     "openai@7.10.0": "patches/openai@7.10.0.patch"
   }

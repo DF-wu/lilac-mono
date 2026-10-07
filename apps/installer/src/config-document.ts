@@ -6,6 +6,7 @@ import { isAlias, isMap, isScalar, parseDocument, type Document } from "yaml";
 import { parseCoreConfigResult } from "@stanley2058/lilac-utils/core-config/parse";
 import { jsonValueSchema } from "@stanley2058/lilac-utils/core-config/v1";
 import type { CoreConfig, JSONValue } from "@stanley2058/lilac-utils/core-config/types";
+import { isRecord } from "@stanley2058/lilac-utils/runtime-utils";
 
 export type ConfigDocument = Document.Parsed;
 export type ConfigPath = readonly (string | number)[];
@@ -101,12 +102,12 @@ export function getConfigValue(
   let value: JSONValue | undefined = parsed.data;
   for (const segment of keyPath) {
     if (value === null || typeof value !== "object") return undefined;
-    if (Array.isArray(value)) {
-      if (typeof segment !== "number") return undefined;
-      value = value[segment];
+    if (isRecord(value)) {
+      value = value[String(segment)];
       continue;
     }
-    value = value[String(segment)];
+    if (typeof segment !== "number") return undefined;
+    value = value[segment];
   }
   return value;
 }
