@@ -1,3 +1,5 @@
+// Normalize process.env before SDK imports initialize their default providers.
+import { env, type ResponsesTransportMode } from "./env";
 import { createHash } from "node:crypto";
 
 import { createCerebras } from "@ai-sdk/cerebras";
@@ -15,7 +17,6 @@ import { z } from "zod";
 
 import { claudeCodeExecutableSettings } from "./claude-code-executable";
 import { CODEX_BASE_INSTRUCTIONS } from "./codex-instructions";
-import { env, type ResponsesTransportMode } from "./env";
 import { OAUTH_DUMMY_KEY } from "./codex-oauth";
 import {
   createCodexOAuthAuthorization,
