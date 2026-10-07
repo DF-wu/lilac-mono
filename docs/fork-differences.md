@@ -21,7 +21,7 @@ The comparison baseline is the merge base with upstream `main` as of 2026-10-06 
 | Custom media plugin example | Provides an external Level 2 image/video plugin using an OpenAI-compatible image API and a QuantumNous/new-api-compatible video flow | [`custom-media/README.md`](../examples/plugins/custom-media/README.md), fork PR [#30](https://github.com/DF-wu/lilac-mono/pull/30) | Plugins are trusted in-process code; restricted callers currently cannot use external callables directly |
 | Compatible-provider tool calls | When a compatible provider returns a nonstandard finish reason such as `other`, parsed local tool calls are still executed and their results preserved | Commit [`1c58e532`](https://github.com/DF-wu/lilac-mono/commit/1c58e532201ee51782c98c1d8b16086f6bf45c34) | Trusts only local tool calls that passed the parser; arbitrary provider text is not treated as a tool invocation |
 | Container delivery | The build workflow publishes verified `catalina`, `claudia`, and SHA tags, with `latest` pointing to `catalina`; each variant has its own account and home directory, and the image also includes `rsync` | [`build-image.yml`](../.github/workflows/build-image.yml), [`Dockerfile`](../Dockerfile) | Both published variants use UID/GID 3000; host bind mounts must grant that numeric identity access |
-| Upstream maintenance | A scheduled workflow fetches upstream `main` every 6 hours, attempts a merge when new commits exist, and triggers an image build after a successful merge | [`sync-upstream.yml`](../.github/workflows/sync-upstream.yml) | Merge conflicts fail the workflow and require manual integration and validation |
+| Upstream maintenance | Every 6 hours, verify clean candidate merges with full CI before updating `main` and publishing images; Git conflicts open a PR with read-only Claude analysis and request `Catalina-df` review | [`sync-upstream.yml`](../.github/workflows/sync-upstream.yml), [configuration](./upstream-sync.md) | CI failures stop the update; humans resolve conflicts and validate integration |
 
 ## Current Telegram Status
 
@@ -115,11 +115,12 @@ The fork keeps behavior in fork-owned modules and touches upstream files only at
 
 ## Branch Policy
 
-`main` is the only long-lived branch: upstream `main` plus the fork's features, always green. Everything else is short-lived and merges into `main` through a pull request so CI (including the upstream-footprint job) runs first.
+`main` is the only long-lived branch: upstream `main` plus the fork's features, always green. Other branches are short-lived and merge through a pull request. Clean automated upstream candidates are the exception: full CI (including the upstream-footprint job) runs before `main` fast-forwards to their existing commit. Only Git conflicts open an upstream synchronization PR.
 
 | Prefix | Use | Lifetime |
 | --- | --- | --- |
-| `chore/sync-upstream-YYYYMMDD` | Merging upstream `main`, conflict resolution, and any follow-up needed to keep fork features working with the new upstream | Deleted after the PR merges |
+| `chore/sync-upstream-<run-id>-<attempt>` | Clean upstream merge candidate verified before updating `main` | Deleted after successful update/publication dispatch; retained on failure |
+| `automation/sync-upstream` | Upstream conflict PR for human resolution and review | Deleted after the PR merges |
 | `feat/`, `fix/`, `refactor/`, `docs/`, `test/` | One change each, named after the change (`feat/telegram-forum-topics`) | Deleted after the PR merges |
 | `archive/<old-branch>` (tag, not branch) | Retired work whose commits are not in `main` but may be worth reading later | Permanent; never checked out for new work |
 
@@ -138,10 +139,15 @@ flowchart TD
     Fetch --> Behind{Fork behind upstream?}
     Behind -->|No| Stop[No change]
     Behind -->|Yes| Merge[Merge upstream main]
-    Merge --> Clean{Merge succeeds?}
-    Clean -->|Yes| Push[Push fork main]
+    Merge --> Clean{Git conflicts?}
+    Clean -->|No| CI[Full CI on candidate SHA]
+    CI --> Passed{All gates pass?}
+    Passed -->|No| Hold[Keep candidate; stop update]
+    Passed -->|Yes| Push[Fast-forward unchanged fork main]
     Push --> Build[Trigger image build]
-    Clean -->|No| Manual[Resolve and validate manually]
+    Clean -->|Yes| PR[Open PR; request Catalina-df review]
+    PR --> AI[Read-only Claude conflict analysis]
+    AI --> Manual[Human resolution and validation]
 ```
 
 Sync principles:

@@ -336,7 +336,7 @@ See [`AGENTS.md`](./AGENTS.md) for each workspace's build, test, and typecheck c
 
 ## Upstream Sync and Support Boundaries
 
-`.github/workflows/sync-upstream.yml` checks upstream `main` every 6 hours and attempts to merge new commits into this fork's `main`. A clean merge triggers an image build; maintainers handle conflicts manually.
+`.github/workflows/sync-upstream.yml` checks upstream `main` every 6 hours. A clean merge is committed on a candidate branch, verified by full CI, then fast-forwarded into `main` before image publication. Only Git conflicts open a PR requesting `Catalina-df` review; Claude Action supplies read-only analysis and never repairs code. See [workflow and prompt configuration](./docs/upstream-sync.md).
 
 - Report new fork features, deployment workflows, Telegram issues, OpenAI `web.search` issues, or OpenAI-compatible image-routing issues in [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues).
 - For an issue reproducible without fork modifications, first confirm the upstream state, then report it to [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono/issues).
