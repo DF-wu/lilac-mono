@@ -322,7 +322,7 @@ bun run fmt:check
 
 ## Upstream 同步與支援邊界
 
-`.github/workflows/sync-upstream.yml` 每 6 小時檢查一次 upstream `main`，有新 commits 時嘗試 merge 到本 fork 的 `main`。乾淨合併後會觸發 image build；發生 conflict 時由維護者人工處理。
+`.github/workflows/sync-upstream.yml` 每 6 小時檢查 upstream `main`。乾淨合併先在候選分支建立 commit，通過完整 CI 後才快轉更新 `main` 並發布映像。只有 Git 衝突會開 PR 並要求 `Catalina-df` review；Claude Action 提供唯讀分析，不自動修復程式或解衝突。詳見 [workflow 與 prompt 設定](./docs/upstream-sync.md)。
 
 - 本 fork 新功能、部署 workflow、Telegram、OpenAI `web.search` 或相容式圖像路由問題：請在 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues) 回報。
 - 可在未修改 upstream 重現的問題：先確認 upstream 狀態，再向 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono/issues) 回報。

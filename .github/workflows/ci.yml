@@ -5,9 +5,21 @@ on:
     branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+  # 同步流程驗證固定候選 SHA；重用所有既有 gate，不複製 CI 實作。
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit SHA to verify
+        required: true
+        type: string
+      upstream_ref:
+        description: Pinned upstream commit for the footprint gate
+        required: true
+        type: string
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -34,6 +46,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -61,6 +75,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
 
       - name: Setup Bun
@@ -69,11 +84,15 @@ jobs:
           bun-version-file: package.json
 
       - name: Fetch upstream main
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
         run: |
           git remote add upstream https://github.com/stanley2058/lilac-mono.git
-          git fetch --no-tags upstream main
+          git fetch --no-tags upstream "$UPSTREAM_REF"
 
       - name: Check modified upstream files against the allowlist
+        env:
+          LILAC_UPSTREAM_REF: FETCH_HEAD
         run: bun run fork:footprint
 
   docker-image:
@@ -97,6 +116,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Build image
         run: |
