@@ -2249,6 +2249,13 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
       },
       {
         identity: {
+          module: "openai-decision-model.ts",
+          exportName: "decodeOpenAIDecisionRequestBody",
+        },
+        category: "request",
+      },
+      {
+        identity: {
           module: "server-compaction-request.ts",
           exportName: "decodeServerCompactionPayload",
         },
