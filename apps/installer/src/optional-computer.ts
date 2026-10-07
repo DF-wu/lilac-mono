@@ -69,7 +69,10 @@ export async function configureComputerUse(prompt: Prompt, draft: SetupDraft): P
   if (!(await prompt.confirm("Enable computer use?", true))) return;
 
   const existing = await savedFile(draft, "mcp-config.yaml");
-  const document = parseDocument(existing ?? "configVersion: 1\nservers: {}\n");
+  const document = parseDocument(
+    existing ??
+      "# yaml-language-server: $schema=./.schemas/mcp-config.schema.json\nconfigVersion: 1\nservers: {}\n",
+  );
   const servers = document.get("servers", true);
   if (
     document.errors.length ||

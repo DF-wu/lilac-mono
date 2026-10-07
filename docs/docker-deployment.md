@@ -94,3 +94,33 @@ The service process and its subprocesses run as `lilac`; `docker compose exec` d
 
 The desktop gateway and runner have separate image builds and an opt-in Compose file. See
 [computer-use deployment](computer-use.md). The standard Compose stack does not enable them.
+
+## Config editor schemas
+
+Core publishes the schemas bundled with its build to `DATA_DIR/.schemas/` on startup, before
+loading configuration. Upgrades and rollbacks replace changed schema files atomically. Unchanged
+files retain their modification times. These files are generated and owned by Core; do not edit them.
+
+New configurations include YAML Language Server comments. Add these once to existing files:
+
+```yaml
+# In core-config.yaml:
+# yaml-language-server: $schema=./.schemas/core-config.schema.json
+```
+
+```yaml
+# In mcp-config.yaml:
+# yaml-language-server: $schema=./.schemas/mcp-config.schema.json
+```
+
+Paths resolve relative to the YAML file. The editor's language server must be able to read both the
+configuration and `.schemas` directory, for example through the host's mounted data directory or a
+remote editor session. If diagnostics stay stale after an upgrade, restart the YAML language server.
+Copying a config elsewhere also requires copying its `.schemas` directory or updating the reference.
+
+Schemas provide structural validation and completion. Runtime validation still checks custom
+constraints, including normalized unit values and cross-field relationships. Core V1 remains the
+default when `configVersion` is omitted. Schema publication does not modify existing configuration.
+
+When changing config validators, run `bun run codegen:config-schemas` and commit the generated files.
+Repository checks detect stale schemas, and the container build regenerates them from its source.

@@ -21,7 +21,10 @@ export class InstallerConfigIoFailed extends TaggedError("InstallerConfigIoFaile
 }> {}
 
 export function createConfigDocument(): ConfigDocument {
-  return parseDocument("configVersion: 2\n", { merge: true });
+  return parseDocument(
+    "# yaml-language-server: $schema=./.schemas/core-config.schema.json\nconfigVersion: 2\n",
+    { merge: true },
+  );
 }
 
 export function validateConfigDocument(

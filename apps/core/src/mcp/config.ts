@@ -291,7 +291,7 @@ export function serializeMcpConfigYamlResult(
     );
   }
   return toConfigInputV1(config).andThen((input) => {
-    const source = `${Bun.YAML.stringify(input, null, 2)}\n`;
+    const source = `# yaml-language-server: $schema=./.schemas/mcp-config.schema.json\n${Bun.YAML.stringify(input, null, 2)}\n`;
     const reparsed = parseMcpConfigYaml(source);
     if (!reparsed.ok) {
       return Result.err(

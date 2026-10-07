@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=./.schemas/core-config.schema.json
 configVersion: 2
 
 # Managed opaque bytes use local storage below the runtime data directory by default.
