@@ -222,23 +222,42 @@ describe("Decision auto-inject", () => {
     });
   });
 
-  it("reports refusals and invalid probabilities as evaluation failures", async () => {
-    for (const answer of [
-      { type: "refusal" as const },
-      { type: "boolean" as const, probability: 1.1 },
-    ]) {
-      const evaluator = createDecisionAutoInjectEvaluatorForModel({
-        modelId: "test",
-        doDecide: async () => ({
-          answers: {
-            ...booleanAnswers({ asks_to_recall: 0, durable_subject: 0, casual: 0 }),
-            asks_to_recall: answer,
-          },
-          warnings: [],
-        }),
-      });
-      const result = await evaluator.evaluate({ message: "hi", candidates: [] });
-      expect(result.isErr() ? result.error._tag : "ok").toBe("DecisionAutoInjectEvaluationFailed");
-    }
+  it("treats refused questions as answers that cannot open a gate or select a candidate", async () => {
+    const evaluator = createDecisionAutoInjectEvaluatorForModel({
+      modelId: "test",
+      doDecide: async () => ({
+        answers: {
+          ...booleanAnswers({ durable_subject: 0.9, candidate_0: 0.95 }),
+          asks_to_recall: { type: "refusal" as const },
+          casual: { type: "refusal" as const },
+          candidate_1: { type: "refusal" as const },
+        },
+        warnings: [],
+      }),
+    });
+
+    const result = await evaluator.evaluate({ message: "hi", candidates: candidates.slice(0, 2) });
+
+    expect(result.isOk() ? result.value : result.error).toMatchObject({
+      asksToRecall: 0,
+      durableSubject: 0.9,
+      casual: 1,
+      relevance: [0.95, 0],
+    });
+  });
+
+  it("reports invalid probabilities as evaluation failures", async () => {
+    const evaluator = createDecisionAutoInjectEvaluatorForModel({
+      modelId: "test",
+      doDecide: async () => ({
+        answers: {
+          ...booleanAnswers({ asks_to_recall: 0, durable_subject: 0, casual: 0 }),
+          asks_to_recall: { type: "boolean" as const, probability: 1.1 },
+        },
+        warnings: [],
+      }),
+    });
+    const result = await evaluator.evaluate({ message: "hi", candidates: [] });
+    expect(result.isErr() ? result.error._tag : "ok").toBe("DecisionAutoInjectEvaluationFailed");
   });
 });

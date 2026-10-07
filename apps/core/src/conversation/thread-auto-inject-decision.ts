@@ -249,6 +249,21 @@ export function createDecisionAutoInjectEvaluator(input: {
   return Result.ok(createDecisionAutoInjectEvaluatorForModel(model));
 }
 
+// Luna refuses individual questions on benign security or network vocabulary, and experimental_decide
+// rejects the whole call when any answer is a refusal. Treat a refusal as "no" so it can neither
+// select a candidate nor open a gate. A refused casual question counts as casual for the same reason.
+function answerRefusalsAsNo(result: DecisionResult): DecisionResult {
+  const answers = Object.fromEntries(
+    Object.entries(result.answers).map(([questionId, answer]) => [
+      questionId,
+      answer.type === "refusal"
+        ? { type: "boolean" as const, probability: questionId === "casual" ? 1 : 0 }
+        : answer,
+    ]),
+  );
+  return { ...result, answers };
+}
+
 export function createDecisionAutoInjectEvaluatorForModel(
   model: Pick<DecisionModel, "modelId" | "doDecide"> &
     Partial<Pick<DecisionModel, "provider" | "specificationVersion" | "supportedQuestionTypes">>,
@@ -259,7 +274,7 @@ export function createDecisionAutoInjectEvaluatorForModel(
     provider: model.provider ?? "decision",
     supportedQuestionTypes: model.supportedQuestionTypes ?? ["boolean"],
     modelId: model.modelId,
-    doDecide: (call) => model.doDecide(call),
+    doDecide: async (call) => answerRefusalsAsNo(await model.doDecide(call)),
   };
   return {
     model: model.modelId,

@@ -91,8 +91,8 @@ the independent labeling calls and Jev calls. Latencies cover decision calls, no
 
 A second replay on 2026-10-07 found that the first Luna preset did not hold up on more data. It used
 the same shortlist query, filters, and gate questions with up to 240 recent requests. 167 had lexical
-candidates, and 163 completed for every provider and question variant. Luna refused 4 requests,
-which skip automatic injection. An independent `gpt-6.1-sol` call with medium reasoning
+candidates, and 163 completed for every provider and question variant. Luna refused one or two
+questions in 4 requests. An independent `gpt-6.1-sol` call with medium reasoning
 effort labeled 72 requests as gate-positive and 138 of 4,735 candidates as relevant.
 
 Luna's candidate ranking was the problem. Thresholds alone could not fix it. Average precision
@@ -127,18 +127,25 @@ cross-validated worse, at 63.9%, so the shipped preset stays at the narrower gri
 A paired rerun on the same 167 requests, with fresh labels, called Jev and tuned Luna one after the
 other from the production deployment.
 
-| Decision call     | Jev, 30 candidates | Luna, 10 candidates | Luna, 30 candidates |
-| ----------------- | -----------------: | ------------------: | ------------------: |
-| p50 latency       |             228 ms |              298 ms |              335 ms |
-| p95 latency       |             288 ms |              417 ms |              406 ms |
-| p99 latency       |             520 ms |              666 ms |              968 ms |
-| Mean input tokens |              5,887 |               3,663 |               9,639 |
-| Refused requests  |                  0 |                   4 |                   4 |
+| Decision call                    | Jev, 30 candidates | Luna, 10 candidates | Luna, 30 candidates |
+| -------------------------------- | -----------------: | ------------------: | ------------------: |
+| p50 latency                      |             228 ms |              298 ms |              335 ms |
+| p95 latency                      |             288 ms |              417 ms |              406 ms |
+| p99 latency                      |             520 ms |              666 ms |              968 ms |
+| Mean input tokens                |              5,887 |               3,663 |               9,639 |
+| Requests with a refused question |                  0 |                   4 |                   4 |
 
 Tuned Luna reached 76.2% precision and 13.6% recall on the fresh labels. At the same recall, Jev with
 `relevanceMinProbability: 0.7` reached 88.9%: 16 correct and 2 incorrect selections. For text-only
 requests, Jev is at least as precise as Luna at matched recall, and it is faster. Keep Luna for
 image-bearing requests.
+
+Each refusal covered one or two questions, not the whole request. The refused questions involved
+benign security and network vocabulary, such as untrusted interfaces, API keys sent to an endpoint,
+VPN routing, and traffic or usage limits. The AI SDK rejects a decision when any answer is a refusal,
+so the evaluator converts a refused question to a "no": probability 0 for recall, durable-subject,
+and candidate questions, and probability 1 for the casual question. A refusal cannot select a
+candidate or open a gate, and the rest of the request still counts.
 
 ## Attached-image replay
 

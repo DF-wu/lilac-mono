@@ -46,7 +46,8 @@ image-capable entry; if none is configured, the first entry evaluates text only.
 select Luna. This is routing, not a retry or failure fallback chain. Only the selected model needs
 credentials. A single string and bare Jev model IDs remain supported as legacy input. TypeSafe uses `TYPESAFE_AI_API_KEY` and optional `TYPESAFE_AI_BASE_URL`; OpenAI uses
 `OPENAI_API_KEY` and optional `OPENAI_BASE_URL`. The endpoint must support `/v1/decisions`.
-Missing credentials, refusals, and evaluation failures continue without injected metadata.
+Missing credentials and evaluation failures continue without injected metadata. A refused question
+counts as "no", so it cannot open a gate or select a candidate.
 
 OpenAI receives attached images as native inline image parts, independently of the primary agent's
 image support. Jev evaluates text only. Shortlisting still uses the latest authored text; image-only
