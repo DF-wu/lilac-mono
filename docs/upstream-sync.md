@@ -147,7 +147,7 @@ Detailed source checks are recorded in [the research note](research/claude-actio
 
 ## Execution limits
 
-The agent runs only for conflict review, with at most **30 turns and 20 minutes**
+The agent runs only for conflict review, with at most **150 turns and 20 minutes**
 per analysis. Prepare has a 30-minute job limit. CI and main-update decisions
 run independently of the agent; model prose cannot mark checks successful.
 

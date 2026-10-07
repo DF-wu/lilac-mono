@@ -211,7 +211,7 @@ jobs:
           claude_args: >-
             --model deepseek-v4.1-flash
             --effort max
-            --max-turns 30
+            --max-turns 150
             --tools "Read,Glob,Grep,Bash"
             --allowedTools "Read,Glob,Grep,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git merge-base:*),Bash(git rev-parse:*),Bash(git ls-files:*),Bash(rg:*)"
             --disallowedTools "Edit,Write,NotebookEdit,Bash(git add:*),Bash(git commit:*),Bash(git merge:*),Bash(git push:*),Bash(gh:*)"
