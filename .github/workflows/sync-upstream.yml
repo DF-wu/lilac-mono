@@ -143,8 +143,6 @@ jobs:
               --title "chore(sync): review upstream merge conflicts" \
               --body-file "$body_file" --reviewer Catalina-df
             pr_number=$(gh pr list --base main --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number')
-          else
-            gh pr edit "$pr_number" --add-reviewer Catalina-df
           fi
           # 保存分析前的 tracked tree/index 指紋；Claude 不應改動待分析內容。
           {
@@ -295,7 +293,7 @@ jobs:
             Provide brief, verifiable rationales; do not expose hidden reasoning.
             </deliverable>
 
-      - name: Publish the analysis and mention the reviewer
+      - name: Publish or update the conflict analysis
         if: steps.merge.outputs.mode == 'conflict'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -311,7 +309,7 @@ jobs:
           test "$(git diff --binary HEAD | sha256sum | cut -d ' ' -f 1)" = "$EXPECTED_TREE"
           test "$(git ls-files --stage | sha256sum | cut -d ' ' -f 1)" = "$EXPECTED_INDEX"
           report_file="$RUNNER_TEMP/upstream-review.md"
-          printf '%s\n\n' '@Catalina-df please review this upstream integration.' > "$report_file"
+          printf '%s\n\n' '## 上游衝突分析' > "$report_file"
           # 只抽取成功執行的最終 review brief，不發布完整對話或工具 transcript。
           if [ "$CLAUDE_OUTCOME" = "success" ] && [ -f "$EXECUTION_FILE" ] &&
              review_brief=$(jq -er '[.[] | select(.type == "result" and .subtype == "success" and .is_error == false)][-1].result // empty' "$EXECUTION_FILE"); then
@@ -319,8 +317,9 @@ jobs:
           else
             printf '%s\n' 'AI analysis did not complete. The conflicts remain for human review; no automatic repair was performed.' >> "$report_file"
           fi
-          gh pr comment "$PR_NUMBER" --body-file "$report_file"
-          echo "Conflict PR #$PR_NUMBER awaits @Catalina-df review." >> "$GITHUB_STEP_SUMMARY"
+          # 重跑更新既有 bot 留言；只在建立 PR 時 mention／要求 review。
+          gh pr comment "$PR_NUMBER" --edit-last --create-if-none --body-file "$report_file"
+          echo "Conflict PR #$PR_NUMBER awaits Catalina-df review." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Finish the local trial merge
         if: always() && steps.merge.outputs.mode == 'conflict'

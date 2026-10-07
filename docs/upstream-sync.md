@@ -25,7 +25,9 @@ token is required.
 4. **Git conflict:** push original upstream commits to
    `automation/sync-upstream` and open one PR against `main`. The PR preserves
    the conflict rather than committing conflict markers. Request review from
-   **Catalina-df** and mention **@Catalina-df** in its body and analysis comment.
+   **Catalina-df** and mention **@Catalina-df** in its body when creating the PR.
+   Reruns update the bot's existing analysis comment without another mention or
+   review request.
 5. **Read-only analysis:** invoke Claude Action on the pending trial merge.
    Publish only its final review brief, then abort the local trial merge.
    If the AI/API fails, the PR remains available with a failure notice for human
