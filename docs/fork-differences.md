@@ -4,7 +4,7 @@ Language: [`English (primary / canonical)`](./fork-differences.md) · [`Traditio
 
 This document describes the current differences between [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) and [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono).
 
-The comparison baseline is upstream commit [`0c906d23`](https://github.com/stanley2058/lilac-mono/commit/0c906d23), included by the PR #85 integration candidate on 2026-10-07. The fork retains the following feature and operational changes on top of it.
+The comparison baseline is upstream commit [`0c906d23`](https://github.com/stanley2058/lilac-mono/commit/0c906d23), integrated through fork PR [#85](https://github.com/DF-wu/lilac-mono/pull/85) on 2026-10-07. The fork retains the following feature and operational changes on top of it.
 
 > [!IMPORTANT]
 > This is a maintenance document, not a permanent compatibility commitment. After an upstream sync, differences that have been accepted upstream or no longer exist must be removed from this table or reclassified.

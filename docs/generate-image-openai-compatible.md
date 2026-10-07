@@ -264,9 +264,20 @@ TOOL_SERVER_BACKEND_URL=http://127.0.0.1:42069 \
 
 The command writes the generated image to the output directory and returns its
 path, byte count, MIME type, requested Lilac alias, provider warnings, and the
-provider metadata the AI SDK reports for the call (`providerMetadata`, for
+aggregated provider metadata (`providerMetadata`, for
 example `{ "openai": { "images": [{ "revisedPrompt": "..." }] } }`; an empty
 object when the provider reports none).
+
+The tool builds this aggregate from the SDK's per-call metadata. It concatenates
+non-gateway providers' image entries and sums gateway cost fields as decimal strings,
+preserving precision and the existing result shape when generation spans multiple
+provider calls.
+
+When an agent uses an OpenAI-compatible chat model, tool-returned images are
+forwarded in a user image message after the complete tool reply group, with
+labels identifying the originating tool and call. This changes only the model
+input view; the canonical transcript remains unchanged. Image recognition still
+depends on the selected endpoint and model supporting vision.
 
 Alias-specific validation still applies. For example, unsupported GPT image
 sizes and unsupported Grok mask combinations are rejected before an HTTP
