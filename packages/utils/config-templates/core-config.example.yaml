@@ -146,12 +146,12 @@ conversation:
         # Minimum P(reading the thread helps respond) for each injected thread.
         relevanceMinProbability: 0.6
       luna:
-        # Provisional text preset; image thresholds need further evaluation.
+        # Tuned text preset; image thresholds need further evaluation.
         # See docs/decision-auto-inject-benchmark.md.
         recallMinProbability: 0.5
-        durableSubjectMinProbability: 0.6
+        durableSubjectMinProbability: 0.5
         casualMaxProbability: 0.3
-        relevanceMinProbability: 0.8
+        relevanceMinProbability: 0.6
 
 surface:
   native:

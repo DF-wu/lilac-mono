@@ -11946,6 +11946,39 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Decision lane", ()
     expect(result).toHaveLength(1);
   });
 
+  it("evaluates only the shortlist entries the evaluator accepts", async () => {
+    const { evaluator, calls } = jevModel({ asks_to_recall: 1, candidate_0: 0.9 });
+    const events: unknown[] = [];
+    const result = await maybeBuildAutoInjectedThreadSearchMessages({
+      cfg: jevCfg(),
+      requestId: "decision-candidate-cap",
+      userMessages: [{ role: "user", content: "remember the router retries?" }],
+      conversationThreads: threadService(async () =>
+        shortlistResult(
+          { threadId: "first", title: "Router retries" },
+          { threadId: "second", title: "Router outage" },
+          { threadId: "third", title: "Router diagram" },
+        ),
+      ),
+      createDecisionEvaluator: () => Result.ok({ ...evaluator, maxCandidates: 2 }),
+      publishToolStatus: async () => {},
+      onDecisionEvaluated: (event) => events.push(event),
+      onError: (message) => {
+        throw new Error(message);
+      },
+    });
+
+    expect(calls[0]?.questionIds).toEqual([
+      "asks_to_recall",
+      "durable_subject",
+      "casual",
+      "candidate_0",
+      "candidate_1",
+    ]);
+    expect(events).toEqual([expect.objectContaining({ candidateCount: 2 })]);
+    expect(result).toHaveLength(1);
+  });
+
   it("does not load images for Jev and skips injection when Luna image loading fails", async () => {
     const { evaluator } = jevModel({ asks_to_recall: 1, candidate_0: 0.9 });
     let loaded = 0;

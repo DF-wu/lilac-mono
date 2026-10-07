@@ -16,8 +16,8 @@ preserves the SDK's question mapping and rewrites image-bearing requests to nati
 See the [OpenAI Decisions guide](https://developers.openai.com/api/docs/guides/decisions) and
 [AI SDK decision guide](https://ai-sdk.dev/docs/ai-sdk-core/decisions).
 
-This is a provisional Luna text preset. Jev's scoped defaults retain the original values.
-Luna's scoped defaults use this preset; image thresholds still need further evaluation.
+Luna's scoped defaults use the tuned text preset from the [Luna precision tuning](#luna-precision-tuning)
+replay. Jev's scoped defaults retain the original values. Image thresholds still need further evaluation.
 
 ```yaml
 conversation:
@@ -37,9 +37,9 @@ conversation:
         relevanceMinProbability: 0.6
       luna:
         recallMinProbability: 0.5
-        durableSubjectMinProbability: 0.6
+        durableSubjectMinProbability: 0.5
         casualMaxProbability: 0.3
-        relevanceMinProbability: 0.8
+        relevanceMinProbability: 0.6
 ```
 
 This list selects Jev for text and Luna when the latest message has an image. The array is not a retry
@@ -66,15 +66,15 @@ The grid covered recall and durable thresholds `0.5, 0.6, 0.7, 0.8, 0.9`; casual
 Selection maximized F0.5, weighting precision more than recall. A positive label required a relevant
 candidate and a positive recall gate or a durable, non-casual message.
 
-| Held-out result, 27 requests       | Jev, original thresholds | Luna, original thresholds | Luna, text preset |
-| ---------------------------------- | -----------------------: | ------------------------: | ----------------: |
-| Correct selections                 |                        5 |                         8 |                 7 |
-| Incorrect selections               |                        2 |                         8 |                 4 |
-| Missed relevant candidates         |                       16 |                        13 |                14 |
-| Precision                          |                    71.4% |                     50.0% |             63.6% |
-| Recall                             |                    23.8% |                     38.1% |             33.3% |
-| F0.5                               |                    0.510 |                     0.471 |             0.538 |
-| Messages with incorrect selections |                        1 |                         4 |                 3 |
+| Held-out result, 27 requests       | Jev, original thresholds | Luna, original thresholds | Luna, first preset |
+| ---------------------------------- | -----------------------: | ------------------------: | -----------------: |
+| Correct selections                 |                        5 |                         8 |                  7 |
+| Incorrect selections               |                        2 |                         8 |                  4 |
+| Missed relevant candidates         |                       16 |                        13 |                 14 |
+| Precision                          |                    71.4% |                     50.0% |              63.6% |
+| Recall                             |                    23.8% |                     38.1% |              33.3% |
+| F0.5                               |                    0.510 |                     0.471 |              0.538 |
+| Messages with incorrect selections |                        1 |                         4 |                  3 |
 
 | Decision call, all 80 requests | Jev 1.13.0 | GPT-6 Luna |
 | ------------------------------ | ---------: | ---------: |
@@ -87,6 +87,59 @@ At the [documented Luna decision price](https://developers.openai.com/api/docs/g
 of $0.10 per million input tokens, the 80 Luna decision calls cost approximately $0.076. This excludes
 the independent labeling calls and Jev calls. Latencies cover decision calls, not the full recall path.
 
+## Luna precision tuning
+
+A second replay on 2026-10-07 found that the first Luna preset did not hold up on more data. It used
+the same shortlist query, filters, and gate questions with up to 240 recent requests. 167 had lexical
+candidates, and 163 completed for every provider and question variant. Luna refused 4 requests,
+which skip automatic injection. An independent `gpt-6.1-sol` call with medium reasoning
+effort labeled 72 requests as gate-positive and 138 of 4,735 candidates as relevant.
+
+Luna's candidate ranking was the problem. Thresholds alone could not fix it. Average precision
+over candidates in gate-positive requests was 0.40 for Luna and 0.61 for Jev. Luna's ranking fell
+off with lexical rank: 0.57 for shortlist positions 1-10, 0.24 for 11-20, and 0.17 for 21-30.
+Splitting the 30 candidates across parallel calls returned identical probabilities, so Luna scores
+each question independently, and position effects come from the shortlist order.
+
+Luna now evaluates the first 10 shortlisted candidates and asks whether `candidate_thread` is "about
+the same specific project, problem, or item that `message` is about." Jev keeps the original
+question and all 30 candidates. Other wordings tested worse or similar: a stricter "specific facts
+or decisions" question, a symmetric "same subject" question, and variants that combined sameness
+with usefulness or excluded shared keywords.
+
+| 160 requests with all variants     | Jev default | Luna, first preset | Luna, tuned |
+| ---------------------------------- | ----------: | -----------------: | ----------: |
+| Candidates evaluated               |          30 |                 30 |          10 |
+| Correct selections                 |          29 |                 24 |          18 |
+| Incorrect selections               |          15 |                 28 |           3 |
+| Precision                          |       65.9% |              46.2% |       85.7% |
+| Recall                             |       21.3% |              17.6% |       13.2% |
+| Messages with incorrect selections |           9 |                 19 |           3 |
+
+The tuned column uses the shipped thresholds on all 160 requests, so it overstates precision.
+Three-fold cross-validation, with the thresholds tuned on two folds and scored on the third, gave
+18 correct and 6 incorrect selections, or 75.0% precision. The same procedure gave 41.2% for the
+original question with 30 candidates. Neighboring thresholds with the tuned question and 10
+candidates stayed between 72% and 88% precision. Allowing 20 candidates dropped precision to 65.6%.
+A wider grid that allowed gate thresholds as low as 0.3 and a casual maximum as low as 0.05
+cross-validated worse, at 63.9%, so the shipped preset stays at the narrower grid's choice.
+
+A paired rerun on the same 167 requests, with fresh labels, called Jev and tuned Luna one after the
+other from the production deployment.
+
+| Decision call     | Jev, 30 candidates | Luna, 10 candidates | Luna, 30 candidates |
+| ----------------- | -----------------: | ------------------: | ------------------: |
+| p50 latency       |             228 ms |              298 ms |              335 ms |
+| p95 latency       |             288 ms |              417 ms |              406 ms |
+| p99 latency       |             520 ms |              666 ms |              968 ms |
+| Mean input tokens |              5,887 |               3,663 |               9,639 |
+| Refused requests  |                  0 |                   4 |                   4 |
+
+Tuned Luna reached 76.2% precision and 13.6% recall on the fresh labels. At the same recall, Jev with
+`relevanceMinProbability: 0.7` reached 88.9%: 16 correct and 2 incorrect selections. For text-only
+requests, Jev is at least as precise as Luna at matched recall, and it is faster. Keep Luna for
+image-bearing requests.
+
 ## Attached-image replay
 
 Twelve additional native requests had cached image attachments and historical lexical candidates,
@@ -95,14 +148,15 @@ verified their content, and generated JPEG previews capped at 1,024 pixels per d
 Luna and the independent judge received those previews; Jev received the authored text. All 12 Luna
 calls succeeded.
 
-| All 12 image requests              | Jev, original thresholds | Luna, original thresholds | Luna, text preset |
-| ---------------------------------- | -----------------------: | ------------------------: | ----------------: |
-| Correct selections                 |                        0 |                         1 |                 0 |
-| Incorrect selections               |                        0 |                         5 |                 4 |
-| Missed relevant candidates         |                        6 |                         5 |                 6 |
-| Messages with incorrect selections |                        0 |                         2 |                 2 |
+| All 12 image requests              | Jev, original thresholds | Luna, original thresholds | Luna, first preset |
+| ---------------------------------- | -----------------------: | ------------------------: | -----------------: |
+| Correct selections                 |                        0 |                         1 |                  0 |
+| Incorrect selections               |                        0 |                         5 |                  4 |
+| Missed relevant candidates         |                        6 |                         5 |                  6 |
+| Messages with incorrect selections |                        0 |                         2 |                  2 |
 
 Jev p50/p95 was 248/334 ms; Luna with images was 760/1,157 ms. Luna reported 124,836 input tokens.
+This replay predates the Luna tuning and used the original question with 30 candidates.
 The four held-out image requests had no positive reference labels, so this sample cannot establish
 image recall quality or validate a separate threshold preset. Do not tune image thresholds from it.
 
@@ -122,5 +176,5 @@ agent model cannot accept images. It enforces existing inline media byte limits 
 request. Shortlisting still uses authored text; image-only messages do not run automatic recall.
 
 Before choosing Luna as a production default, use more image-bearing examples with relevant historical
-threads and human labels. The current evidence supports an opt-in Luna path with a provisional text
+threads and human labels. The current evidence supports an opt-in Luna path with a tuned text
 preset.

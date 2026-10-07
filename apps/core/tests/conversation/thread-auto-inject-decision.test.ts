@@ -185,6 +185,43 @@ describe("Decision auto-inject", () => {
     ).toBe(true);
   });
 
+  it("asks Luna whether each candidate covers the same subject and caps its candidates", async () => {
+    const requests: Array<{ questions: Array<{ name: string; instructions: string }> }> = [];
+    const fetch = Object.assign(
+      async (_request: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body));
+        requests.push(body);
+        return Response.json({
+          model: "gpt-6-luna",
+          answers: body.questions.map((question: { name: string }) => ({
+            type: "predicate",
+            name: question.name,
+            probability: 0.5,
+          })),
+        });
+      },
+      { preconnect: () => {} },
+    );
+    const created = createDecisionAutoInjectEvaluator({
+      apiKey: "test",
+      model: "openai/gpt-6-luna",
+      fetch,
+    });
+    if (created.isErr()) throw created.error;
+
+    const result = await created.value.evaluate({ message: "router retries", candidates });
+
+    expect(created.value.maxCandidates).toBe(10);
+    expect(result.isOk()).toBe(true);
+    const candidateQuestion = requests[0]?.questions.find(
+      (question) => question.name === "candidate_0",
+    );
+    expect(JSON.parse(candidateQuestion?.instructions ?? "{}")).toMatchObject({
+      question:
+        "Is `candidate_thread` about the same specific project, problem, or item that `message` is about?",
+    });
+  });
+
   it("reports refusals and invalid probabilities as evaluation failures", async () => {
     for (const answer of [
       { type: "refusal" as const },

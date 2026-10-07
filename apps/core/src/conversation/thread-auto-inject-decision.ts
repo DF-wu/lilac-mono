@@ -48,6 +48,8 @@ export type DecisionAutoInjectAnswers = {
 export type DecisionAutoInjectEvaluator = {
   readonly model: string;
   readonly supportsImages?: boolean;
+  /** Evaluate only this many shortlisted candidates, in shortlist order. */
+  readonly maxCandidates?: number;
   evaluate(input: {
     message: string;
     candidates: readonly DecisionAutoInjectCandidate[];
@@ -90,6 +92,13 @@ const GATE_QUESTIONS = {
 
 const CANDIDATE_QUESTION = "Would reading `candidate_thread` help respond to `message`?";
 
+// Luna scores each question independently and ranked lower lexical matches poorly. Asking whether the
+// thread concerns the same subject and evaluating only the top shortlist entries raised precision
+// in the production replay documented in docs/decision-auto-inject-benchmark.md.
+const OPENAI_CANDIDATE_QUESTION =
+  "Is `candidate_thread` about the same specific project, problem, or item that `message` is about?";
+const OPENAI_MAX_CANDIDATES = 10;
+
 function candidateQuestionId(index: number): string {
   return `candidate_${index}`;
 }
@@ -97,6 +106,7 @@ function candidateQuestionId(index: number): string {
 export function buildDecisionAutoInjectCall(input: {
   message: string;
   candidates: readonly DecisionAutoInjectCandidate[];
+  candidateQuestion?: string;
 }): Pick<DecisionCall, "state" | "questions"> {
   const questions: Record<string, DecisionCall["questions"][string]> = {
     asks_to_recall: { type: "boolean", instructions: GATE_QUESTIONS.asks_to_recall },
@@ -108,7 +118,7 @@ export function buildDecisionAutoInjectCall(input: {
       type: "boolean",
       instructions: {
         candidate_thread: { title: candidate.title, summary: candidate.brief },
-        question: CANDIDATE_QUESTION,
+        question: input.candidateQuestion ?? CANDIDATE_QUESTION,
       },
     };
   });
@@ -218,6 +228,7 @@ export function createDecisionAutoInjectEvaluator(input: {
     return Result.ok({
       model: `openai/${modelId}`,
       supportsImages: true,
+      maxCandidates: OPENAI_MAX_CANDIDATES,
       async evaluate(evaluateInput) {
         const model = createOpenAIDecisionModel({
           apiKey,
@@ -226,7 +237,9 @@ export function createDecisionAutoInjectEvaluator(input: {
           images: evaluateInput.images,
           fetch: input.fetch,
         });
-        return createDecisionAutoInjectEvaluatorForModel(model).evaluate(evaluateInput);
+        return createDecisionAutoInjectEvaluatorForModel(model, {
+          candidateQuestion: OPENAI_CANDIDATE_QUESTION,
+        }).evaluate(evaluateInput);
       },
     });
   }
@@ -239,6 +252,7 @@ export function createDecisionAutoInjectEvaluator(input: {
 export function createDecisionAutoInjectEvaluatorForModel(
   model: Pick<DecisionModel, "modelId" | "doDecide"> &
     Partial<Pick<DecisionModel, "provider" | "specificationVersion" | "supportedQuestionTypes">>,
+  options: { candidateQuestion?: string } = {},
 ): DecisionAutoInjectEvaluator {
   const decisionModel: DecisionModel = {
     specificationVersion: "v4",
@@ -254,7 +268,7 @@ export function createDecisionAutoInjectEvaluatorForModel(
         try: async () =>
           await experimental_decide({
             model: decisionModel,
-            ...buildDecisionAutoInjectCall(evaluateInput),
+            ...buildDecisionAutoInjectCall({ ...evaluateInput, ...options }),
             maxRetries: 0,
           }),
         catch: (cause) =>

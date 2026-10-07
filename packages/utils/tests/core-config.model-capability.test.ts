@@ -121,9 +121,9 @@ describe("coreConfigSchema models.capability", () => {
       },
       luna: {
         recallMinProbability: 0.5,
-        durableSubjectMinProbability: 0.6,
+        durableSubjectMinProbability: 0.5,
         casualMaxProbability: 0.3,
-        relevanceMinProbability: 0.8,
+        relevanceMinProbability: 0.6,
       },
     };
 

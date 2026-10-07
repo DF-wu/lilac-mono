@@ -1418,8 +1418,8 @@ async function maybeBuildDecisionAutoInjectedThreadSearchMessages(
     autoInjectUsage.finish({ status: "failed" });
     return [];
   }
-  const { source, results } = shortlisted.value;
-  if (source === "none" || results.length === 0) {
+  const { source, results: shortlistedResults } = shortlisted.value;
+  if (source === "none" || shortlistedResults.length === 0) {
     autoInjectUsage.finish({ status: "abstained" });
     return [];
   }
@@ -1451,6 +1451,7 @@ async function maybeBuildDecisionAutoInjectedThreadSearchMessages(
   // Without a length gate most messages end here, so status is shown only once the evaluator has work.
   await publishAutoInjectToolStatusBestEffort(params, { toolCallId, status: "start", display });
   const evaluator = resolution.evaluator;
+  const results = shortlistedResults.slice(0, evaluator.maxCandidates);
   const decisionStartedAt = performance.now();
   const evaluated = await evaluator.evaluate({
     message,
