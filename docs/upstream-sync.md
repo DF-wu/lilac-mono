@@ -89,6 +89,9 @@ When upgrading, update the SHA and its version comment together.
 
 - `ANTHROPIC_BASE_URL`: `https://llm-api.dfder.tw`. This is the root URL;
   Claude Code uses the Anthropic Messages protocol at `/v1/messages`.
+- `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`: Claude Code uses streaming
+  requests by default; disable its fallback to non-streaming after a stream
+  failure. See the [environment variable reference](https://code.claude.com/docs/en/env-vars).
 - `anthropic_api_key`: repository Actions Secret **`ANTHROPIC_API_KEY`**.
   Configure it in GitHub **Settings → Secrets and variables → Actions**.
   Never put its value in repository files, prompts, or action settings.
@@ -144,7 +147,7 @@ Detailed source checks are recorded in [the research note](research/claude-actio
 
 ## Execution limits
 
-The agent runs only for conflict review, with at most **30 turns and 20 minutes**
+The agent runs only for conflict review, with at most **150 turns and 20 minutes**
 per analysis. Prepare has a 30-minute job limit. CI and main-update decisions
 run independently of the agent; model prose cannot mark checks successful.
 
