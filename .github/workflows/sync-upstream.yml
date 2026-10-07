@@ -186,8 +186,6 @@ jobs:
           OTEL_METRICS_EXPORTER: "none"
           OTEL_LOGS_EXPORTER: "none"
           OTEL_TRACES_EXPORTER: "none"
-          # 將憑證從模型執行的 shell 子程序移除。
-          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
           CLAUDE_BRANCH: automation/sync-upstream
         with:
           # Key 僅存於 GitHub Secret，不可寫進 settings 或 repository。
