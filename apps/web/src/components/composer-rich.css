@@ -110,12 +110,3 @@
 .composer-attachment-chip[data-state="missing"] {
   color: var(--ui-danger);
 }
-
-.composer .skill-chips .badge {
-  max-width: 100%;
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
-.composer .skill-chips .badge svg {
-  flex: none;
-}

@@ -17,7 +17,7 @@ import {
   useState,
   type DragEvent,
 } from "react";
-import { ArrowUp, Paperclip, Square, X, Upload } from "lucide-react";
+import { ArrowUp, Paperclip, Square, Upload } from "lucide-react";
 import { createPortal } from "react-dom";
 import { hasFileDrag, installWindowFileDrop } from "../window-file-drop";
 import "./composer-drop.css";
@@ -78,6 +78,10 @@ export const Composer = memo(function Composer(props: ComposerProps) {
   const setCommandId = props.onCommand;
   const skillIds = props.skillIds;
   const setSkills = props.onSkills;
+  const skills = useMemo(
+    () => catalog?.skills.filter((skill) => skillIds.includes(skill.id)) ?? [],
+    [skillIds, catalog],
+  );
   const [editorValue, setEditorValue] = useState<{
     text: string;
     plainText: string;
@@ -141,7 +145,11 @@ export const Composer = memo(function Composer(props: ComposerProps) {
 
   function choose(item: Completion) {
     insertingCompletion.current = true;
-    input.current?.complete(item.insertText, (match?.[2]?.length ?? 0) + 1);
+    input.current?.complete(
+      item.insertText,
+      (match?.[2]?.length ?? 0) + 1,
+      item.kind === "skill" ? { id: item.id, name: item.name } : undefined,
+    );
     if (item.kind === "skill") setSkills([...new Set([...skillIds, item.id])].slice(0, 32));
     if (item.kind !== "skill") setCommandId(item.id);
     setMenuHidden(true);
@@ -330,7 +338,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     props.onAttach([...event.dataTransfer.files]);
   }
 
-  const changeText = useEventCallback((value: string, visibleText: string) => {
+  const changeText = useEventCallback((value: string, visibleText: string, badges: string[]) => {
     setEditorValue({
       text: value,
       plainText: visibleText,
@@ -349,11 +357,8 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       !visibleText.startsWith(`/${chosen.name} `)
     )
       setCommandId(undefined);
-    const retainedSkills = skillIds.filter((id) => {
-      const skill = catalog?.skills.find((item) => item.id === id);
-      return !!skill && hasSkillMention(visibleText, skill.name);
-    });
-    if (retainedSkills.length !== skillIds.length) setSkills(retainedSkills);
+    const badgeSkills = badges.slice(0, 32);
+    if (badgeSkills.join("\n") !== skillIds.join("\n")) setSkills(badgeSkills);
     onText(value);
     setMenuHidden(false);
     setSelected(0);
@@ -444,21 +449,6 @@ export const Composer = memo(function Composer(props: ComposerProps) {
         </PopoverContent>
       </Popover>
       <div className="composer bg-surface text-card-foreground rounded-lg p-3">
-        {skillIds.length ? (
-          <div className="skill-chips">
-            {skillIds.map((id) => (
-              <button
-                type="button"
-                className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap"
-                key={id}
-                onClick={() => setSkills(skillIds.filter((item) => item !== id))}
-              >
-                {catalog?.skills.find((skill) => skill.id === id)?.name ?? id}
-                <X />
-              </button>
-            ))}
-          </div>
-        ) : null}
         <Suspense
           fallback={
             <div role="status" aria-label="Loading editor">
@@ -484,6 +474,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
             ref={input}
             text={text}
             attachments={attachments}
+            skills={skills}
             onRemoveAttachment={props.onRemoveAttachment}
             onRetryAttachment={props.onRetryAttachment}
             onText={changeText}
@@ -584,11 +575,6 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     </div>
   );
 });
-
-export function hasSkillMention(text: string, name: string): boolean {
-  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?:^|\\s)(?:\\$|/skill:)${escaped}(?=$|[^\\p{L}\\p{N}_-])`, "u").test(text);
-}
 
 const ComposerModel = memo(function ComposerModel({
   models,

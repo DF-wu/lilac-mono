@@ -29,6 +29,7 @@ import {
   SquareCode,
   X,
   RotateCcw,
+  Package,
 } from "lucide-react";
 import { IconButton } from "./ui";
 import { referenceChipStyles } from "./ui/button";
@@ -48,6 +49,8 @@ import {
   composerExtensions,
   attachmentNode,
   referenceNode,
+  skillNode,
+  markEditorSkills,
   readComposerDocument,
   writeComposerDocument,
   composerText,
@@ -56,6 +59,8 @@ import {
   captureEditorPaste,
   Placeholder,
   editorAttachmentKeys,
+  editorSkillIds,
+  type ComposerSkill,
   completeEditor,
   replaceEditorDocument,
   insertEditorReference,
@@ -76,6 +81,7 @@ export {
   captureComposerPaste,
 } from "./composer-document";
 const emptyAttachments: readonly Attachment[] = [];
+const emptySkills: readonly ComposerSkill[] = [];
 const AttachmentContext = createContext<{
   attachments: readonly Attachment[];
   disabled: boolean;
@@ -174,9 +180,42 @@ function ReferenceElement(props: NodeViewProps) {
     </NodeViewWrapper>
   );
 }
+
+function SkillElement(props: NodeViewProps) {
+  const context = useContext(AttachmentContext);
+  const name = props.node.attrs.name as string;
+  return (
+    <NodeViewWrapper as="span" className="inline">
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <span
+              data-ui="composer-skill-chip"
+              className={`composer-attachment-chip relative inline-flex items-center gap-1 max-w-full px-2 rounded-sm whitespace-nowrap ${referenceChipStyles}`}
+            />
+          }
+        >
+          <Package aria-hidden="true" />
+          <span className="overflow-hidden text-ellipsis">{name}</span>
+          <IconButton
+            label={`Remove ${name}`}
+            disabled={context.disabled}
+            onClick={() => {
+              props.deleteNode();
+              props.editor.commands.focus();
+            }}
+          >
+            <X />
+          </IconButton>
+        </TooltipTrigger>
+        <TooltipContent>{`Skill: ${name}`}</TooltipContent>
+      </Tooltip>
+    </NodeViewWrapper>
+  );
+}
 export type ComposerEditorHandle = {
   capturePaste: () => ReturnType<typeof captureEditorPaste>;
-  complete: (text: string, replaceLength: number) => void;
+  complete: (text: string, replaceLength: number, skill?: ComposerSkill) => void;
   submissionText: () => string;
   hasMissingAttachments: () => boolean;
 };
@@ -187,11 +226,12 @@ export type ComposerEditorProps = {
   loadingDraft?: boolean;
   autoFocus?: boolean;
   attachments?: readonly Attachment[];
+  skills?: readonly ComposerSkill[];
   onRemoveAttachment?: (key: string) => void;
   onRetryAttachment?: (key: string) => void;
   disabled: boolean;
   placeholder: string;
-  onText: (text: string, plainText: string) => void;
+  onText: (text: string, plainText: string, skillIds: string[]) => void;
   onPlainText: (text: string, markdown: string) => void;
   onPrefix: (prefix: string) => void;
   onKeyDown: (event: globalThis.KeyboardEvent) => void;
@@ -207,6 +247,7 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
   const seenAttachments = useRef(new Set<string>());
   const referencedAttachments = useRef(new Set<string>());
   const attachments = props.attachments ?? emptyAttachments;
+  const skills = props.skills ?? emptySkills;
   const [initialDocument] = useState(() => readComposerDocument(props.text).toJSON());
   const editor = useEditor({
     immediatelyRender: false,
@@ -223,6 +264,12 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
       referenceNode.extend({
         addNodeView: () =>
           ReactNodeViewRenderer(ReferenceElement, {
+            attrs: { contenteditable: "inherit", "data-composer-badge": "" },
+          }),
+      }),
+      skillNode.extend({
+        addNodeView: () =>
+          ReactNodeViewRenderer(SkillElement, {
             attrs: { contenteditable: "inherit", "data-composer-badge": "" },
           }),
       }),
@@ -300,7 +347,7 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
       const text = writeComposerDocument(editor.state.doc);
       const plain = composerText(editor.state.doc);
       lastText.current = text;
-      if (text !== p.text) p.onText(text, plain);
+      if (text !== p.text) p.onText(text, plain, editorSkillIds(editor.state.doc));
       p.onPlainText(plain, text);
       p.onPrefix(composerCompletionPrefix(editor));
     },
@@ -315,14 +362,20 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
       seenAttachments.current.clear();
       referencedAttachments.current.clear();
       replaceEditorDocument(editor, props.text);
+      markEditorSkills(editor, skills);
     } else if (props.text !== lastText.current) {
       lastText.current = props.text;
       editor.commands.setContent(readComposerDocument(props.text, editor.schema).toJSON(), {
         emitUpdate: false,
       });
+      markEditorSkills(editor, skills);
     }
     props.onPlainText(composerText(editor.state.doc), props.text);
-  }, [editor, props.documentKey, props.loadingDraft, props.text, props.onPlainText]);
+  }, [editor, props.documentKey, props.loadingDraft, props.text, props.onPlainText, skills]);
+  useLayoutEffect(() => {
+    if (!editor || props.loadingDraft) return;
+    markEditorSkills(editor, skills);
+  }, [editor, props.loadingDraft, skills]);
   useEffect(() => {
     if (!editor) return;
     editor.setEditable(!props.disabled, false);
@@ -372,9 +425,9 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
         [...editorAttachmentKeys(editor.state.doc)].some(
           (key) => !attachments.some((attachment) => attachment.key === key),
         ),
-      complete(text, length) {
+      complete(text, length, skill) {
         if (!editor) return;
-        completeEditor(editor, text, length);
+        completeEditor(editor, text, length, skill);
         editor.commands.focus();
       },
     }),
