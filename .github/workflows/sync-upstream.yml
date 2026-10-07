@@ -165,6 +165,9 @@ jobs:
         env:
           # Anthropic Messages 協定；CLI 自行加 /v1/messages，URL 不要重複加 /v1。
           ANTHROPIC_BASE_URL: https://llm-api.dfder.tw
+          # Claude Code 預設送 stream=true；停用串流中斷後的非串流 fallback。
+          # 官方說明：https://code.claude.com/docs/en/env-vars
+          CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: "1"
           # 輔助模型也走指定模型，避免隱性呼叫 Claude Haiku/Sonnet/Opus。
           ANTHROPIC_DEFAULT_HAIKU_MODEL: deepseek-v4.1-flash
           ANTHROPIC_DEFAULT_SONNET_MODEL: deepseek-v4.1-flash

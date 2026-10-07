@@ -89,6 +89,9 @@ When upgrading, update the SHA and its version comment together.
 
 - `ANTHROPIC_BASE_URL`: `https://llm-api.dfder.tw`. This is the root URL;
   Claude Code uses the Anthropic Messages protocol at `/v1/messages`.
+- `CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1`: Claude Code uses streaming
+  requests by default; disable its fallback to non-streaming after a stream
+  failure. See the [environment variable reference](https://code.claude.com/docs/en/env-vars).
 - `anthropic_api_key`: repository Actions Secret **`ANTHROPIC_API_KEY`**.
   Configure it in GitHub **Settings → Secrets and variables → Actions**.
   Never put its value in repository files, prompts, or action settings.
