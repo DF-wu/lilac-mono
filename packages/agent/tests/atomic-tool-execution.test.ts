@@ -8,7 +8,6 @@ import {
   executeAtomicToolCall,
   type AtomicToolExecutionEvent,
 } from "../atomic-tool-execution";
-import { ToolExpansion } from "../tool-call-expansion";
 
 describe("executeAtomicToolCall", () => {
   it("validates input and preserves execution options, updates, conversion, and normalization", async () => {
@@ -52,7 +51,7 @@ describe("executeAtomicToolCall", () => {
       abortSignal: abortController.signal,
       pendingToolCalls,
       inputValidation: { type: "validate" },
-      expansionHandling: { type: "capture" },
+
       normalizeToolResultOutput: (output, normalizationContext) => ({
         type: "text",
         value: `${normalizationContext.toolCallId}:${output.type}`,
@@ -103,51 +102,12 @@ describe("executeAtomicToolCall", () => {
       messages: [],
       pendingToolCalls: new Set(),
       inputValidation: { type: "validate" },
-      expansionHandling: { type: "capture" },
     });
 
     expect(executions).toBe(0);
     expect(outcome.outcome).toBe("invalid-input");
     expect(outcome.isError).toBe(true);
     expect(outcome.toolOutput).toMatchObject({ type: "error-text" });
-  });
-
-  it("supports expansion capture or rejection without scheduling children", async () => {
-    const expansion = new ToolExpansion({ ok: true }, [
-      { toolCallId: "child-1", toolName: "child", input: {} },
-    ]);
-    const tools = {
-      expand: tool({
-        inputSchema: jsonSchema({ type: "object" }),
-        execute: () => expansion,
-      }),
-    };
-    const base = {
-      call: { toolCallId: "parent-1", toolName: "expand", input: {} },
-      tools,
-      messages: [],
-      inputValidation: { type: "prevalidated" } as const,
-    };
-
-    const captured = await executeAtomicToolCall({
-      ...base,
-      pendingToolCalls: new Set(),
-      expansionHandling: { type: "capture" },
-    });
-    const rejected = await executeAtomicToolCall({
-      ...base,
-      pendingToolCalls: new Set(),
-      expansionHandling: { type: "reject", message: "expansion rejected" },
-    });
-
-    expect(captured.expansion).toBe(expansion);
-    expect(captured.toolOutput).toEqual({ type: "json", value: { ok: true } });
-    expect(rejected).toMatchObject({
-      isError: true,
-      outcome: "error",
-      toolOutput: { type: "error-text", value: "expansion rejected" },
-    });
-    expect(rejected.expansion).toBeUndefined();
   });
 
   it("preserves both stream and cleanup failures", async () => {
@@ -171,7 +131,6 @@ describe("executeAtomicToolCall", () => {
       messages: [],
       pendingToolCalls: new Set(),
       inputValidation: { type: "prevalidated" },
-      expansionHandling: { type: "capture" },
     });
 
     expect(outcome).toMatchObject({
@@ -233,7 +192,7 @@ describe("executeAtomicToolCall", () => {
         messages: [],
         pendingToolCalls,
         inputValidation: { type: "prevalidated" },
-        expansionHandling: { type: "capture" },
+
         onEvent: (event) => events.push(event),
       }),
     ).rejects.toBe(panic);
@@ -265,7 +224,7 @@ describe("executeAtomicToolCall", () => {
         messages: [],
         pendingToolCalls,
         inputValidation: { type: "prevalidated" },
-        expansionHandling: { type: "capture" },
+
         onEvent: (event) => {
           if (event.type !== "tool_execution_end") return;
           terminalAttempted = true;
@@ -295,7 +254,7 @@ describe("executeAtomicToolCall", () => {
       messages: [],
       pendingToolCalls,
       inputValidation: { type: "prevalidated" },
-      expansionHandling: { type: "capture" },
+
       assertNotAborted: () => {
         throw operationError;
       },
@@ -336,7 +295,7 @@ describe("executeAtomicToolCall", () => {
         messages: [],
         pendingToolCalls,
         inputValidation: { type: "prevalidated" },
-        expansionHandling: { type: "capture" },
+
         normalizeToolResultOutput: () => {
           throw panic;
         },
@@ -370,7 +329,7 @@ describe("executeAtomicToolCall", () => {
         abortSignal: abortController.signal,
         pendingToolCalls,
         inputValidation: { type: "prevalidated" },
-        expansionHandling: { type: "capture" },
+
         onEvent: (event) => events.push(event),
       }),
     ).rejects.toThrow("cancelled");

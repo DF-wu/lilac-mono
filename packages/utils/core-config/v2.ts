@@ -543,16 +543,76 @@ const toolsSchema = z
     },
   });
 
-const jevAutoInjectDefaultsV2 = {
-  model: "jev-1.13.0",
-  limit: 3,
-  candidateLimit: 30,
-  semanticFallback: true,
+const jevDecisionProbabilitiesV2 = {
   recallMinProbability: 0.7,
   durableSubjectMinProbability: 0.6,
   casualMaxProbability: 0.6,
   relevanceMinProbability: 0.6,
 };
+
+const lunaDecisionProbabilitiesV2 = {
+  recallMinProbability: 0.5,
+  durableSubjectMinProbability: 0.5,
+  casualMaxProbability: 0.3,
+  relevanceMinProbability: 0.6,
+};
+
+const decisionProbabilityOverridesSchemaV2 = z.object({
+  recallMinProbability: z.number().min(0).max(1).optional(),
+  durableSubjectMinProbability: z.number().min(0).max(1).optional(),
+  casualMaxProbability: z.number().min(0).max(1).optional(),
+  relevanceMinProbability: z.number().min(0).max(1).optional(),
+});
+
+const decisionAutoInjectDefaultsV2 = {
+  model: ["typesafe/jev-1.13.0"],
+  limit: 3,
+  candidateLimit: 30,
+  semanticFallback: true,
+  jev: jevDecisionProbabilitiesV2,
+  luna: lunaDecisionProbabilitiesV2,
+};
+
+const decisionAutoInjectSchemaV2 = decisionProbabilityOverridesSchemaV2
+  .extend({
+    model: z
+      .union([z.string().trim().min(1), z.array(z.string().trim().min(1)).min(1)])
+      .transform((model) => (typeof model === "string" ? [model] : model))
+      .default(decisionAutoInjectDefaultsV2.model),
+    limit: z.number().int().positive().max(10).default(decisionAutoInjectDefaultsV2.limit),
+    candidateLimit: z
+      .number()
+      .int()
+      .positive()
+      .max(50)
+      .default(decisionAutoInjectDefaultsV2.candidateLimit),
+    semanticFallback: z.boolean().default(decisionAutoInjectDefaultsV2.semanticFallback),
+    jev: decisionProbabilityOverridesSchemaV2.optional(),
+    luna: decisionProbabilityOverridesSchemaV2.optional(),
+  })
+  .transform(
+    ({
+      jev,
+      luna,
+      recallMinProbability,
+      durableSubjectMinProbability,
+      casualMaxProbability,
+      relevanceMinProbability,
+      ...options
+    }) => {
+      const legacy = {
+        ...(recallMinProbability !== undefined ? { recallMinProbability } : {}),
+        ...(durableSubjectMinProbability !== undefined ? { durableSubjectMinProbability } : {}),
+        ...(casualMaxProbability !== undefined ? { casualMaxProbability } : {}),
+        ...(relevanceMinProbability !== undefined ? { relevanceMinProbability } : {}),
+      };
+      return {
+        ...options,
+        jev: { ...jevDecisionProbabilitiesV2, ...legacy, ...jev },
+        luna: { ...lunaDecisionProbabilitiesV2, ...legacy, ...luna },
+      };
+    },
+  );
 
 const conversationSchemaV2 = z
   .object({
@@ -602,41 +662,18 @@ const conversationSchemaV2 = z
             mode: "hybrid",
             filterCurrentParticipants: false,
           }),
-        autoInjectMode: z.enum(["llm", "jev"]).default("llm"),
-        jevAutoInject: z
-          .object({
-            model: z.string().trim().min(1).default(jevAutoInjectDefaultsV2.model),
-            limit: z.number().int().positive().max(10).default(jevAutoInjectDefaultsV2.limit),
-            candidateLimit: z
-              .number()
-              .int()
-              .positive()
-              .max(50)
-              .default(jevAutoInjectDefaultsV2.candidateLimit),
-            semanticFallback: z.boolean().default(jevAutoInjectDefaultsV2.semanticFallback),
-            recallMinProbability: z
-              .number()
-              .min(0)
-              .max(1)
-              .default(jevAutoInjectDefaultsV2.recallMinProbability),
-            durableSubjectMinProbability: z
-              .number()
-              .min(0)
-              .max(1)
-              .default(jevAutoInjectDefaultsV2.durableSubjectMinProbability),
-            casualMaxProbability: z
-              .number()
-              .min(0)
-              .max(1)
-              .default(jevAutoInjectDefaultsV2.casualMaxProbability),
-            relevanceMinProbability: z
-              .number()
-              .min(0)
-              .max(1)
-              .default(jevAutoInjectDefaultsV2.relevanceMinProbability),
-          })
-          .default(jevAutoInjectDefaultsV2),
+        autoInjectMode: z
+          .enum(["llm", "decision", "jev"])
+          .default("llm")
+          .transform((mode) => (mode === "jev" ? ("decision" as const) : mode)),
+        decisionAutoInject: decisionAutoInjectSchemaV2.optional(),
+        jevAutoInject: decisionAutoInjectSchemaV2.optional(),
       })
+      .transform(({ jevAutoInject, decisionAutoInject, ...thread }) => ({
+        ...thread,
+        decisionAutoInject: decisionAutoInject ??
+          jevAutoInject ?? { ...decisionAutoInjectDefaultsV2 },
+      }))
       .default({
         summarization: {
           enabled: false,
@@ -657,7 +694,7 @@ const conversationSchemaV2 = z
           filterCurrentParticipants: false,
         },
         autoInjectMode: "llm",
-        jevAutoInject: jevAutoInjectDefaultsV2,
+        decisionAutoInject: decisionAutoInjectDefaultsV2,
       }),
   })
   .default({
@@ -681,7 +718,7 @@ const conversationSchemaV2 = z
         filterCurrentParticipants: false,
       },
       autoInjectMode: "llm",
-      jevAutoInject: jevAutoInjectDefaultsV2,
+      decisionAutoInject: decisionAutoInjectDefaultsV2,
     },
   });
 

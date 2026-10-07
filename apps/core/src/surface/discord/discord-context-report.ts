@@ -284,7 +284,6 @@ export function createDiscordContextReportProvider(params: {
         transcriptStore: params.transcriptStore,
       });
       const activeToolNames = selectedLevel1ToolNames(toolset, selectedCatalogIds);
-      toolset.updateActiveBatchTools(activeToolNames);
       const activeTools = selectActiveTools(toolset.tools, activeToolNames);
       const estimate = estimateContextSnapshotTokens({
         system,

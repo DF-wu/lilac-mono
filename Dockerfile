@@ -279,6 +279,7 @@ COPY packages/plugin-runtime packages/plugin-runtime
 COPY packages/remote-fs-runner packages/remote-fs-runner
 COPY packages/tool-results packages/tool-results
 COPY packages/utils packages/utils
+RUN bun run codegen:config-schemas
 COPY --from=web /app/apps/web/dist /app/apps/web/dist
 COPY --from=native-launcher /build/tools /app/apps/tool-bridge/dist/tools
 COPY --from=tool-worker /app/apps/tool-bridge/dist/ /app/apps/tool-bridge/dist/

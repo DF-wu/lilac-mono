@@ -28,22 +28,38 @@ Explicit port, URL and origin values are preserved. To move an existing deployme
 public URL changes, also update `publicUrl`, `allowedOrigins` and any reverse-proxy destination.
 The installer preserves existing deployment port mappings. No config-version bump is required.
 
-## Jev auto-inject lane
+## Decision auto-inject lane
 
-Version 2 accepts `conversation.thread.autoInjectMode`, defaulting to `llm`, which keeps the existing
-length gate, planner and ranking. Set it to `jev` to replace them with one TypeSafe Jev call. The call
-decides whether the latest message needs past context and which shortlisted threads help. The shortlist
-matches any message word against thread summaries. When nothing matches and embeddings are configured, it
-falls back to a single embedding search. `conversation.thread.autoInject.enabled` still turns the feature
-on, and `filterCurrentParticipants` applies to both lanes.
+Version 2 uses `conversation.thread.autoInjectMode: decision` and
+`conversation.thread.decisionAutoInject`. Rename the old `jev` mode and `jevAutoInject` section.
+Existing version-2 Jev settings still parse into the new runtime fields without changing thresholds.
+If both sections exist, `decisionAutoInject` takes precedence. No config-version bump is required.
 
-`conversation.thread.jevAutoInject` holds the Jev options: `model`, `limit`, `candidateLimit`,
-`semanticFallback`, and the probability thresholds `recallMinProbability`,
-`durableSubjectMinProbability`, `casualMaxProbability` and `relevanceMinProbability`. The `jev` mode
-requires `TYPESAFE_AI_API_KEY`; `TYPESAFE_AI_BASE_URL` optionally overrides the API endpoint. Without a
-key, Lilac logs an error and answers without injected metadata.
+The decision lane uses a local shortlist and one call to judge whether past context helps and which
+threads to inject. The `llm` lane remains the default. `autoInject.enabled` and
+`filterCurrentParticipants` still apply to both lanes.
 
-Both fields are optional; no config rewrite is required. Remove them before using an older parser.
+`decisionAutoInject.model` is an ordered, nonempty array. Configure
+`[typesafe/jev-1.13.0, openai/gpt-6-luna]` to use Jev for text and Luna for image attachments.
+Text selects the first entry. A supported image in the latest user message selects the first
+image-capable entry; if none is configured, the first entry evaluates text only. PDFs alone do not
+select Luna. This is routing, not a retry or failure fallback chain. Only the selected model needs
+credentials. A single string and bare Jev model IDs remain supported as legacy input. TypeSafe uses `TYPESAFE_AI_API_KEY` and optional `TYPESAFE_AI_BASE_URL`; OpenAI uses
+`OPENAI_API_KEY` and optional `OPENAI_BASE_URL`. The endpoint must support `/v1/decisions`.
+Missing credentials and evaluation failures continue without injected metadata. A refused question
+counts as "no", so it cannot open a gate or select a candidate.
+
+OpenAI receives attached images as native inline image parts, independently of the primary agent's
+image support. Jev evaluates text only. Shortlisting still uses the latest authored text; image-only
+messages do not run automatic recall. Image preparation uses existing scoped resource access and inline
+media limits. Images are kept in memory. No transcript or database migration is needed.
+
+`decisionAutoInject` retains shared `limit`, `candidateLimit`, and `semanticFallback`. The four
+probability thresholds now live under `decisionAutoInject.jev` and `decisionAutoInject.luna`.
+TypeSafe Jev IDs use the `jev` scope; OpenAI Luna IDs use `luna`. Each scope has independent defaults.
+Legacy flat thresholds apply to both scopes, and explicit scoped fields override them individually.
+The default model list contains Jev only. The provisional Luna defaults and their benchmark limits are
+recorded in [the production benchmark](decision-auto-inject-benchmark.md).
 
 ## Native title model
 

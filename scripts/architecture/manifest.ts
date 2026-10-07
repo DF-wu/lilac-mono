@@ -713,15 +713,6 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
     "packages/coding-tools",
     [
       { module: "src/apply-patch.ts", exportName: "parsePatchResult" },
-      {
-        module: "src/batch.ts",
-        exportName: "collectApplyPatchTouchedPathsResult",
-      },
-      {
-        module: "src/batch.ts",
-        exportName: "collectEditFileTouchedPathsResult",
-      },
-      { module: "src/batch.ts", exportName: "createBatchToolResult" },
       { module: "src/guardrails.ts", exportName: "validateLocalCwd" },
     ],
   ],
@@ -1258,12 +1249,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: { module: "message-clone.ts", exportName },
         category: "projection" as const,
       })),
-      ...["AgentToolHost.executeExternalToolCall", "AgentToolHost.executeExpansionChildren"].map(
-        (exportName) => ({
-          identity: { module: "agent-tool-host.ts", exportName },
-          category: "projection" as const,
-        }),
-      ),
+      ...["AgentToolHost.executeExternalToolCall"].map((exportName) => ({
+        identity: { module: "agent-tool-host.ts", exportName },
+        category: "projection" as const,
+      })),
       {
         identity: { module: "adapters/ai-sdk/model-call.ts", exportName: "executeAiSdkModelCall" },
         category: "projection",
@@ -1722,24 +1711,6 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
   [
     "packages/coding-tools",
     [
-      {
-        identity: {
-          module: "src/batch.ts",
-          exportName: "decodeBatchEditInput",
-        },
-        category: "plugin",
-      },
-      {
-        identity: { module: "src/batch.ts", exportName: "validateInput" },
-        category: "plugin",
-      },
-      {
-        identity: {
-          module: "src/batch.ts",
-          exportName: "resolveBatchEditTargets",
-        },
-        category: "plugin",
-      },
       {
         identity: {
           module: "src/instructions.ts",
@@ -2290,6 +2261,13 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
       },
       {
         identity: {
+          module: "openai-decision-model.ts",
+          exportName: "decodeOpenAIDecisionRequestBody",
+        },
+        category: "request",
+      },
+      {
+        identity: {
           module: "server-compaction-request.ts",
           exportName: "decodeServerCompactionPayload",
         },
@@ -2438,10 +2416,6 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
           "Carries settled plugin tool output opaquely through the established HTTP wire contract.",
       },
       {
-        identity: { module: "src/tools/batch.ts", exportName: "batchTool" },
-        reason: "Carries an AI SDK tool-call payload opaquely to the selected child tool boundary.",
-      },
-      {
         identity: {
           module: "src/plugins/manager.ts",
           exportName:
@@ -2451,18 +2425,7 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
       },
     ],
   ],
-  [
-    "packages/coding-tools",
-    [
-      {
-        identity: {
-          module: "src/batch.ts",
-          exportName: "createBatchToolResult",
-        },
-        reason: "Carries an AI SDK tool-call payload opaquely to the selected child tool boundary.",
-      },
-    ],
-  ],
+  ["packages/coding-tools", []],
   [
     "packages/claude-code-bridge",
     [
@@ -2640,13 +2603,6 @@ const INTEGRATED_CAPABILITY_PREDICATES = new Map<string, readonly ReasonedSymbol
       {
         identity: { module: "failure-adapters.ts", exportName: "isAgentPanic" },
         reason: "Checks exact Panic identity without interpreting an ordinary failure.",
-      },
-      {
-        identity: {
-          module: "tool-call-expansion.ts",
-          exportName: "isToolExpansion",
-        },
-        reason: "Checks the exact project-owned ToolExpansion class and brand.",
       },
       {
         identity: {
@@ -3831,6 +3787,13 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               category: "wire" as const,
             },
             {
+              identity: {
+                module: "src/activity-presentation.ts",
+                exportName: "decodeToolLabelArgs",
+              },
+              category: "wire" as const,
+            },
+            {
               identity: { module: "src/keybindings.ts", exportName: "recordedBinding" },
               category: "projection" as const,
             },
@@ -4182,28 +4145,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             {
               identity: BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity,
               category: "persistence",
-            },
-          ] satisfies readonly BoundaryDecoder[])
-        : []),
-      ...(root === "packages/agent"
-        ? ([
-            {
-              identity: {
-                module: "adapters/ai-sdk/support.ts",
-                exportName: "repairLegacyBatchInput",
-              },
-              category: "request",
-            },
-          ] satisfies readonly BoundaryDecoder[])
-        : []),
-      ...(root === "packages/claude-code-bridge"
-        ? ([
-            {
-              identity: {
-                module: "claude-code-tools.ts",
-                exportName: "normalizeLegacyBatchArguments",
-              },
-              category: "request",
             },
           ] satisfies readonly BoundaryDecoder[])
         : []),
@@ -5564,7 +5505,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "64d0e93755f08a774aca52366162530cfb0401baef05fa047f3562398d4c3909";
+  "81bf00a7c0d571f6e3aa1fbe16f373d59f21f5144231fa72da752cc3eff5917b";
 
 export const architectureManifest = {
   version: 1,

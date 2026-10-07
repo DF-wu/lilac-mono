@@ -1,4 +1,5 @@
 import { Result } from "better-result";
+import { z } from "zod";
 import type { DisplayPart } from "@stanley2058/lilac-client-protocol";
 
 export type ActivityPart = Extract<DisplayPart, { type: "data-activity" }>;
@@ -34,12 +35,86 @@ export function parseToolLabel(label: string): { name: string; args: string } {
   return { name: match?.[1] ?? "", args: match?.[2]?.trim() ?? "" };
 }
 
+const toolArgsSchema = z.object({
+  path: z.string().optional(),
+  pattern: z.string().optional(),
+  patterns: z.array(z.string()).optional(),
+  query: z.string().optional(),
+  cwd: z.string().optional(),
+  profile: z.string().optional(),
+  task: z.string().optional(),
+});
+type ToolArgs = z.infer<typeof toolArgsSchema>;
+
+/** Native labels carry JSON arguments; older labels carry arguments already formatted by Core. */
+export function decodeToolLabelArgs(args: string): ToolArgs | undefined {
+  if (!args.startsWith("{")) return undefined;
+  const value = Result.try({ try: () => JSON.parse(args), catch: () => undefined }).match({
+    ok: (value) => value,
+    err: () => undefined,
+  });
+  const parsed = toolArgsSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
+const toolsInvocation = /^tools\s+([\w.-]+)(?:\s+([\s\S]*))?$/;
+
+/** Only the first `tools` call counts, so trailing commands do not change how the row reads. */
+function toolsCall(part: ActivityPart): { callable: string; rest: string } | undefined {
+  const match = toolsInvocation.exec(activityCommand(part));
+  return match ? { callable: match[1]!, rest: match[2] ?? "" } : undefined;
+}
+
+function unquote(token: string): string {
+  return token.replace(
+    /'([^']*)'|"((?:[^"\\]|\\.)*)"/g,
+    (_match, single: string | undefined, double: string | undefined) =>
+      single ?? double?.replace(/\\(.)/g, "$1") ?? "",
+  );
+}
+
+/** The query or URL the first `tools web.*` call receives, positionally or as `--query=`/`--url=`. */
+function webTarget(rest: string): string | undefined {
+  // Sticky matching stops at the first `;`, `&`, or `|` outside quotes.
+  const tokens = /\s*((?:[^\s;&|'"]|'[^']*'|"(?:[^"\\]|\\.)*")+)/y;
+  for (let match = tokens.exec(rest); match; match = tokens.exec(rest)) {
+    const token = match[1]!;
+    const named = /^--(?:query|url)=([\s\S]*)$/.exec(token);
+    if (named) return unquote(named[1]!);
+    if (token.startsWith("-")) continue;
+    return unquote(token);
+  }
+  return undefined;
+}
+
 export function activityRowKind(part: ActivityPart): ActivityRowKind {
   if (part.data.kind !== "tool") return part.data.kind;
   const { name } = parseToolLabel(part.data.label);
   const known = toolKinds[name];
+  if (known === "command" && toolsCall(part)?.callable.startsWith("web.")) return "web";
   if (known) return known;
   return /(^|[._])(web|fetch|browse|url)([._]|$)/i.test(name) ? "web" : "tool";
+}
+
+/** The subagent profile in a legacy progress label or a native `subagent_delegate` label. */
+/**
+ * Core caps labels at 256 characters but keeps the same `<tool> <JSON args>` text in the detail
+ * up to 8192, so long arguments only decode from the detail.
+ */
+function toolCallArgs(part: ActivityPart): { name: string; args: ToolArgs | undefined } {
+  const { name, args } = parseToolLabel(part.data.label);
+  const detail = parseToolLabel(part.data.detail ?? "");
+  const fromDetail = detail.name === name ? decodeToolLabelArgs(detail.args) : undefined;
+  return { name, args: fromDetail ?? decodeToolLabelArgs(args) };
+}
+
+export function subagentLabelProfile(part: ActivityPart): string | undefined {
+  const legacy = /^subagent(?:_delegate)? \((explore|general|self)(?:;|\))/.exec(
+    part.data.label,
+  )?.[1];
+  if (legacy) return legacy;
+  const { name, args } = toolCallArgs(part);
+  return name === "subagent_delegate" ? args?.profile : undefined;
 }
 
 /** Thinking only has something to show once its reasoning text arrives. */
@@ -103,20 +178,65 @@ export function commandProgramName(command: string): string {
   return oneLine(local);
 }
 
+function located(subject: string | undefined, location: string | undefined): string | undefined {
+  if (!subject) return undefined;
+  return location ? `${subject} in ${location}` : subject;
+}
+
+function toolArgsTitle(name: string, args: ToolArgs): string | undefined {
+  switch (name) {
+    case "read":
+    case "read_file":
+    case "readFile":
+      return args.path;
+    case "glob":
+      return located(args.patterns?.join(", "), args.cwd);
+    case "grep":
+      return located(args.pattern, args.path);
+    case "fuzzy_search":
+      return located(args.query, args.cwd);
+    case "subagent_delegate":
+      return args.task;
+    default:
+      return undefined;
+  }
+}
+
+function toolTitle(part: ActivityPart): string {
+  const { name, args } = toolCallArgs(part);
+  const title = args ? toolArgsTitle(name, args) : undefined;
+  return oneLine(title ?? part.data.label);
+}
+
+function editTitle(part: ActivityPart): string {
+  const { paths, others } = activityEditedPaths(part);
+  const extra = paths.length - 1 + others;
+  if (!paths[0]) return oneLine(part.data.label);
+  return extra > 0 ? `${paths[0]} (+${extra})` : paths[0];
+}
+
+function webTitle(part: ActivityPart): string {
+  const call = toolsCall(part);
+  if (!call) return toolTitle(part);
+  return oneLine(webTarget(call.rest) ?? call.callable);
+}
+
 export function activityRowTitle(part: ActivityPart): string {
   switch (activityRowKind(part)) {
     case "thinking":
       return flattenMarkdown(part.data.detail ?? "") || "Thought";
     case "command":
       return commandLine(part) || oneLine(part.data.label);
+    case "edit":
+      return editTitle(part);
+    case "web":
+      return webTitle(part);
     case "workflow":
     case "agent":
     case "read":
     case "search":
-    case "edit":
-    case "web":
     case "tool":
-      return oneLine(part.data.label);
+      return toolTitle(part);
   }
 }
 
@@ -158,7 +278,10 @@ export function activityEditedPaths(part: ActivityPart): { paths: string[]; othe
     const paths = parseToolLabel(part.data.detail).args.split("\n").filter(Boolean);
     return { paths, others: 0 };
   }
-  const match = /^(.*?)(?: \(\+(\d+)\))?$/.exec(parseToolLabel(part.data.label).args);
+  const { args } = parseToolLabel(part.data.label);
+  const decoded = decodeToolLabelArgs(args);
+  if (decoded) return { paths: decoded.path ? [decoded.path] : [], others: 0 };
+  const match = /^(.*?)(?: \(\+(\d+)\))?$/.exec(args);
   return { paths: match?.[1] ? [match[1]] : [], others: Number(match?.[2] ?? 0) };
 }
 

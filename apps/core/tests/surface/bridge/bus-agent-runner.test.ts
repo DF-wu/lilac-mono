@@ -1,3 +1,4 @@
+import { generatedMessageMetadata } from "@stanley2058/lilac-agent";
 import {
   createNativeOutputPublisher,
   NativeOutputPublishFailed,
@@ -39,7 +40,6 @@ import { createMemoryBlobStore, type BlobStore } from "@stanley2058/lilac-blob-s
 import {
   AiSdkPiAgent,
   attachAutoCompaction,
-  ToolExpansion,
   buildSyntheticToolCallId,
   createAgentRunIdleWatchdog,
   hashCanonicalMessagesV1,
@@ -59,10 +59,10 @@ import type {
   ConversationThreadToolService,
 } from "../../../src/conversation/thread-service";
 import {
-  createJevAutoInjectEvaluator,
-  createJevAutoInjectEvaluatorForModel,
-  type JevAutoInjectEvaluator,
-} from "../../../src/conversation/thread-auto-inject-jev";
+  createDecisionAutoInjectEvaluator,
+  createDecisionAutoInjectEvaluatorForModel,
+  type DecisionAutoInjectEvaluator,
+} from "../../../src/conversation/thread-auto-inject-decision";
 
 import {
   AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH,
@@ -71,7 +71,7 @@ import {
   assertWorkflowDispatchPolicy,
   appendConfiguredAliasPromptBlock,
   appendAdditionalSessionMemoBlock,
-  buildAutoInjectedThreadSearchOverlay,
+  buildGeneratedMessageOverlay,
   BusAgentRunnerIntakeFailed,
   BusAgentRunnerRequestHeadersInvalid,
   BusAgentRunnerQueueAttemptRouteInvalid,
@@ -408,7 +408,6 @@ function level1TestToolset(params?: {
         description: "Deferred metadata",
       },
     },
-    updateActiveBatchTools: (activeToolNames) => params?.onBatchUpdate?.(activeToolNames),
     genericOutputNormalizerBypassTools: new Set(["builtin"]),
     aggregateOutputBudgetExemptTools: new Set(),
     release: async () => Result.ok(undefined),
@@ -691,101 +690,6 @@ describe("runner Level 1 catalog selection", () => {
     ]);
   });
 
-  it("executes selected expansion children and denies hidden children under the same step authority", async () => {
-    let selectedExecutions = 0;
-    let hiddenExecutions = 0;
-    const selectedTool = level1TestTool(() => {
-      selectedExecutions += 1;
-      return "selected";
-    });
-    const hiddenTool = level1TestTool(() => {
-      hiddenExecutions += 1;
-      return "hidden";
-    });
-    const tools = {
-      batch: level1TestTool(
-        () =>
-          new ToolExpansion("expanded", [
-            {
-              toolCallId: "selected-child",
-              toolName: "selected_tool",
-              input: {},
-            },
-            { toolCallId: "hidden-child", toolName: "hidden_tool", input: {} },
-          ]),
-      ),
-      selected_tool: selectedTool,
-      hidden_tool: hiddenTool,
-    } satisfies ToolSet;
-    const toolset: BuiltLevel1Toolset = {
-      tools,
-      specs: new Map(),
-      contributionInfo: new Map(),
-      directToolNames: new Set(["batch"]),
-      catalog: [
-        {
-          source: "plugin",
-          sourceId: "selected-plugin",
-          rawName: "selected",
-          modelName: "selected_tool",
-          identity: {
-            source: "plugin",
-            sourceId: "selected-plugin",
-            rawToolName: "selected",
-          },
-          stableId: "selected-id",
-          tool: selectedTool,
-        },
-        {
-          source: "plugin",
-          sourceId: "hidden-plugin",
-          rawName: "hidden",
-          modelName: "hidden_tool",
-          identity: {
-            source: "plugin",
-            sourceId: "hidden-plugin",
-            rawToolName: "hidden",
-          },
-          stableId: "hidden-id",
-          tool: hiddenTool,
-        },
-      ],
-      catalogMetadata: {},
-      updateActiveBatchTools: () => {},
-      genericOutputNormalizerBypassTools: new Set(),
-      aggregateOutputBudgetExemptTools: new Set(),
-      release: async () => Result.ok(undefined),
-    };
-    let calls = 0;
-    const model = new MockLanguageModelV4({
-      doStream: async () => {
-        calls += 1;
-        return calls === 1
-          ? level1ToolCallStep([{ toolCallId: "batch", toolName: "batch" }])
-          : level1TextStep("done");
-      },
-    });
-    let agent: AiSdkPiAgent<ToolSet> | null = null;
-    agent = new AiSdkPiAgent({
-      system: "test",
-      model,
-      tools,
-      beforeStep: async () => {
-        if (!agent) throw new Error("agent not ready");
-        await refreshSelectedLevel1Tools({
-          target: agent,
-          toolset,
-          listSelectedCatalogIds: () => ["selected-id"],
-        });
-      },
-    });
-
-    await agent.prompt("batch it");
-
-    expect(selectedExecutions).toBe(1);
-    expect(hiddenExecutions).toBe(0);
-  });
-
   it("passes Claude the exact complete tools and deferred metadata with complete authority", () => {
     const toolset = level1TestToolset();
     const mapping = completeLevel1ToolMapping(toolset);
@@ -810,16 +714,12 @@ describe("runner Level 1 catalog selection", () => {
     expect([...(applied.names ?? [])]).toEqual(["builtin", "find_tools", "deferred_tool"]);
   });
 
-  it("refreshes selection and batch authority without rebuilding the catalog", async () => {
+  it("refreshes selection without rebuilding the catalog", async () => {
     let catalogCreates = 0;
-    let batchUpdates = 0;
     let appliedNames: ReadonlySet<string> = new Set();
     const toolset = level1TestToolset({
       onCatalogCreate: () => {
         catalogCreates += 1;
-      },
-      onBatchUpdate: () => {
-        batchUpdates += 1;
       },
     });
 
@@ -834,7 +734,6 @@ describe("runner Level 1 catalog selection", () => {
     });
 
     expect(catalogCreates).toBe(1);
-    expect(batchUpdates).toBe(1);
     expect([...appliedNames]).toEqual(["builtin", "find_tools"]);
   });
 });
@@ -896,31 +795,16 @@ describe("deferred subagent result", () => {
       finalText: "complete",
     });
 
-    expect(messages).toMatchObject([
-      {
-        role: "assistant",
-        content: [
-          {
-            type: "tool-call",
-            toolName: "subagent_result",
-            input: { workflowRunId: "wfrun:subagent:opaque-run" },
-          },
-        ],
-      },
-      {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolName: "subagent_result",
-            output: {
-              type: "json",
-              value: { workflowRunId: "wfrun:subagent:opaque-run" },
-            },
-          },
-        ],
-      },
-    ]);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.role).toBe("user");
+    expect(generatedMessageMetadata(messages[0]!)).toMatchObject({
+      kind: "subagent_completion",
+      id: "wfrun:subagent:opaque-run",
+    });
+    expect(readGeneratedPayload(messages)).toMatchObject({
+      workflowRunId: "wfrun:subagent:opaque-run",
+      finalText: "complete",
+    });
     expect(JSON.stringify(messages)).not.toContain("synthetic-child-request");
   });
 
@@ -956,22 +840,7 @@ describe("deferred subagent result", () => {
     expect(hasDeferredSubagentResult(checkpointMessages, completion)).toBe(true);
 
     const emitted = buildDeferredSubagentResultMessages(completion);
-    const emittedAssistant = emitted[0];
-    if (
-      emittedAssistant?.role !== "assistant" ||
-      !Array.isArray(emittedAssistant.content) ||
-      emittedAssistant.content[0]?.type !== "tool-call"
-    ) {
-      throw new Error("expected a synthetic subagent result tool call");
-    }
-    const emittedToolCallId = emittedAssistant.content[0].toolCallId;
-    expect(emittedToolCallId).toBe(
-      buildSyntheticToolCallId({
-        prefix: "subagent_result",
-        seed: completion.runId,
-      }),
-    );
-    expect(emittedToolCallId).not.toBe(legacyToolCallId);
+    expect(generatedMessageMetadata(emitted[0]!)?.id).toBe(completion.runId);
     expect(hasDeferredSubagentResult(emitted, completion)).toBe(true);
 
     const upgrade = planDeferredSubagentBoundary({
@@ -1083,11 +952,32 @@ describe("deferred subagent result", () => {
     expect(assistantOnly.forceNextTurn).toBe(true);
 
     const missingResult = planDeferredSubagentBoundary({
-      canonicalMessages: [buildDeferredSubagentResultMessages(completion)[0]!],
+      canonicalMessages: [normalizedModelInput[0]!],
       modelInputMessages: [],
       completions: [completion],
     });
-    expect(missingResult.append).toEqual([buildDeferredSubagentResultMessages(completion)[1]!]);
+    expect(missingResult.append.map((message) => message.role)).toEqual(["tool", "user"]);
+    expect(missingResult.append[0]).toMatchObject({
+      content: [{ type: "tool-result", toolCallId: "subagentr" }],
+    });
+    expect(missingResult.append[1]).toEqual(buildDeferredSubagentResultMessages(completion)[0]);
+    const restartedResult: ModelMessage = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolName: "subagent_result",
+          toolCallId: "subagentr",
+          output: { type: "error-text", value: "server restarted" },
+        },
+      ],
+    };
+    const restarted = planDeferredSubagentBoundary({
+      canonicalMessages: [normalizedModelInput[0]!, restartedResult],
+      modelInputMessages: [],
+      completions: [completion],
+    });
+    expect(restarted.append).toEqual(buildDeferredSubagentResultMessages(completion));
   });
 });
 
@@ -3558,7 +3448,6 @@ describe("durable accepted runner recovery", () => {
           }),
           beforeStep: undefined,
           normalizeToolResultOutput: undefined,
-          normalizeSettledToolResultOutputs: undefined,
           tools: {
             retry_checkpoint: tool({
               inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
@@ -3777,7 +3666,6 @@ describe("durable accepted runner recovery", () => {
           }),
           beforeStep: undefined,
           normalizeToolResultOutput: undefined,
-          normalizeSettledToolResultOutputs: undefined,
           tools: {
             read: tool({
               inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
@@ -3992,7 +3880,6 @@ describe("durable accepted runner recovery", () => {
           }),
           beforeStep: undefined,
           normalizeToolResultOutput: undefined,
-          normalizeSettledToolResultOutputs: undefined,
           tools: {
             read: tool({
               inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
@@ -9009,7 +8896,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     ]);
     expect(
       persistedFirstManifest.segments.at(-1)?.canonicalMessages.map((message) => message.role),
-    ).toEqual(["assistant", "tool"]);
+    ).toEqual(["user"]);
     const firstOutput = adapter.outputs[0];
     if (!firstOutput) throw new Error("first output stream was not created");
     expect(
@@ -9790,322 +9677,329 @@ describe("Core-primary local compaction replacement", () => {
     expect(compatibilityCalls).toBe(0);
   });
 
-  it("maps the current boundary and text-lowers retained mixed history in the fresh payload", async () => {
-    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-primary-compaction-"));
-    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
-    const oldPrefix = [
-      { role: "user", content: `old question ${"x".repeat(20_000)}` },
-      { role: "assistant", content: "old answer" },
-    ] satisfies ModelMessage[];
-    const retainedHistorical = [
-      { role: "user", content: "retained historical question" },
-      {
-        role: "assistant",
-        content: [
-          {
-            type: "tool-call",
-            toolCallId: "old-tool",
-            toolName: "builtin",
-            input: {},
-          },
-        ],
-      },
-      {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "old-tool",
-            toolName: "builtin",
-            output: { type: "text", value: "historical tool output" },
-          },
-        ],
-      },
-      { role: "assistant", content: "retained historical answer" },
-    ] satisfies ModelMessage[];
-    const current = [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: "current question" },
-          {
-            type: "file",
-            data: new Uint8Array([1, 2, 3]),
-            mediaType: "image/png",
-          },
-        ],
-      },
-    ] satisfies ModelMessage[];
-    const oldPrefixStored = transcriptResultValue(projectStoredMessagesV1(oldPrefix));
-    const retainedHistoricalStored = transcriptResultValue(
-      projectStoredMessagesV1(retainedHistorical),
-    );
-    const currentStored = transcriptResultValue(
-      projectStoredMessagesV1([
+  it.each([0, 2])(
+    "maps current segment %i and prepares retained mixed history in the fresh payload",
+    async (currentSegmentIndex) => {
+      const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-primary-compaction-"));
+      const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+      const oldPrefix = [
+        { role: "user", content: `old question ${"x".repeat(20_000)}` },
+        { role: "assistant", content: "old answer" },
+      ] satisfies ModelMessage[];
+      const retainedHistorical = [
+        { role: "user", content: "retained historical question" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "old-tool",
+              toolName: "builtin",
+              input: {},
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "old-tool",
+              toolName: "builtin",
+              output: { type: "text", value: "historical tool output" },
+            },
+          ],
+        },
+        { role: "assistant", content: "retained historical answer" },
+      ] satisfies ModelMessage[];
+      const current = [
         {
           role: "user",
           content: [
             { type: "text", text: "current question" },
             {
-              type: "blob",
-              blob: {
-                version: 1,
-                objectId: `b1_${"11".repeat(16)}`,
-                sha256: "22".repeat(32),
-                byteLength: 3,
-              },
+              type: "file",
+              data: new Uint8Array([1, 2, 3]),
               mediaType: "image/png",
             },
           ],
         },
-      ]),
-    );
-    const originalMessages = [...oldPrefix, ...retainedHistorical, ...current];
-    let lineage: CorePrimaryLineageV2 = buildCoreLineageManifestV2(
-      [
-        {
-          atoms: [
-            {
-              kind: "synthetic",
-              source: "old-prefix",
-              messageDigest: transcriptResultValue(hashCanonicalStoredMessagesV2(oldPrefixStored))
-                .hash,
-            },
-          ],
-          canonicalMessages: oldPrefixStored,
+      ] satisfies ModelMessage[];
+      const oldPrefixStored = transcriptResultValue(projectStoredMessagesV1(oldPrefix));
+      const retainedHistoricalStored = transcriptResultValue(
+        projectStoredMessagesV1(retainedHistorical),
+      );
+      const currentStored = transcriptResultValue(
+        projectStoredMessagesV1([
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "current question" },
+              {
+                type: "blob",
+                blob: {
+                  version: 1,
+                  objectId: `b1_${"11".repeat(16)}`,
+                  sha256: "22".repeat(32),
+                  byteLength: 3,
+                },
+                mediaType: "image/png",
+              },
+            ],
+          },
+        ]),
+      );
+      const originalMessages = [...oldPrefix, ...retainedHistorical, ...current];
+      let lineage: CorePrimaryLineageV2 = buildCoreLineageManifestV2(
+        [
+          {
+            atoms: [
+              {
+                kind: "synthetic",
+                source: "old-prefix",
+                messageDigest: transcriptResultValue(hashCanonicalStoredMessagesV2(oldPrefixStored))
+                  .hash,
+              },
+            ],
+            canonicalMessages: oldPrefixStored,
+          },
+          {
+            atoms: [
+              {
+                kind: "synthetic",
+                source: "retained-history",
+                messageDigest: transcriptResultValue(
+                  hashCanonicalStoredMessagesV2(retainedHistoricalStored),
+                ).hash,
+              },
+            ],
+            canonicalMessages: retainedHistoricalStored,
+          },
+          {
+            atoms: [
+              {
+                kind: "synthetic",
+                source: "current-media",
+                messageDigest: transcriptResultValue(hashCanonicalStoredMessagesV2(currentStored))
+                  .hash,
+              },
+            ],
+            canonicalMessages: currentStored,
+          },
+        ],
+        { currentSegmentIndex },
+      );
+      const mainPayloads: ModelMessage[][] = [];
+      const mainModel = new MockLanguageModelV4({
+        modelId: "sonnet",
+        doStream: async (call) => {
+          mainPayloads.push([...call.prompt]);
+          return level1TextStep("fresh response");
         },
-        {
-          atoms: [
-            {
-              kind: "synthetic",
-              source: "retained-history",
-              messageDigest: transcriptResultValue(
-                hashCanonicalStoredMessagesV2(retainedHistoricalStored),
-              ).hash,
+      });
+      const summaryModel = new MockLanguageModelV4({
+        modelId: "summary",
+        doStream: async () => level1TextStep("## Objective\n- Preserve current input."),
+      });
+      const materializedStarts: ClaudeNativeSessionStart[] = [];
+      const disposedSessionIds: string[] = [];
+      const observation: ClaudeNativeAttemptObservation = {
+        requestedSessionId: null,
+        sourceSessionId: null,
+        initSessionId: null,
+        resultSessionId: null,
+        contextTokens: null,
+        contextMaxTokens: null,
+        requestedModel: "sonnet",
+        initializedModel: null,
+        requestedReasoning: null,
+        providerWarnings: [],
+        invoked: false,
+        requiredObservabilityError: null,
+        callbackError: null,
+      };
+      const runtime = createCorePrimaryClaudeRuntime({
+        store,
+        sessionId: "compaction-session",
+        requestId: "compaction-request",
+        providerId: "claude-code",
+        modelSpecifier: "claude-code/sonnet",
+        reasoning: "provider-default",
+        executionScopeHash: "scope",
+        executionCwd: dataDir,
+        getLineage: () => lineage,
+        materialize: async (start) => {
+          materializedStarts.push(start);
+          return {
+            agentModel: mainModel,
+            continuationModel: mainModel,
+            createUtilityModelResult: () => Result.ok(summaryModel),
+            createUtilityModel: () => summaryModel,
+            control: {
+              inject: () => false,
+              interrupt: async () => false,
+              async interruptResult() {
+                return Result.ok(await this.interrupt());
+              },
+              clear: () => {},
+              clearResult() {
+                this.clear();
+                return Result.ok();
+              },
             },
-          ],
-          canonicalMessages: retainedHistoricalStored,
-        },
-        {
-          atoms: [
-            {
-              kind: "synthetic",
-              source: "current-media",
-              messageDigest: transcriptResultValue(hashCanonicalStoredMessagesV2(currentStored))
-                .hash,
+            nativeSession: {
+              getObservation: () => ({
+                ...observation,
+                requestedSessionId: start.mode === "ephemeral" ? null : start.sessionId,
+                initSessionId: start.mode === "ephemeral" ? null : start.sessionId,
+                resultSessionId: start.mode === "ephemeral" ? null : start.sessionId,
+                invoked: true,
+              }),
+              waitForObservation: async () => observation,
+              recordWarning: () => {},
+              finalize: async () => ({
+                status: "unpromotable" as const,
+                issues: [
+                  {
+                    code: "candidate-missing" as const,
+                    message: "not finalized in this test",
+                  },
+                ],
+                observations: observation,
+                candidate: null,
+                sourcePreflight: null,
+                sourceFinal: null,
+              }),
+              async finalizeResult() {
+                return Result.ok(await this.finalize());
+              },
             },
-          ],
-          canonicalMessages: currentStored,
-        },
-      ],
-      { currentSegmentIndex: 2 },
-    );
-    const mainPayloads: ModelMessage[][] = [];
-    const mainModel = new MockLanguageModelV4({
-      modelId: "sonnet",
-      doStream: async (call) => {
-        mainPayloads.push([...call.prompt]);
-        return level1TextStep("fresh response");
-      },
-    });
-    const summaryModel = new MockLanguageModelV4({
-      modelId: "summary",
-      doStream: async () => level1TextStep("## Objective\n- Preserve current input."),
-    });
-    const materializedStarts: ClaudeNativeSessionStart[] = [];
-    const disposedSessionIds: string[] = [];
-    const observation: ClaudeNativeAttemptObservation = {
-      requestedSessionId: null,
-      sourceSessionId: null,
-      initSessionId: null,
-      resultSessionId: null,
-      contextTokens: null,
-      contextMaxTokens: null,
-      requestedModel: "sonnet",
-      initializedModel: null,
-      requestedReasoning: null,
-      providerWarnings: [],
-      invoked: false,
-      requiredObservabilityError: null,
-      callbackError: null,
-    };
-    const runtime = createCorePrimaryClaudeRuntime({
-      store,
-      sessionId: "compaction-session",
-      requestId: "compaction-request",
-      providerId: "claude-code",
-      modelSpecifier: "claude-code/sonnet",
-      reasoning: "provider-default",
-      executionScopeHash: "scope",
-      executionCwd: dataDir,
-      getLineage: () => lineage,
-      materialize: async (start) => {
-        materializedStarts.push(start);
-        return {
-          agentModel: mainModel,
-          continuationModel: mainModel,
-          createUtilityModelResult: () => Result.ok(summaryModel),
-          createUtilityModel: () => summaryModel,
-          control: {
-            inject: () => false,
-            interrupt: async () => false,
-            async interruptResult() {
-              return Result.ok(await this.interrupt());
+            dispose: async () => {
+              if (start.mode !== "ephemeral") disposedSessionIds.push(start.sessionId);
             },
-            clear: () => {},
-            clearResult() {
-              this.clear();
+            async disposeResult() {
+              if (start.mode !== "ephemeral") disposedSessionIds.push(start.sessionId);
               return Result.ok();
             },
-          },
-          nativeSession: {
-            getObservation: () => ({
-              ...observation,
-              requestedSessionId: start.mode === "ephemeral" ? null : start.sessionId,
-              initSessionId: start.mode === "ephemeral" ? null : start.sessionId,
-              resultSessionId: start.mode === "ephemeral" ? null : start.sessionId,
-              invoked: true,
-            }),
-            waitForObservation: async () => observation,
-            recordWarning: () => {},
-            finalize: async () => ({
-              status: "unpromotable" as const,
-              issues: [
-                {
-                  code: "candidate-missing" as const,
-                  message: "not finalized in this test",
-                },
-              ],
-              observations: observation,
-              candidate: null,
-              sourcePreflight: null,
-              sourceFinal: null,
-            }),
-            async finalizeResult() {
-              return Result.ok(await this.finalize());
-            },
-          },
-          dispose: async () => {
-            if (start.mode !== "ephemeral") disposedSessionIds.push(start.sessionId);
-          },
-          async disposeResult() {
-            if (start.mode !== "ephemeral") disposedSessionIds.push(start.sessionId);
-            return Result.ok();
-          },
-        };
-      },
-    });
-    await runtime.prepareModelCall({
-      canonicalMessages: originalMessages,
-      fullBudgetView: originalMessages,
-      runtime: {
+          };
+        },
+      });
+      await runtime.prepareModelCall({
+        canonicalMessages: originalMessages,
+        fullBudgetView: originalMessages,
+        runtime: {
+          model: mainModel,
+          modelSpecifier: "claude-code/sonnet",
+          executionMode: "provider-tools",
+        },
+        payload: { mode: "full" },
+        transformContext: { system: "test", tools: level1TestToolset().tools },
+      });
+      const agent = new AiSdkPiAgent({
+        system: "test",
         model: mainModel,
         modelSpecifier: "claude-code/sonnet",
-        executionMode: "provider-tools",
-      },
-      payload: { mode: "full" },
-      transformContext: { system: "test", tools: level1TestToolset().tools },
-    });
-    const agent = new AiSdkPiAgent({
-      system: "test",
-      model: mainModel,
-      modelSpecifier: "claude-code/sonnet",
-      messages: originalMessages,
-      tools: level1TestToolset().tools,
-      sendToolsToModel: false,
-      prepareModelCall: runtime.prepareModelCall,
-    });
-    let replacement:
-      | {
-          originalSuffixStart: number;
-          replacementSuffixStart: number;
-          replacementMessageCount: number;
-        }
-      | undefined;
-    const detach = await attachAutoCompaction(agent, {
-      model: "claude-code/sonnet",
-      modelCapability: new ModelCapability({ fetch: globalThis.fetch }),
-      summaryModel,
-      resolveContextLimit: async () => ({ context: 2_000, output: 200 }),
-      resolveSummaryContextLimit: () => 2_000,
-      thresholdInputSource: "transcript-estimate",
-      keepRecentTurns: 2,
-      keepRecentTokens: 1_000,
-      prepareFullModelView: (messages) => runtime.prepareHistoryView(messages),
-      prepareFullBudgetView: (messages, context) =>
-        runtime.prepareFullBudgetView(messages, context.canonicalStartIndex),
-      resolveCurrentInputCanonicalStart: () => lineage.currentCanonicalStart,
-      onCompactionEnd: (event) => {
-        if (event.status !== "completed" || !event.canonicalReplacement) return;
-        replacement = event.canonicalReplacement;
-        lineage = degradeCorePrimaryLineageForMutation(
-          "compaction-checkpoint-transform",
-          mapCorePrimaryCompactionCurrentCanonicalStart({
-            previousCurrentCanonicalStart: lineage.currentCanonicalStart,
-            replacement: event.canonicalReplacement,
-          }),
-        );
-      },
-    });
+        messages: originalMessages,
+        tools: level1TestToolset().tools,
+        sendToolsToModel: false,
+        prepareModelCall: runtime.prepareModelCall,
+      });
+      let replacement:
+        | {
+            originalSuffixStart: number;
+            replacementSuffixStart: number;
+            replacementMessageCount: number;
+          }
+        | undefined;
+      const detach = await attachAutoCompaction(agent, {
+        model: "claude-code/sonnet",
+        modelCapability: new ModelCapability({ fetch: globalThis.fetch }),
+        summaryModel,
+        resolveContextLimit: async () => ({ context: 2_000, output: 200 }),
+        resolveSummaryContextLimit: () => 2_000,
+        thresholdInputSource: "transcript-estimate",
+        keepRecentTurns: 2,
+        keepRecentTokens: 1_000,
+        prepareFullModelView: (messages) => runtime.prepareHistoryView(messages),
+        prepareFullBudgetView: (messages, context) =>
+          runtime.prepareFullBudgetView(messages, context.canonicalStartIndex),
+        onCompactionEnd: (event) => {
+          if (event.status !== "completed" || !event.canonicalReplacement) return;
+          replacement = event.canonicalReplacement;
+          lineage = degradeCorePrimaryLineageForMutation(
+            "compaction-checkpoint-transform",
+            mapCorePrimaryCompactionCurrentCanonicalStart({
+              previousCurrentCanonicalStart: lineage.currentCanonicalStart,
+              replacement: event.canonicalReplacement,
+            }),
+          );
+        },
+      });
 
-    try {
-      await agent.continue();
-    } finally {
-      detach();
-      await runtime.retireAtRunEnd();
-    }
+      try {
+        await agent.continue();
+      } finally {
+        detach();
+        await runtime.retireAtRunEnd();
+      }
 
-    expect(replacement).toMatchObject({
-      originalSuffixStart: 3,
-      replacementSuffixStart: 1,
-      replacementMessageCount: 5,
-    });
-    expect(String(lineage.state)).toBe("fresh-only");
-    expect(lineage.currentCanonicalStart).toBe(4);
-    expect("reason" in lineage ? lineage.reason : null).toBe("compaction-checkpoint-transform");
-    expect(materializedStarts).toHaveLength(2);
-    expect(materializedStarts[0]).toMatchObject({ mode: "fresh" });
-    expect(materializedStarts[1]).toMatchObject({ mode: "fresh" });
-    const firstStart = materializedStarts[0];
-    const replacementStart = materializedStarts[1];
-    if (
-      !firstStart ||
-      !replacementStart ||
-      firstStart.mode === "ephemeral" ||
-      replacementStart.mode === "ephemeral"
-    ) {
-      throw new Error("expected persisted compaction candidates");
-    }
-    expect(replacementStart.sessionId).not.toBe(firstStart.sessionId);
-    expect(disposedSessionIds).toContain(firstStart.sessionId);
-    expect(agent.state.messages.slice(1, 5)).toEqual([...retainedHistorical.slice(1), ...current]);
-    expect(mainPayloads).toHaveLength(1);
-    const actualPayload = mainPayloads[0]!;
-    const serializedPayload = JSON.stringify(actualPayload);
-    expect(serializedPayload).not.toContain('"type":"tool-call"');
-    expect(serializedPayload).not.toContain('"type":"tool-result"');
-    expect(serializedPayload).toContain("historical tool output");
-    const payloadCurrent = actualPayload.find(
-      (message) =>
-        message.role === "user" &&
-        Array.isArray(message.content) &&
-        message.content.some((part) => part.type === "file"),
-    );
-    if (!payloadCurrent || !Array.isArray(payloadCurrent.content)) {
-      throw new Error("current media payload is missing");
-    }
-    expect(
-      payloadCurrent.content.some(
-        (part) => part.type === "text" && part.text === "current question",
-      ),
-    ).toBe(true);
-    expect(
-      payloadCurrent.content.some((part) => part.type === "file" && part.mediaType === "image/png"),
-    ).toBe(true);
+      expect(replacement).toMatchObject({
+        originalSuffixStart: 3,
+        replacementSuffixStart: 1,
+        replacementMessageCount: 5,
+      });
+      expect(String(lineage.state)).toBe("fresh-only");
+      expect(lineage.currentCanonicalStart).toBe(currentSegmentIndex === 0 ? 0 : 4);
+      expect("reason" in lineage ? lineage.reason : null).toBe("compaction-checkpoint-transform");
+      expect(materializedStarts).toHaveLength(2);
+      expect(materializedStarts[0]).toMatchObject({ mode: "fresh" });
+      expect(materializedStarts[1]).toMatchObject({ mode: "fresh" });
+      const firstStart = materializedStarts[0];
+      const replacementStart = materializedStarts[1];
+      if (
+        !firstStart ||
+        !replacementStart ||
+        firstStart.mode === "ephemeral" ||
+        replacementStart.mode === "ephemeral"
+      ) {
+        throw new Error("expected persisted compaction candidates");
+      }
+      expect(replacementStart.sessionId).not.toBe(firstStart.sessionId);
+      expect(disposedSessionIds).toContain(firstStart.sessionId);
+      expect(agent.state.messages.slice(1, 5)).toEqual([
+        ...retainedHistorical.slice(1),
+        ...current,
+      ]);
+      expect(mainPayloads).toHaveLength(1);
+      const actualPayload = mainPayloads[0]!;
+      const serializedPayload = JSON.stringify(actualPayload);
+      expect(serializedPayload.includes('"type":"tool-call"')).toBe(currentSegmentIndex === 0);
+      expect(serializedPayload.includes('"type":"tool-result"')).toBe(currentSegmentIndex === 0);
+      expect(serializedPayload).toContain("historical tool output");
+      const payloadCurrent = actualPayload.find(
+        (message) =>
+          message.role === "user" &&
+          Array.isArray(message.content) &&
+          message.content.some((part) => part.type === "file"),
+      );
+      if (!payloadCurrent || !Array.isArray(payloadCurrent.content)) {
+        throw new Error("current media payload is missing");
+      }
+      expect(
+        payloadCurrent.content.some(
+          (part) => part.type === "text" && part.text === "current question",
+        ),
+      ).toBe(true);
+      expect(
+        payloadCurrent.content.some(
+          (part) => part.type === "file" && part.mediaType === "image/png",
+        ),
+      ).toBe(true);
 
-    store.close();
-    await rm(dataDir, { recursive: true, force: true });
-  });
+      store.close();
+      await rm(dataDir, { recursive: true, force: true });
+    },
+  );
 });
 
 describe("formatAutoCompactionToolDisplay", () => {
@@ -10153,25 +10047,16 @@ describe("buildAutoInjectedThreadSearchMessages", () => {
       ],
     });
 
-    expect(messages).toHaveLength(2);
-    expect(messages[0]?.role).toBe("assistant");
-    expect(messages[1]?.role).toBe("tool");
-    const assistantMessage = messages[0];
-    if (assistantMessage?.role !== "assistant" || typeof assistantMessage.content === "string") {
-      throw new Error("expected assistant tool-call message");
-    }
-    const toolCall = assistantMessage.content[0];
-    expect(toolCall?.type).toBe("tool-call");
-    if (toolCall?.type !== "tool-call") throw new Error("expected tool call");
-    expect(toolCall.toolName).toBe("conversation_thread_search");
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    expect(result?.type).toBe("tool-result");
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
-    expect(result.toolName).toBe("conversation_thread_search");
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.role).toBe("user");
+    expect(generatedMessageMetadata(messages[0]!)).toMatchObject({
+      kind: "conversation_recall",
+      id: "auto-thread-1",
+      threadIds: ["thread-1"],
+    });
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -10257,7 +10142,7 @@ describe("buildAutoInjectedThreadSearchMessages", () => {
       canonicalEnd: sourceMessages.length + injected.length,
       cumulativeAtomCount: source.segments.at(-1)!.cumulativeAtomCount + 1,
     });
-    expect(synthetic.canonicalMessages).toHaveLength(2);
+    expect(synthetic.canonicalMessages).toHaveLength(1);
     expect(synthetic.atoms).toHaveLength(1);
     expect(synthetic.atoms[0]?.kind).toBe("synthetic");
     expect(decodeCorePrimaryLineageV2(first, [...sourceMessages, ...injected]).status).toBe("ok");
@@ -10431,7 +10316,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       recordTiming: () => {},
       recordPlannerUsage: () => {},
       recordEmbeddingUsage: () => {},
-      recordJevUsage: () => {},
+      recordDecisionUsage: () => {},
       finish: (usage) => finishedUsage.push(usage),
     };
 
@@ -10603,12 +10488,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       onError: () => {},
     });
 
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -10843,13 +10725,10 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(plannedText).not.toContain("LILAC_META");
     expect(searchVerbose).toBe(true);
     expect(searchMinScore).toBe(0.42);
-    expect(messages).toHaveLength(2);
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
+    expect(messages).toHaveLength(1);
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -10992,12 +10871,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     });
 
     expect(searchQueries).toEqual(["auth cookies", "workplace context", "project architecture"]);
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -11085,12 +10961,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       onError: () => {},
     });
 
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -11227,12 +11100,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
 
     expect(requestedLimits).toEqual([15]);
     expect(highestRejectedThreadIds).toEqual(["generic-1"]);
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -11332,12 +11202,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(errors).toEqual([
       "auto-injected thread search failed; continuing with partial metadata",
     ]);
-    const toolMessage = messages[1];
-    if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
-      throw new Error("expected tool message");
-    }
-    const result = toolMessage.content[0];
-    if (result?.type !== "tool-result") throw new Error("expected tool result");
+    const result = {
+      output: { type: "json", value: { entries: readGeneratedPayload(messages).entries } },
+    };
     expect(result.output).toEqual({
       type: "json",
       value: {
@@ -11517,7 +11384,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     });
 
     expect(plannerCalls).toBe(1);
-    expect(messages).toHaveLength(2);
+    expect(messages).toHaveLength(1);
   });
 
   it("uses the follow-up threshold after previous auto-injected metadata", async () => {
@@ -11704,7 +11571,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     });
 
     expect(plannerCalls).toBe(1);
-    expect(messages).toHaveLength(2);
+    expect(messages).toHaveLength(1);
   });
 
   it("searches across surfaces when no comparable participant IDs are available", async () => {
@@ -11783,7 +11650,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       onError: () => {},
     });
 
-    expect(messages).toHaveLength(2);
+    expect(messages).toHaveLength(1);
     expect(plannerCalls).toBe(1);
     expect(searchCalls).toBe(1);
   });
@@ -11873,7 +11740,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       },
     });
 
-    expect(messages).toHaveLength(2);
+    expect(messages).toHaveLength(1);
     expect(injectedEvents).toHaveLength(1);
     const injectedEvent = injectedEvents[0];
     expect(injectedEvent?.toolCallId.startsWith("conversation_thread_")).toBe(true);
@@ -11891,7 +11758,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
   });
 });
 
-describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
+describe("maybeBuildAutoInjectedThreadSearchMessages with the Decision lane", () => {
   type ShortlistInput = Parameters<
     NonNullable<ConversationThreadToolService["shortlistAutoInjectCandidates"]>
   >[0];
@@ -11904,7 +11771,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
       configVersion: 2,
       surface: { discord: { botName: "lilac", allowedChannelIds: ["c1"] } },
       conversation: {
-        thread: { autoInject: { enabled: true }, autoInjectMode: "jev" },
+        thread: { autoInject: { enabled: true }, autoInjectMode: "decision" },
       },
     });
     return cfg;
@@ -11926,9 +11793,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
 
   function jevModel(probabilities: Record<string, number>) {
     const calls: Array<{ state: unknown; questionIds: string[] }> = [];
-    const evaluator: JevAutoInjectEvaluator = createJevAutoInjectEvaluatorForModel({
+    const evaluator: DecisionAutoInjectEvaluator = createDecisionAutoInjectEvaluatorForModel({
       modelId: "jev-test",
-      doEvaluate: async (options) => {
+      doDecide: async (options) => {
         calls.push({ state: options.state, questionIds: Object.keys(options.questions) });
         return {
           answers: Object.fromEntries(
@@ -11950,10 +11817,10 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
   ): ConversationThreadToolService {
     return {
       planAutoInjectSearch: async () => {
-        throw new Error("the Jev lane must not call the planner");
+        throw new Error("the Decision lane must not call the planner");
       },
       search: async () => {
-        throw new Error("the Jev lane must not call planned search");
+        throw new Error("the Decision lane must not call planned search");
       },
       metadata: async () => ({ threads: [], missing: [] }),
       read: async () => {
@@ -11968,18 +11835,205 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
 
   function usageRecorder() {
     const finished: Parameters<ConversationThreadAutoInjectUsageAccumulator["finish"]>[0][] = [];
-    const jev: Parameters<ConversationThreadAutoInjectUsageAccumulator["recordJevUsage"]>[0][] = [];
+    const jev: Parameters<
+      ConversationThreadAutoInjectUsageAccumulator["recordDecisionUsage"]
+    >[0][] = [];
     const usage: ConversationThreadAutoInjectUsageAccumulator = {
       recordTiming: () => {},
       recordPlannerUsage: () => {},
       recordEmbeddingUsage: () => {},
-      recordJevUsage: (input) => jev.push(input),
+      recordDecisionUsage: (input) => jev.push(input),
       finish: (input) => finished.push(input),
     };
     return { usage, finished, jev };
   }
 
-  it("injects Jev-selected candidates without the length gate or planner", async () => {
+  it("routes actual images to Luna and applies only the selected model's thresholds", async () => {
+    const cfg = jevCfg();
+    cfg.conversation.thread.decisionAutoInject.model = ["typesafe/jev-1.13.0", "openai/gpt-6-luna"];
+    cfg.conversation.thread.decisionAutoInject.jev.relevanceMinProbability = 0.7;
+    cfg.conversation.thread.decisionAutoInject.luna.relevanceMinProbability = 0.8;
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NMQEAAAjDMMC/ZzDBvlRA01vZJvwHAAAAAAAAAAAAbx2jxAE/i2AjOgAAAABJRU5ErkJggg==";
+    const models: string[] = [];
+    const cases: ModelMessage[][] = [
+      [{ role: "user", content: "recall the router diagram" }],
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "recall the router diagram" },
+            { type: "file", mediaType: "application/pdf", data: "ignored" },
+          ],
+        },
+      ],
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "recall the router diagram" },
+            { type: "file", mediaType: "image/png", data: Buffer.from(png, "base64") },
+          ],
+        },
+      ],
+      [
+        {
+          role: "user",
+          content: [{ type: "file", mediaType: "image/png", data: Buffer.from(png, "base64") }],
+        },
+        { role: "user", content: "recall the router diagram" },
+      ],
+    ];
+    const lengths: number[] = [];
+    for (const userMessages of cases) {
+      const result = await maybeBuildAutoInjectedThreadSearchMessages({
+        cfg,
+        requestId: "model-routing",
+        userMessages,
+        conversationThreads: threadService(async () =>
+          shortlistResult({ threadId: "prior", title: "Router diagram" }),
+        ),
+        createDecisionEvaluator: (model) => {
+          models.push(model);
+          return Result.ok({
+            model,
+            supportsImages: model.startsWith("openai/"),
+            evaluate: async () =>
+              Result.ok({ asksToRecall: 1, durableSubject: 0, casual: 1, relevance: [0.75] }),
+          });
+        },
+        publishToolStatus: async () => {},
+        onError: (message) => {
+          throw new Error(message);
+        },
+      });
+      lengths.push(result.length);
+    }
+    expect(models).toEqual([
+      "typesafe/jev-1.13.0",
+      "typesafe/jev-1.13.0",
+      "openai/gpt-6-luna",
+      "typesafe/jev-1.13.0",
+    ]);
+    expect(lengths).toEqual([1, 1, 0, 1]);
+  });
+
+  it("loads attached images for Luna even when the primary model received text markers", async () => {
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NMQEAAAjDMMC/ZzDBvlRA01vZJvwHAAAAAAAAAAAAbx2jxAE/i2AjOgAAAABJRU5ErkJggg==";
+    const cfg = jevCfg();
+    cfg.conversation.thread.decisionAutoInject.model = ["typesafe/jev-1.13.0", "openai/gpt-6-luna"];
+    const models: string[] = [];
+    let received: readonly string[] | undefined;
+    let loaded = 0;
+    const evaluator: DecisionAutoInjectEvaluator = {
+      model: "openai/gpt-6-luna",
+      supportsImages: true,
+      evaluate: async (input) => {
+        received = input.images;
+        return Result.ok({ asksToRecall: 1, durableSubject: 1, casual: 0, relevance: [0.9] });
+      },
+    };
+    const result = await maybeBuildAutoInjectedThreadSearchMessages({
+      cfg,
+      requestId: "decision-image",
+      userMessages: [{ role: "user", content: "remember the router diagram?" }],
+      loadDecisionUserMessages: async () => {
+        loaded++;
+        return [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "remember the router diagram?" },
+              { type: "file", mediaType: "image/png", data: Buffer.from(png, "base64") },
+            ],
+          },
+        ];
+      },
+      conversationThreads: threadService(async () =>
+        shortlistResult({ threadId: "prior", title: "Router diagram" }),
+      ),
+      createDecisionEvaluator: (model) => {
+        models.push(model);
+        return Result.ok(evaluator);
+      },
+      publishToolStatus: async () => {},
+      onError: () => {},
+    });
+    expect(models).toEqual(["openai/gpt-6-luna"]);
+    expect(loaded).toBe(1);
+    expect(received).toEqual([`data:image/png;base64,${png}`]);
+    expect(result).toHaveLength(1);
+  });
+
+  it("evaluates only the shortlist entries the evaluator accepts", async () => {
+    const { evaluator, calls } = jevModel({ asks_to_recall: 1, candidate_0: 0.9 });
+    const events: unknown[] = [];
+    const result = await maybeBuildAutoInjectedThreadSearchMessages({
+      cfg: jevCfg(),
+      requestId: "decision-candidate-cap",
+      userMessages: [{ role: "user", content: "remember the router retries?" }],
+      conversationThreads: threadService(async () =>
+        shortlistResult(
+          { threadId: "first", title: "Router retries" },
+          { threadId: "second", title: "Router outage" },
+          { threadId: "third", title: "Router diagram" },
+        ),
+      ),
+      createDecisionEvaluator: () => Result.ok({ ...evaluator, maxCandidates: 2 }),
+      publishToolStatus: async () => {},
+      onDecisionEvaluated: (event) => events.push(event),
+      onError: (message) => {
+        throw new Error(message);
+      },
+    });
+
+    expect(calls[0]?.questionIds).toEqual([
+      "asks_to_recall",
+      "durable_subject",
+      "casual",
+      "candidate_0",
+      "candidate_1",
+    ]);
+    expect(events).toEqual([expect.objectContaining({ candidateCount: 2 })]);
+    expect(result).toHaveLength(1);
+  });
+
+  it("does not load images for Jev and skips injection when Luna image loading fails", async () => {
+    const { evaluator } = jevModel({ asks_to_recall: 1, candidate_0: 0.9 });
+    let loaded = 0;
+    const errors: string[] = [];
+    const input = {
+      cfg: jevCfg(),
+      requestId: "decision-image-failure",
+      userMessages: [{ role: "user" as const, content: "remember the router diagram?" }],
+      loadDecisionUserMessages: async () => {
+        loaded++;
+        throw new Error("image unavailable");
+      },
+      conversationThreads: threadService(async () =>
+        shortlistResult({ threadId: "prior", title: "Router diagram" }),
+      ),
+      publishToolStatus: async () => {},
+      onError: (message: string) => errors.push(message),
+    };
+    const jevResult = await maybeBuildAutoInjectedThreadSearchMessages({
+      ...input,
+      createDecisionEvaluator: () => Result.ok(evaluator),
+    });
+    expect(jevResult).toHaveLength(1);
+    expect(loaded).toBe(0);
+    input.cfg.conversation.thread.decisionAutoInject.model = ["openai/gpt-6-luna"];
+    const lunaResult = await maybeBuildAutoInjectedThreadSearchMessages({
+      ...input,
+      createDecisionEvaluator: () => Result.ok({ ...evaluator, supportsImages: true }),
+    });
+    expect(lunaResult).toEqual([]);
+    expect(loaded).toBe(1);
+    expect(errors).toEqual(["Decision image preparation failed; continuing without metadata"]);
+  });
+
+  it("injects Decision-selected candidates without the length gate or planner", async () => {
     const shortlistInputs: ShortlistInput[] = [];
     const { evaluator, calls } = jevModel({
       asks_to_recall: 0.92,
@@ -12007,12 +12061,12 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
           { threadId: "native:retries", title: "Router retries" },
         );
       }),
-      createJevEvaluator: () => Result.ok(evaluator),
+      createDecisionEvaluator: () => Result.ok(evaluator),
       autoInjectUsage: usage,
       publishToolStatus: async (update) => {
         statuses.push({ status: update.status, ok: update.ok, output: update.output });
       },
-      onJevEvaluated: (event) => events.push(event),
+      onDecisionEvaluated: (event) => events.push(event),
       onError: (message) => {
         throw new Error(message);
       },
@@ -12032,27 +12086,16 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
         questionIds: ["asks_to_recall", "durable_subject", "casual", "candidate_0", "candidate_1"],
       },
     ]);
-    expect(messages[0]).toMatchObject({
-      role: "assistant",
-      content: [{ input: { note: "auto-injected for the latest user input" } }],
-    });
-    expect(messages[1]).toMatchObject({
-      role: "tool",
-      content: [
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.role).toBe("user");
+    expect(readGeneratedPayload(messages)).toMatchObject({
+      note: "auto-injected for the latest user input",
+      entries: [
         {
-          output: {
-            type: "json",
-            value: {
-              entries: [
-                {
-                  surface: "native",
-                  threadId: "native:retries",
-                  title: "Router retries",
-                  brief: "Router retries brief.",
-                },
-              ],
-            },
-          },
+          surface: "native",
+          threadId: "native:retries",
+          title: "Router retries",
+          brief: "Router retries brief.",
         },
       ],
     });
@@ -12099,7 +12142,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
         shortlistTexts.push(input.text);
         return { source: "none", results: [] };
       }),
-      createJevEvaluator: () => Result.ok(evaluator),
+      createDecisionEvaluator: () => Result.ok(evaluator),
       autoInjectUsage: usage,
       publishToolStatus: async () => {
         statusCount += 1;
@@ -12116,7 +12159,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
     expect(finished).toEqual([{ status: "abstained" }]);
   });
 
-  it("abstains when the Jev gate stays closed", async () => {
+  it("abstains when the Decision gate stays closed", async () => {
     const { evaluator } = jevModel({ casual: 0.95, durable_subject: 0.9, candidate_0: 0.99 });
     const { usage, finished } = usageRecorder();
     const events: Array<{ gate: string | null; entries: readonly unknown[] }> = [];
@@ -12128,10 +12171,10 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
       conversationThreads: threadService(async () =>
         shortlistResult({ threadId: "native:garden", title: "Garden plan" }),
       ),
-      createJevEvaluator: () => Result.ok(evaluator),
+      createDecisionEvaluator: () => Result.ok(evaluator),
       autoInjectUsage: usage,
       publishToolStatus: async () => {},
-      onJevEvaluated: (event) => events.push({ gate: event.gate, entries: event.entries }),
+      onDecisionEvaluated: (event) => events.push({ gate: event.gate, entries: event.entries }),
       onError: (message) => {
         throw new Error(message);
       },
@@ -12142,10 +12185,10 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
     expect(finished).toEqual([{ status: "abstained" }]);
   });
 
-  it("reports Jev failures and continues without metadata", async () => {
-    const evaluator = createJevAutoInjectEvaluatorForModel({
+  it("reports Decision failures and continues without metadata", async () => {
+    const evaluator = createDecisionAutoInjectEvaluatorForModel({
       modelId: "jev-test",
-      doEvaluate: async () => {
+      doDecide: async () => {
         throw new Error("503 Service Unavailable");
       },
     });
@@ -12160,7 +12203,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
       conversationThreads: threadService(async () =>
         shortlistResult({ threadId: "native:retries", title: "Router retries" }),
       ),
-      createJevEvaluator: () => Result.ok(evaluator),
+      createDecisionEvaluator: () => Result.ok(evaluator),
       autoInjectUsage: usage,
       publishToolStatus: async (update) => {
         statuses.push({ status: update.status, ok: update.ok, error: update.error });
@@ -12176,7 +12219,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
     });
     expect(errors).toEqual([
       {
-        message: "Jev auto-inject evaluation failed; continuing without metadata",
+        message: "Decision auto-inject evaluation failed; continuing without metadata",
         error: "503 Service Unavailable",
       },
     ]);
@@ -12193,19 +12236,19 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Jev lane", () => {
       userMessages: [{ role: "user", content: "what did we decide about the router?" }],
       conversationThreads: threadService(async () => {
         shortlistCalls += 1;
-        return { source: "none", results: [] };
+        return shortlistResult({ threadId: "prior", title: "Router" });
       }),
       publishToolStatus: async () => {
         throw new Error("status must not be published");
       },
       onError: (message, error) => errors.push(`${message}: ${error.message}`),
-      createJevEvaluator: (model) => createJevAutoInjectEvaluator({ model }),
+      createDecisionEvaluator: (model) => createDecisionAutoInjectEvaluator({ model }),
     });
 
     expect(messages).toEqual([]);
-    expect(shortlistCalls).toBe(0);
+    expect(shortlistCalls).toBe(1);
     expect(errors).toEqual([
-      "Jev auto-inject is unavailable; continuing without metadata: TYPESAFE_AI_API_KEY is required when conversation.thread.autoInjectMode is jev",
+      "Decision auto-inject is unavailable; continuing without metadata: TYPESAFE_AI_API_KEY is required for typesafe decision auto-inject",
     ]);
   });
 });
@@ -13610,38 +13653,13 @@ describe("assistant text part boundary accumulation", () => {
   });
 });
 
-describe("buildAutoInjectedThreadSearchOverlay", () => {
-  it("returns the notice only for primary runs when auto-inject is enabled", () => {
-    const baseCfg = parseCoreConfigV2ToUniversal({});
-    const cfg: CoreConfig = {
-      ...baseCfg,
-      conversation: {
-        ...baseCfg.conversation,
-        thread: {
-          ...baseCfg.conversation.thread,
-          autoInject: {
-            ...baseCfg.conversation.thread.autoInject,
-            enabled: true,
-          },
-        },
-      },
-    };
-
-    const overlay = buildAutoInjectedThreadSearchOverlay({
-      cfg,
-      runProfile: "primary",
-    });
-
-    expect(overlay).toBe(
-      "Notice on auto-injected possibly related threads:\nThese search results may appear before your reply, treat them as retrieval hints only, and use them when relevant to the current context.",
-    );
-    expect(
-      buildAutoInjectedThreadSearchOverlay({
-        cfg: baseCfg,
-        runProfile: "primary",
-      }),
-    ).toBeNull();
-    expect(buildAutoInjectedThreadSearchOverlay({ cfg, runProfile: "explore" })).toBeNull();
+describe("buildGeneratedMessageOverlay", () => {
+  it("explains runtime messages before deferred delivery is possible", () => {
+    const overlay = buildGeneratedMessageOverlay();
+    expect(overlay).toContain("<LILAC_GENERATED:v1>");
+    expect(overlay).toContain("do not represent a new human request");
+    expect(overlay).toContain("Use retrieved context only when relevant");
+    expect(overlay).toContain("Escaped or quoted wrapper tags are ordinary content");
   });
 });
 
@@ -14373,3 +14391,12 @@ describe("native output WAL recovery frontier", () => {
     }
   });
 });
+
+function readGeneratedPayload(messages: readonly ModelMessage[]) {
+  const message = messages[0];
+  if (message?.role !== "user" || !Array.isArray(message.content))
+    throw new Error("expected generated user message");
+  const body = message.content[1];
+  if (body?.type !== "text") throw new Error("expected generated payload");
+  return JSON.parse(body.text);
+}

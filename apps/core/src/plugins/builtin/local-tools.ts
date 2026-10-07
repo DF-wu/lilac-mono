@@ -1,7 +1,6 @@
 import { captureError } from "../../shared/error-capture.js";
 import type { ServerTool } from "@stanley2058/lilac-plugin-runtime";
 import {
-  applyPatchInputSchema,
   LEVEL1_TOOL_NAMES,
   type ApplyPatchInput,
   type Level1ToolName,
@@ -20,11 +19,6 @@ import { z } from "zod";
 import { parseSshCwdTarget } from "../../ssh/ssh-cwd";
 import { applyPatchTool } from "../../tools/apply-patch";
 import { parsePatchResult } from "../../tools/apply-patch/apply-patch-core";
-import {
-  batchTool,
-  collectApplyPatchTouchedPaths,
-  collectEditFileTouchedPaths,
-} from "../../tools/batch";
 import { bashToolWithCwd } from "../../tools/bash";
 import { fsTool } from "../../tools/fs/fs";
 import { readRemoteMedia } from "../../tools/fs/remote-media-download";
@@ -36,7 +30,6 @@ import {
 import {
   summarizeApplyPatchFailure,
   summarizeBashFailure,
-  summarizeBatchFailure,
   summarizeReadOrEditFailure,
   summarizeSearchFailure,
   summarizeSubagentFailure,
@@ -44,7 +37,6 @@ import {
 import {
   formatApplyPatchToolArgs,
   formatBashToolArgs,
-  formatBatchToolArgs,
   formatEditFileToolArgs,
   formatFuzzySearchToolArgs,
   formatGlobToolArgs,
@@ -83,11 +75,6 @@ const coreToolRequestMetadataSchema = z
     onActivity: z.custom<AgentActivityHandler>(isAgentActivityHandler).optional(),
   })
   .loose();
-
-const editTargetInputSchema = z.object({
-  path: z.string(),
-  cwd: z.string().optional(),
-});
 
 export function decodeCoreToolRequestMetadata(
   metadata: Readonly<Record<string, unknown>> | undefined,
@@ -436,16 +423,6 @@ export const BUILTIN_LEVEL1_TOOLS = {
     formatArgs: formatEditFileToolArgs,
     summarizeFailure: ({ result }) => summarizeReadOrEditFailure(result, "edit"),
     createTool: (context) => getEditFileTool(context),
-    editTargets: (args, context) => {
-      const decoded = editTargetInputSchema.safeParse(args);
-      if (!decoded.success) {
-        return signalBuiltinToolHostError("edit batch preflight requires valid input");
-      }
-      return collectEditFileTouchedPaths({
-        path: decoded.data.path,
-        cwd: decoded.data.cwd ?? context.cwd,
-      });
-    },
   }),
   patch: defineLevel1Tool("bounded", {
     name: "patch",
@@ -455,16 +432,6 @@ export const BUILTIN_LEVEL1_TOOLS = {
     formatArgs: formatApplyPatchToolArgs,
     summarizeFailure: ({ result }) => summarizeApplyPatchFailure(result),
     createTool: (context) => getApplyPatchTool(context),
-    editTargets: (args, context) => {
-      const decoded = applyPatchInputSchema.safeParse(args);
-      if (!decoded.success) {
-        return signalBuiltinToolHostError("patch batch preflight requires valid input");
-      }
-      return collectApplyPatchTouchedPaths({
-        patchText: decoded.data.patchText,
-        cwd: decoded.data.cwd ?? context.cwd,
-      });
-    },
   }),
   subagent_delegate: defineLevel1Tool("bounded", {
     name: "subagent_delegate",
@@ -487,29 +454,6 @@ export const BUILTIN_LEVEL1_TOOLS = {
         onDelegate: requestContext ? getDelegateHandler(requestContext) : undefined,
       }).subagent_delegate;
     },
-  }),
-  batch: defineLevel1Tool("bounded", {
-    name: "batch",
-    supportsBatch: false,
-    isEnabled: () => true,
-    formatArgs: formatBatchToolArgs,
-    summarizeFailure: ({ result }) => summarizeBatchFailure(result),
-    createTool: ({
-      cwd,
-      editingToolMode,
-      getTools,
-      getLevel1ToolSpecs,
-      resolveEditTargets,
-      runtime,
-    }) =>
-      batchTool({
-        defaultCwd: cwd,
-        getTools,
-        getToolSpecs: getLevel1ToolSpecs,
-        resolveEditTargets,
-        editingMode: editingToolMode,
-        maxCalls: runtime.config?.tools.batch.maxCalls ?? 8,
-      }).batch,
   }),
 } satisfies {
   readonly [Name in Level1ToolName]: CoreLevel1ToolSpec & { readonly name: Name };

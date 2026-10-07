@@ -16,6 +16,7 @@ import { ConnectionLoading } from "./components/ui/connection-loading";
 import { ReconnectionDemo } from "./components/ReconnectionDemo";
 import { ConversationBadge, ConversationIcon } from "./components/ConversationReference";
 import lilacLogo from "./assets/logo.svg";
+import { ActivityItem } from "./components/ActivityLog";
 import { LinkPreviewAnchor } from "./components/LinkWithFavicon";
 import { SidebarEmptyState } from "./components/SidebarEmptyState";
 import { ConversationStatus } from "./components/ConversationStatus";
@@ -96,6 +97,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { Markdown } from "./components/Markdown";
 import { Composer } from "./components/Composer";
 import { Message, ThinkingIndicator } from "./components/Timeline";
+import { ThreadSettleButton } from "./components/ThreadSettleButton";
 import { ThreadQueueDemo } from "./components/ThreadQueueDemo";
 import { DeploymentSettingsForm } from "./components/DeploymentSettings";
 import { AgentWorkDemo } from "./components/AgentWorkDemo";
@@ -104,6 +106,7 @@ import { AgentDiscordLink } from "./components/AgentIdentity";
 import { ExternalMessages } from "./components/ExternalMessages";
 import { ExternalSkeleton } from "./components/ExternalSidebar";
 import { ThreadCard } from "./components/ThreadSelect";
+import { toolActivities } from "./generated/tool-activities";
 import "./design-system.css";
 
 const sections = [
@@ -282,17 +285,7 @@ const messageFixtures: DisplayMessage[] = [
           durationMs: 2100,
         },
       },
-      {
-        type: "data-activity",
-        id: "gallery-search",
-        data: {
-          kind: "tool",
-          label: "Searched nearby places",
-          state: "complete",
-          detail: "Found three cafés and two independent bookstores.",
-          durationMs: 900,
-        },
-      },
+      { type: "data-activity", id: "gallery-search", data: toolActivities.nearby.settled },
       {
         type: "text",
         text: "The café opens earlier than the bookstore, so that order works well.",
@@ -342,7 +335,7 @@ const messageFixtures: DisplayMessage[] = [
   },
 ];
 const richText =
-  '### A small plan\n\nUse **bold**, *italic*, ~~strikethrough~~, and `inline code`. Links include a favicon: [GitHub](https://github.com).\n\n> Leave enough room to change your mind.\n\n- [x] Pick a place\n- [ ] Check the weather\n\n| Time | Plan |\n| --- | --- |\n| Morning | Coffee and a walk |\n| Afternoon | Bookstore |\n\n```typescript\nconst weekend = { pace: "slow", reservations: false };\nconsole.log("There is time to stop and explore", weekend);\n```\n\n```bash\nbun run dev:web\n```\n\nCurrency stays prose: your $10 suggestion makes sense over $7.\n\n**注意：**粗體與~~刪除線：~~在全形標點後也能正確結束。\n\nInline math: $a^2 + b^2 = c^2$.\n\n$$\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n$$\n\nLaTeX delimiters: \\(e^{i\\pi} + 1 = 0\\)\n\n\\[\n\\sum_{n=1}^{\\infty} \\frac{1}{n^2} = \\frac{\\pi^2}{6}\n\\]\n\nEscaped brackets stay literal: array\\[0\\] and see \\[1\\].\n\n```mermaid\nflowchart LR\n  Coffee --> Walk --> Bookstore\n```';
+  '### A small plan\n\nUse **bold**, *italic*, ~~strikethrough~~, and `inline code`. Links include a favicon: [GitHub](https://github.com).\n\n> Leave enough room to change your mind.\n\n- [x] Pick a place\n- [ ] Check the weather\n\n| Time | Plan |\n| --- | --- |\n| Morning | Coffee and a walk |\n| Afternoon | Bookstore |\n\n```typescript\nconst weekend = { pace: "slow", reservations: false };\nconsole.log("There is time to stop and explore", weekend);\n```\n\n```bash\nbun run dev:web\n```\n\nCurrency stays prose: your $10 suggestion makes sense over $7.\n\n**注意：**粗體與~~刪除線：~~在全形標點後也能正確結束。\n\nInline math: $a^2 + b^2 = c^2$.\n\n$$\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n$$\n\nLaTeX delimiters: \\(e^{i\\pi} + 1 = 0\\)\n\n\\[\n\\sum_{n=1}^{\\infty} \\frac{1}{n^2} = \\frac{\\pi^2}{6}\n\\]\n\nEscaped brackets stay literal: array\\[0\\] and see \\[1\\].\n\n```mermaid\nflowchart TD\n  Coffee["Coffee and a slow start"] --> Weather{"What does the weather look like?"}\n  Weather -->|Clear| Walk["A long walk through the neighborhood"]\n  Weather -->|Rain| Bookstore["Find a book and somewhere warm to read"]\n```';
 
 const tableExample = [
   "| Restaurant | Location | Budget per person | Why consider it |",
@@ -397,24 +390,7 @@ function Specimen({
   );
 }
 function DemoThreadActions({ onAction }: { onAction: (label: string) => void }) {
-  return (
-    <>
-      <IconButton
-        label="Settle conversation"
-        tooltip="Settle"
-        onClick={() => onAction("Settle selected")}
-      >
-        <Check />
-      </IconButton>
-      <IconButton
-        label="Rename conversation"
-        tooltip="Rename"
-        onClick={() => onAction("Rename selected")}
-      >
-        <Pencil />
-      </IconButton>
-    </>
-  );
+  return <ThreadSettleButton onClick={() => onAction("Settle selected")} />;
 }
 function Foundations() {
   return (
@@ -895,7 +871,7 @@ function ComposerSpecimen() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(false);
   const [text, setText] = useState(
-    "Help me turn these **notes** into a weekend plan.\n\nKeep Sunday free.\nhttps://example.com/weekend",
+    "Help me turn these **notes** into a weekend plan.\n\nCompare [the discussion](/?ref=discord%3Aweekend). Keep Sunday free.\nhttps://example.com/weekend",
   );
   const [disabled, setDisabled] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>(() => [
@@ -1747,6 +1723,34 @@ export default function DesignSystem() {
                       Loading preview
                     </LinkPreviewAnchor>
                   </div>
+                  <Specimen title="Remote images">
+                    <LinkPreviewAnchor
+                      href="https://claude.dev/blog/how-we-made-claude-ai-faster/"
+                      preview={{
+                        title: "How we made claude.ai 3x faster in two weeks",
+                        icon: "https://claude.dev/shared/img/favicon.svg",
+                        image: "https://claude.dev/blog/how-we-made-claude-ai-faster/og.png",
+                      }}
+                    >
+                      claude.dev
+                    </LinkPreviewAnchor>
+                    <ActivityItem
+                      part={{
+                        type: "data-activity",
+                        id: "remote-image-preview",
+                        data: {
+                          kind: "tool",
+                          label: "read",
+                          state: "complete",
+                          detail: 'read {"path":"https://claude.dev/shared/img/favicon.svg"}',
+                          file: {
+                            path: "https://claude.dev/shared/img/favicon.svg",
+                            mediaType: "image/svg+xml",
+                          },
+                        },
+                      }}
+                    />
+                  </Specimen>
                   <Markdown text={richText} />
                   <Specimen title="Table with long descriptions">
                     <Markdown text={tableExample} />

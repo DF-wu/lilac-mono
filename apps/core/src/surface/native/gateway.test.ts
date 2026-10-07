@@ -171,6 +171,14 @@ async function expectSocketRejected(url: URL, headers: Record<string, string> = 
 }
 
 describe("native gateway", () => {
+  test("remote images require authentication and reject private destinations", async () => {
+    const { url, token } = await fixture();
+    const endpoint = new URL("api/remote-image?url=http%3A%2F%2F127.0.0.1%2Fimage.png", url);
+    expect((await fetch(endpoint)).status).toBe(401);
+    expect((await fetch(endpoint, { headers: { authorization: `Bearer ${token}` } })).status).toBe(
+      502,
+    );
+  });
   test("link metadata uses the authenticated RPC contract", async () => {
     const { url, token, services } = await fixture();
     let viewer: string | undefined;

@@ -43,7 +43,6 @@ export type AgentToolRequest = {
 export type AgentToolResult = {
   readonly callId: string;
   readonly message: ToolModelMessage;
-  readonly expansionMessages?: readonly ModelMessage[];
   readonly executedCallCount?: number;
 };
 

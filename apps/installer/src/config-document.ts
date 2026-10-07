@@ -6,6 +6,7 @@ import { isAlias, isMap, isScalar, parseDocument, type Document } from "yaml";
 import { parseCoreConfigResult } from "@stanley2058/lilac-utils/core-config/parse";
 import { jsonValueSchema } from "@stanley2058/lilac-utils/core-config/v1";
 import type { CoreConfig, JSONValue } from "@stanley2058/lilac-utils/core-config/types";
+import { isRecord } from "@stanley2058/lilac-utils/runtime-utils";
 
 export type ConfigDocument = Document.Parsed;
 export type ConfigPath = readonly (string | number)[];
@@ -20,7 +21,10 @@ export class InstallerConfigIoFailed extends TaggedError("InstallerConfigIoFaile
 }> {}
 
 export function createConfigDocument(): ConfigDocument {
-  return parseDocument("configVersion: 2\n", { merge: true });
+  return parseDocument(
+    "# yaml-language-server: $schema=./.schemas/core-config.schema.json\nconfigVersion: 2\n",
+    { merge: true },
+  );
 }
 
 export function validateConfigDocument(
@@ -101,12 +105,12 @@ export function getConfigValue(
   let value: JSONValue | undefined = parsed.data;
   for (const segment of keyPath) {
     if (value === null || typeof value !== "object") return undefined;
-    if (Array.isArray(value)) {
-      if (typeof segment !== "number") return undefined;
-      value = value[segment];
+    if (isRecord(value)) {
+      value = value[String(segment)];
       continue;
     }
-    value = value[String(segment)];
+    if (typeof segment !== "number") return undefined;
+    value = value[segment];
   }
   return value;
 }

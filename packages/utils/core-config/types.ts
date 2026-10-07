@@ -1,8 +1,8 @@
 import type { GenerateToolsConfig } from "./generate-image";
 import type { TelegramSurfaceConfig } from "./telegram-surface";
 
-export type JSONValue = null | string | number | boolean | JSONObject | JSONArray;
-export type JSONArray = JSONValue[];
+export type JSONValue = null | string | number | boolean | Readonly<JSONObject> | JSONArray;
+export type JSONArray = readonly JSONValue[];
 export type JSONObject = {
   [key: string]: JSONValue | undefined;
 };
@@ -29,6 +29,13 @@ export type RetentionLimit =
 export const DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000;
 export const DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS = 10_000;
 export const DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+export type DecisionAutoInjectProbabilities = {
+  recallMinProbability: number;
+  durableSubjectMinProbability: number;
+  casualMaxProbability: number;
+  relevanceMinProbability: number;
+};
 
 export type DiscordUserAliasConfig = {
   discord: string;
@@ -256,16 +263,14 @@ export type UniversalCoreConfig = {
         mode: "hybrid" | "semantic" | "lexical";
         filterCurrentParticipants: boolean;
       };
-      autoInjectMode: "llm" | "jev";
-      jevAutoInject: {
-        model: string;
+      autoInjectMode: "llm" | "decision";
+      decisionAutoInject: {
+        model: string[];
         limit: number;
         candidateLimit: number;
         semanticFallback: boolean;
-        recallMinProbability: number;
-        durableSubjectMinProbability: number;
-        casualMaxProbability: number;
-        relevanceMinProbability: number;
+        jev: DecisionAutoInjectProbabilities;
+        luna: DecisionAutoInjectProbabilities;
       };
     };
   };

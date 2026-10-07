@@ -1,5 +1,48 @@
 # MIGRATIONS.md
 
+## Decision auto-inject configuration
+
+Rename version-2 `conversation.thread.autoInjectMode: jev` to `decision` and the `jevAutoInject`
+section to `decisionAutoInject`. Old settings normalize to the new runtime shape, preserving thresholds;
+the new section wins if both are present. No config-version or database migration is required.
+`decisionAutoInject.model` is now an ordered array. Single strings still parse. Move the four
+`*Probability` fields into `decisionAutoInject.jev` or `decisionAutoInject.luna`; old flat fields
+apply to both scopes, with explicit scoped fields taking precedence. Configure
+`[typesafe/jev-1.13.0, openai/gpt-6-luna]` to select Jev for text and Luna for attached images.
+The array controls routing, without retrying another model on failure. Log queries must also change:
+the `conversation.thread.auto_inject.jev` event is now `conversation.thread.auto_inject.decision`,
+and the usage record's `jev` field and timing stage are now `decision`. OpenAI can evaluate
+attached images through existing scoped resource access. See [config migration guidance](docs/core-config-migrations.md#decision-auto-inject-lane).
+
+## Native workflow cards
+
+Native display messages accept a `data-workflow` part that carries a structured workflow progress
+card: status, start and end times, step counts, phases, current steps, waits, the result or failure
+reason, agent counts, and the next scheduled run. Core adds it to native workflow progress messages
+next to the existing markdown text and `data-actions` controls, and replaces it on each edit. The web
+app renders the card as its own block in place of the text. Discord and GitHub cards are unchanged.
+Existing progress messages keep their text-only form until their next edit. Stored data needs no
+backfill. Update Core, web, and TUI together because older strict validators reject the new part.
+
+## Generated context messages
+
+New deferred subagent completions, automatic conversation recall, and custom-command outputs use
+labeled user messages with `providerOptions.lilac.generated` version 1 metadata. Existing message
+codecs preserve this metadata, so no database rewrite or schema bump is required. Existing synthetic
+tool exchanges remain readable and participate in completion and recall deduplication. Generated
+messages do not count as human turns for compaction. Deploy the runtime and adapters together.
+
+## Batch retirement
+
+The `batch` tool and tool-call expansion API are removed. Ordinary model-issued calls run concurrently
+in received-order groups separated by `write`, `edit`, and `patch` calls, including their legacy
+aliases. Each mutation waits for the preceding group and finishes before the following group starts.
+Bash calls may race. The Claude MCP bridge applies barriers in request-receipt order; Claude owns when
+it submits those requests. Existing `tools.batch.maxCalls`, `supportsBatch`, and `editTargets` fields
+remain accepted for configuration/plugin compatibility but no longer control execution. Remove them
+from maintained configurations and plugins. Old transcripts remain replayable; a newly attempted
+`batch` call receives the ordinary unknown-tool error.
+
 ## Native activity details
 
 Native output activity payloads and `data-activity` display parts add optional `output`,
@@ -23,7 +66,6 @@ Viewer credentials are fetched under the native thread edit permission, kept in 
 the viewer frame using origin-checked messages. They are not included in URLs or the conversation
 cache. Existing direct noVNC links and provisioning responses remain unchanged.
 
-
 ## Native web keybindings
 
 Keyboard shortcuts are stored only in the browser under `lilac-keybindings-v1`, scoped to the
@@ -31,13 +73,11 @@ installation and principal. The version 1 payload contains physical key codes an
 each action; null disables an action. Missing, invalid, duplicate, or unsupported payloads use
 default bindings without rewriting storage. No Core configuration or server-data migration is needed.
 
-
 ## Native reaction names
 
 Reaction responses add optional `userNames` (at most five display names) and `overflowCount`.
 Core projects these fields from current users when personalizing messages; stored messages need no
 backfill. Update Core and web together because older strict response validators reject these fields.
-
 
 ## Native deployment settings
 
@@ -140,7 +180,6 @@ old credential/cache directories are not automatically deleted. Stop using those
 those local files if no longer needed. Web authentication and retained conversations are unchanged.
 Operator-only Core startup is enabled by the existing container operator-token hash without enabling
 the public native listener or requiring Discord. The native owner ID is reused if web is enabled later.
-
 
 This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
 documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).

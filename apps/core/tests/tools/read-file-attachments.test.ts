@@ -3,13 +3,9 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { asSchema, type ToolModelMessage, type ToolSet } from "ai";
-import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
-import { AiSdkPiAgent } from "@stanley2058/lilac-agent";
+import { asSchema } from "ai";
 import { Result } from "better-result";
 
-import { createToolResultOutputNormalizer } from "../../src/artifacts/tool-result-output-normalizer";
-import { batchTool } from "../../src/tools/batch";
 import { fsTool } from "../../src/tools/fs/fs";
 
 describe("read attachments", () => {
@@ -73,22 +69,6 @@ describe("read attachments", () => {
         property.description,
       ]),
     );
-  }
-
-  function zeroUsage() {
-    return {
-      inputTokens: {
-        total: 0,
-        noCache: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-      },
-      outputTokens: {
-        total: 0,
-        text: 0,
-        reasoning: 0,
-      },
-    };
   }
 
   beforeEach(async () => {
@@ -411,101 +391,6 @@ describe("read attachments", () => {
       success: false,
       error: { message: expect.stringContaining("does not accept this file type") },
     });
-  });
-
-  it("returns image content through an expanded batch child result", async () => {
-    const pngBase64 =
-      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=";
-    const pngBytes = Buffer.concat([Buffer.from(pngBase64, "base64"), Buffer.alloc(50 * 1024)]);
-    await writeFile(path.join(baseDir, "batched.png"), pngBytes);
-    const tools: ToolSet = {} as ToolSet;
-    Object.assign(
-      tools,
-      fsTool(baseDir, {
-        readFileDirectImageSupported: true,
-        readFileDirectPdfSupported: true,
-      }),
-    );
-    Object.assign(
-      tools,
-      batchTool({ defaultCwd: baseDir, getTools: () => tools, editingMode: "none" }),
-    );
-    const model = new MockLanguageModelV4({
-      doStream: [
-        {
-          stream: simulateReadableStream({
-            chunks: [
-              {
-                type: "tool-call",
-                toolCallId: "batch-media",
-                toolName: "batch",
-                input: JSON.stringify({
-                  tool_calls: [{ tool: "read", parameters: { path: "batched.png" } }],
-                }),
-              },
-              {
-                type: "finish",
-                finishReason: { unified: "tool-calls", raw: "tool-calls" },
-                usage: zeroUsage(),
-              },
-            ],
-          }),
-        },
-        {
-          stream: simulateReadableStream({
-            chunks: [
-              {
-                type: "finish",
-                finishReason: { unified: "stop", raw: "stop" },
-                usage: zeroUsage(),
-              },
-            ],
-          }),
-        },
-      ],
-    });
-    const normalize = createToolResultOutputNormalizer({
-      owner: { requestId: "batch-media-request", scopeId: "batch-media-session" },
-      getOutputConfig: () => ({
-        maxPreviewBytes: 40 * 1024,
-        artifactTtlMs: 60_000,
-        artifactMaxBytesPerSession: 1024 * 1024,
-      }),
-    });
-    const agent = new AiSdkPiAgent({
-      system: "test",
-      model,
-      tools,
-      normalizeToolResultOutput: normalize,
-      normalizeSettledToolResultOutputs: normalize.normalizeSettled,
-    });
-
-    await agent.prompt("read the image in a batch");
-
-    const childResult = agent.state.messages.find(
-      (message): message is ToolModelMessage =>
-        message.role === "tool" &&
-        message.content.some((part) => part.type === "tool-result" && part.toolName === "read"),
-    );
-    expect(childResult).toBeDefined();
-    if (!childResult) return;
-    const part = childResult.content.find(
-      (candidate) => candidate.type === "tool-result" && candidate.toolName === "read",
-    );
-    expect(part?.type).toBe("tool-result");
-    if (part?.type !== "tool-result") return;
-    expect(part.output.type).toBe("content");
-    if (part.output.type !== "content") return;
-    expect(part.output.value).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "file",
-          mediaType: "image/png",
-          filename: "batched.png",
-          data: { type: "data", data: pngBytes.toString("base64") },
-        }),
-      ]),
-    );
   });
 
   it("rejects oversized images before attachment caching with resize guidance", async () => {

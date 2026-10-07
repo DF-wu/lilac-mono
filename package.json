@@ -16,6 +16,8 @@
     "bench:blob-storage": "bun apps/core/scripts/bench-blob-storage.ts",
     "codegen:model-options": "bun scripts/generate-provider-option-shapes.ts",
     "codegen:model-options:check": "bun scripts/generate-provider-option-shapes.ts --check",
+    "codegen:design-tool-activities": "bun apps/core/scripts/generate-design-tool-activities.ts",
+    "codegen:design-tool-activities:check": "bun apps/core/scripts/generate-design-tool-activities.ts --check",
     "docker:build": "bun scripts/docker-build.ts build",
     "docker:compose:build": "bun scripts/docker-build.ts compose-build",
     "docker:verify": "docker compose exec -T lilac /usr/local/bin/tools --operator --list",
@@ -23,7 +25,7 @@
     "fork:footprint": "bun scripts/fork/check-upstream-footprint.ts",
     "check": "bun run --parallel --no-exit-on-error 'check:lane:*'",
     "check:lane:architecture": "bun scripts/architecture/runner.ts check --workers=2 && bun run test:architecture",
-    "check:lane:static": "bun run codegen:model-options:check && bun run lint:oxlint && bun run lint:architecture:syntax && bun run fmt:check",
+    "check:lane:static": "bun run codegen:config-schemas:check && bun run codegen:model-options:check && bun run codegen:design-tool-activities:check && bun run lint:oxlint && bun run lint:architecture:syntax && bun run fmt:check",
     "check:lane:typed-tests": "bun run typecheck && bun run test:non-architecture",
     "lint": "bun run lint:oxlint && bun run lint:architecture",
     "lint:fix": "oxlint --tsconfig tsconfig.json --fix apps packages scripts/generate-provider-option-shapes.ts scripts/architecture scripts/oxlint-plugins scripts/fork examples __tests__",
@@ -50,7 +52,7 @@
     "typecheck:workspaces": "set -e; pids=''; for dir in apps/* packages/*; do if [ -f \"$dir/tsconfig.json\" ]; then bunx tsc -p \"$dir/tsconfig.json\" --noEmit & pids=\"$pids $!\"; fi; done; for pid in $pids; do wait \"$pid\"; done",
     "fmt": "oxfmt --write \"apps/**/*.{ts,tsx,js,cjs,mjs,json}\" \"packages/**/*.{ts,tsx,js,cjs,mjs,json}\" \"scripts/generate-provider-option-shapes.ts\" \"scripts/architecture/**/*.{ts,mts,json}\" \"scripts/oxlint-plugins/**/*.{ts,mts}\" \"scripts/fork/**/*.ts\" \"examples/**/*.{ts,tsx,js,cjs,mjs,json}\" \"__tests__/**/*.{ts,tsx,js,cjs,mjs,json}\" \"*.json\"",
     "fmt:check": "oxfmt --check \"apps/**/*.{ts,tsx,js,cjs,mjs,json}\" \"packages/**/*.{ts,tsx,js,cjs,mjs,json}\" \"scripts/generate-provider-option-shapes.ts\" \"scripts/architecture/**/*.{ts,mts,json}\" \"scripts/oxlint-plugins/**/*.{ts,mts}\" \"scripts/fork/**/*.ts\" \"examples/**/*.{ts,tsx,js,cjs,mjs,json}\" \"__tests__/**/*.{ts,tsx,js,cjs,mjs,json}\" \"*.json\"",
-    "ci": "bun run codegen:model-options:check && bun run lint && bun run test:ci && bun run typecheck && bun run fmt:check && echo 'check passed'",
+    "ci": "bun run codegen:config-schemas:check && bun run codegen:model-options:check && bun run codegen:design-tool-activities:check && bun run lint && bun run test:ci && bun run typecheck && bun run fmt:check && echo 'check passed'",
     "docker:build:computer-use": "docker build -t lilac-computer:local packages/computer-use-runner && docker build -t lilac-computer-gateway:local -f apps/computer-use-gateway/Dockerfile .",
     "test:computer-use": "bun run --filter='@stanley2058/lilac-computer-use-gateway' --filter='@stanley2058/lilac-computer-use-runner' test",
     "test:computer-use:docker": "LILAC_COMPUTER_DOCKER_TEST=1 bun run --filter='@stanley2058/lilac-computer-use-gateway' test",
@@ -59,7 +61,9 @@
     "typecheck:installer": "bunx tsc -p apps/installer/tsconfig.json --noEmit",
     "dev:tui": "bun --cwd=apps/tui run dev",
     "test:tui": "bun run --filter=@stanley2058/lilac-tui test",
-    "typecheck:tui": "bun run --filter=@stanley2058/lilac-tui typecheck"
+    "typecheck:tui": "bun run --filter=@stanley2058/lilac-tui typecheck",
+    "codegen:config-schemas": "bun apps/core/scripts/generate-config-schemas.ts",
+    "codegen:config-schemas:check": "bun apps/core/scripts/generate-config-schemas.ts --check"
   },
   "devDependencies": {
     "@oxlint/plugins": "1.75.0",
@@ -74,7 +78,7 @@
     "packages/*"
   ],
   "patchedDependencies": {
-    "@ai-sdk/mcp@2.0.39": "patches/@ai-sdk%2Fmcp@2.0.39.patch",
+    "@ai-sdk/mcp@2.0.69": "patches/@ai-sdk%2Fmcp@2.0.69.patch",
     "bun-types@1.4.1": "patches/bun-types@1.4.1.patch",
     "openai@7.10.0": "patches/openai@7.10.0.patch"
   }

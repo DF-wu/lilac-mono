@@ -1,3 +1,4 @@
+import { isGeneratedMessage } from "./generated-message";
 import { streamText, type LanguageModel, type ModelMessage, type ToolSet } from "ai";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
@@ -564,7 +565,8 @@ function hasCompletedAssistantToolTurn(messages: readonly ModelMessage[], start:
 
 function isContinuableTurnStart(messages: readonly ModelMessage[], index: number): boolean {
   const message = messages[index];
-  if (message?.role === "user") return !isAutoContinueMessage(message);
+  if (message?.role === "user")
+    return !isAutoContinueMessage(message) && !isGeneratedMessage(message);
   return hasCompletedAssistantToolTurn(messages, index);
 }
 
@@ -620,7 +622,7 @@ function renderMessageForSummary(message: ModelMessage): string {
   if (message.role === "user") {
     const content =
       typeof message.content === "string" ? message.content : stringifyTextOnly(message.content, 2);
-    return `USER:\n${content}`;
+    return `${isGeneratedMessage(message) ? "GENERATED CONTEXT" : "USER"}:\n${content}`;
   }
 
   if (message.role === "assistant") {
@@ -2206,6 +2208,23 @@ export async function attachAutoCompaction(
       });
     }
 
+    const maximumCanonicalSuffixStart = (() => {
+      const currentStart = options.resolveCurrentInputCanonicalStart?.(canonicalMessages);
+      if (currentStart === null || currentStart === undefined) return undefined;
+      if (
+        !Number.isSafeInteger(currentStart) ||
+        currentStart < 0 ||
+        currentStart > canonicalMessages.length
+      ) {
+        return signalAutoCompactionHost(
+          autoCompactionFailure(
+            new RangeError("Current-input canonical start is outside the compaction transcript"),
+          ),
+        );
+      }
+      return Math.min(currentStart, canonicalSeparated.messages.length);
+    })();
+
     const canonicalReference = agent.state.messages;
     const maybeTransformed = await preparePreparedModelView(canonicalMessages, context);
     // Provider rejection recovery may intentionally repair canonical server-compaction artifacts.
@@ -2292,23 +2311,6 @@ export async function attachAutoCompaction(
       estimatedInputTokens: floorAwareFullViewTokens,
     });
     if (!activeBudget) return;
-
-    const maximumCanonicalSuffixStart = (() => {
-      const currentStart = options.resolveCurrentInputCanonicalStart?.(canonicalMessages);
-      if (currentStart === null || currentStart === undefined) return undefined;
-      if (
-        !Number.isSafeInteger(currentStart) ||
-        currentStart < 0 ||
-        currentStart > canonicalMessages.length
-      ) {
-        return signalAutoCompactionHost(
-          autoCompactionFailure(
-            new RangeError("Current-input canonical start is outside the compaction transcript"),
-          ),
-        );
-      }
-      return Math.min(currentStart, compactableMessages.length);
-    })();
 
     if (pendingReason === "threshold") {
       const retainedTailTokenCap = resolveRetainedTailTokenCap(

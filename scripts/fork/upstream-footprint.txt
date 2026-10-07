@@ -114,6 +114,11 @@ packages/utils/core-config.ts  # re-exports fork config modules
 packages/utils/core-config/types.ts  # UniversalCoreConfig gains surface.telegram and tools.generate
 packages/utils/core-config/v1.ts  # v1 fallbacks for fork config keys
 packages/utils/core-config/v2.ts  # v2 schema includes fork config modules
+apps/core/scripts/generate-config-schemas.ts  # represents rejected legacy image config fields in the editor schema without accepting unsupported Zod types
+apps/core/src/generated/config-schemas/core-config.schema.json  # generated from the fork input schemas including Telegram, image routing, and OpenAI search
+apps/core/tests/runtime/config-schemas.test.ts  # verifies fork runtime and editor schema acceptance and legacy image field rejection
+apps/web/src/generated/tool-activities.ts  # generated from fork tool definitions and workflow progress content
+apps/core/scripts/generate-design-tool-activities.ts  # includes the existing fork workflow content format in generated fixture types
 packages/utils/index.ts  # re-exports the custom-command menu and compatible image provider modules
 
 # --- Agent and event bus fixes carried by the fork

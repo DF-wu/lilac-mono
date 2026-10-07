@@ -94,6 +94,150 @@ function serverCompactionArtifact(
 }
 
 describe("auto-compaction internals", () => {
+  it.each([
+    ["threshold", "omitted"],
+    ["overflow", "omitted"],
+    ["threshold", "null"],
+    ["overflow", "null"],
+  ] as const)(
+    "compacts an active request repeatedly after %s pressure with %s protection and resumes its checkpoint",
+    async (reason, protection) => {
+      let calls = 0;
+      let completedRounds = 0;
+      const executions: string[] = [];
+      const checkpoints: ModelMessage[][] = [];
+      const compactionReasons: string[] = [];
+      const summaryModel = new MockLanguageModelV4({
+        doStream: async () => summaryResponse(`Continue the task after round ${completedRounds}.`),
+      });
+      const mainModel = new MockLanguageModelV4({
+        doStream: async () => {
+          calls += 1;
+          if (reason === "overflow" && (calls === 3 || calls === 6)) {
+            return {
+              stream: simulateReadableStream({
+                chunks: [{ type: "error", error: new Error("maximum context length exceeded") }],
+              }),
+            };
+          }
+          if (completedRounds === 4) return summaryResponse("task complete");
+          completedRounds += 1;
+          return {
+            stream: simulateReadableStream({
+              chunks: [
+                ...["a", "b"].map((suffix) => ({
+                  type: "tool-call" as const,
+                  toolCallId: `round-${completedRounds}-${suffix}`,
+                  toolName: "read",
+                  input: JSON.stringify({ id: `round-${completedRounds}-${suffix}` }),
+                })),
+                {
+                  type: "finish",
+                  finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                  usage: {
+                    ...zeroUsage(),
+                    inputTokens: {
+                      total: reason === "threshold" && completedRounds % 2 === 0 ? 9_000 : 100,
+                      noCache: reason === "threshold" && completedRounds % 2 === 0 ? 9_000 : 100,
+                      cacheRead: 0,
+                      cacheWrite: 0,
+                    },
+                  },
+                },
+              ],
+            }),
+          };
+        },
+      });
+      const tools = {
+        read: tool({
+          inputSchema: jsonSchema<{ id: string }>({
+            type: "object",
+            properties: { id: { type: "string" } },
+            required: ["id"],
+          }),
+          execute: ({ id }) => {
+            executions.push(id);
+            return `result-${id}`;
+          },
+        }),
+      };
+      const agent = new AiSdkPiAgent({
+        system: "test",
+        model: mainModel,
+        modelSpecifier: "test/main",
+        tools,
+        recoveryCheckpointHandler: (messages) => {
+          checkpoints.push(structuredClone([...messages]));
+        },
+      });
+      const detach = await attachAutoCompaction(agent, {
+        model: "test/main",
+        modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+        summaryModel,
+        resolveContextLimit: async () => ({ context: 10_000, output: 2_000 }),
+        keepRecentTurns: 1,
+        keepRecentTokens: 1_000,
+        ...(protection === "null" ? { resolveCurrentInputCanonicalStart: () => null } : {}),
+        onCompactionEnd: (event) => {
+          if (event.status === "completed") compactionReasons.push(event.reason);
+        },
+      });
+      try {
+        await agent.prompt("Finish the task across four tool rounds.");
+      } finally {
+        detach();
+      }
+
+      expect(compactionReasons).toEqual([reason, reason]);
+      expect(summaryModel.doStreamCalls).toHaveLength(2);
+      expect(JSON.stringify(summaryModel.doStreamCalls[0]?.prompt)).toContain(
+        "Finish the task across four tool rounds.",
+      );
+      expect(JSON.stringify(summaryModel.doStreamCalls[1]?.prompt)).toContain(
+        "Continue the task after round 2.",
+      );
+      expect(executions.toSorted()).toEqual([
+        "round-1-a",
+        "round-1-b",
+        "round-2-a",
+        "round-2-b",
+        "round-3-a",
+        "round-3-b",
+        "round-4-a",
+        "round-4-b",
+      ]);
+      expect(JSON.stringify(agent.state.messages)).toContain("task complete");
+      for (const call of mainModel.doStreamCalls) {
+        expect(__autoCompactionInternals.isValidSuffix(call.prompt, 0)).toBe(true);
+      }
+      const finalPrompt = JSON.stringify(mainModel.doStreamCalls.at(-1)?.prompt);
+      expect(finalPrompt).toContain("Continue the task after round 4.");
+      expect(finalPrompt).toContain("result-round-4-a");
+      expect(finalPrompt).toContain("result-round-4-b");
+      expect(finalPrompt).not.toContain("result-round-1-a");
+
+      const checkpoint = checkpoints.find(
+        (messages) =>
+          messages.at(-1)?.role === "tool" &&
+          JSON.stringify(messages).includes("Continue the task after round 2."),
+      );
+      expect(checkpoint).toBeDefined();
+      const resumedModel = new MockLanguageModelV4({ doStream: summaryResponse("resumed task") });
+      const resumed = new AiSdkPiAgent({
+        system: "test",
+        model: resumedModel,
+        tools,
+        messages: checkpoint,
+      });
+      await resumed.continue();
+      expect(JSON.stringify(resumedModel.doStreamCalls[0]?.prompt)).toContain(
+        "Continue the task after round 2.",
+      );
+      expect(executions).toHaveLength(8);
+      expect(JSON.stringify(resumed.state.messages)).toContain("resumed task");
+    },
+  );
   it("continues a high-usage current request when no older prefix can be compacted", async () => {
     let calls = 0;
     const mainModel = new MockLanguageModelV4({
@@ -156,43 +300,46 @@ describe("auto-compaction internals", () => {
     expect(JSON.stringify(agent.state.messages)).not.toContain("context-compaction");
   });
 
-  it("compacts an older prefix while preserving the entire current request", async () => {
-    const mainModel = new MockLanguageModelV4({ doStream: summaryResponse("done") });
-    const summaryModel = new MockLanguageModelV4({
-      doStream: summaryResponse("older context summary"),
-    });
-    const agent = new AiSdkPiAgent({
-      system: "test",
-      model: mainModel,
-      modelSpecifier: "test/main",
-      messages: [
-        { role: "user", content: `older request ${"a".repeat(8_000)}` },
-        { role: "assistant", content: "older response" },
-      ],
-    });
-    const detach = await attachAutoCompaction(agent, {
-      model: "test/main",
-      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
-      summaryModel,
-      thresholdInputSource: "transcript-estimate",
-      keepRecentTokens: 100,
-      keepRecentTurns: 1,
-      resolveContextLimit: async () => ({ context: 3_000, output: 1_000 }),
-      resolveCurrentInputCanonicalStart: () => 2,
-    });
-    try {
-      await agent.prompt("current request must stay verbatim");
-    } finally {
-      detach();
-    }
-    const sentPrompt = JSON.stringify(mainModel.doStreamCalls[0]!.prompt);
-    expect(sentPrompt).toContain("older context summary");
-    expect(sentPrompt).toContain("current request must stay verbatim");
-    expect(sentPrompt).not.toContain("older request");
-    expect(JSON.stringify(summaryModel.doStreamCalls)).not.toContain(
-      "current request must stay verbatim",
-    );
-  });
+  it.each([0, 100])(
+    "compacts an older prefix while preserving current input with a %i-token tail cap",
+    async (keepRecentTokens) => {
+      const mainModel = new MockLanguageModelV4({ doStream: summaryResponse("done") });
+      const summaryModel = new MockLanguageModelV4({
+        doStream: summaryResponse("older context summary"),
+      });
+      const agent = new AiSdkPiAgent({
+        system: "test",
+        model: mainModel,
+        modelSpecifier: "test/main",
+        messages: [
+          { role: "user", content: `older request ${"a".repeat(8_000)}` },
+          { role: "assistant", content: "older response" },
+        ],
+      });
+      const detach = await attachAutoCompaction(agent, {
+        model: "test/main",
+        modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+        summaryModel,
+        thresholdInputSource: "transcript-estimate",
+        keepRecentTokens,
+        keepRecentTurns: 1,
+        resolveContextLimit: async () => ({ context: 3_000, output: 1_000 }),
+        resolveCurrentInputCanonicalStart: () => 2,
+      });
+      try {
+        await agent.prompt("current request must stay verbatim");
+      } finally {
+        detach();
+      }
+      const sentPrompt = JSON.stringify(mainModel.doStreamCalls[0]!.prompt);
+      expect(sentPrompt).toContain("older context summary");
+      expect(sentPrompt).toContain("current request must stay verbatim");
+      expect(sentPrompt).not.toContain("older request");
+      expect(JSON.stringify(summaryModel.doStreamCalls)).not.toContain(
+        "current request must stay verbatim",
+      );
+    },
+  );
 
   it("still fails real overflow when the current request cannot be compacted", async () => {
     const mainModel = new MockLanguageModelV4({
@@ -225,33 +372,36 @@ describe("auto-compaction internals", () => {
     expect(JSON.stringify(agent.state.messages)).toContain("protected request");
   });
 
-  it("rejects an invalid protected-current boundary instead of skipping compaction", async () => {
-    const agent = new AiSdkPiAgent({
-      system: "test",
-      model: new MockLanguageModelV4({ doStream: summaryResponse() }),
-      modelSpecifier: "test/main",
-      messages: [
-        { role: "user", content: "a".repeat(8_000) },
-        { role: "assistant", content: "prior answer" },
-      ],
-    });
-    const detach = await attachAutoCompaction(agent, {
-      model: "test/main",
-      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
-      thresholdInputSource: "transcript-estimate",
-      keepRecentTokens: 100,
-      keepRecentTurns: 1,
-      resolveContextLimit: async () => ({ context: 3_000, output: 1_000 }),
-      resolveCurrentInputCanonicalStart: () => -1,
-    });
-    try {
-      await expect(agent.prompt("current request")).rejects.toThrow(
-        "Current-input canonical start is outside",
-      );
-    } finally {
-      detach();
-    }
-  });
+  it.each([-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 4])(
+    "rejects invalid protected-current boundary %s before threshold evaluation",
+    async (currentStart) => {
+      const agent = new AiSdkPiAgent({
+        system: "test",
+        model: new MockLanguageModelV4({ doStream: summaryResponse() }),
+        modelSpecifier: "test/main",
+        messages: [
+          { role: "user", content: "a".repeat(8_000) },
+          { role: "assistant", content: "prior answer" },
+        ],
+      });
+      const detach = await attachAutoCompaction(agent, {
+        model: "test/main",
+        modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+        thresholdInputSource: "transcript-estimate",
+        keepRecentTokens: 100,
+        keepRecentTurns: 1,
+        resolveContextLimit: async () => ({ context: 100_000, output: 1_000 }),
+        resolveCurrentInputCanonicalStart: () => currentStart,
+      });
+      try {
+        await expect(agent.prompt("current request")).rejects.toThrow(
+          "Current-input canonical start is outside",
+        );
+      } finally {
+        detach();
+      }
+    },
+  );
 
   it("wraps summaries as stable prior context rather than a new request", () => {
     expect(__autoCompactionInternals.buildCompactionSummaryMessage("summary details")).toEqual({

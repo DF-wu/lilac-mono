@@ -11,7 +11,7 @@ import type {
   FunctionTool,
   Tool,
 } from "openai/resources/responses/responses";
-import { captureResultOutcome } from "@stanley2058/lilac-utils/runtime-utils";
+import { captureResultOutcome, isRecord } from "@stanley2058/lilac-utils/runtime-utils";
 import { AgentAdapterFailure } from "../../agent-adapter";
 import {
   captureAgentOperation,
@@ -81,8 +81,7 @@ function cacheBreakpoint(
 ): ResponseInputContent["prompt_cache_breakpoint"] {
   const value = metadata(options).promptCacheBreakpoint;
   if (value == null || value === false) return undefined;
-  if (typeof value === "object" && !Array.isArray(value) && value.mode === "explicit")
-    return { mode: "explicit" };
+  if (isRecord(value) && value.mode === "explicit") return { mode: "explicit" };
   return undefined;
 }
 
@@ -564,17 +563,14 @@ function encodeToolDefinitions(
     const encodedParameters = captureResultOutcome(parseJson(tool.inputSchemaJson));
     if (!encodedParameters.ok) return Result.err(encodedParameters.error);
     const parameters = encodedParameters.value;
-    if (parameters === null || typeof parameters !== "object" || Array.isArray(parameters))
+    if (!isRecord(parameters))
       return unsupported("OpenAI tool parameters must be a JSON schema object");
     const encodedOutputSchema = captureResultOutcome(
       tool.outputSchemaJson === undefined ? Result.ok(undefined) : parseJson(tool.outputSchemaJson),
     );
     if (!encodedOutputSchema.ok) return Result.err(encodedOutputSchema.error);
     const outputSchema = encodedOutputSchema.value;
-    if (
-      outputSchema !== undefined &&
-      (outputSchema === null || typeof outputSchema !== "object" || Array.isArray(outputSchema))
-    )
+    if (outputSchema !== undefined && !isRecord(outputSchema))
       return unsupported("OpenAI tool output must be a JSON schema object");
     const toolOptions = metadata(tool.providerOptions);
     tools.push({

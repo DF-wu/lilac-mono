@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { asSchema } from "ai";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import {
   parseCoreConfigV1ToUniversal,
@@ -107,18 +106,6 @@ function getToolDescription(tools: Record<string, unknown>, name: string): strin
   }
 
   return description;
-}
-
-function getBatchToolNames(tools: Record<string, unknown>): string[] {
-  const batch = tools["batch"];
-  if (!batch || typeof batch !== "object") throw new Error("missing batch tool");
-  const inputSchema = (batch as { inputSchema?: unknown }).inputSchema;
-  const schema = asSchema(inputSchema as never).jsonSchema as {
-    properties?: {
-      tool_calls?: { items?: { properties?: { tool?: { enum?: string[] } } } };
-    };
-  };
-  return schema.properties?.tool_calls?.items?.properties?.tool?.enum ?? [];
 }
 
 const EXPECTED_STABLE_LEVEL2_CALLABLE_IDS = [
@@ -380,7 +367,6 @@ describe("core tool plugin manager", () => {
     });
     expect([...applyPatchTools.specs.keys()].sort()).toEqual([
       "bash",
-      "batch",
       "glob",
       "grep",
       "patch",
@@ -389,7 +375,6 @@ describe("core tool plugin manager", () => {
     ]);
     expect([...applyPatchTools.genericOutputNormalizerBypassTools].sort()).toEqual([
       "bash",
-      "batch",
       "grep",
       "patch",
       "read",
@@ -398,7 +383,6 @@ describe("core tool plugin manager", () => {
     expect([...applyPatchTools.aggregateOutputBudgetExemptTools]).toEqual(["read", "grep"]);
     expect([...applyPatchTools.directToolNames].sort()).toEqual([
       "bash",
-      "batch",
       "glob",
       "grep",
       "patch",
@@ -416,7 +400,6 @@ describe("core tool plugin manager", () => {
     });
     expect([...editFileTools.specs.keys()].sort()).toEqual([
       "bash",
-      "batch",
       "edit",
       "glob",
       "grep",
@@ -431,13 +414,7 @@ describe("core tool plugin manager", () => {
       subagentDepth: 1,
       subagentConfig: cfg.agent.subagents!,
     });
-    expect([...exploreTools.specs.keys()].sort()).toEqual([
-      "bash",
-      "batch",
-      "glob",
-      "grep",
-      "read",
-    ]);
+    expect([...exploreTools.specs.keys()].sort()).toEqual(["bash", "glob", "grep", "read"]);
 
     const generalTools = await manager.buildLevel1Toolset({
       cwd: dataDir,
@@ -448,7 +425,6 @@ describe("core tool plugin manager", () => {
     });
     expect(Object.keys(generalTools.tools).sort()).toEqual([
       "bash",
-      "batch",
       "glob",
       "grep",
       "patch",
@@ -464,7 +440,6 @@ describe("core tool plugin manager", () => {
     });
     expect(Object.keys(selfTools.tools).sort()).toEqual([
       "bash",
-      "batch",
       "glob",
       "grep",
       "patch",
@@ -501,13 +476,7 @@ describe("core tool plugin manager", () => {
     });
 
     expect(exploreTools.specs.has("bash")).toBe(false);
-    expect([...exploreTools.specs.keys()].sort()).toEqual([
-      "batch",
-      "fuzzy_search",
-      "glob",
-      "grep",
-      "read",
-    ]);
+    expect([...exploreTools.specs.keys()].sort()).toEqual(["fuzzy_search", "glob", "grep", "read"]);
   });
 
   it("hides unsandboxed local tools in restricted mode", async () => {
@@ -543,7 +512,7 @@ describe("core tool plugin manager", () => {
       },
     });
 
-    expect([...restrictedTools.specs.keys()].sort()).toEqual(["bash", "batch", "read"]);
+    expect([...restrictedTools.specs.keys()].sort()).toEqual(["bash", "read"]);
   });
 
   it("threads direct attachment support metadata into read description", async () => {
@@ -1101,8 +1070,6 @@ export default {
     expect(level1.aggregateOutputBudgetExemptTools).not.toContain(
       "plugin_fixture_plugin_fixture_level1",
     );
-    expect(getBatchToolNames(level1.tools)).not.toContain("plugin_fixture_plugin_fixture_level1");
-    expect(getBatchToolNames(level1.tools)).not.toContain("batch");
 
     const callableIds = (
       await Promise.all(
@@ -1532,67 +1499,6 @@ export default {
     await manager.destroy();
     await registry.shutdown();
     expect(client.closeCount).toBe(1);
-  });
-
-  it("updates batch membership for selected external tools while excluding opt-outs and MCP", async () => {
-    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
-    const dataDir = path.join(tmpRoot, "data");
-    await writeExternalPlugin({
-      dataDir,
-      pluginId: "batch-fixture",
-      entryBody: `export default {
-  meta: { id: "batch-fixture" },
-  create() { return { level1: [
-    { name: "allowed", createTool() { return { inputSchema: { type: "object" }, execute() { return "allowed"; } }; }, isEnabled() { return true; } },
-    { name: "blocked", supportsBatch: false, createTool() { return { inputSchema: { type: "object" }, execute() { return "blocked"; } }; }, isEnabled() { return true; } },
-  ] }; },
-};`,
-    });
-    const cfg = testConfig({});
-    const identity = { source: "mcp", sourceId: "server", rawToolName: "remote" } as const;
-    const manager = createCoreToolPluginManager({
-      runtime: {
-        config: cfg,
-        mcpRegistry: {
-          async init() {},
-          async reload() {
-            return Result.ok([]);
-          },
-          getConfigStatus: () => ({ status: "valid" }),
-          list: () => [],
-          getCatalogServers: () => [],
-          getTools: () => [
-            {
-              serverId: "server",
-              rawName: "remote",
-              identity,
-              stableId: catalogToolStableId(identity),
-              tool: convertedMcpTool("remote"),
-            },
-          ],
-          async shutdown() {},
-        },
-      },
-      dataDir,
-    });
-    await manager.init();
-    const toolset = await manager.buildLevel1Toolset({
-      cwd: dataDir,
-      runProfile: "primary",
-      editingToolMode: "none",
-      subagentDepth: 0,
-      subagentConfig: cfg.agent.subagents,
-    });
-    const allowed = toolset.catalog.find((entry) => entry.rawName === "allowed")?.modelName;
-    const blocked = toolset.catalog.find((entry) => entry.rawName === "blocked")?.modelName;
-    const remote = toolset.catalog.find((entry) => entry.source === "mcp")?.modelName;
-    if (!allowed || !blocked || !remote) throw new Error("missing deferred test tools");
-
-    toolset.updateActiveBatchTools(new Set([...toolset.directToolNames, allowed, blocked, remote]));
-
-    expect(getBatchToolNames(toolset.tools)).toContain(allowed);
-    expect(getBatchToolNames(toolset.tools)).not.toContain(blocked);
-    expect(getBatchToolNames(toolset.tools)).not.toContain(remote);
   });
 
   it("uses the same native profile plugin gates with and without a request context", async () => {

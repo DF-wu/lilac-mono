@@ -1,3 +1,4 @@
+import { groupToolCalls } from "./tool-call-scheduling";
 import type {
   AssistantContent,
   AssistantModelMessage,
@@ -6,29 +7,19 @@ import type {
   ToolSet,
 } from "ai";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
-import { createLogger } from "@stanley2058/lilac-utils/logging";
-import { normalizeToolCallInputValue } from "@stanley2058/lilac-utils/tool-call-input-normalization";
 import {
   executeAtomicToolCallResult,
-  finalizeSettledAtomicToolCall,
   normalizeToolResultOutput,
-  settleAtomicToolCallResult,
   type AtomicToolExecutionOutcome,
   type AtomicToolExecutionFailed,
-  type AtomicToolExecutionOutcomeKind,
   type AtomicToolExecutionEvent,
-  type ExecuteAtomicToolCallOptions,
-  type NormalizeSettledToolResultOutputsFn,
   type NormalizeToolResultOutputFn,
-  type SettledToolResultOutputEntry,
   type ToolResultOutput,
 } from "./atomic-tool-execution";
 import { captureAgentPromise, rethrowAgentPanic, type OpaqueAgentValue } from "./failure-adapters";
-import type { ExpandedToolCall } from "./tool-call-expansion";
+import type { AgentToolCall } from "./tool-call";
 import { cloneMessage, canonicalToolName } from "./agent-runtime-support";
 
-const logger = createLogger({ module: "agent-tool-host" });
-const SETTLED_NORMALIZATION_FAILED = "[settled tool results could not be normalized]";
 type AssistantContentParts = Extract<AssistantContent, unknown[]>;
 export type StepToolSnapshot<TOOLS extends ToolSet = ToolSet> = {
   /** Monotonic model-step number, 1-based. */
@@ -39,52 +30,7 @@ export type StepToolSnapshot<TOOLS extends ToolSet = ToolSet> = {
   readonly names: readonly string[];
 };
 
-export type ExecutedExpansionChild = {
-  toolCallId: string;
-  toolName: string;
-  isError: boolean;
-  outcome: AtomicToolExecutionOutcomeKind;
-  toolOutput: ToolResultOutput;
-};
-
-export type ExternalToolExecutionOutcome = AtomicToolExecutionOutcome & {
-  executedExpansion?: {
-    children: ExecutedExpansionChild[];
-  };
-};
-
-export function projectExternalToolOutcome(outcome: ExternalToolExecutionOutcome): {
-  expansionMessages?: readonly ModelMessage[];
-  executedCallCount: number;
-} {
-  const children = outcome.expansion?.children;
-  const executedChildren = outcome.executedExpansion?.children ?? [];
-  const executedCallCount = 1 + executedChildren.length;
-  if (!children?.length) return { executedCallCount };
-  const assistant: AssistantModelMessage = {
-    role: "assistant",
-    content: children.map((child) => ({
-      type: "tool-call",
-      toolCallId: child.toolCallId,
-      toolName: child.toolName,
-      input: normalizeToolCallInputValue(child.input),
-    })),
-  };
-  const toolMessages = executedChildren.map(
-    (child): ToolModelMessage => ({
-      role: "tool",
-      content: [
-        {
-          type: "tool-result",
-          toolCallId: child.toolCallId,
-          toolName: child.toolName,
-          output: child.toolOutput,
-        },
-      ],
-    }),
-  );
-  return { expansionMessages: [assistant, ...toolMessages], executedCallCount };
-}
+export type ExternalToolExecutionOutcome = AtomicToolExecutionOutcome;
 
 function hiddenToolRejection(toolName: string): string {
   return `Tool '${toolName}' was not offered on the step that produced this call, so it was not executed.`;
@@ -144,7 +90,6 @@ export interface AgentToolHostOptions<TOOLS extends ToolSet> {
   appendMessage(message: ModelMessage): void;
   checkpointMessages(candidate?: ModelMessage[]): void;
   normalizeToolResultOutput?: NormalizeToolResultOutputFn;
-  normalizeSettledToolResultOutputs?: NormalizeSettledToolResultOutputsFn;
   genericOutputNormalizerBypassTools?: ReadonlySet<string>;
   aggregateOutputBudgetExemptTools?: ReadonlySet<string>;
   exclusiveToolNames?: ReadonlySet<string>;
@@ -152,23 +97,18 @@ export interface AgentToolHostOptions<TOOLS extends ToolSet> {
 
 export class AgentToolHost<TOOLS extends ToolSet> {
   private normalizeToolResultOutput: NormalizeToolResultOutputFn | undefined;
-  private normalizeSettledToolResultOutputs: NormalizeSettledToolResultOutputsFn | undefined;
   private genericOutputNormalizerBypassTools: ReadonlySet<string>;
   private aggregateOutputBudgetExemptTools: ReadonlySet<string>;
   private exclusiveToolNames: ReadonlySet<string>;
   private alreadyNormalizedExternalToolCallIds = new Set<string>();
   constructor(private readonly host: AgentToolHostOptions<TOOLS>) {
     this.normalizeToolResultOutput = host.normalizeToolResultOutput;
-    this.normalizeSettledToolResultOutputs = host.normalizeSettledToolResultOutputs;
     this.genericOutputNormalizerBypassTools = new Set(host.genericOutputNormalizerBypassTools);
     this.aggregateOutputBudgetExemptTools = new Set(host.aggregateOutputBudgetExemptTools);
     this.exclusiveToolNames = new Set(host.exclusiveToolNames);
   }
   setNormalizeToolResultOutput(value: NormalizeToolResultOutputFn | undefined) {
     this.normalizeToolResultOutput = value;
-  }
-  setNormalizeSettledToolResultOutputs(value: NormalizeSettledToolResultOutputsFn | undefined) {
-    this.normalizeSettledToolResultOutputs = value;
   }
   setGenericOutputNormalizerBypassTools(value: ReadonlySet<string>) {
     this.genericOutputNormalizerBypassTools = new Set(value);
@@ -203,7 +143,7 @@ export class AgentToolHost<TOOLS extends ToolSet> {
     },
     toolSnapshot?: StepToolSnapshot<TOOLS>,
     cohortNames?: readonly string[],
-  ): Promise<ExternalToolExecutionOutcome> {
+  ): Promise<AtomicToolExecutionOutcome> {
     const signals = [input.abortSignal, this.host.readAbortSignal()].filter(
       (signal): signal is AbortSignal => signal !== undefined,
     );
@@ -249,7 +189,6 @@ export class AgentToolHost<TOOLS extends ToolSet> {
       abortSignal,
       pendingToolCalls: this.host.readState().pendingToolCalls,
       inputValidation: { type: input.inputValidation ?? "validate" },
-      expansionHandling: { type: "capture" },
       normalizeToolResultOutput: this.normalizeToolResultOutput,
       bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(toolName),
       aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(toolName),
@@ -262,40 +201,8 @@ export class AgentToolHost<TOOLS extends ToolSet> {
     }
     const outcome = executedOutcome.value;
 
-    let executedExpansion: ExternalToolExecutionOutcome["executedExpansion"];
-    if (outcome.expansion) {
-      const childResult =
-        outcome.expansion.children.length === 0
-          ? Result.ok<AtomicToolExecutionOutcome[], ToolBatchExecutionFailed>([])
-          : await this.executeExpansionChildren([...outcome.expansion.children], snapshot, {
-              abortSignal,
-              appendToTranscript: false,
-            });
-      const childResultOutcome = resultOutcome(childResult);
-      if (!childResultOutcome.ok) {
-        if (abortSignal?.aborted) this.alreadyNormalizedExternalToolCallIds.clear();
-        return signalExternalToolCallHost(childResultOutcome.error);
-      }
-      const childOutcomes = childResultOutcome.value;
-      executedExpansion = {
-        children: outcome.expansion.children.map((child, index) => {
-          const childOutcome = childOutcomes[index];
-          if (!childOutcome) {
-            throw new Error(`Missing tool execution outcome for toolCallId=${child.toolCallId}`);
-          }
-          return {
-            toolCallId: child.toolCallId,
-            toolName: child.toolName,
-            isError: childOutcome.isError,
-            outcome: childOutcome.outcome,
-            toolOutput: childOutcome.toolOutput,
-          };
-        }),
-      };
-    }
-
     this.markExternalToolCallNormalized(input.toolCallId);
-    return { ...outcome, ...(executedExpansion ? { executedExpansion } : {}) };
+    return outcome;
   }
 
   private async normalizeToolOutput(
@@ -361,265 +268,16 @@ export class AgentToolHost<TOOLS extends ToolSet> {
     return { ...message, content };
   }
 
-  private async executeExpansionChildren(
-    toolCalls: ExpandedToolCall[],
-    snapshot: StepToolSnapshot<TOOLS>,
-    options: { abortSignal?: AbortSignal; appendToTranscript: boolean },
-  ): Promise<ResultType<AtomicToolExecutionOutcome[], ToolBatchExecutionFailed>> {
-    const MAX_PARALLEL_TOOLS = 8;
-    const hasExclusiveTool = toolCalls.some((call) => this.exclusiveToolNames.has(call.toolName));
-    const isAborted = (): boolean => options.abortSignal?.aborted === true;
-    const assertNotAborted = () => this.host.assertNotAborted(options.abortSignal);
-
-    const atomicOptions = toolCalls.map(
-      (call): ExecuteAtomicToolCallOptions => ({
-        call,
-        tools: snapshot.tools,
-        messages: this.host.readState().messages,
-        context: this.host.readContext(),
-        abortSignal: options.abortSignal,
-        pendingToolCalls: this.host.readState().pendingToolCalls,
-        inputValidation: call.invalid
-          ? { type: "invalid", error: call.error }
-          : { type: "prevalidated" },
-        expansionHandling: {
-          type: "reject",
-          message: "Nested tool-call expansions are not supported.",
-        },
-        bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(call.toolName),
-        aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(call.toolName),
-        executionRejection: toolExecutionRejection({
-          toolName: call.toolName,
-          snapshotTools: snapshot.tools,
-          currentTools: this.host.readState().tools,
-          hasExclusiveTool,
-          exclusiveToolNames: this.exclusiveToolNames,
-        }),
-        assertNotAborted,
-        onEvent: (event) => this.host.emit(event),
-      }),
-    );
-
-    const settled: Array<AtomicToolExecutionOutcome | undefined> = Array.from({
-      length: toolCalls.length,
-    });
-    let executionError: AtomicToolExecutionFailed | undefined;
-    let next = 0;
-    const workers = Array.from({ length: Math.min(MAX_PARALLEL_TOOLS, toolCalls.length) }, () =>
-      (async () => {
-        while (true) {
-          if (isAborted()) return;
-          const index = next;
-          if (index >= toolCalls.length) return;
-          next += 1;
-          const result = await settleAtomicToolCallResult(atomicOptions[index]!);
-          result.match({
-            ok: (value) => {
-              settled[index] = value;
-            },
-            err: (error) => {
-              executionError ??= error;
-            },
-          });
-          if (isAborted()) return;
-        }
-      })(),
-    );
-    await Promise.all(workers);
-
-    const entryFor = (index: number): SettledToolResultOutputEntry | undefined => {
-      const child = settled[index];
-      if (!child) return undefined;
-      const callOptions = atomicOptions[index]!;
-      return {
-        output: child.toolOutput,
-        context: {
-          toolCallId: callOptions.call.toolCallId,
-          toolName: callOptions.call.toolName,
-          ...(callOptions.bypassGenericOutputNormalizer === undefined
-            ? {}
-            : {
-                bypassGenericOutputNormalizer: callOptions.bypassGenericOutputNormalizer,
-              }),
-          ...(callOptions.aggregateOutputBudgetExempt === undefined
-            ? {}
-            : {
-                aggregateOutputBudgetExempt: callOptions.aggregateOutputBudgetExempt,
-              }),
-        },
-      };
-    };
-
-    const normalizeEntries = async (
-      entries: readonly SettledToolResultOutputEntry[],
-    ): Promise<ToolResultOutput[]> => {
-      if (!this.normalizeSettledToolResultOutputs) {
-        return await Promise.all(
-          entries.map((entry) => this.normalizeToolOutput(entry.output, entry.context)),
-        );
-      }
-      const normalized = resultOutcome(
-        await captureAgentPromise(() =>
-          this.normalizeSettledToolResultOutputs!(entries, (output, context) =>
-            this.normalizeToolOutput(output, context),
-          ),
-        ),
-      );
-      if (normalized.ok) {
-        const outputs = normalized.value;
-        if (outputs.length !== entries.length) {
-          logger.warn("settled expansion output normalization returned wrong output count", {
-            expected: entries.length,
-            actual: outputs.length,
-          });
-          return entries.map(() => ({
-            type: "error-text" as const,
-            value: SETTLED_NORMALIZATION_FAILED,
-          }));
-        }
-        return outputs;
-      }
-      rethrowAgentPanic(normalized.error);
-      logger.warn("settled expansion output normalization failed", {
-        error:
-          normalized.error instanceof Error ? normalized.error.message : String(normalized.error),
-      });
-      return entries.map(() => ({
-        type: "error-text" as const,
-        value: SETTLED_NORMALIZATION_FAILED,
-      }));
-    };
-
-    const checkpointCompleted = (
-      completed: readonly (AtomicToolExecutionOutcome | undefined)[],
-    ): void => {
-      if (!options.appendToTranscript) return;
-      const baseLength = this.host.readToolExchangeBaseLength();
-      const assistant = this.host.readState().messages[baseLength];
-      if (assistant?.role !== "assistant") return;
-      const candidate = this.host
-        .readState()
-        .messages.slice(0, baseLength + 1)
-        .map(cloneMessage);
-      for (let index = 0; index < completed.length; index += 1) {
-        const outcome = completed[index];
-        if (!outcome) continue;
-        const call = toolCalls[index]!;
-        candidate.push({
-          role: "tool",
-          content: [
-            {
-              type: "tool-result",
-              toolCallId: call.toolCallId,
-              toolName: call.toolName,
-              output: outcome.toolOutput,
-            },
-          ],
-        });
-      }
-      this.host.checkpointMessages(candidate);
-    };
-
-    const finalizeCompleted = async (): Promise<void> => {
-      const completed: Array<AtomicToolExecutionOutcome | undefined> = Array.from({
-        length: settled.length,
-      });
-      const completedIndexes = settled.flatMap((child, index) => (child ? [index] : []));
-      const entries = completedIndexes.flatMap((index) => {
-        const entry = entryFor(index);
-        return entry ? [entry] : [];
-      });
-      const outputs = await normalizeEntries(entries);
-      for (let offset = 0; offset < completedIndexes.length; offset += 1) {
-        const index = completedIndexes[offset]!;
-        completed[index] = finalizeSettledAtomicToolCall(
-          atomicOptions[index]!,
-          settled[index]!,
-          outputs[offset]!,
-        );
-      }
-      checkpointCompleted(completed);
-    };
-
-    if (isAborted() || executionError) {
-      await finalizeCompleted();
-      if (executionError) {
-        return Result.err(
-          new ToolBatchExecutionFailed({
-            cause: executionError.cause,
-            message: executionError.message,
-          }),
-        );
-      }
-      assertNotAborted();
-    }
-
-    if (settled.some((outcome) => outcome === undefined)) {
-      await finalizeCompleted();
-      const missingIndex = settled.findIndex((outcome) => outcome === undefined);
-      return Result.err(
-        new ToolBatchExecutionFailed({
-          cause: new Error(
-            `Missing tool execution outcome for toolCallId=${toolCalls[missingIndex]!.toolCallId}`,
-          ),
-          message: `Missing tool execution outcome for toolCallId=${toolCalls[missingIndex]!.toolCallId}`,
-        }),
-      );
-    }
-
-    const entries = settled.flatMap((_child, index) => {
-      const entry = entryFor(index);
-      return entry ? [entry] : [];
-    });
-    const normalizedOutputs = await normalizeEntries(entries);
-
-    const outcomes: AtomicToolExecutionOutcome[] = [];
-    for (let index = 0; index < settled.length; index += 1) {
-      outcomes.push(
-        finalizeSettledAtomicToolCall(
-          atomicOptions[index]!,
-          settled[index]!,
-          normalizedOutputs[index]!,
-        ),
-      );
-    }
-
-    checkpointCompleted(outcomes);
-    if (isAborted()) assertNotAborted();
-
-    if (options.appendToTranscript) {
-      for (let index = 0; index < outcomes.length; index += 1) {
-        const call = toolCalls[index]!;
-        const toolMessage: ModelMessage = {
-          role: "tool",
-          content: [
-            {
-              type: "tool-result",
-              toolCallId: call.toolCallId,
-              toolName: call.toolName,
-              output: outcomes[index]!.toolOutput,
-            },
-          ],
-        };
-        this.host.appendMessage(toolMessage);
-        this.host.checkpointMessages();
-      }
-    }
-
-    return Result.ok(outcomes);
-  }
-
   async executeToolCalls(
-    toolCalls: ExpandedToolCall[],
+    toolCalls: AgentToolCall[],
     snapshot: StepToolSnapshot<TOOLS>,
   ): Promise<ResultType<number, ToolBatchExecutionFailed>> {
-    const MAX_PARALLEL_TOOLS = 8;
     const hasExclusiveTool = toolCalls.some((call) => this.exclusiveToolNames.has(call.toolName));
 
     const isAborted = (): boolean => this.host.readAbortSignal()?.aborted === true;
     const assertNotAborted = () => this.host.assertNotAborted();
 
-    const executeOne = (call: ExpandedToolCall) =>
+    const executeOne = (call: AgentToolCall) =>
       executeAtomicToolCallResult({
         call,
         tools: snapshot.tools,
@@ -630,7 +288,6 @@ export class AgentToolHost<TOOLS extends ToolSet> {
         inputValidation: call.invalid
           ? { type: "invalid", error: call.error }
           : { type: "prevalidated" },
-        expansionHandling: { type: "capture" },
         normalizeToolResultOutput: this.normalizeToolResultOutput,
         bypassGenericOutputNormalizer: this.genericOutputNormalizerBypassTools.has(call.toolName),
         aggregateOutputBudgetExempt: this.aggregateOutputBudgetExemptTools.has(call.toolName),
@@ -706,28 +363,33 @@ export class AgentToolHost<TOOLS extends ToolSet> {
 
     let stoppedDueToAbort = false;
     let executionError: AtomicToolExecutionFailed | undefined;
-    let next = 0;
-    const workers = Array.from({ length: Math.min(MAX_PARALLEL_TOOLS, toolCalls.length) }, () =>
-      (async () => {
-        while (true) {
-          if (isAborted()) return;
-          const index = next;
-          if (index >= toolCalls.length) return;
-          next += 1;
-
-          const result = await executeOne(toolCalls[index]!);
-          const outcome = resultOutcome(result);
-          if (!outcome.ok) {
-            executionError ??= outcome.error;
-            return;
-          }
-          outcomes[index] = outcome.value;
-          checkpointCompletedOutcomes();
-          appendReadyOutcomes();
-        }
-      })(),
-    );
-    await Promise.all(workers);
+    const indexed = toolCalls.map((call, index) => ({ call, index }));
+    for (const group of groupToolCalls(indexed, ({ call }) => call.toolName)) {
+      if (isAborted() || executionError) break;
+      const completed = await Promise.all(
+        group.map(({ call, index }) =>
+          captureAgentPromise(async () => {
+            if (isAborted()) return;
+            const outcome = resultOutcome(await executeOne(call));
+            if (!outcome.ok) {
+              executionError ??= outcome.error;
+              return;
+            }
+            outcomes[index] = outcome.value;
+            checkpointCompletedOutcomes();
+            appendReadyOutcomes();
+          }),
+        ),
+      );
+      for (const captured of completed) {
+        const outcome = resultOutcome(captured);
+        if (outcome.ok) continue;
+        rethrowAgentPanic(outcome.error);
+        return Result.err(
+          new ToolBatchExecutionFailed({ cause: outcome.error, message: "Tool execution failed" }),
+        );
+      }
+    }
     if (isAborted()) stoppedDueToAbort = true;
     if (executionError) {
       return Result.err(
@@ -749,30 +411,6 @@ export class AgentToolHost<TOOLS extends ToolSet> {
       return Result.err(new ToolBatchExecutionFailed({ cause, message: cause.message }));
     }
 
-    let executed = toolCalls.length;
-    for (const outcome of outcomes) {
-      const expansion = outcome?.expansion;
-      if (!expansion || expansion.children.length === 0) continue;
-
-      const syntheticAssistant: AssistantModelMessage = {
-        role: "assistant",
-        content: expansion.children.map((child) => ({
-          type: "tool-call" as const,
-          toolCallId: child.toolCallId,
-          toolName: child.toolName,
-          input: normalizeToolCallInputValue(child.input),
-        })),
-      };
-      this.host.appendMessage(syntheticAssistant);
-      const childOutcomes = await this.executeExpansionChildren([...expansion.children], snapshot, {
-        abortSignal: this.host.readAbortSignal(),
-        appendToTranscript: true,
-      });
-      const childOutcome = resultOutcome(childOutcomes);
-      if (!childOutcome.ok) return Result.err(childOutcome.error);
-      executed += childOutcome.value.length;
-    }
-
-    return Result.ok(executed);
+    return Result.ok(toolCalls.length);
   }
 }

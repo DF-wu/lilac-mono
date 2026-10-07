@@ -1,3 +1,4 @@
+import { ToolCallScheduler } from "@stanley2058/lilac-agent";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -12,7 +13,6 @@ import { asSchema, type ToolSet } from "ai";
 import type { ClaudeCodeSettings } from "ai-sdk-provider-claude-code";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import path from "node:path";
-import { z } from "zod";
 
 const SERVER_NAME = "lilac";
 const NAMESPACED_PREFIX = `mcp__${SERVER_NAME}__`;
@@ -30,37 +30,6 @@ function canonicalLilacToolName(name: string): string {
     default:
       return name;
   }
-}
-
-const legacyBatchArgumentsSchema = z.object({
-  tool_calls: z.array(
-    z.object({
-      tool: z.string(),
-      parameters: z.record(z.string(), z.unknown()).optional(),
-    }),
-  ),
-});
-
-export function normalizeLegacyBatchArguments(
-  input: Record<string, unknown>,
-  exposedNames: ReadonlySet<string>,
-): Record<string, unknown> {
-  const decoded = legacyBatchArgumentsSchema.safeParse(input);
-  if (!decoded.success) return input;
-  let changed = false;
-  const toolCalls = decoded.data.tool_calls.map((call) => {
-    const requestedName = call.tool;
-    const toolName = exposedNames.has(requestedName)
-      ? requestedName
-      : canonicalLilacToolName(requestedName);
-    if (toolName === requestedName || !exposedNames.has(toolName)) return call;
-    changed = true;
-    return {
-      tool: toolName,
-      ...(call.parameters === undefined ? {} : { parameters: call.parameters }),
-    };
-  });
-  return changed ? { ...decoded.data, tool_calls: toolCalls } : input;
 }
 
 type CanUseTool = NonNullable<ClaudeCodeSettings["canUseTool"]>;
@@ -415,55 +384,6 @@ export function mapToolResultOutputToMcp(
   return mapped.value;
 }
 
-function mapExecutedExpansionToMcp(
-  executedExpansion: NonNullable<ExternalToolExecutionOutcome["executedExpansion"]>,
-): CallToolResult {
-  const { children } = executedExpansion;
-  const content: CallToolResult["content"] = [
-    { type: "text", text: `Batch accepted: ${children.length} children.` },
-  ];
-  const childMetadata = children.map((child, childOffset) => {
-    const index = childOffset + 1;
-    const contentStart = content.length;
-    content.push({
-      type: "text",
-      text: `[${index}/${children.length}] tool=${child.toolName} id=${child.toolCallId} outcome=${child.outcome} isError=${child.isError}`,
-    });
-
-    const mapped = mapToolResultOutputToMcpResult(child.toolOutput, child.isError);
-    mapped.match({
-      ok: (value) => content.push(...value.content),
-      err: (error) =>
-        content.push({
-          type: "text",
-          text: `Failed to map child tool output: ${error.message}`,
-        }),
-    });
-
-    return {
-      index,
-      toolCallId: child.toolCallId,
-      toolName: child.toolName,
-      outcome: child.outcome,
-      isError: child.isError,
-      outputType: child.toolOutput.type,
-      contentStart,
-      contentCount: content.length - contentStart,
-    };
-  });
-
-  return {
-    content,
-    structuredContent: {
-      type: "lilac.batch-result",
-      version: 1,
-      accepted: true,
-      total: children.length,
-      children: childMetadata,
-    },
-  };
-}
-
 function pruneCorrelations(pending: Map<string, PendingCorrelation>, now: number): void {
   for (const [nonce, correlation] of pending) {
     if (now - correlation.createdAt > CORRELATION_TTL_MS) pending.delete(nonce);
@@ -567,6 +487,7 @@ export async function createClaudeCodeToolBridgeResult(options: {
   const now = options.now ?? Date.now;
   const nonceKey = `__lilac_tool_${crypto.randomUUID().replaceAll("-", "")}`;
   const pending = new Map<string, PendingCorrelation>();
+  const scheduler = new ToolCallScheduler();
   const server = new McpServer(
     { name: SERVER_NAME, version: "1.0.0" },
     { capabilities: { tools: {} } },
@@ -582,7 +503,7 @@ export async function createClaudeCodeToolBridgeResult(options: {
     if (!validate || !exposedNames.has(toolName))
       return toolError(`Unknown Lilac tool '${toolName}'`);
 
-    let rawInput = { ...request.params.arguments };
+    const rawInput = { ...request.params.arguments };
     const nonce = rawInput[nonceKey];
     delete rawInput[nonceKey];
     if (typeof nonce !== "string") {
@@ -597,54 +518,56 @@ export async function createClaudeCodeToolBridgeResult(options: {
     if (now() - correlation.createdAt > CORRELATION_TTL_MS) {
       return toolError(`Lilac tool '${toolName}' has expired execution correlation`);
     }
-    if (toolName === "batch") rawInput = normalizeLegacyBatchArguments(rawInput, exposedNames);
 
-    const validation = await validate(rawInput);
-    if (!validation.success) {
-      return toolError(validation.error.message);
-    }
+    return scheduler.run(toolName, async () => {
+      extra.signal.throwIfAborted();
+      const validation = await validate(rawInput);
+      if (!validation.success) {
+        return toolError(validation.error.message);
+      }
 
-    const executed = resultOutcome(
-      await captureClaudeToolPromise(() =>
-        options.execute({
-          toolCallId: correlation.toolUseId,
-          toolName,
-          input: validation.value,
-          abortSignal: extra.signal,
-          inputValidation: "prevalidated",
-        }),
-      ),
-    );
-    if (executed.ok) {
-      const outcome = executed.value;
-      if (outcome.executedExpansion) {
-        return mapExecutedExpansionToMcp(outcome.executedExpansion);
+      const executed = resultOutcome(
+        await captureClaudeToolPromise(() =>
+          options.execute({
+            toolCallId: correlation.toolUseId,
+            toolName,
+            input: validation.value,
+            abortSignal: extra.signal,
+            inputValidation: "prevalidated",
+          }),
+        ),
+      );
+      if (executed.ok) {
+        const outcome = executed.value;
+        const mapped = mapToolResultOutputToMcpResult(outcome.toolOutput, outcome.isError);
+        return mapped.match({ ok: (value) => value, err: (error) => toolError(error.message) });
       }
-      if (outcome.expansion) {
-        return toolError(`Lilac tool '${toolName}' returned an unsupported tool-call expansion`);
-      }
-      const mapped = mapToolResultOutputToMcpResult(outcome.toolOutput, outcome.isError);
-      return mapped.match({ ok: (value) => value, err: (error) => toolError(error.message) });
-    }
-    if (Panic.is(executed.error)) throw executed.error;
-    const error = extra.signal.aborted
-      ? new ClaudeCodeToolExecutionCancelled({
-          toolName,
-          cause: capturedClaudeToolError(executed.error, `Lilac tool '${toolName}' was cancelled`),
-          message: opaqueErrorMessage(
-            executed.error,
-            `Lilac tool '${toolName}' execution was cancelled`,
-          ),
-        })
-      : new ClaudeCodeToolExecutionFailed({
-          toolName,
-          cause: capturedClaudeToolError(
-            executed.error,
-            `Lilac tool '${toolName}' execution failed`,
-          ),
-          message: opaqueErrorMessage(executed.error, `Lilac tool '${toolName}' execution failed`),
-        });
-    return toolError(error.message);
+      if (Panic.is(executed.error)) throw executed.error;
+      const error = extra.signal.aborted
+        ? new ClaudeCodeToolExecutionCancelled({
+            toolName,
+            cause: capturedClaudeToolError(
+              executed.error,
+              `Lilac tool '${toolName}' was cancelled`,
+            ),
+            message: opaqueErrorMessage(
+              executed.error,
+              `Lilac tool '${toolName}' execution was cancelled`,
+            ),
+          })
+        : new ClaudeCodeToolExecutionFailed({
+            toolName,
+            cause: capturedClaudeToolError(
+              executed.error,
+              `Lilac tool '${toolName}' execution failed`,
+            ),
+            message: opaqueErrorMessage(
+              executed.error,
+              `Lilac tool '${toolName}' execution failed`,
+            ),
+          });
+      return toolError(error.message);
+    });
   });
 
   const canUseTool: CanUseTool = async (toolName, input, callbackOptions) => {

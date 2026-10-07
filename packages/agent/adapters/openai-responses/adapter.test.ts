@@ -15,7 +15,6 @@ import {
   type AgentExecutionEvent,
   type AgentExecution,
 } from "../../agent-adapter";
-import { ToolExpansion } from "../../tool-call-expansion";
 import { AgentExecutor } from "../../agent-executor";
 import type { AgentExecutionHost } from "../../agent-execution-host";
 import {
@@ -1290,37 +1289,6 @@ describe("OpenAI Responses native execution", () => {
     await run;
     expect(socket.sent.filter((request) => request.type === "response.create")).toHaveLength(3);
   });
-
-  test("accepted steering tool continuation includes normalized expansion children", async () => {
-    const { socket, agent } = fixture({
-      tools: {
-        expand: tool({
-          inputSchema: z.object({}),
-          execute: () =>
-            new ToolExpansion({ expanded: true }, [
-              { toolCallId: "child-call", toolName: "child", input: {} },
-            ]),
-        }),
-        child: tool({ inputSchema: z.object({}), execute: () => "child output" }),
-      },
-    });
-    const run = agent.prompt("question");
-    await socket.nextSend();
-    socket.created("r1");
-    agent.steer("use those results");
-    await socket.nextSend();
-    socket.accepted("r1");
-    socket.finished("r1", "", false, [
-      { type: "function_call", id: "fc", call_id: "parent-call", name: "expand", arguments: "{}" },
-    ]);
-    const continuation = await socket.nextSend();
-    expect(JSON.stringify(continuation.input)).toContain("child-call");
-    expect(JSON.stringify(continuation.input)).toContain("child output");
-    socket.created("r2", "r1");
-    socket.finished("r2", "done");
-    await run;
-    expect(JSON.stringify(agent.state.messages)).toContain("child output");
-  });
   test("a control admitted during socket cleanup runs once on a fresh attempt", async () => {
     const first = new SocketFixture();
     const second = new SocketFixture();
@@ -1709,6 +1677,67 @@ test("native search snapshots use original results even when the model view is t
   );
   expect(next.input).not.toContainEqual(expect.objectContaining({ type: "additional_tools" }));
   socket.created("r2");
+  socket.finished("r2", "done");
+  await run;
+});
+
+test("native calls execute in parallel groups separated by write barriers", async () => {
+  const first = Promise.withResolvers<void>();
+  const bothStarted = Promise.withResolvers<void>();
+  const patch = Promise.withResolvers<void>();
+  const patchStarted = Promise.withResolvers<void>();
+  const starts: string[] = [];
+  const names = ["read", "bash", "patch", "grep", "read"];
+  const tools = Object.fromEntries(
+    [...new Set(names)].map((name) => [
+      name,
+      tool({
+        inputSchema: z.object({}),
+        execute: async (_, { toolCallId }) => {
+          starts.push(toolCallId);
+          if (starts.length === 2) bothStarted.resolve();
+          if (toolCallId === "0" || toolCallId === "1") await first.promise;
+          if (name === "patch") {
+            patchStarted.resolve();
+            await patch.promise;
+          }
+          return toolCallId;
+        },
+      }),
+    ]),
+  );
+  const { socket, agent } = fixture({ tools });
+  const run = agent.prompt("run tools");
+  await socket.nextSend();
+  socket.created("r1");
+  socket.finished(
+    "r1",
+    "",
+    false,
+    names.map((name, index) => ({
+      type: "function_call",
+      id: `fc${index}`,
+      call_id: String(index),
+      name,
+      arguments: "{}",
+    })),
+  );
+  await bothStarted.promise;
+  expect(starts).toEqual(["0", "1"]);
+  first.resolve();
+  await patchStarted.promise;
+  expect(starts).toEqual(["0", "1", "2"]);
+  patch.resolve();
+  const continuation = await socket.nextSend();
+  expect(starts).toEqual(["0", "1", "2", "3", "4"]);
+  expect(continuation.input).toEqual(
+    names.map((_, index) => ({
+      type: "function_call_output",
+      call_id: String(index),
+      output: JSON.stringify(String(index)),
+    })),
+  );
+  socket.created("r2", "r1");
   socket.finished("r2", "done");
   await run;
 });

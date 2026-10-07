@@ -4,7 +4,7 @@ import type {
   ServerToolResult,
 } from "@stanley2058/lilac-plugin-runtime";
 import { Result } from "better-result";
-import { generateImage } from "ai";
+import { generateImage, type ImageModelProviderMetadata } from "ai";
 import fs from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -63,7 +63,7 @@ export type GenerateImageResult = {
   readonly mimeType: string;
   readonly model: SupportedImageModelId;
   readonly warnings: GenerateImageOutcome["warnings"];
-  readonly providerMetadata: GenerateImageOutcome["providerMetadata"];
+  readonly providerMetadata: ImageModelProviderMetadata;
 };
 
 export type GenerateImageCallableDefinition = ServerToolCallableDefinition<
@@ -71,6 +71,95 @@ export type GenerateImageCallableDefinition = ServerToolCallableDefinition<
   GenerateImageResult,
   RegisteredSurfacePlatform
 >;
+
+const GATEWAY_COST_METADATA_KEYS = [
+  "cost",
+  "gatewayCost",
+  "inferenceCost",
+  "inputInferenceCost",
+  "marketCost",
+  "outputInferenceCost",
+  "surchargeCost",
+] as const;
+
+function addDecimalStrings(
+  value1: string | undefined,
+  value2: string | undefined,
+): string | undefined {
+  if (
+    typeof value1 !== "string" ||
+    typeof value2 !== "string" ||
+    !/^\d+(?:\.\d+)?$/.test(value1) ||
+    !/^\d+(?:\.\d+)?$/.test(value2)
+  )
+    return undefined;
+  const [integer1, fraction1 = ""] = value1.split(".");
+  const [integer2, fraction2 = ""] = value2.split(".");
+  const precision = Math.max(fraction1.length, fraction2.length);
+  const sum = (
+    BigInt(integer1 + fraction1.padEnd(precision, "0")) +
+    BigInt(integer2 + fraction2.padEnd(precision, "0"))
+  )
+    .toString()
+    .padStart(precision + 1, "0");
+  return precision === 0
+    ? sum
+    : `${sum.slice(0, -precision)}.${sum.slice(-precision)}`.replace(/\.?0+$/, "");
+}
+
+/** Preserve the tool's aggregate contract using the SDK's per-call metadata.
+ * Matches AI SDK 7's generateImage merge, including gateway decimal costs.
+ */
+function aggregateProviderMetadata(
+  calls: GenerateImageOutcome["calls"],
+): ImageModelProviderMetadata {
+  const providerMetadata: ImageModelProviderMetadata = {};
+  for (const call of calls) {
+    for (const [providerName, metadata] of Object.entries(call.providerMetadata ?? {})) {
+      if (providerName === "gateway") {
+        const current = providerMetadata.gateway;
+        const merged = { images: metadata.images };
+        for (const [key, value] of [
+          ...Object.entries(current ?? {}),
+          ...Object.entries(metadata),
+        ]) {
+          Object.defineProperty(merged, key, {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
+        }
+        for (const key of GATEWAY_COST_METADATA_KEYS) {
+          const previous = current == null ? undefined : Reflect.get(current, key);
+          const next = Reflect.get(metadata, key);
+          const total = addDecimalStrings(
+            typeof previous === "string" ? previous : undefined,
+            typeof next === "string" ? next : undefined,
+          );
+          if (total !== undefined) Reflect.set(merged, key, total);
+        }
+        if (Array.isArray(merged.images) && merged.images.length === 0) {
+          Reflect.deleteProperty(merged, "images");
+        }
+        providerMetadata.gateway = merged;
+        continue;
+      }
+      const current = Object.hasOwn(providerMetadata, providerName)
+        ? providerMetadata[providerName]
+        : undefined;
+      const entry = current ?? { images: [] };
+      entry.images.push(...metadata.images);
+      Object.defineProperty(providerMetadata, providerName, {
+        value: entry,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+  }
+  return providerMetadata;
+}
 
 async function resolveModels(
   getConfig: GenerateImageConfigSource | undefined,
@@ -146,7 +235,7 @@ async function runGenerateImage(
       mimeType: image.mediaType,
       model: picked.id,
       warnings: res.warnings,
-      providerMetadata: res.providerMetadata,
+      providerMetadata: aggregateProviderMetadata(res.calls),
     });
   });
 }

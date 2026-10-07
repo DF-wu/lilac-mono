@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=./.schemas/core-config.schema.json
 configVersion: 2
 
 # Managed opaque bytes use local storage below the runtime data directory by default.
@@ -55,8 +56,6 @@ tools:
     enabled: false
     protectTokens: 40000
     minimumTokens: 20000
-  batch:
-    maxCalls: 8
   media:
     maxInlineBytesPerPart: 10MiB
     maxInlineBytesTotal: 20MiB
@@ -149,28 +148,41 @@ conversation:
       filterCurrentParticipants: false
     # Which lane decides auto-injection when autoInject.enabled is true:
     # - llm: the length gate, planner model, and search ranking configured above.
-    # - jev: one TypeSafe Jev call judges the latest message and a local shortlist.
-    #   Requires TYPESAFE_AI_API_KEY; TYPESAFE_AI_BASE_URL is optional.
+    # - decision: one decision call judges the latest message and a local shortlist.
+    #   TypeSafe uses TYPESAFE_AI_API_KEY and optional TYPESAFE_AI_BASE_URL.
+    #   OpenAI uses OPENAI_API_KEY and optional OPENAI_BASE_URL, with native image inputs.
     #   Ignores the autoInject length, planner, score, and mode settings.
     autoInjectMode: llm
-    jevAutoInject:
-      # TypeSafe evaluation model id.
-      model: jev-1.13.0
+    decisionAutoInject:
+      # Ordered model list. Text uses the first entry; attached images use the first
+      # image-capable entry. Only the selected model's API key is required.
+      # Add openai/gpt-6-luna after Jev to route images to Luna. This is not a retry chain.
+      model: [typesafe/jev-1.13.0]
       # Max thread titles to inject.
       limit: 3
-      # Threads shortlisted for Jev to judge. Latency barely changes with this value.
+      # Threads shortlisted for the decision model to judge.
       candidateLimit: 30
+      # Shortlisting uses authored text; images help judge the resulting shortlist.
+      # Image-only messages do not run automatic recall.
       # Search summary embeddings once when no summary shares a word with the
       # message, for example CJK text. Needs conversation.thread.embedding.
       semanticFallback: true
-      # Inject when P(message asks to recall a past conversation) reaches this...
-      recallMinProbability: 0.7
-      # ...or when P(message is about a lasting subject) reaches this and
-      # P(message is casual chatter) stays below casualMaxProbability.
-      durableSubjectMinProbability: 0.6
-      casualMaxProbability: 0.6
-      # Minimum P(reading the thread helps respond) for each injected thread.
-      relevanceMinProbability: 0.6
+      jev:
+        # Inject when P(message asks to recall a past conversation) reaches this...
+        recallMinProbability: 0.7
+        # ...or when P(message is about a lasting subject) reaches this and
+        # P(message is casual chatter) stays below casualMaxProbability.
+        durableSubjectMinProbability: 0.6
+        casualMaxProbability: 0.6
+        # Minimum P(reading the thread helps respond) for each injected thread.
+        relevanceMinProbability: 0.6
+      luna:
+        # Tuned text preset; image thresholds need further evaluation.
+        # See docs/decision-auto-inject-benchmark.md.
+        recallMinProbability: 0.5
+        durableSubjectMinProbability: 0.5
+        casualMaxProbability: 0.3
+        relevanceMinProbability: 0.6
 
 surface:
   native:

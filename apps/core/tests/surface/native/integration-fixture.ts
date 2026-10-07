@@ -88,7 +88,6 @@ function fixturePluginManager(): CoreToolPluginManager {
     directToolNames: new Set(),
     catalog: [],
     catalogMetadata: {},
-    updateActiveBatchTools: () => undefined,
     genericOutputNormalizerBypassTools: new Set(),
     aggregateOutputBudgetExemptTools: new Set(),
     release: async () => Result.ok(undefined),

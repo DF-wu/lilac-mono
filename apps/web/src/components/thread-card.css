@@ -38,6 +38,7 @@
   font-size: calc(var(--ui-text-xs) * 0.75);
 }
 
+.thread-card.selected .thread-card-title,
 .thread-card[data-state="completed"] .thread-card-title {
   font-weight: 600;
 }
@@ -76,6 +77,14 @@
     opacity: 1;
     pointer-events: auto;
   }
+  .thread-card-actions .thread-settle-button {
+    width: auto;
+    gap: var(--ui-space-unit);
+    padding-inline: calc(var(--ui-space-unit) * 1.5);
+    background: var(--ui-surface-raised);
+    color: var(--ui-surface-raised-foreground);
+    font-size: var(--ui-text-xs);
+  }
   .thread-card:has(.thread-card-actions) .thread-card-status,
   .thread-card:has(.thread-card-actions) .thread-card-meta time {
     visibility: visible;
@@ -110,4 +119,32 @@
 .thread-draft-icon svg {
   width: var(--ui-icon-size);
   height: var(--ui-icon-size);
+}
+
+.thread-card[data-settled] {
+  color: var(--ui-muted-foreground);
+}
+.thread-settled-avatars {
+  filter: grayscale(1);
+  opacity: 0.6;
+  transition: filter var(--ui-motion-duration), opacity var(--ui-motion-duration);
+}
+.thread-card[data-settled]:hover,
+.thread-card[data-settled]:focus-within {
+  color: var(--ui-hover-foreground);
+}
+.thread-card[data-settled]:is(:hover, :focus-within) .thread-settled-avatars {
+  filter: grayscale(0);
+  opacity: 1;
+
+}
+
+.thread-settled-avatars > [data-slot="avatar"] {
+  transition: transform var(--ui-motion-duration) ease-out;
+}
+.thread-card[data-settled]:is(:hover, :focus-within) .thread-settled-avatars > :first-child {
+  transform: translate(calc(-1 * var(--ui-space-unit)), calc(-0.5 * var(--ui-space-unit)));
+}
+.thread-card[data-settled]:is(:hover, :focus-within) .thread-settled-avatars > :last-child {
+  transform: translate(var(--ui-space-unit), calc(-0.5 * var(--ui-space-unit)));
 }

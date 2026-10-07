@@ -172,6 +172,7 @@ import {
 } from "../surface/discord/discord-context-report";
 import { CustomCommandManager } from "../custom-commands/manager";
 import { handleCoreConfigWatchEvent } from "./core-config-watch";
+import { publishConfigSchemas } from "./config-schemas";
 import { loadOrCreateCoreDeadLetterKey, type CoreDeadLetterKeyError } from "./core-dead-letter-key";
 import {
   captureRuntimeError,
@@ -1943,11 +1944,14 @@ export async function createCoreRuntime(
 
   const loadedCoreConfig = (
     await Result.tryPromise({
-      try: () => getCoreConfig(),
+      try: async () => {
+        await publishConfigSchemas(env.dataDir);
+        return getCoreConfig();
+      },
       catch: captureRuntimeError,
     })
   ).mapError((captured) =>
-    projectCapturedRuntimeError(captured, "Core config startup read failed"),
+    projectCapturedRuntimeError(captured, "Core config startup preparation failed"),
   );
   const coreConfigSelection = loadedCoreConfig.match<
     | {

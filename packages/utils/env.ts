@@ -6,6 +6,19 @@ export type Env = ReturnType<typeof parseEnv>;
 
 export type ResponsesTransportMode = "sse" | "auto" | "websocket";
 
+const PROVIDER_BASE_URL_ENV_KEYS = [
+  "OPENAI_BASE_URL",
+  "OPENAI_COMPATIBLE_BASE_URL",
+  "XAI_BASE_URL",
+  "ANTHROPIC_BASE_URL",
+  "OPENROUTER_BASE_URL",
+  "GROQ_BASE_URL",
+  "GEMINI_BASE_URL",
+  "GOOGLE_BASE_URL",
+  "AI_GATEWAY_BASE_URL",
+  "TYPESAFE_AI_BASE_URL",
+] as const;
+
 function parseBoolean(value: string | undefined): boolean {
   if (!value) return false;
   const normalized = value.trim().toLowerCase();
@@ -28,6 +41,11 @@ function parseResponsesTransportMode(value: string | undefined): ResponsesTransp
 
 export function parseEnv() {
   const env = process.env;
+  // SDK default providers also read process.env during module initialization.
+  for (const key of PROVIDER_BASE_URL_ENV_KEYS) {
+    if (env[key]?.trim() !== "") continue;
+    delete env[key];
+  }
   const dataDir = env.DATA_DIR || path.resolve(findWorkspaceRoot(), "data");
 
   const perfLog = parseBoolean(env.LILAC_PERF_LOG);

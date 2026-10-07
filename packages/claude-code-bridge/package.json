@@ -15,7 +15,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@stanley2058/lilac-agent": "workspace:*",
     "@stanley2058/lilac-utils": "workspace:*",
-    "ai": "^7.0.22",
+    "ai": "^7.0.130",
     "ai-sdk-provider-claude-code": "^4.0.1",
     "better-result": "catalog:",
     "zod": "^4.3.6"

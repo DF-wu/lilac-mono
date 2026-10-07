@@ -5,44 +5,15 @@ import type {
   TextStreamPart,
   ModelMessage,
 } from "ai";
-import { z } from "zod";
 import { normalizeToolCallInputValue } from "@stanley2058/lilac-utils/tool-call-input-normalization";
-import type { OpaqueAgentValue } from "../../failure-adapters";
 import type { AgentAdapter } from "../../agent-adapter";
 import type { AgentExecutionHost } from "../../agent-execution-host";
 import {
-  canonicalToolName,
   getToolResultToolCallIds,
   type AgentOptions,
   type AgentState,
   type TransformMessagesContext,
 } from "../../agent-runtime-support";
-const legacyBatchInputSchema = z.object({
-  tool_calls: z.array(
-    z.object({
-      tool: z.string(),
-      parameters: z.record(z.string(), z.unknown()).optional(),
-    }),
-  ),
-});
-
-export function repairLegacyBatchInput(input: OpaqueAgentValue, tools: ToolSet): string | null {
-  const decoded = legacyBatchInputSchema.safeParse(normalizeToolCallInputValue(input));
-  if (!decoded.success) return null;
-  let changed = false;
-  const toolCalls = decoded.data.tool_calls.map((call) => {
-    const requestedName = call.tool;
-    const toolName = tools[requestedName] ? requestedName : canonicalToolName(requestedName);
-    if (toolName === requestedName || !tools[toolName]) return call;
-    changed = true;
-    return {
-      tool: toolName,
-      ...(call.parameters === undefined ? {} : { parameters: call.parameters }),
-    };
-  });
-  return changed ? JSON.stringify({ ...decoded.data, tool_calls: toolCalls }) : null;
-}
-
 type SupportedAiSdkTextStreamPartType =
   | "abort"
   | "start-step"

@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@stanley2058/lilac-utils": "workspace:*",
-    "ai": "^7.0.22",
+    "ai": "^7.0.130",
     "better-result": "catalog:",
     "openai": "7.10.0",
     "ws": "^8.21.3",

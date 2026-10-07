@@ -8,7 +8,12 @@ import { SubagentContext } from "./subagent-context";
 import { SubagentPanelView, RightPanelToggle } from "./SubagentPanel";
 import { useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Pause, Play, RotateCcw } from "lucide-react";
-import { agentWorkStages } from "../agent-work-fixtures";
+import {
+  agentWorkStages,
+  rebaseWorkflowTimes,
+  workflowActionFrame,
+  type AgentWorkFrame,
+} from "../agent-work-fixtures";
 import { MessageIdentityContext } from "./message-identity";
 import { type MessageServices } from "./message-services";
 import { Timeline } from "./Timeline";
@@ -61,6 +66,7 @@ export function AgentWorkDemo() {
   const [optimistic, setOptimistic] = useState<OptimisticTurn>();
   const [promptText, setPromptText] = useState("");
   const [feedback, setFeedback] = useState("");
+  const [workflowOverride, setWorkflowOverride] = useState<AgentWorkFrame>();
   const container = useRef<HTMLDivElement>(null);
   const stage = agentWorkStages[playhead.stage]!;
   const frames = useMemo(
@@ -74,11 +80,13 @@ export function AgentWorkDemo() {
           ),
     [stage, streaming],
   );
-  const slot = frames[Math.min(playhead.frame, frames.length - 1)] ?? stage.frames.at(-1)!;
+  const slot =
+    workflowOverride ?? frames[Math.min(playhead.frame, frames.length - 1)] ?? stage.frames.at(-1)!;
   const [stageStartedAt, setStageStartedAt] = useState(Date.now);
   useLayoutEffect(() => setStageStartedAt(Date.now()), [stage.id, run]);
   useLayoutEffect(() => {
-    const messages = slot.messages.map((message) => ({
+    const { following, ...turn } = slot;
+    const messages = turn.messages.map((message) => ({
       ...message,
       id: stage.id === "conversation" ? `${message.id}_${run}` : message.id,
       parts:
@@ -102,12 +110,16 @@ export function AgentWorkDemo() {
         stage.id === "conversation" && !sent
           ? []
           : [
-              {
-                ...slot,
-                messages,
-                // Running stages count up from when they appear instead of from the fixture date.
-                ...(slot.settledAt === undefined ? { startedAt: stageStartedAt } : {}),
-              },
+              rebaseWorkflowTimes(
+                {
+                  ...turn,
+                  messages,
+                  // Running stages count up from when they appear instead of from the fixture date.
+                  ...(turn.settledAt === undefined ? { startedAt: stageStartedAt } : {}),
+                },
+                stageStartedAt,
+              ),
+              ...(following ? [rebaseWorkflowTimes(following, stageStartedAt)] : []),
             ],
     });
   }, [store, slot, stage.id, sent, promptText, run, stageStartedAt]);
@@ -126,7 +138,8 @@ export function AgentWorkDemo() {
       () => {
         setPlayhead((current) => {
           if (current.frame + 1 < frames.length) return { ...current, frame: current.frame + 1 };
-          if (stage.id === "conversation") return { ...current, playing: false };
+          if (stage.id === "conversation" || stage.id === "workflow")
+            return { ...current, playing: false };
           if (current.stage + 1 < agentWorkStages.length)
             return { ...current, stage: current.stage + 1, frame: 0 };
           return { ...current, playing: false };
@@ -159,25 +172,47 @@ export function AgentWorkDemo() {
     setSent(false);
     setOptimistic(undefined);
     setFeedback("");
+    setWorkflowOverride(undefined);
   }
   function togglePlayback() {
     setOptimistic(undefined);
     setFeedback("");
+    setWorkflowOverride(undefined);
     setSent(true);
     setPlayhead((current) => {
       if (current.playing) return { ...current, playing: false };
+      if (
+        (stage.id === "conversation" || stage.id === "workflow") &&
+        current.frame === frames.length - 1
+      )
+        return { ...current, frame: 0, playing: true };
       if (current.stage === agentWorkStages.length - 1)
         return { stage: 0, frame: 0, playing: true };
       return { ...current, playing: true };
     });
   }
+  function selectFrame(index: number) {
+    setPlayhead((current) => ({ ...current, frame: index, playing: false }));
+    setSent(true);
+    setOptimistic(undefined);
+    setFeedback("");
+    setWorkflowOverride(undefined);
+  }
+  const onAction: MessageServices["onAction"] = (_messageId, part, actionId) => {
+    const updated = workflowActionFrame(slot, actionId);
+    if (updated) {
+      setWorkflowOverride(updated);
+      setPlayhead((current) => ({ ...current, playing: false }));
+      return;
+    }
+    setFeedback(
+      `Selected: ${part.data.actions.find((action) => action.actionId === actionId)?.label ?? actionId}`,
+    );
+  };
   const services: MessageServices = {
     canEdit: true,
     resourceUrl: () => "",
-    onAction: (_messageId, part, actionId) =>
-      setFeedback(
-        `Selected: ${part.data.actions.find((action) => action.actionId === actionId)?.label ?? actionId}`,
-      ),
+    onAction,
     onReaction: () => {},
   };
   return (
@@ -240,6 +275,27 @@ export function AgentWorkDemo() {
         </span>
         <p className="ds-muted">{stage.description}</p>
       </div>
+      {frames.length > 1 ? (
+        <div className="ds-row flex items-center gap-2">
+          <IconButton
+            label="Previous frame"
+            disabled={playhead.frame === 0}
+            onClick={() => selectFrame(playhead.frame - 1)}
+          >
+            <ChevronLeft />
+          </IconButton>
+          <span className="ds-muted">
+            Frame {Math.min(playhead.frame + 1, frames.length)} / {frames.length}
+          </span>
+          <IconButton
+            label="Next frame"
+            disabled={playhead.frame >= frames.length - 1}
+            onClick={() => selectFrame(playhead.frame + 1)}
+          >
+            <ChevronRight />
+          </IconButton>
+        </div>
+      ) : null}
       <SubagentContext value={agentContext}>
         <div
           className={`ds-agent-workspace h-144 max-h-[70dvh] overflow-clip relative [border:1px_solid_var(--ui-border)] rounded-lg ${panelOpen ? "" : "right-panel-hidden"}`}
@@ -296,6 +352,7 @@ export function AgentWorkDemo() {
                             setPlayhead((current) => ({ ...current, playing: false }))
                           }
                           onSubmit={(submission) => {
+                            setWorkflowOverride(undefined);
                             setRun((value) => value + 1);
                             setPromptText(submission.text);
                             setText("");

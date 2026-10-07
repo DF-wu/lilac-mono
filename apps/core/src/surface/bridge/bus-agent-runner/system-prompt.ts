@@ -14,7 +14,7 @@ import type { SessionSafetyMode } from "../../session-policy";
 import {
   appendAdditionalSessionMemoBlock,
   appendConfiguredAliasPromptBlock,
-  buildAutoInjectedThreadSearchOverlay,
+  buildGeneratedMessageOverlay,
   buildRestrictedSessionOverlay,
   buildSurfaceMetadataOverlay,
   buildDiscordOutputOverlay,
@@ -70,10 +70,6 @@ export function buildAgentRunSystemPrompt(params: {
   });
   prompt = appendAdditionalSessionMemoBlock(prompt, params.additionalSessionPrompts);
 
-  const autoInjectedThreadSearchOverlay = buildAutoInjectedThreadSearchOverlay({
-    cfg: params.cfg,
-    runProfile: params.runProfile,
-  });
   const surfaceMetadataOverlay = buildSurfaceMetadataOverlay(params.messages);
   const restrictedSessionOverlay =
     params.safetyMode === "restricted"
@@ -81,7 +77,7 @@ export function buildAgentRunSystemPrompt(params: {
       : null;
   for (const overlay of [
     params.heartbeatOverlay,
-    autoInjectedThreadSearchOverlay,
+    buildGeneratedMessageOverlay(),
     surfaceMetadataOverlay,
     params.requestClient === "discord" ? buildDiscordOutputOverlay() : null,
     params.requestClient === "native" ? buildNativeOutputOverlay() : null,

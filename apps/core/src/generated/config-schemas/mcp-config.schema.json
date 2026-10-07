@@ -1,0 +1,179 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "configVersion": { "type": "number", "const": 1 },
+    "servers": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "transport": { "type": "string", "const": "stdio" },
+              "allowSubagents": { "default": false, "type": "boolean" },
+              "description": { "type": "string", "minLength": 1 },
+              "command": { "type": "string", "minLength": 1 },
+              "args": { "type": "array", "items": { "type": "string" } },
+              "cwd": { "type": "string", "minLength": 1 },
+              "env": {
+                "type": "object",
+                "propertyNames": { "type": "string", "minLength": 1 },
+                "additionalProperties": {
+                  "anyOf": [
+                    { "type": "string" },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "env": { "type": "string", "minLength": 1 },
+                        "prefix": { "type": "string" }
+                      },
+                      "required": ["env"],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "file": { "type": "string", "minLength": 1 },
+                        "pointer": { "type": "string" },
+                        "prefix": { "type": "string" }
+                      },
+                      "required": ["file"],
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              }
+            },
+            "required": ["transport", "command"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "transport": { "type": "string", "const": "http" },
+              "allowSubagents": { "default": false, "type": "boolean" },
+              "description": { "type": "string", "minLength": 1 },
+              "url": { "type": "string", "minLength": 1 },
+              "headers": {
+                "type": "object",
+                "propertyNames": { "type": "string", "minLength": 1 },
+                "additionalProperties": {
+                  "anyOf": [
+                    { "type": "string" },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "env": { "type": "string", "minLength": 1 },
+                        "prefix": { "type": "string" }
+                      },
+                      "required": ["env"],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "file": { "type": "string", "minLength": 1 },
+                        "pointer": { "type": "string" },
+                        "prefix": { "type": "string" }
+                      },
+                      "required": ["file"],
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              },
+              "auth": {
+                "type": "object",
+                "properties": {
+                  "type": { "type": "string", "const": "oauth" },
+                  "grant": { "type": "string", "const": "authorization_code" },
+                  "scopes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+                  "client": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "type": { "type": "string", "const": "static" },
+                          "clientId": {
+                            "anyOf": [
+                              { "type": "string" },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "env": { "type": "string", "minLength": 1 },
+                                  "prefix": { "type": "string" }
+                                },
+                                "required": ["env"],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "file": { "type": "string", "minLength": 1 },
+                                  "pointer": { "type": "string" },
+                                  "prefix": { "type": "string" }
+                                },
+                                "required": ["file"],
+                                "additionalProperties": false
+                              }
+                            ]
+                          },
+                          "clientSecret": {
+                            "anyOf": [
+                              { "type": "string" },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "env": { "type": "string", "minLength": 1 },
+                                  "prefix": { "type": "string" }
+                                },
+                                "required": ["env"],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "file": { "type": "string", "minLength": 1 },
+                                  "pointer": { "type": "string" },
+                                  "prefix": { "type": "string" }
+                                },
+                                "required": ["file"],
+                                "additionalProperties": false
+                              }
+                            ]
+                          }
+                        },
+                        "required": ["type", "clientId"],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "properties": { "type": { "type": "string", "const": "dynamic" } },
+                        "required": ["type"],
+                        "additionalProperties": false
+                      }
+                    ]
+                  }
+                },
+                "required": ["type", "grant", "client"],
+                "additionalProperties": false
+              }
+            },
+            "required": ["transport", "url"],
+            "additionalProperties": false
+          }
+        ]
+      }
+    }
+  },
+  "required": ["configVersion"],
+  "additionalProperties": false,
+  "title": "Lilac MCP configuration"
+}

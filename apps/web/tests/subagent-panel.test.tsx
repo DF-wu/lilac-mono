@@ -63,14 +63,14 @@ test("shared panel shows agent status and production messages without editing co
     expect(html).toContain(selected.title);
     expect(html).toContain('aria-label="About Lilac"');
     expect(html).not.toContain("Participant");
-    expect(html).toContain('data-message-id="child_prompt"');
+    expect(html).toContain('data-message-id="child_0_0_0"');
     if (state === "running") {
-      expect(html).toContain('data-message-id="child_thought"');
+      expect(html).toContain('data-message-id="child_1_0"');
       expect(html.match(/class="activity-group/g)).toHaveLength(1);
     } else {
       expect(html).toContain("Worked");
-      expect(html).toContain('data-message-id="child_final"');
-      expect(html).not.toContain('data-message-id="child_work"');
+      expect(html).toContain('data-message-id="child_3_0_0"');
+      expect(html).not.toContain('data-message-id="child_1_1"');
     }
     expect(html).not.toContain('contenteditable="true"');
     expect(html).not.toContain("Rewind to this turn");
@@ -131,5 +131,5 @@ test("completed transcripts keep every initial prompt chunk outside folded work"
   );
   expect(html).toContain("x".repeat(2000) + "End of the long prompt.");
   expect(html).toContain("Worked");
-  expect(html).not.toContain('data-message-id="child_thought"');
+  expect(html).not.toContain('data-message-id="child_1_0"');
 });
