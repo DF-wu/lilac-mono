@@ -50,6 +50,15 @@ import {
 import { DiscordAdapter } from "../surface/discord/discord-adapter";
 import { createDiscordResourceOriginAdapter } from "../surface/discord/discord-resource-origin";
 import { GithubAdapter } from "../surface/github/github-adapter";
+import type { TelegramAdapter } from "../surface/telegram/telegram-adapter";
+import {
+  createTelegramWorkflowTargetAuthorizer,
+  refreshTelegramCoreConfig,
+  resolveTelegramAdapterForStartup,
+  telegramSurfaceRuntimeInput,
+  hydrateTelegramConversationAttachments,
+  telegramConversationMemoryInput,
+} from "../surface/telegram/telegram-surface-runtime";
 import { createDiscordRuntimeHealthPort } from "../surface/discord/discord-runtime-health";
 import { createDescriptorBoundSurfaceEventSource } from "../surface/produced-ref-guard";
 import {
@@ -2238,7 +2247,10 @@ export async function createCoreRuntime(
         openConversationThread: () => {
           conversationThreadStore = new ConversationThreadStore(discordSearchDbPath, {
             surfaceDbPath: discordSurfaceDbPath,
-            mainAgentUserNames: [initialCoreConfig.surface.discord.botName],
+            mainAgentUserNames: [
+              initialCoreConfig.surface.discord.botName,
+              initialCoreConfig.surface.telegram.botName,
+            ],
           });
         },
         openDiscovery: () => {
@@ -2413,6 +2425,7 @@ export async function createCoreRuntime(
     reportFatalPanic: reportFatalError,
   });
   const githubAdapter = new GithubAdapter();
+  let telegramAdapter: TelegramAdapter | null = null;
   const discordEventSource = createDescriptorBoundSurfaceEventSource("discord", adapter);
   let discordSearchService: DiscordSearchService | null = null;
   let conversationThreadService: ConversationThreadService | null = null;
@@ -2793,6 +2806,7 @@ export async function createCoreRuntime(
         coreConfigValidationHadError = false;
         lastCoreConfigValidationError = null;
         if (discordEnabled) await adapter.refreshCoreConfig();
+        await refreshTelegramCoreConfig(telegramAdapter, logger);
         await toolServer?.reload();
         conversationThreadMaterializer?.markAllDirty();
       },
@@ -2926,6 +2940,11 @@ export async function createCoreRuntime(
             };
           }
           const startupConfig = initialCoreConfig;
+          telegramAdapter ??= resolveTelegramAdapterForStartup({
+            config: startupConfig,
+            customCommands,
+            logger,
+          });
           const activeDurableWorkflowStore = durableWorkflowStore;
           const activeTranscriptStore = transcriptStore;
           const activeDiscordSearchStore = discordSearchStore;
@@ -3191,6 +3210,15 @@ export async function createCoreRuntime(
             githubAdapter,
             descriptorBoundDiscordEventSource: discordEventSource,
             discordHealth: createDiscordRuntimeHealthPort(adapter),
+            ...(telegramAdapter
+              ? {
+                  telegram: telegramSurfaceRuntimeInput({
+                    adapter: telegramAdapter,
+                    customCommands,
+                    getWorkflowStore: () => activeDurableWorkflowStore,
+                  }),
+                }
+              : {}),
             bus: durableBus,
             blobStore: activeBlobStore,
             subscriptionPrefix,
@@ -3327,12 +3355,32 @@ export async function createCoreRuntime(
               hydrated.push(decision.value);
               return hydrateAt(index + 1);
             };
+            const hydrateTelegramAt = async (
+              index: number,
+              ref: Parameters<ConversationThreadAttachmentHydrator>[0]["refs"][number],
+            ): Promise<ResultType<typeof hydrated, ConversationThreadOperationFailed>> => {
+              const result = await hydrateTelegramConversationAttachments({
+                adapter: telegramAdapter,
+                ref,
+              });
+              const decision = result.match<
+                | { kind: "value"; value: (typeof hydrated)[number] }
+                | { kind: "error"; error: ConversationThreadOperationFailed }
+              >({
+                ok: (value) => ({ kind: "value" as const, value }),
+                err: (error) => ({ kind: "error" as const, error }),
+              });
+              if (decision.kind === "error") return Result.err(decision.error);
+              hydrated.push(decision.value);
+              return hydrateAt(index + 1);
+            };
             const hydrateAt = async (
               index: number,
             ): Promise<ResultType<typeof hydrated, ConversationThreadOperationFailed>> => {
               const ref = input.refs[index];
               if (!ref) return Result.ok(hydrated);
               if (ref.surface === "native") return hydrateNativeAt(index, ref);
+              if (ref.surface === "telegram") return hydrateTelegramAt(index, ref);
               const read = await surfaceAdapter.readMsg({
                 platform: "discord",
                 ...ref,
@@ -3372,6 +3420,15 @@ export async function createCoreRuntime(
             : undefined;
           if (nativeConversationDbPath)
             activeConversationThreadStore.attachNativeSource(nativeConversationDbPath);
+          const telegramConversationMemory = telegramConversationMemoryInput({
+            adapter: telegramAdapter,
+            config: startupConfig,
+          });
+          if (telegramConversationMemory)
+            activeConversationThreadStore.attachTelegramSource(
+              telegramConversationMemory.dbPath,
+              telegramConversationMemory.botName,
+            );
           const threadService = new ConversationThreadService({
             store: activeConversationThreadStore,
             getConfig: () => getCoreConfig(),
@@ -3412,6 +3469,8 @@ export async function createCoreRuntime(
             );
           stopConversationThreadSummarizationWorker = startConversationThreadSummarizationWorker({
             nativeDbPath: nativeConversationDbPath,
+            telegramDbPath: telegramConversationMemory?.dbPath,
+            telegramBotName: telegramConversationMemory?.botName,
             attachmentHydrator: hydrateThreadAttachments,
             searchDbPath: discordSearchDbPath,
             surfaceDbPath: discordSurfaceDbPath,
@@ -3571,6 +3630,7 @@ export async function createCoreRuntime(
             store: activeDurableWorkflowStore,
             ports: workflowProgressPorts,
             subscriptionId: subId(subscriptionPrefix, "workflow-progress"),
+            isTargetAuthorized: createTelegramWorkflowTargetAuthorizer(getCoreConfig),
             reportFatalPanic: reportFatalError,
           });
           await workflowProgressProjector.start();

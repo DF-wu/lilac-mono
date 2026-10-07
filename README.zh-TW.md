@@ -1,0 +1,342 @@
+# Lilac Mono
+
+<p align="center">
+  <strong>面向 Web、Discord、Telegram、GitHub 與本機終端的事件驅動 AI Agent Runtime</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/stanley2058/lilac-mono"><img alt="Upstream" src="https://img.shields.io/badge/upstream-stanley2058%2Flilac--mono-6f42c1"></a>
+  <a href="./package.json"><img alt="Bun 1.4.2" src="https://img.shields.io/badge/Bun-1.4.2-14151a?logo=bun&logoColor=white"></a>
+  <a href="./LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
+</p>
+
+<p align="center">
+  <strong>語言：</strong> <a href="./README.md">English（主要／規範版本）</a> · <a href="./README.zh-TW.md">繁體中文（翻譯）</a>
+</p>
+
+<p align="center">
+  <a href="#本-fork-的主要差異">Fork 差異</a> ·
+  <a href="#快速開始">快速開始</a> ·
+  <a href="#core-surfaces">Surfaces</a> ·
+  <a href="./docs/README.zh-TW.md">完整文件</a> ·
+  <a href="./PROJECT.md">架構細節</a>
+</p>
+
+> [!IMPORTANT]
+> 這是以 Git history 與 `upstream` remote 持續追蹤 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的 downstream fork，不是上游官方發行版。本專案定期合併上游更新，同時維護 Telegram、相容式圖像路由、OpenAI `web.search` 與部署自動化等獨立功能。
+
+Lilac 把平台訊息、路由、模型執行、工具、Skills 與可恢復工作流程放在同一套 Core runtime 中。
+
+## 本 Fork 的主要差異
+
+以下只列出目前仍與上游不同的行為。GitHub reply permalinks 與 comment self-loop 防護已被上游接收，不再列出。完整依據、限制與所有向上游開過的 pull request 見 [`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md)。
+
+| 領域 | 本 fork 提供的差異 | 重要限制 |
+| --- | --- | --- |
+| Telegram surface | DMs、群組、forum topics、串流 HTML 回覆、取消、reaction、command menu、inbound/outbound attachments、workflow cards、同 surface tools，以及納入跨 surface 對話記憶的 Telegram 歷史 | 預設停用；僅 long polling；記憶以每個聊天或 topic 為一個 thread |
+| OpenAI-compatible 圖像路由 | 將既有 `generate.image` aliases 路由到 operator 指定的 OpenAI-compatible endpoint，並支援 per-alias `provider/model` routes | 僅 `configVersion: 2`；provider 之間無自動 fallback |
+| OpenAI `web.search` provider | `tools.web.extract.providers` 填入 `openai` 後，`web.search` 改走 OpenAI Responses 的 `web_search` 工具，回傳答案引用的來源 | 僅 `configVersion: 2`；只做搜尋（`web.extract` 會略過）；日期限制只是對模型的指示 |
+| Custom media plugin | 可部署的 Level 2 image/video plugin 範例，示範嚴格設定與檔案安全處理 | Plugin 是 trusted in-process code；restricted caller 目前不能使用 external callables |
+| 維運與交付 | 每 6 小時檢查 upstream、發布經驗證的 GHCR `catalina`/`claudia` tags，CI 並強制執行 upstream-footprint allowlist | 自動合併發生衝突時仍需人工處理 |
+
+## 架構概覽
+
+### Core request flow
+
+```mermaid
+flowchart LR
+    Discord[Discord] --> Bus[Typed Redis Streams bus]
+    Telegram[Telegram] --> Bus
+    Bus --> Router[Surface router]
+    GitHub[GitHub webhook] --> Request[Request queue]
+    Router --> Request
+    Request --> Agent[Agent runner]
+    Agent --> L1[Level 1 local tools]
+    Agent --> L2[Level 2 HTTP tools]
+    Agent --> Skills[Level 3 skills]
+    Agent --> Output[Request-scoped output]
+    Output --> Discord
+    Output --> Telegram
+    Output --> GitHub
+    Workflow[Durable workflow engine] <--> Request
+```
+
+Core 的平台 adapter 會把事件送入 typed bus。Router 建立或更新 request，agent runner 再使用模型、工具與 Skills 執行，最後由 output relay 將結果送回原 surface。GitHub webhook 可直接建立 request。
+
+Durable workflow engine 使用相同 request bus，並以 SQLite journal 保存 trigger、wait、sleep、subagent 與恢復資訊。完整 topic、queue mode、權限與啟停順序見 [`PROJECT.md`](./PROJECT.md)。
+
+### Fork maintenance flow
+
+```mermaid
+flowchart LR
+    Upstream[stanley2058/lilac-mono main] -->|scheduled check every 6 hours| Sync[Sync Upstream workflow]
+    Sync -->|clean merge| Fork[DF-wu/lilac-mono main]
+    Features[Fork features and fixes] --> Fork
+    Fork --> CI[CI]
+    Fork --> Images[GHCR image workflow]
+```
+
+## 快速開始
+
+### Core：Docker Compose
+
+需求：Docker Compose 2.30 以上、Bun 1.4.2，以及至少一組符合 `models.main` 設定的 model provider credential。只有啟用 Discord 時才需要有效的 `DISCORD_TOKEN`；各 surface 的 allowlist 依然採 fail-closed 設計。
+
+```bash
+git clone https://github.com/DF-wu/lilac-mono.git
+cd lilac-mono
+bun install
+
+cp .env.example .env
+chmod 600 .env
+mkdir -p data
+cp packages/utils/config-templates/core-config.example.yaml data/core-config.yaml
+
+cat > compose.override.yaml <<'YAML'
+services:
+  lilac:
+    env_file:
+      - .env
+YAML
+```
+
+啟動前請完成兩件事：
+
+1. 在 `.env` 設定 `data/core-config.yaml` 所選 model provider 的 credential；若啟用 Discord，再設定 `DISCORD_TOKEN`。Stock `compose.yaml` 不會傳入 provider credentials；上面的 `compose.override.yaml` 透過 `env_file` 明確傳入 `.env`。
+2. 在 `data/core-config.yaml` 設定 Discord allowlist，並啟用與限制其他要使用的 surface。
+
+```bash
+docker compose up -d --build --wait --wait-timeout 120
+bun run docker:verify
+docker compose ps
+curl -fsS http://localhost:8080/readyz
+```
+
+`compose.yaml` 同時啟動 Redis，並把 `./data` 掛載到 `/data`。正式部署、operator token、UID、持久化與診斷方式見 [`docs/docker-deployment.md`](./docs/docker-deployment.md)。
+
+引導式安裝程式、provider 認證、terminal-only 存取與 native Web 登入見 [`docs/installation.md`](./docs/installation.md)。臨時的 operator TUI 可用 `docker compose exec --user root lilac lilac-tui` 開啟；啟用 native Web 後請開啟 `http://localhost:8789`。
+
+> [!WARNING]
+> Core tool server 沒有一般用途的 public HTTP authentication。請將 `8080` 保留在可信任的主機或網路邊界，不要直接暴露到公網。
+
+### Core：從 source 執行
+
+先安裝 dependencies 並準備可連線的 Redis：
+
+```bash
+bun install
+docker run --rm -d --name lilac-source-redis -p 127.0.0.1:6380:6379 redis:7-alpine
+
+export REDIS_URL=redis://127.0.0.1:6380
+export DATA_DIR="$PWD/data"
+export LL_TOOL_SERVER_PORT=8080
+bun apps/core/src/runtime/main.ts
+```
+
+Core 必須有 `REDIS_URL` 與有效的 model 設定。啟用 Discord 時才需設定 `DISCORD_TOKEN`；native-only 部署可在沒有 Discord credential 的情況下啟動。
+
+## Core Surfaces
+
+| Surface | 最低設定 | 預設保護 | 詳細文件 |
+| --- | --- | --- | --- |
+| Native | `surface.native.enabled: true`、installation ID、local 或 Clerk 認證，以及 provider credentials | 預設停用；僅限已認證的 owner 存取 | [`docs/native-surface.md`](./docs/native-surface.md) |
+| Discord | `DISCORD_TOKEN`；設定 `allowedChannelIds` 或 `allowedGuildIds` | 兩個 allowlist 都空時忽略所有 Discord traffic | [`core-config.example.yaml`](./packages/utils/config-templates/core-config.example.yaml) |
+| Telegram | `configVersion: 2`、`enabled: true`、`token`、`allowedChatIds` | 預設停用；空 chat allowlist 時忽略所有 chats | [`docs/telegram-surface.md`](./docs/telegram-surface.md) |
+| GitHub | GitHub App auth、`GITHUB_WEBHOOK_SECRET`、可被 GitHub 連到的 HTTPS/reverse proxy；user token 是可選的 preferred outbound identity | 沒有 GitHub App secret 時整個 surface 不啟動；signature 不符回傳 `401` | [`docs/github-reply-permalinks.md`](./docs/github-reply-permalinks.md) |
+
+GitHub webhook 預設監聽 port `8787`、path `/github/webhook`。Stock Compose 沒有轉送或公開 GitHub webhook 的環境與 port，因此 production deployment 必須自行補上 reverse proxy、environment 與 network wiring。
+
+Webhook secret 只驗證 inbound request；目前 runtime 以 GitHub App secret 作為整個 surface 的啟用條件。先設定 App，再視需要加入 user token 作為 preferred outbound identity。可用 operator-only onboarding 查看兩者參數：
+
+```bash
+docker compose exec -T lilac /usr/local/bin/tools --operator --help onboarding.github_app
+docker compose exec -T lilac /usr/local/bin/tools --operator --help onboarding.github_user_token
+```
+
+Telegram 支援完整對話路徑、workflow cards 與同 surface tools，其 request router 也鏡射上游 Discord router（debounce 批次、LLM gate、steer/interrupt/follow-up，以及 `!model:`、`!continue`、`!interrupt` directives），但平台能力不等於 Discord。Inbound media、history、reaction 與 search 差異請以 [`Telegram feature status`](./docs/telegram-surface.md#10-what-works-and-what-does-not) 為準；與 Discord 逐項能力對照見 [`docs/telegram-feature-parity.zh-TW.md`](./docs/telegram-feature-parity.zh-TW.md)。
+
+## 工具、Skills 與工作流程
+
+Core 將 agent 能力分成三層：
+
+1. **Level 1**：`bash`、檔案讀寫、search、patch、batch、subagent delegation 等 run-local tools。
+2. **Level 2**：由 HTTP tool server 提供的 web、surface、workflow、MCP、attachments、generation、SSH 等 callables。
+3. **Level 3**：從磁碟探索、按需載入的 `SKILL.md` bundles。
+
+建立並使用 `tools` CLI：
+
+```bash
+cd apps/tool-bridge
+bun run build
+./dist/index.js --list
+./dist/index.js --help workflow.run.list
+```
+
+連到其他 backend：
+
+```bash
+TOOL_SERVER_BACKEND_URL=http://host:8080 ./apps/tool-bridge/dist/index.js --list
+```
+
+外部 plugins 放在 `DATA_DIR/plugins/<plugin-id>/`。它們與 Core 在同一 process 中執行，具有 Core process 的權限；開發前請閱讀 [`PLUGIN_AUTHORING.md`](./PLUGIN_AUTHORING.md)。
+
+## Fork 專屬用法
+
+### 啟用 Telegram
+
+```yaml
+configVersion: 2
+
+surface:
+  telegram:
+    enabled: true
+    token: replace-with-botfather-token
+    allowedChatIds:
+      - "1001"
+```
+
+請妥善限制 `data/core-config.yaml` 的權限，因為 bot token 會直接儲存在其中：
+
+```bash
+chmod 600 data/core-config.yaml
+```
+
+```bash
+docker compose up -d --wait --wait-timeout 120
+curl -s localhost:8080/readyz | jq '.checks[] | select(.name == "telegram.ready")'
+```
+
+群組 privacy mode、forum topic session IDs、streaming、command menu 與 troubleshooting 見 [`docs/telegram-surface.md`](./docs/telegram-surface.md)。
+
+### 路由圖像生成到相容 endpoint
+
+```yaml
+configVersion: 2
+
+tools:
+  generate:
+    image:
+      provider: openai-compatible
+```
+
+要路由個別 alias，請以 `<provider>/<model id>` 加入 `routes` 項目，provider 可為 `openai`、`openrouter`、`xai` 或 `openai-compatible`；未列出的 alias 依 `provider` 路由，舊的 `openaiCompatible` 區塊會在解析時被拒絕：
+
+```yaml
+tools:
+  generate:
+    image:
+      provider: openai-compatible
+      routes:
+        nanobanana-2: openai-compatible/gemini-3.1-flash-image-preview
+        gpt-image-2: openai/gpt-image-2
+```
+
+Docker Compose 請把 endpoint 與 credential 寫入已由 `compose.override.yaml` 載入的 `.env`：
+
+```dotenv
+OPENAI_COMPATIBLE_BASE_URL=https://provider.example.com/v1
+OPENAI_COMPATIBLE_API_KEY=replace-with-api-key
+```
+
+然後重建 container：
+
+```bash
+docker compose up -d --force-recreate --wait --wait-timeout 120 lilac
+```
+
+從 source 執行時，改為 `export` 同名變數後再啟動 Core。
+
+Alias、`models` allowlist 與 per-alias `routes`（`<provider>/<model id>`）、從已移除的 `openaiCompatible` 區塊遷移、generation/edit endpoints、結果中的 `providerMetadata`、無 fallback 行為與 colon-form `size` aspect-ratio 轉送見 [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md)。
+
+### 透過 OpenAI 搜尋網頁
+
+```yaml
+configVersion: 2
+
+tools:
+  web:
+    extract:
+      providers: [tavily, openai]
+    openai:
+      model: openai-compatible/gpt-5.6-terra
+      searchContextSize: medium
+```
+
+provider 清單就是 `web.search` 的依序 fallback 鏈，`openai` 只有列在裡面才會被使用。`model` 以 `provider/model` 指定實際執行 hosted search 的模型（預設 `openai/gpt-5-mini`；裸的 model id 視同 `openai/<id>`）。`openai/...` 模型使用 `OPENAI_API_KEY` 與 `OPENAI_BASE_URL`；`openai-compatible/...` 模型使用 `OPENAI_COMPATIBLE_API_KEY` 與 `OPENAI_COMPATIBLE_BASE_URL`。所指向的 gateway 必須能轉送 Responses API 的 `web_search` 工具。結果會先列模型引用的 URL（每筆都標示為 OpenAI 產生的摘要），再附上未被引用的檢索來源。`web.extract` 會略過這個 provider，需要抓取頁面時請保留 `tavily`、`exa` 或 `firecrawl`。
+
+完整資料流（中介模型究竟拿到什麼、對話模型收到什麼）、錯誤與限制見 [`docs/web-search-openai.md`](./docs/web-search-openai.md)；`tools.web.openai` 欄位見 [`docs/core-config-migrations.md`](./docs/core-config-migrations.md)。
+
+### 使用 custom-media plugin 範例
+
+```bash
+mkdir -p data/plugins
+cp -R examples/plugins/custom-media data/plugins/custom-media
+docker compose restart lilac
+docker compose up -d --wait --wait-timeout 120 lilac
+docker compose exec -T lilac /usr/local/bin/tools --operator --list
+docker compose exec -T lilac /usr/local/bin/tools --operator --help custom-media.image
+```
+
+完整 build、credential、model 與 file-safety contract 見 [`examples/plugins/custom-media/README.md`](./examples/plugins/custom-media/README.md)。
+
+## Repository Map
+
+| Path | Purpose |
+| --- | --- |
+| `apps/core/` | Redis-backed Core runtime 與所有 surface、workflow、tool wiring |
+| `apps/tool-bridge/` | `tools` CLI 與 standalone tool-server entrypoint |
+| `apps/installer/` | 引導式 Docker 安裝與重新設定 CLI |
+| `apps/computer-use-gateway/` | 選用的 authenticated desktop-session gateway |
+| `packages/event-bus/` | Typed Redis Streams contract 與 transport |
+| `packages/agent/` | AI SDK streaming、steering、follow-up 與 interrupt control |
+| `packages/plugin-runtime/` | Level 1/Level 2 plugin contract |
+| `packages/utils/` | Config、providers、prompts 與 Skills |
+| `data/` | Core 的 local runtime state；不要提交 secrets |
+| `ref/` | Vendored/reference repositories；依各自 license，視為 read-only |
+
+## 開發與驗證
+
+本 repo 使用 Bun workspaces：
+
+```bash
+bun install
+bun run ci
+```
+
+`bun run ci` 會依序檢查 codegen、lint、root/workspace tests、TypeScript 與 formatting。常用的個別命令：
+
+```bash
+bun run check
+bun run ci
+bun run test:core
+bun run test:all
+bun run typecheck
+bun run lint
+bun run fmt:check
+```
+
+`bun run check` 執行並行的本機 repository gates；`bun run ci` 執行保守的序列 CI 流程。完整套件包含常設的 architecture 與 production-syntax gates。
+
+各 workspace 的 build、test 與 typecheck 命令見 [`AGENTS.md`](./AGENTS.md)；專案名詞與完整架構見 [`PROJECT.md`](./PROJECT.md)。
+
+## Upstream 同步與支援邊界
+
+`.github/workflows/sync-upstream.yml` 每 6 小時檢查 upstream `main`。乾淨合併先在候選分支建立 commit，通過完整 CI 後才快轉更新 `main` 並發布映像。只有 Git 衝突會開 PR 並要求 `Catalina-df` review；Claude Action 提供唯讀分析，不自動修復程式或解衝突。詳見 [workflow 與 prompt 設定](./docs/upstream-sync.md)。
+
+- 本 fork 新功能、部署 workflow、Telegram、OpenAI `web.search` 或相容式圖像路由問題：請在 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues) 回報。
+- 可在未修改 upstream 重現的問題：先確認 upstream 狀態，再向 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono/issues) 回報。
+- 歷史上由本 fork 回饋並已被 upstream 接收的功能，不再列為當前差異。清單見 [`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md#已被上游接收的貢獻)。
+- Fork 的行為放在 fork 自有模組；upstream 檔案只保留很薄的接縫。`bun run fork:footprint` 會把每個被修改的 upstream 檔案對照 [`scripts/fork/upstream-footprint.txt`](./scripts/fork/upstream-footprint.txt)，[`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md#fork-程式碼配置) 則列出每項功能對應的模組與接縫。
+
+## 文件
+
+從 [`docs/README.zh-TW.md`](./docs/README.zh-TW.md) 開始查找部署、surface、fork 功能與 extension 文件。
+
+## License 與致謝
+
+本 repository 依 [MIT License](./LICENSE) 發布，保留上游原作者的 copyright 與授權文字。
+
+感謝 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的原始設計與持續開發。本 fork 與上游維護者沒有從屬或官方背書關係。
+
+`ref/` 內的 vendored/reference material 各自適用其原始授權條款。

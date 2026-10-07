@@ -71,6 +71,19 @@ model failures retain the current title. Existing conversations are not renamed.
 
 The field is optional; no config rewrite is required. Remove it before using an older parser.
 
+## Image routes
+
+`tools.generate.image.openaiCompatible` is replaced by two fields next to `provider`:
+`tools.generate.image.models` (the alias allowlist, formerly `openaiCompatible.models`) and
+`tools.generate.image.routes`, a map from alias to `<provider>/<model id>`. A former
+`openaiCompatible.modelIds` entry becomes `routes.<alias>: openai-compatible/<model id>`. Routes also
+accept `openai`, `openrouter`, and `xai`, so one alias can leave the compatible endpoint while the rest
+follow `provider`. Configs that still contain `openaiCompatible` fail to parse with a message that names
+the replacement; no config version bump is required. Older builds do not reject `models` and `routes` at
+this level: they log them as unknown keys and ignore them while keeping `provider`, so a downgrade with
+`provider: openai-compatible` silently advertises every alias with its canonical model ID. Move the fields
+back under `openaiCompatible` before starting an older build.
+
 ## Image table style
 
 Table rendering now accepts `style: image`. The default remains `unicode`, so existing configurations
@@ -139,9 +152,30 @@ New v2 fields:
 - `agent.idleTimeoutMs`: primary agent inactivity timeout; defaults to `900000` (15 minutes). Active runs
   have no total runtime cap. Frozen v1 configs receive the same universal fallback but cannot override it.
 - `tools.inspect.model`: configurable Gemini model for `content.inspect`; must start with `google/`.
+- `tools.generate.image.provider`: the route for aliases without an explicit route, either the
+  built-in provider preference (`default`) or the `openai-compatible` endpoint. The optional
+  `tools.generate.image.models` allowlist limits the aliases advertised and considered for fallback,
+  and `tools.generate.image.routes` maps an alias to `<provider>/<model id>` (`openai`, `openrouter`,
+  `xai`, or `openai-compatible`). Frozen v1 configs cannot configure these fields and receive
+  `provider: default` with an empty `routes` map in the universal config.
 - `tools.web.firecrawl`: optional process-local concurrency policy applied independently to Firecrawl
   fetch and search calls. When present, `maxConcurrency` defaults to `2` and `queueTtl` defaults to `3s`;
   when absent, Firecrawl calls remain unlimited.
+- `tools.web.extract.providers` accepts `openai` in v2: `web.search` then runs the OpenAI Responses
+  `web_search` tool with `OPENAI_API_KEY` (and `OPENAI_BASE_URL` when set) and returns the answer's URL
+  citations followed by uncited retrieved sources. It is search-only; `web.extract` skips it and uses the
+  next configured provider. `tools.web.openai.model` (default `openai/gpt-5-mini`) and
+  `tools.web.openai.searchContextSize` (`low` | `medium` | `high`, default `medium`) tune the call.
+  `model` is a `provider/model` spec: an `openai/...` model uses `OPENAI_API_KEY` / `OPENAI_BASE_URL`,
+  an `openai-compatible/...` model uses `OPENAI_COMPATIBLE_API_KEY` / `OPENAI_COMPATIBLE_BASE_URL`,
+  and any other provider leaves the `openai` provider unconfigured with a logged error. A bare model
+  id from an existing config means `openai/<id>`. Set `model` to one your endpoint serves when the
+  base URL points at a gateway. [`web-search-openai.md`](./web-search-openai.md) documents the full
+  request and result contract. Cited URLs lose
+  the `utm_source=openai` tag; cited `content` is explicitly labeled as an OpenAI-generated summary,
+  not a page excerpt, and may combine cited sources. Date constraints are model instructions, not
+  enforced publication-date filters.
+  Frozen v1 configs cannot select this provider.
 - `models.capability.overrides.<provider/model>.attachment`: optional manual override for model attachment
   input support.
 - `conversation.thread.summarization.enabled`: default-false gate for background conversation thread
@@ -208,6 +242,21 @@ New v2 fields:
 - `surface.discord.markdownMathRender`: Discord markdown math rendering policy. Defaults to
   `{ enabled: false, maxWidth: 50, fallbackMode: source }`; frozen v1 configs receive this disabled
   universal fallback but cannot configure it.
+- `surface.telegram`: opt-in Telegram surface; `enabled` defaults to `false`, and the adapter is
+  constructed only when it is `true` and `token` is set (otherwise startup logs a warning and skips the
+  surface). `token` holds the Bot API token; a `tokenEnv` key is rejected with migration guidance, so
+  copy the secret to `token`. `botName` defaults to `lilac` and must not contain
+  spaces; `botUsername` is optional, must omit the leading `@`, and is resolved from `getMe` when unset.
+  `allowedChatIds` fails closed when empty and `allowedUserIds` is an optional second gate; both hold
+  string ids. `dbPath` and `apiRoot` (a full URL; the runtime defaults to `https://api.telegram.org`)
+  are optional. `outputMode` (`inline` | `preview`, default `preview`), `parseMode` (`html` | `plain`,
+  default `html`), `streamEditIntervalMs` (`500` through `60000`, default `1500`), `outputNotification`
+  (default `true`), `workingIndicators` (at least one entry), `commandMenu` (default `true`), and
+  `markdownTableRender` (`unicode` | `ascii` only, otherwise the Discord defaults) complete the surface.
+  Frozen v1 configs receive the disabled universal fallback but cannot configure any of these fields.
+- `surface.telegram.inboundMedia`: inbound photo and document delivery to the model. Defaults to
+  `{ enabled: true, maxBytesPerAttachment: 5MiB, maxBytesPerRequest: 10MiB }`; the byte-size fields accept
+  the suffixes listed below, and oversized media degrades to a metadata marker.
 
 Local example:
 

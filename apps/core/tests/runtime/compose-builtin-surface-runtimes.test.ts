@@ -10,17 +10,17 @@ import type {
   SurfaceAdapterEventSource,
 } from "../../src/surface/adapter";
 import { createDescriptorBoundSurfaceEventSource } from "../../src/surface/produced-ref-guard";
+import type { SurfaceRuntimeHealthPort } from "../../src/surface/runtime-descriptor";
+import type { TelegramAdapterHealthSnapshot } from "../../src/surface/telegram/telegram-adapter";
 import { nativeSurfaceProtocol } from "../../src/surface/native/native-protocol";
-import type {
-  SurfaceRuntimeDescriptor,
-  SurfaceRuntimeHealthPort,
-} from "../../src/surface/runtime-descriptor";
+import type { SurfaceRuntimeDescriptor } from "../../src/surface/runtime-descriptor";
 import { createInMemoryDeliveryBus } from "../helpers/in-memory-delivery-bus";
 
 function createComposition(input: {
   readonly webhookSecret?: string;
   readonly githubAppCredentialsAvailable: boolean;
   readonly discordHealth?: SurfaceRuntimeHealthPort;
+  readonly telegramEnabled?: boolean;
   readonly discordEnabled?: boolean;
   readonly nativeDescriptor?: SurfaceRuntimeDescriptor<"native">;
 }) {
@@ -33,6 +33,11 @@ function createComposition(input: {
   let transcriptStoreLookups = 0;
   const discordAdapter = {} as SurfaceAdapter;
   const githubAdapter = {} as SurfaceAdapter;
+  const telegramAdapter = Object.assign({} as SurfaceAdapter, {
+    connect: async () => undefined,
+    stopIngress: async () => undefined,
+    getSelf: async () => ({ platform: "telegram", userId: "1", userName: "lilac" }) as const,
+  });
   const eventSource: SurfaceAdapterEventSource = {
     subscribe: async (handler) => {
       adapterEventHandler = handler;
@@ -49,6 +54,36 @@ function createComposition(input: {
       eventSource,
     ),
     ...(input.discordHealth ? { discordHealth: input.discordHealth } : {}),
+    ...(input.telegramEnabled
+      ? {
+          telegram: {
+            adapter: telegramAdapter,
+            eventSource,
+            healthProvider: {
+              getHealthSnapshot: (): TelegramAdapterHealthSnapshot => ({
+                connectionState: "ready",
+                isReady: true,
+              }),
+            },
+            config: {
+              configVersion: 2,
+              surface: {
+                telegram: {
+                  enabled: true,
+                  botName: "lilac",
+                  allowedChatIds: ["1001"],
+                },
+                router: {
+                  defaultMode: "mention",
+                  sessionModes: {},
+                  activeDebounceMs: 1,
+                  activeGate: { enabled: false, timeoutMs: 2500 },
+                },
+              },
+            },
+          },
+        }
+      : {}),
     bus: createLilacBus(createInMemoryDeliveryBus()),
     blobStore: {} as BlobStore,
     subscriptionPrefix: "focused",
@@ -70,6 +105,7 @@ function createComposition(input: {
     registry: created.value,
     discordAdapter,
     githubAdapter,
+    telegramAdapter,
     logs,
     getAdapterEventHandler: () => adapterEventHandler,
     getTranscriptStoreLookups: () => transcriptStoreLookups,
@@ -77,6 +113,69 @@ function createComposition(input: {
 }
 
 describe("built-in surface runtime composition", () => {
+  it("registers Telegram only when its runtime input is present", () => {
+    const disabled = createComposition({ githubAppCredentialsAvailable: false });
+    const enabled = createComposition({
+      githubAppCredentialsAvailable: false,
+      telegramEnabled: true,
+    });
+
+    expect(disabled.registry.entries().map(({ platform }) => platform)).toEqual([
+      "discord",
+      "github",
+    ]);
+    expect(enabled.registry.entries().map(({ platform }) => platform)).toEqual([
+      "discord",
+      "github",
+      "telegram",
+    ]);
+    const telegram = enabled.registry.entries()[2];
+    expect(telegram?.adapterIngress).toBeDefined();
+    expect(telegram?.requestIngress).toBeDefined();
+    expect(telegram?.relay).toBeDefined();
+    expect(telegram?.health).toBeDefined();
+    expect(telegram?.workflowProgress).toBeDefined();
+  });
+
+  it("starts Telegram adapter ingress, request ingress, and output relay together", async () => {
+    const composition = createComposition({
+      githubAppCredentialsAvailable: false,
+      telegramEnabled: true,
+    });
+    const telegram = composition.registry.entries()[2];
+    if (!telegram?.adapterIngress || !telegram.requestIngress || !telegram.relay) {
+      throw new Error("Telegram production composition is missing an ingress stage");
+    }
+
+    const adapterIngress = await telegram.adapterIngress.start();
+    const requestIngress = await telegram.requestIngress.start();
+    const relay = await telegram.relay.lifecycle.start();
+
+    expect(composition.logs).toEqual(
+      expect.arrayContaining([
+        {
+          level: "debug",
+          message: "Telegram adapter ingress started",
+          context: { subscriptionId: "focused:telegram-adapter-to-bus" },
+        },
+        {
+          level: "debug",
+          message: "Telegram request router started",
+          context: { subscriptionId: "focused:telegram-request-router" },
+        },
+        {
+          level: "debug",
+          message: "Telegram output relay started",
+          context: { subscriptionId: "focused:bus-to-telegram" },
+        },
+      ]),
+    );
+
+    await relay.stop();
+    await requestIngress.stop();
+    await adapterIngress.stop();
+  });
+
   it("runs native without registering Discord ingress, relay or questions", () => {
     const composition = createComposition({
       githubAppCredentialsAvailable: false,

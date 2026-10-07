@@ -7,6 +7,8 @@ export type RequestContext<P extends string = string> = {
   requestId?: string;
   requestDeliveryId?: string;
   sessionId?: string;
+  /** Server-issued surface origin when sessionId is a synthetic workflow session. */
+  originSessionId?: string;
   requestClient?: string;
   cwd?: string;
   safetyMode?: "trusted" | "restricted";
@@ -14,6 +16,7 @@ export type RequestContext<P extends string = string> = {
   serverOwnedRequest?: boolean;
   /** Set only after authenticating the root-only container operator token. */
   operator?: boolean;
+  authenticatedPrincipal?: { platform: P; userId: string };
   requestInitiator?: { platform: P; userId: string };
   requestInitiatorSessionId?: string;
   currentTurnUserId?: string;

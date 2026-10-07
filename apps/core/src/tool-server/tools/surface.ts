@@ -54,6 +54,8 @@ import {
   inferMimeTypeFromFilename,
   resolveToolPathForRequestContextResult,
 } from "../../shared/attachment-utils";
+import { isTelegramChatAllowed } from "../../surface/telegram/telegram-guards";
+import { tryParseTelegramSessionId } from "../../surface/telegram/telegram-ids";
 import type { DiscordAttachmentMeta } from "../../surface/discord/discord-attachment";
 import {
   projectDiscordMessage,
@@ -229,7 +231,10 @@ function resolveSurfaceAdapter(params: {
   resolver: SurfaceAdapterResolver;
 }): ResultType<ResolvedSurfaceAdapter, ServerToolFailure> {
   const ctxClientRaw = params.ctx?.requestClient;
-  const ctxClient = isAdapterPlatform(ctxClientRaw) ? ctxClientRaw : null;
+  const initiatorClientRaw = params.ctx?.requestInitiator?.platform;
+  const initiatorClient = isAdapterPlatform(initiatorClientRaw) ? initiatorClientRaw : null;
+  const requestClient = isAdapterPlatform(ctxClientRaw) ? ctxClientRaw : null;
+  const ctxClient = requestClient && requestClient !== "unknown" ? requestClient : initiatorClient;
   const contextAdapter = ctxClient ? params.resolver.resolve(ctxClient) : null;
 
   if (params.inputClient) {
@@ -245,7 +250,7 @@ function resolveSurfaceAdapter(params: {
 
   if (contextAdapter) return Result.ok(contextAdapter);
 
-  if (ctxClient && ctxClient !== "unknown") {
+  if (ctxClient) {
     return Result.err(
       surfaceFailure(
         "unavailable",
@@ -254,7 +259,7 @@ function resolveSurfaceAdapter(params: {
     );
   }
 
-  if (typeof ctxClientRaw === "string" && ctxClientRaw.length > 0 && !ctxClient) {
+  if (typeof ctxClientRaw === "string" && ctxClientRaw.length > 0 && !requestClient) {
     return Result.err(
       surfaceFailure(
         "usage",
@@ -414,12 +419,32 @@ function withDefaultSessionId<TInput extends { readonly sessionId?: string }>(
   input: TInput,
   ctx: RequestContext | undefined,
 ): ResultType<TInput, ServerToolFailure> {
-  if (input.sessionId !== undefined) return Result.ok(input);
+  const initiatorSessionId =
+    typeof ctx?.requestInitiatorSessionId === "string" && ctx.requestInitiatorSessionId.length > 0
+      ? ctx.requestInitiatorSessionId
+      : undefined;
+
+  if (input.sessionId !== undefined) {
+    if (
+      ctx?.safetyMode === "restricted" &&
+      initiatorSessionId &&
+      input.sessionId !== initiatorSessionId
+    ) {
+      return Result.err(
+        surfaceFailure(
+          "denied",
+          `Restricted surface call cannot target session '${input.sessionId}' outside request origin '${initiatorSessionId}'`,
+        ),
+      );
+    }
+    return Result.ok(input);
+  }
 
   const ctxSessionId =
-    typeof ctx?.sessionId === "string" && ctx.sessionId.length > 0
+    initiatorSessionId ??
+    (typeof ctx?.sessionId === "string" && ctx.sessionId.length > 0
       ? ctx.sessionId
-      : inferBuiltinSurfaceToolRequestTarget(ctx?.requestId)?.sessionId;
+      : inferBuiltinSurfaceToolRequestTarget(ctx?.requestId)?.sessionId);
 
   if (ctxSessionId) {
     return Result.ok({ ...input, sessionId: ctxSessionId });
@@ -1202,6 +1227,7 @@ export class Surface implements ServerTool {
             `Lilac reference links use ${new URL(cfg.surface.native.publicUrl).origin}/?ref=<surface>:<sessionId>&message=<messageId>; relative /?ref= links use this installation.`,
             "Decode query parameters once, split ref at the first colon, and pass the prefix as client, the remainder as sessionId, and optional message as messageId. Supported prefixes: native, discord, github. Keep the remaining sessionId intact.",
             "For Discord message URLs, use client=discord, the channel ID as sessionId, and the final message ID as messageId.",
+            "For Telegram links, use client=telegram: https://t.me/c/<internal>/<messageId> means sessionId=-100<internal>; https://t.me/c/<internal>/<topicId>/<messageId> means sessionId=-100<internal>:<topicId>. Public https://t.me/<username>/... links cannot be resolved because the history index stores chat ids, not usernames.",
             "Use surface.messages.read for an anchored message, then surface.messages.list with beforeMessageId or afterMessageId for nearby context. For a thread-only link, start with surface.messages.list. Always pass the target client explicitly.",
             "Native surface tools require native request authority. From Discord or GitHub, read retained native history with conversation.thread.read using threadId=native:<threadId>; page with offset and limit to locate the referenced messageId. This requires conversation indexing and retained history.",
             "An optional range=<startMessageId>..<endMessageId> selects inclusive endpoints instead of message. Range endpoints may be native web display IDs; do not pass those external display IDs to surface tools. Injected previews include sourceMessageId when a platform message ID is available. Use that ID with surface.messages.read or surface.messages.list to retrieve more.",
@@ -1464,6 +1490,15 @@ export class Surface implements ServerTool {
             if (!message) continue;
             nativeText = message.text;
           }
+          if (row.client === "telegram") {
+            const telegramSession = tryParseTelegramSessionId(row.sessionId);
+            if (
+              !telegramSession ||
+              !isTelegramChatAllowed({ cfg, chatId: telegramSession.chatId })
+            ) {
+              continue;
+            }
+          }
           if (row.client === "discord") {
             const discord = this.params.adapterResolver.resolve("discord");
             if (!discord) continue;
@@ -1533,7 +1568,9 @@ export class Surface implements ServerTool {
     const resolvedResult = this.resolveAdapter(input.client, ctx);
     return resolvedResult.andThenAsync(async (resolved) => {
       const cfgResult =
-        resolved.platform === "discord" ? await this.getCfg() : Result.ok(undefined);
+        resolved.platform === "discord" || resolved.platform === "telegram"
+          ? await this.getCfg()
+          : Result.ok(undefined);
       return cfgResult.andThenAsync(async (cfg) => {
         const limit = input.limit ?? Number.POSITIVE_INFINITY;
 
@@ -1570,13 +1607,25 @@ export class Surface implements ServerTool {
               if (!include) continue;
             }
 
+            if (s.ref.platform === "telegram" && cfg) {
+              const telegramSession = tryParseTelegramSessionId(channelId);
+              if (
+                !telegramSession ||
+                !isTelegramChatAllowed({ cfg, chatId: telegramSession.chatId })
+              ) {
+                continue;
+              }
+            }
+
             out.push({
               channelId,
-              guildId,
-              parentChannelId,
+              ...(guildId ? { guildId } : {}),
+              ...(parentChannelId ? { parentChannelId } : {}),
               kind: s.kind,
-              title: s.title,
-              alias: cfg ? bestEffortAliasForDiscordChannelId({ channelId, cfg }) : undefined,
+              ...(s.title !== undefined ? { title: s.title } : {}),
+              ...(resolved.platform === "discord" && cfg
+                ? { alias: bestEffortAliasForDiscordChannelId({ channelId, cfg }) }
+                : {}),
             });
 
             if (out.length >= limit) break;

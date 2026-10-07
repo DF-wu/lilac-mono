@@ -4,6 +4,8 @@ import { z } from "zod";
 import { cloneDefaultWorkingIndicators } from "../working-indicators";
 
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
+import { defaultGenerateToolsConfig } from "./generate-image";
+import { cloneDefaultTelegramSurface } from "./telegram-surface";
 
 import type {
   ConfigParser,
@@ -704,6 +706,7 @@ function coreConfigV1ToUniversal(
     tools: {
       ...toolsRest,
       fsBackend: parsed.tools.fsBackend,
+      generate: defaultGenerateToolsConfig(),
       inspect: {
         model: "google/gemini-3-flash",
       },
@@ -792,6 +795,10 @@ function coreConfigV1ToUniversal(
           fallbackMode: "source",
         },
       },
+      // v1's input schema is frozen, so the Telegram surface cannot be
+      // configured on v1. Synthesise the v2 defaults (disabled) so both
+      // versions expose the same universal shape.
+      telegram: cloneDefaultTelegramSurface(),
     },
     agent: {
       ...agentRest,

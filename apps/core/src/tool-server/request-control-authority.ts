@@ -8,6 +8,7 @@ type SafetyMode = "trusted" | "restricted";
 type RequestControlPolicyBase = {
   requestId: string;
   sessionId: string;
+  originSessionId?: string;
   platform: string;
   canonicalCwd: string;
   safetyMode: SafetyMode;

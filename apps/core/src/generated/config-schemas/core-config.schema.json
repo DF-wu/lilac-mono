@@ -836,6 +836,58 @@
           "type": "object",
           "properties": {
             "fsBackend": { "default": "fff", "type": "string", "enum": ["fff", "node-rg"] },
+            "generate": {
+              "type": "object",
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "properties": {
+                    "provider": {
+                      "default": "default",
+                      "type": "string",
+                      "enum": ["default", "openai-compatible"]
+                    },
+                    "models": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "gpt-image-2",
+                          "gpt-5-image",
+                          "nanobanana",
+                          "nanobanana-2",
+                          "nanobanana-2-lite",
+                          "nanobanana-pro",
+                          "grok-imagine-image",
+                          "grok-imagine-image-pro"
+                        ]
+                      }
+                    },
+                    "routes": {
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string",
+                        "enum": [
+                          "gpt-image-2",
+                          "gpt-5-image",
+                          "nanobanana",
+                          "nanobanana-2",
+                          "nanobanana-2-lite",
+                          "nanobanana-pro",
+                          "grok-imagine-image",
+                          "grok-imagine-image-pro"
+                        ]
+                      },
+                      "additionalProperties": { "type": "string" }
+                    },
+                    "openaiCompatible": { "not": {} }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
             "web": {
               "type": "object",
               "properties": {
@@ -845,7 +897,10 @@
                     "providers": {
                       "minItems": 1,
                       "type": "array",
-                      "items": { "type": "string", "enum": ["tavily", "exa", "firecrawl"] }
+                      "items": {
+                        "type": "string",
+                        "enum": ["tavily", "exa", "firecrawl", "openai"]
+                      }
                     },
                     "provider": {
                       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -888,13 +943,28 @@
                   },
                   "additionalProperties": false
                 },
+                "openai": {
+                  "type": "object",
+                  "properties": {
+                    "model": { "default": "openai/gpt-5-mini", "type": "string", "minLength": 1 },
+                    "searchContextSize": {
+                      "default": "medium",
+                      "type": "string",
+                      "enum": ["low", "medium", "high"]
+                    }
+                  },
+                  "additionalProperties": false
+                },
                 "search": {
                   "type": "object",
                   "properties": {
                     "providers": {
                       "minItems": 1,
                       "type": "array",
-                      "items": { "type": "string", "enum": ["tavily", "exa", "firecrawl"] }
+                      "items": {
+                        "type": "string",
+                        "enum": ["tavily", "exa", "firecrawl", "openai"]
+                      }
                     },
                     "provider": {
                       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -1609,6 +1679,193 @@
                       "default": "source",
                       "type": "string",
                       "enum": ["source", "passthrough"]
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "telegram": {
+              "type": "object",
+              "properties": {
+                "enabled": { "default": false, "type": "boolean" },
+                "token": { "type": "string", "minLength": 1 },
+                "tokenEnv": { "not": {} },
+                "botName": { "default": "lilac", "type": "string", "minLength": 1 },
+                "botUsername": { "type": "string", "minLength": 1 },
+                "allowedChatIds": {
+                  "default": [],
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 }
+                },
+                "allowedUserIds": {
+                  "default": [],
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 }
+                },
+                "dbPath": { "type": "string", "minLength": 1 },
+                "apiRoot": { "type": "string", "format": "uri" },
+                "outputMode": {
+                  "default": "preview",
+                  "type": "string",
+                  "enum": ["inline", "preview"]
+                },
+                "parseMode": { "default": "html", "type": "string", "enum": ["html", "plain"] },
+                "streamEditIntervalMs": {
+                  "default": 1500,
+                  "type": "integer",
+                  "minimum": 500,
+                  "maximum": 60000
+                },
+                "outputNotification": { "default": true, "type": "boolean" },
+                "workingIndicators": {
+                  "default": [
+                    "Alchemizing",
+                    "Aromatizing",
+                    "Assembling",
+                    "Bleeping",
+                    "Blooming",
+                    "Blooping",
+                    "Blossoming",
+                    "Bouqueting",
+                    "Brainstorming",
+                    "Bubbling",
+                    "Calibrating",
+                    "Carbonating",
+                    "Cascading",
+                    "Catalyzing",
+                    "Compiling",
+                    "Composing",
+                    "Crystallizing",
+                    "Daydreaming",
+                    "Dazzling",
+                    "Decanting",
+                    "Deducing",
+                    "Defragmenting",
+                    "Distilling",
+                    "Doodling",
+                    "Effervescing",
+                    "Embroidering",
+                    "Extrapolating",
+                    "Fascinating",
+                    "Fathoming",
+                    "Fermenting",
+                    "Fiddling",
+                    "Finessing",
+                    "Fizzing",
+                    "Flourishing",
+                    "Formulating",
+                    "Gallivanting",
+                    "Gesticulating",
+                    "Glimmering",
+                    "Harmonizing",
+                    "Humming",
+                    "Illuminating",
+                    "Infusing",
+                    "Investigating",
+                    "Juggling",
+                    "Lavenderizing",
+                    "Materializing",
+                    "Meandering",
+                    "Nebulizing",
+                    "Orchestrating",
+                    "Origami-ing",
+                    "Parsing",
+                    "Perambulating",
+                    "Perfuming",
+                    "Permutating",
+                    "Petalling",
+                    "Philosophizing",
+                    "Photosynthesizing",
+                    "Phytomerizing",
+                    "Ping-ponging",
+                    "Pinging",
+                    "Pirouetting",
+                    "Plucking",
+                    "Polishing",
+                    "Pollinating",
+                    "Pruning",
+                    "Radiating",
+                    "Recalibrating",
+                    "Resonating",
+                    "Reverberating",
+                    "Rummaging",
+                    "Sashaying",
+                    "Scenting",
+                    "Scrutinizing",
+                    "Shimmering",
+                    "Sifting",
+                    "Sparkling",
+                    "Spiraling",
+                    "Sprinkling",
+                    "Sprouting",
+                    "Steeping",
+                    "Sublimating",
+                    "Synchronizing",
+                    "Tessellating",
+                    "Tiptoeing",
+                    "Tuning",
+                    "Twiddling",
+                    "Twinkling",
+                    "Unscrambling",
+                    "Waltzing",
+                    "Weaving",
+                    "Whispering",
+                    "Whittling",
+                    "Whizzing",
+                    "Zesting"
+                  ],
+                  "minItems": 1,
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 }
+                },
+                "commandMenu": { "default": true, "type": "boolean" },
+                "markdownTableRender": {
+                  "default": {
+                    "enabled": true,
+                    "style": "unicode",
+                    "maxWidth": 50,
+                    "fallbackMode": "list"
+                  },
+                  "type": "object",
+                  "properties": {
+                    "enabled": { "default": true, "type": "boolean" },
+                    "style": {
+                      "default": "unicode",
+                      "type": "string",
+                      "enum": ["unicode", "ascii"]
+                    },
+                    "maxWidth": { "default": 50, "type": "integer", "minimum": 40, "maximum": 240 },
+                    "fallbackMode": {
+                      "default": "list",
+                      "type": "string",
+                      "enum": ["list", "passthrough"]
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "inboundMedia": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": { "default": true, "type": "boolean" },
+                    "maxBytesPerAttachment": {
+                      "anyOf": [
+                        { "type": "integer", "exclusiveMinimum": 0, "maximum": 9007199254740991 },
+                        {
+                          "type": "string",
+                          "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?(B|KB|MB|GB|KiB|MiB|GiB)$"
+                        }
+                      ]
+                    },
+                    "maxBytesPerRequest": {
+                      "anyOf": [
+                        { "type": "integer", "exclusiveMinimum": 0, "maximum": 9007199254740991 },
+                        {
+                          "type": "string",
+                          "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?(B|KB|MB|GB|KiB|MiB|GiB)$"
+                        }
+                      ]
                     }
                   },
                   "additionalProperties": false

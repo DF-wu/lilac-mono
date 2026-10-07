@@ -371,34 +371,28 @@ The file remains `configVersion: 1`; existing configurations keep their behavior
 `mcp.reload` or restart Core after editing. Older builds reject references containing `prefix`;
 remove the field and include the prefix in the referenced value before downgrading.
 
+## Automatic Transcript And Workflow Blob Migration
+
+The production Docker entrypoint coordinates the one-way Core transcript schema 5 and workflow
+schema 25 migration before starting the default Core command. When both databases are at those exact
+legacy versions, startup first writes an immutable backup to
+`/data/migration-backups/blob-storage-v2/<timestamp>/`, then runs the blob-storage migration.
+
+If either database is already newer, startup skips this compatibility migration. If either database is
+older or only one database is at the expected legacy version, startup fails closed and requires an
+operator to inspect and migrate the deployment explicitly. Rollback after a successful migration
+requires restoring the generated backup and running a pre-migration image that expects schema 5/25.
+
+Set `LILAC_AUTO_MIGRATE_BLOB_STORAGE=0` only as an operator-controlled temporary opt-out when the
+migration will be run manually with `bun run migrate:blob-storage`. The Docker gate applies only to the
+image's exact default Core command; maintenance and diagnostic commands do not trigger it.
+
 ## Agent tool approval removal
 
 Lilac executes available tools without an approval step. Per-tool `needsApproval` callbacks are no
 longer evaluated, and agent options do not expose a `toolApproval` policy. Input validation, tool
 availability rules, and cancellation still apply. Existing persisted approval message formats remain
 readable; no stored-data or configuration version changes are needed.
-
-## Image generation script interface
-
-`generate.image` now accepts only `{ code: string }`, with JavaScript executed by Bun in the calling
-CLI's cwd and Core's inherited container environment. Replace calls using `prompt`, `model`, `size`,
-`aspectRatio`, `inputImages`, `maskImage`, or `outputDir` with scripts. The injected global `providers`
-maps configured `openai`, `openrouter`, and `xai` connections to `{ baseURL, apiKey? }`. Tool discovery
-advertises configured provider names; model choices and request examples live in the built-in
-`image-generation` skill.
-
-Successful execution collection returns `{ stdout, stderr, exitCode, truncated }` inside the existing
-Level 2 Result envelope, including when a script exits nonzero. Callers must check `exitCode`. Scripts
-own image decoding and file writes and should print saved paths. The former image path, MIME, model,
-and warning result fields are removed. Each stream is capped at 40 Ki characters and configured image
-provider keys are redacted. Scripts have a 10-minute limit and receive caller cancellation through
-process termination. A failed or interrupted script is not automatically retried.
-
-The callable now has native container execution authority and is removed from restricted-session
-allowances. Trusted callers with permission to call it can execute arbitrary code and access the
-container environment. There is no additional sandbox. `generate.video` keeps its existing contract.
-No stored data or configuration version changes are needed. Rollback requires restoring old callers
-alongside the old tool implementation.
 
 ## Tool launcher build artifacts
 
@@ -707,6 +701,29 @@ streams remain tail-only, and supported trimming preserves all managed pending f
 
 <a id="core-transcript-database-schemas-1-9"></a>
 
+## Downstream Core Config Extensions
+
+Manual v1-to-v2 upgrades follow [`docs/core-config-migrations.md`](docs/core-config-migrations.md). The
+DF-wu fork adds these downstream-only v2 contracts:
+
+- `surface.discord.outputPreviewPlainFinalStats` was removed. Discord preview plus plain final output
+  appends the stats footer whenever stats metadata is produced.
+- `surface.telegram` is disabled by default and requires `configVersion: 2` to enable or configure. Frozen
+  v1 configs receive the disabled universal fallback. Existing v2 configs using `tokenEnv` are rejected;
+  copy the secret to `token` in `core-config.yaml`. `allowedChatIds` fails closed, `streamEditIntervalMs`
+  defaults to `1500`, and `parseMode` defaults to `html`. See
+  [`docs/telegram-surface.md`](docs/telegram-surface.md).
+- `tools.generate.image.provider` selects `default` built-in routing or `openai-compatible` routing for
+  aliases without an explicit route. `tools.generate.image.models` restricts advertised aliases and
+  `tools.generate.image.routes` maps an alias to `<provider>/<model id>` (`openai`, `openrouter`, `xai`,
+  `openai-compatible`); the former `openaiCompatible` block is rejected with a migration hint. These
+  fields are v2-only; frozen v1 configs retain the built-in provider. No route falls back to another
+  provider. The `generate.image` result gained `providerMetadata`. See
+  [`docs/generate-image-openai-compatible.md`](docs/generate-image-openai-compatible.md).
+- `surface.telegram.inboundMedia` delivers inbound Telegram photos and documents to the model. It is
+  enabled by default with `maxBytesPerAttachment: 5MiB` and `maxBytesPerRequest: 10MiB`; set
+  `inboundMedia.enabled: false` to restore caption-only routing.
+
 ## Core transcript database schemas 1-11
 
 Core's `agent-transcripts.db` has its own `transcript_schema_migrations` sequence. These are internal
@@ -914,6 +931,15 @@ apply. Native UI read and write permissions remain unchanged. Derived native sta
 its retained message content or history generation changes, including edits, rewinds, and deletion.
 Model selection, titles, archiving, and grant changes preserve existing summaries. Downgrading requires
 rebuilding the derived index for the older runtime; do not reuse cross-surface derived rows with an older binary.
+
+This fork additionally attaches `telegram-surface.db` as a conversation source when the Telegram
+surface is usable. Telegram sessions are projected into the same derived tables as `telegram_thread`
+rows with thread references `telegram:<sessionId>`, one thread per chat or forum topic, and are
+subject to `surface.telegram.allowedChatIds` on every read. Retained Telegram messages are unchanged;
+derived Telegram rows are rebuilt whenever a session's message count, latest timestamp, latest edit, or
+deletion count changes. Removing the Telegram surface leaves stale `telegram_thread` rows that the
+next materialization pass deletes. Downgrading to a runtime without the Telegram source requires the
+same derived-index rebuild as above.
 
 ## Transcript schema 14: model image previews
 

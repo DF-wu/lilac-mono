@@ -29,6 +29,8 @@ secrets.env
 # caches
 .eslintcache
 .cache
+.sisyphus/
+.omo/
 *.tsbuildinfo
 
 # IntelliJ based IDEs

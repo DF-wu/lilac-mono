@@ -18,7 +18,7 @@ type RequestMessage = Extract<LilacMessageForTopic<"cmd.request">, { type: "cmd.
 function requestMessage(input: {
   readonly requestId?: string;
   readonly sessionId?: string;
-  readonly requestClient?: "discord" | "github" | "native" | "slack" | "unknown";
+  readonly requestClient?: "discord" | "github" | "telegram" | "native" | "slack" | "unknown";
   readonly raw?: unknown;
   readonly requestDeliveryId?: string;
 }): RequestMessage {

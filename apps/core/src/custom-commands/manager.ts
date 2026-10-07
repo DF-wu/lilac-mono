@@ -4,7 +4,6 @@ import { pathToFileURL } from "node:url";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import {
   buildCustomCommandTextName,
-  CUSTOM_COMMAND_TEXT_PREFIX,
   CUSTOM_COMMAND_TOOL_NAME,
   decodeCustomCommandResult,
   discoverCustomCommands,
@@ -12,13 +11,18 @@ import {
   isRecord,
   opaqueErrorCause,
   opaqueErrorMessage,
+  parseCustomCommandToken,
   type CustomCommandArgDef,
   type CustomCommandContext,
   type CustomCommandDiscoveryDependencies,
   type CustomCommandDiscoveryError,
   type CustomCommandResult,
+  type CustomCommandToken,
   type DiscoveredCustomCommand,
+  type ParseCustomCommandTokenOpts,
 } from "@stanley2058/lilac-utils";
+
+import { assignMenuAliases, collapseWhitespace, type CustomCommandMenuEntry } from "./menu-aliases";
 
 type CustomCommandErrorDetails = {
   readonly commandName: string;
@@ -394,6 +398,12 @@ function tokenize(text: string): ResultType<string[], CustomCommandUnterminatedQ
 
 export type LoadedCustomCommand = DiscoveredCustomCommand & {
   textName: string;
+  /**
+   * Menu-safe alias, or `null` when the command cannot be advertised in a bot
+   * command menu. A `null` here never removes the command — it stays reachable
+   * through `textName`.
+   */
+  menuAlias: string | null;
 };
 
 export type ParsedCustomCommandInvocation = {
@@ -412,6 +422,7 @@ type ParsedArgsAndPrompt = {
 export class CustomCommandManager {
   private readonly reserved = new Set(["lilac", "model", "divider"]);
   private readonly byName = new Map<string, LoadedCustomCommand>();
+  private readonly byMenuAlias = new Map<string, LoadedCustomCommand>();
   private readonly warnings: string[] = [];
 
   constructor(
@@ -421,6 +432,7 @@ export class CustomCommandManager {
 
   async init(): Promise<ResultType<void, CustomCommandDiscoveryError>> {
     this.byName.clear();
+    this.byMenuAlias.clear();
     this.warnings.length = 0;
 
     const discovered = await discoverCustomCommands({
@@ -447,13 +459,52 @@ export class CustomCommandManager {
         this.byName.set(cmd.def.name, {
           ...cmd,
           textName: buildCustomCommandTextName(cmd.def.name),
+          menuAlias: null,
         });
       }
+
+      this.assignMenuAliases();
     });
   }
 
   list(): LoadedCustomCommand[] {
     return [...this.byName.values()].sort((a, b) => a.def.name.localeCompare(b.def.name));
+  }
+
+  /**
+   * The command menu to publish, in registry order.
+   *
+   * Only commands with an assigned alias appear; the rest stay invocable by
+   * their typed form, and the reason each was left out is in `listWarnings()`.
+   */
+  listMenuEntries(): CustomCommandMenuEntry[] {
+    return this.list().flatMap((cmd) =>
+      cmd.menuAlias === null
+        ? []
+        : [
+            {
+              command: cmd.menuAlias,
+              // Straight from the registry: a placeholder here would describe
+              // the menu rather than the command it invokes.
+              description: collapseWhitespace(cmd.def.description),
+            },
+          ],
+    );
+  }
+
+  private assignMenuAliases(): void {
+    const assignment = assignMenuAliases(
+      this.list().map((cmd) => ({ name: cmd.def.name, dir: cmd.dir, textName: cmd.textName })),
+    );
+    this.warnings.push(...assignment.warnings);
+
+    for (const [name, alias] of assignment.aliases) {
+      const cmd = this.byName.get(name);
+      if (!cmd) continue;
+      const withAlias: LoadedCustomCommand = { ...cmd, menuAlias: alias };
+      this.byName.set(name, withAlias);
+      this.byMenuAlias.set(alias, withAlias);
+    }
   }
 
   listWarnings(): string[] {
@@ -464,28 +515,43 @@ export class CustomCommandManager {
     return this.byName.get(name) ?? null;
   }
 
-  peekTextName(text: string): string | null {
+  /**
+   * Menu aliases resolve through the alias index rather than by undoing the
+   * `-`/`_` mapping. An alias that was never advertised — because it collided
+   * or could not be represented — therefore does not silently invoke whichever
+   * command happens to share its de-normalized name.
+   */
+  private resolveToken(token: CustomCommandToken): LoadedCustomCommand | null {
+    if (token.form === "text") return this.get(token.name);
+    return (token.alias === undefined ? null : this.byMenuAlias.get(token.alias)) ?? null;
+  }
+
+  /**
+   * `opts.botUsername` is required for a command carrying an `@target` to be
+   * recognized at all; without it such a command is treated as not ours.
+   */
+  peekTextName(text: string, opts: ParseCustomCommandTokenOpts = {}): string | null {
     const trimmed = text.trim();
-    if (!trimmed.startsWith(`/${CUSTOM_COMMAND_TEXT_PREFIX}`)) return null;
-    const token = trimmed.slice(1).split(/\s/u, 1)[0]?.trim();
-    if (!token?.startsWith(CUSTOM_COMMAND_TEXT_PREFIX)) return null;
-    const name = token.slice(CUSTOM_COMMAND_TEXT_PREFIX.length).trim();
-    return name.length > 0 ? name : null;
+    if (!trimmed.startsWith("/")) return null;
+    const head = trimmed.slice(1).split(/\s/u, 1)[0];
+    const token = head === undefined ? null : parseCustomCommandToken(head, opts);
+    return token?.name ?? null;
   }
 
   parseText(
     text: string,
+    opts: ParseCustomCommandTokenOpts = {},
   ): ResultType<ParsedCustomCommandInvocation | null, CustomCommandInvocationError> {
     const trimmed = text.trim();
-    if (!trimmed.startsWith(`/${CUSTOM_COMMAND_TEXT_PREFIX}`)) return Result.ok(null);
+    if (!trimmed.startsWith("/")) return Result.ok(null);
 
     const tokenized = tokenize(trimmed.slice(1));
     return continueInvocation(tokenized, (tokens) => {
       const head = tokens.shift();
-      if (!head || !head.startsWith(CUSTOM_COMMAND_TEXT_PREFIX)) return Result.ok(null);
+      const token = head === undefined ? null : parseCustomCommandToken(head, opts);
+      if (!token) return Result.ok(null);
 
-      const name = head.slice(CUSTOM_COMMAND_TEXT_PREFIX.length);
-      const command = this.get(name);
+      const command = this.resolveToken(token);
       if (!command) return Result.ok(null);
       const parsed = this.parseArgsAndPrompt(command, tokens);
       return continueInvocation(parsed, (value) =>

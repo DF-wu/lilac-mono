@@ -13,6 +13,115 @@ import {
 import { deriveSubagentIdleTimeoutMs } from "../subagent-idle-timeout";
 
 describe("core config versioning", () => {
+  it("preserves explicit v1 web tool settings", async () => {
+    // Given
+    const raw = {
+      configVersion: 1,
+      tools: {
+        web: {
+          extract: {
+            providers: ["exa", "firecrawl"],
+          },
+          fetch: {
+            mode: "browser",
+          },
+        },
+      },
+    };
+
+    // When
+    const parsed = await parseCoreConfig(raw);
+
+    // Then
+    expect(parsed.tools.web.extract.providers).toEqual(["exa", "firecrawl"]);
+    expect(parsed.tools.web.fetch.mode).toBe("browser");
+  });
+
+  it("preserves explicit v2 batch and media tool settings", async () => {
+    // Given
+    const raw = {
+      configVersion: 2,
+      tools: {
+        batch: {
+          maxCalls: 4,
+        },
+        media: {
+          maxInlineBytesPerPart: 1_024,
+          maxInlineBytesTotal: 2_048,
+        },
+      },
+    };
+
+    // When
+    const parsed = await parseCoreConfig(raw);
+
+    // Then
+    expect(parsed.tools.batch.maxCalls).toBe(4);
+    expect(parsed.tools.media).toEqual({
+      maxInlineBytesPerPart: 1_024,
+      maxInlineBytesTotal: 2_048,
+    });
+  });
+
+  it("defaults the v1 universal image provider", async () => {
+    // Given
+    const raw = { configVersion: 1 };
+
+    // When
+    const parsed = await parseCoreConfig(raw);
+
+    // Then
+    expect(parsed.tools.generate.image.provider).toBe("default");
+  });
+
+  it("defaults an omitted v2 image provider", async () => {
+    // Given
+    const raw = { configVersion: 2 };
+
+    // When
+    const parsed = await parseCoreConfig(raw);
+
+    // Then
+    expect(parsed.tools.generate.image.provider).toBe("default");
+  });
+
+  it("accepts the v2 openai-compatible image provider", async () => {
+    // Given
+    const raw = {
+      configVersion: 2,
+      tools: {
+        generate: {
+          image: {
+            provider: "openai-compatible",
+          },
+        },
+      },
+    };
+
+    // When
+    const parsed = await parseCoreConfig(raw);
+
+    // Then
+    expect(parsed.tools.generate.image.provider).toBe("openai-compatible");
+  });
+
+  it("rejects an unknown v2 image provider", async () => {
+    // Given
+    const raw = {
+      configVersion: 2,
+      tools: {
+        generate: {
+          image: {
+            provider: "unknown",
+          },
+        },
+      },
+    };
+
+    // When / Then
+    await expect(parseCoreConfig(raw)).rejects.toThrow();
+  });
+
   it("accepts opt-in image table style in both config versions without changing defaults", () => {
     const v1 = parseCoreConfigV1ToUniversal({
       surface: {
@@ -56,6 +165,15 @@ describe("core config versioning", () => {
     const invalid = parseCoreConfigResult({ configVersion: 2, tools: { output: null } });
     expect(invalid.status).toBe("error");
     if (invalid.status === "error") expect(invalid.error._tag).toBe("CoreConfigV2Invalid");
+
+    const deprecated = parseCoreConfigResult({
+      configVersion: 2,
+      surface: { telegram: { tokenEnv: "TELEGRAM_BOT_TOKEN" } },
+    });
+    expect(deprecated.status).toBe("error");
+    if (deprecated.status === "error") {
+      expect(deprecated.error._tag).toBe("CoreConfigV2Invalid");
+    }
   });
 
   it("keeps legacy config exceptions as Error and ZodError", async () => {
@@ -71,6 +189,12 @@ describe("core config versioning", () => {
     await expect(
       parseCoreConfig({ configVersion: 2, tools: { output: null } }),
     ).rejects.toBeInstanceOf(ZodError);
+    await expect(
+      parseCoreConfig({
+        configVersion: 2,
+        surface: { telegram: { tokenEnv: "TELEGRAM_BOT_TOKEN" } },
+      }),
+    ).rejects.toThrow("surface.telegram.tokenEnv was removed");
   });
 
   it("parses explicit v1 configs with current defaults", async () => {

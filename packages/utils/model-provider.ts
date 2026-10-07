@@ -26,6 +26,7 @@ export { refreshCodexOAuthTokens, shouldRefreshCodexOAuthTokens } from "./codex-
 export type { RefreshCodexOAuthTokensOptions } from "./codex-provider-auth";
 import { createLogger } from "./logging";
 import { withOpenAIImageEditFilenamesFetch } from "./openai-image-edit-fetch";
+import { withOpenAICompatibleToolImages } from "./openai-compatible-tool-images";
 import { createOpenAIResponsesWebSocketFetch } from "./openai-responses-websocket-fetch";
 import { withLlmWireDebugFetch } from "./llm-wire-debug";
 import { captureResultOutcome, isPanic, isRecord } from "./runtime-utils";
@@ -384,12 +385,14 @@ export function getModelProviders() {
       : null,
 
     "openai-compatible": env.providers.openaiCompatible.baseUrl
-      ? createOpenAICompatible({
-          name: "openaiCompatible",
-          baseURL: env.providers.openaiCompatible.baseUrl,
-          apiKey: env.providers.openaiCompatible.apiKey,
-          includeUsage: true,
-        })
+      ? withOpenAICompatibleToolImages(
+          createOpenAICompatible({
+            name: "openaiCompatible",
+            baseURL: env.providers.openaiCompatible.baseUrl,
+            apiKey: env.providers.openaiCompatible.apiKey,
+            includeUsage: true,
+          }),
+        )
       : null,
 
     cerebras: createCerebras({

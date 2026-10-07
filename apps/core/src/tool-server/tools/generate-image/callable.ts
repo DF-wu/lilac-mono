@@ -1,0 +1,266 @@
+import type { CoreConfig } from "@stanley2058/lilac-utils";
+import type {
+  ServerToolCallableDefinition,
+  ServerToolResult,
+} from "@stanley2058/lilac-plugin-runtime";
+import { Result } from "better-result";
+import { generateImage, type ImageModelProviderMetadata } from "ai";
+import fs from "node:fs/promises";
+import { dirname, join } from "node:path";
+
+import {
+  formatToolPathForRequestContext,
+  inferExtensionFromMimeType,
+  resolveToolPathForRequestContext,
+} from "../../../shared/attachment-utils";
+import type { RegisteredSurfacePlatform } from "../../../surface/types";
+import type { ServerToolCallOptions } from "../../types";
+import {
+  captureGenerateFailure,
+  settleCapturedError,
+  settleCapturedPromise,
+  writeFileWithUniqueName,
+} from "../generate";
+import {
+  DEFAULT_IMAGE_MODEL_FALLBACK_ORDER,
+  resolveImageDimensions,
+  type SupportedImageModelId,
+} from "./catalog";
+import { generateFailureFromCause } from "./failures";
+import { imageGenerateInputSchema, type ImageGenerateInput } from "./input";
+import { buildImageGenerationPrompt } from "./prompt";
+import {
+  advertisedImageModelIds,
+  imageRequestOptions,
+  pickImageModel,
+  resolveImageModels,
+  type ResolvedImageModels,
+} from "./routing";
+import { validateImageGenerationInputForModel } from "./validation";
+
+const DEFAULT_IMAGE_OUTPUT_BASENAME = "generated-image";
+
+const IMAGE_CALLABLE_DESCRIPTION =
+  "Generate or edit an image with a configured provider and write it to a local file in outputDir (or cwd). Returns absolute output path + MIME type. " +
+  `Recommended/default: ${DEFAULT_IMAGE_MODEL_FALLBACK_ORDER[0]} when available.`;
+
+/**
+ * Reads `tools.generate.image` lazily so config changes apply without
+ * rebuilding the tool. `undefined` means no config source is wired (direct
+ * construction), in which case the default provider routing applies.
+ */
+export type GenerateImageConfigSource = () =>
+  | Pick<CoreConfig, "tools">
+  | undefined
+  | Promise<Pick<CoreConfig, "tools"> | undefined>;
+
+type GenerateImageOutcome = Awaited<ReturnType<typeof generateImage>>;
+
+export type GenerateImageResult = {
+  readonly ok: true;
+  readonly path: string;
+  readonly bytes: number;
+  readonly mimeType: string;
+  readonly model: SupportedImageModelId;
+  readonly warnings: GenerateImageOutcome["warnings"];
+  readonly providerMetadata: ImageModelProviderMetadata;
+};
+
+export type GenerateImageCallableDefinition = ServerToolCallableDefinition<
+  typeof imageGenerateInputSchema,
+  GenerateImageResult,
+  RegisteredSurfacePlatform
+>;
+
+const GATEWAY_COST_METADATA_KEYS = [
+  "cost",
+  "gatewayCost",
+  "inferenceCost",
+  "inputInferenceCost",
+  "marketCost",
+  "outputInferenceCost",
+  "surchargeCost",
+] as const;
+
+function addDecimalStrings(
+  value1: string | undefined,
+  value2: string | undefined,
+): string | undefined {
+  if (
+    typeof value1 !== "string" ||
+    typeof value2 !== "string" ||
+    !/^\d+(?:\.\d+)?$/.test(value1) ||
+    !/^\d+(?:\.\d+)?$/.test(value2)
+  )
+    return undefined;
+  const [integer1, fraction1 = ""] = value1.split(".");
+  const [integer2, fraction2 = ""] = value2.split(".");
+  const precision = Math.max(fraction1.length, fraction2.length);
+  const sum = (
+    BigInt(integer1 + fraction1.padEnd(precision, "0")) +
+    BigInt(integer2 + fraction2.padEnd(precision, "0"))
+  )
+    .toString()
+    .padStart(precision + 1, "0");
+  return precision === 0
+    ? sum
+    : `${sum.slice(0, -precision)}.${sum.slice(-precision)}`.replace(/\.?0+$/, "");
+}
+
+/** Preserve the tool's aggregate contract using the SDK's per-call metadata.
+ * Matches AI SDK 7's generateImage merge, including gateway decimal costs.
+ */
+function aggregateProviderMetadata(
+  calls: GenerateImageOutcome["calls"],
+): ImageModelProviderMetadata {
+  const providerMetadata: ImageModelProviderMetadata = {};
+  for (const call of calls) {
+    for (const [providerName, metadata] of Object.entries(call.providerMetadata ?? {})) {
+      if (providerName === "gateway") {
+        const current = providerMetadata.gateway;
+        const merged = { images: metadata.images };
+        for (const [key, value] of [
+          ...Object.entries(current ?? {}),
+          ...Object.entries(metadata),
+        ]) {
+          Object.defineProperty(merged, key, {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
+        }
+        for (const key of GATEWAY_COST_METADATA_KEYS) {
+          const previous = current == null ? undefined : Reflect.get(current, key);
+          const next = Reflect.get(metadata, key);
+          const total = addDecimalStrings(
+            typeof previous === "string" ? previous : undefined,
+            typeof next === "string" ? next : undefined,
+          );
+          if (total !== undefined) Reflect.set(merged, key, total);
+        }
+        if (Array.isArray(merged.images) && merged.images.length === 0) {
+          Reflect.deleteProperty(merged, "images");
+        }
+        providerMetadata.gateway = merged;
+        continue;
+      }
+      const current = Object.hasOwn(providerMetadata, providerName)
+        ? providerMetadata[providerName]
+        : undefined;
+      const entry = current ?? { images: [] };
+      entry.images.push(...metadata.images);
+      Object.defineProperty(providerMetadata, providerName, {
+        value: entry,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+  }
+  return providerMetadata;
+}
+
+async function resolveModels(
+  getConfig: GenerateImageConfigSource | undefined,
+): Promise<ResolvedImageModels> {
+  const config = await getConfig?.();
+  return resolveImageModels(config?.tools.generate.image);
+}
+
+async function runGenerateImage(
+  payload: ImageGenerateInput,
+  opts: ServerToolCallOptions | undefined,
+  getConfig: GenerateImageConfigSource | undefined,
+): Promise<ServerToolResult<GenerateImageResult>> {
+  return Result.gen(async function* () {
+    const picked = yield* pickImageModel(await resolveModels(getConfig), payload.model);
+    yield* validateImageGenerationInputForModel(picked.id, payload);
+
+    const cwd = opts?.context?.cwd ?? process.cwd();
+    const resolvedOutputDir = yield* settleCapturedError(
+      Result.try({
+        try: () =>
+          resolveToolPathForRequestContext({
+            cwd,
+            inputPath:
+              payload.outputDir ?? (opts?.context?.safetyMode === "restricted" ? "/tmp" : "."),
+            context: opts?.context,
+          }),
+        catch: captureGenerateFailure,
+      }),
+      generateFailureFromCause("denied"),
+    );
+
+    const prompt = yield* Result.await(buildImageGenerationPrompt(cwd, payload, opts?.context));
+    const requestOptions = imageRequestOptions(
+      picked.route.provider,
+      resolveImageDimensions(picked.id, payload),
+    );
+    const res = yield* Result.await(
+      settleCapturedPromise(
+        Result.tryPromise({
+          try: () =>
+            generateImage({
+              model: picked.model,
+              prompt,
+              abortSignal: opts?.signal,
+              ...requestOptions,
+            }),
+          catch: captureGenerateFailure,
+        }),
+        generateFailureFromCause(() => (opts?.signal?.aborted ? "cancelled" : "unavailable")),
+      ),
+    );
+
+    const image = res.image;
+    const inferredExt = inferExtensionFromMimeType(image.mediaType) || ".png";
+    const targetWithExt = join(resolvedOutputDir, `${DEFAULT_IMAGE_OUTPUT_BASENAME}${inferredExt}`);
+
+    yield* Result.await(
+      settleCapturedPromise(
+        Result.tryPromise({
+          try: () => fs.mkdir(dirname(targetWithExt), { recursive: true }),
+          catch: captureGenerateFailure,
+        }),
+        generateFailureFromCause("unavailable"),
+      ),
+    );
+    const outPath = yield* Result.await(writeFileWithUniqueName(targetWithExt, image.uint8Array));
+
+    return Result.ok({
+      ok: true as const,
+      path: formatToolPathForRequestContext({ path: outPath, context: opts?.context }),
+      bytes: image.uint8Array.byteLength,
+      mimeType: image.mediaType,
+      model: picked.id,
+      warnings: res.warnings,
+      providerMetadata: aggregateProviderMetadata(res.calls),
+    });
+  });
+}
+
+/**
+ * The structured `generate.image` callable this fork keeps in place of
+ * upstream's script runner. `Generate` in `../generate` registers it; every
+ * other piece of the image contract lives in this directory.
+ */
+export function createGenerateImageCallable(input: {
+  readonly getConfig?: GenerateImageConfigSource;
+}): GenerateImageCallableDefinition {
+  return {
+    name: "Generate Image",
+    description: IMAGE_CALLABLE_DESCRIPTION,
+    inputSchema: imageGenerateInputSchema,
+    validation: "zod",
+    primaryPositional: "prompt",
+    catalog: async () => {
+      const imageModels = advertisedImageModelIds(await resolveModels(input.getConfig));
+      if (imageModels.length === 0) return false;
+      return {
+        description: `${IMAGE_CALLABLE_DESCRIPTION} Available models: ${imageModels.join(", ")}`,
+      };
+    },
+    run: (payload, opts) => runGenerateImage(payload, opts, input.getConfig),
+  };
+}

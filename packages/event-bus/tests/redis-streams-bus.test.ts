@@ -1424,10 +1424,15 @@ describe("RedisStreamsBus", () => {
     const streamKey = `${keyPrefix}:topic`;
     const raw = createRedisStreamsBus({ redis, keyPrefix });
     const originalXgroup = Reflect.get(redis, "xgroup");
-    if (typeof originalXgroup !== "function") throw new Error("Redis XGROUP is unavailable");
+    const originalScan = Reflect.get(redis, "scan");
+    if (typeof originalXgroup !== "function" || typeof originalScan !== "function") {
+      throw new Error("Redis cleanup commands are unavailable");
+    }
     const destroyStarted = Promise.withResolvers<void>();
     const releaseDestroy = Promise.withResolvers<void>();
     let destroyCalls = 0;
+    let cleanupAttempts = 0;
+    let stopSettled = false;
     let subscription: { stop(): Promise<ResultType<void, EventDeliveryStopFailed>> } | undefined;
     try {
       subscription = requireOk(
@@ -1446,6 +1451,13 @@ describe("RedisStreamsBus", () => {
       const groups = ephemeralGroupNames(await redis.xinfo("GROUPS", streamKey));
       expect(groups).toHaveLength(1);
       const physicalGroup = groups[0]!;
+      const statePattern = `lilac:event-bus:managed-delivery:v2:${managedRedisGroupId(streamKey, physicalGroup)}:message:*`;
+      Reflect.set(redis, "scan", async (...args: unknown[]) => {
+        if (args[0] === "0" && args[1] === "MATCH" && args[2] === statePattern) {
+          cleanupAttempts += 1;
+        }
+        return await Reflect.apply(originalScan, redis, args);
+      });
       Reflect.set(redis, "xgroup", async (...args: unknown[]) => {
         if (args[0] === "DESTROY" && args[1] === streamKey && args[2] === physicalGroup) {
           destroyCalls += 1;
@@ -1462,14 +1474,17 @@ describe("RedisStreamsBus", () => {
 
       requireOk(await stopping);
       await closing;
+      stopSettled = true;
       expect(destroyCalls).toBe(1);
+      expect(cleanupAttempts).toBe(1);
       expect(consumerGroupNames(await redis.xinfo("GROUPS", streamKey))).not.toContain(
         physicalGroup,
       );
     } finally {
       releaseDestroy.resolve();
       Reflect.set(redis, "xgroup", originalXgroup);
-      if (subscription) await subscription.stop().catch(() => undefined);
+      Reflect.set(redis, "scan", originalScan);
+      if (subscription && !stopSettled) await subscription.stop().catch(() => undefined);
       await raw.close().catch(() => undefined);
       await redis.del(streamKey);
       await redis.quit();

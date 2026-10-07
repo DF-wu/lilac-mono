@@ -34,6 +34,15 @@ tools:
     # firecrawl:
     #   maxConcurrency: 2
     #   queueTtl: 3s
+    # `openai` in extract.providers runs web.search through the OpenAI Responses web_search tool
+    # (search-only, web.extract skips it). Dates are prompt guidance with this
+    # provider, not enforced publication-date filters. `model` is the provider/model
+    # that runs the hosted search: `openai/...` uses OPENAI_API_KEY / OPENAI_BASE_URL,
+    # `openai-compatible/...` uses OPENAI_COMPATIBLE_API_KEY / OPENAI_COMPATIBLE_BASE_URL.
+    # A bare model id means `openai/<id>`.
+    # openai:
+    #   model: openai/gpt-5-mini   # or openai-compatible/gpt-5.6-terra
+    #   searchContextSize: medium
   inspect:
     # Must start with google/.
     model: google/gemini-3.5-flash
@@ -50,6 +59,27 @@ tools:
   media:
     maxInlineBytesPerPart: 10MiB
     maxInlineBytesTotal: 20MiB
+  generate:
+    image:
+      # Route for aliases without an entry in `routes`.
+      # - default: the first configured provider in openai, openrouter, xai
+      #   that serves the alias, with the alias's catalog model ID.
+      # - openai-compatible: every alias goes to OPENAI_COMPATIBLE_BASE_URL
+      #   (with OPENAI_COMPATIBLE_API_KEY) using its catalog model ID.
+      # No route falls back to another provider after a failure.
+      provider: default
+      # Optional allowlist of Lilac aliases to advertise and serve. Omit to
+      # consider every alias. Default-routed aliases without a configured
+      # provider are not advertised; explicit routes and openai-compatible
+      # routes stay advertised when their credentials are missing, so a call
+      # reports the exact gap.
+      # models: [nanobanana-2, gpt-image-2]
+      # Optional per-alias routes as "<provider>/<model id>" with provider
+      # openai, openrouter, xai, or openai-compatible. The model id may itself
+      # contain slashes (OpenRouter slugs). Unlisted aliases follow `provider`.
+      # routes:
+      #   nanobanana-2: openai-compatible/gemini-3.1-flash-image-preview
+      #   gpt-image-2: openrouter/openai/gpt-image-2
 
 plugins:
   disabled: []
@@ -301,6 +331,98 @@ surface:
       # - passthrough: pass the original content through unchanged
       fallbackMode: source
 
+  # Telegram surface (opt-in). Requires configVersion 2.
+  # See docs/telegram-surface.md for BotFather setup and group privacy notes.
+  telegram:
+    # The adapter is only constructed when this is true.
+    enabled: false
+
+    # Keep this file private: the token is stored directly in core-config.yaml.
+    # token: "123456789:replace-with-your-bot-token"
+
+    # Fails closed: while allowedChatIds is empty the bot ignores every chat.
+    # Use numeric chat ids (negative for groups/supergroups), as strings.
+    allowedChatIds: []
+
+    # Optional second gate. Empty means "any user in an allowed chat".
+    allowedUserIds: []
+
+    # Display name used in attribution + mention stripping. Must not contain spaces.
+    botName: "lilac"
+
+    # Optional: the @username of the bot, without the leading "@".
+    # Resolved from getMe on connect when omitted.
+    # botUsername: "Catalina_agentbot"
+
+    # Optional: override surface DB location (default: <dataDir>/telegram-surface.db).
+    # Telegram has no history API, so the adapter keeps its own message index.
+    # dbPath: "/path/to/telegram-surface.db"
+
+    # Optional: Bot API endpoint. Telegram supports self-hosted Bot API servers,
+    # which raise the file-size limits and keep traffic on your own network.
+    # Must be a full URL. Changing it takes effect on restart.
+    # Default: https://api.telegram.org
+    # apiRoot: "http://127.0.0.1:8081"
+
+    # What happens to the streamed messages when a request is cancelled.
+    # Telegram edits in place, so a successful run looks identical either way.
+    # - inline: leave the partial answer visible
+    # - preview: delete the streamed messages on cancellation
+    outputMode: preview
+
+    # Message formatting sent to the Bot API:
+    # - html: convert markdown to Telegram HTML (recommended)
+    # - plain: send unformatted text
+    parseMode: html
+
+    # Minimum gap between streaming edits. Telegram throttles edits at roughly
+    # one per second per chat; lowering this trips 429 retry_after responses.
+    streamEditIntervalMs: 1500
+
+    # - true: allow messages to notify chat members
+    # - false: send with disable_notification
+    outputNotification: true
+
+    # Publish the custom-command menu via setMyCommands on connect.
+    #
+    # Each command in <dataDir>/cmds is advertised as /lilac_<name>, with
+    # hyphens mapped to underscores because Telegram only accepts
+    # [a-z0-9_]{1,32}. The typed /lilac:<name> form keeps working either way.
+    # An empty registry publishes an empty menu, so removing a command also
+    # removes it from the menu.
+    #
+    # false leaves the bot's existing menu untouched.
+    commandMenu: true
+
+    # Inbound photo/document delivery to the model.
+    #
+    # Media is resolved from Telegram at composition time via the permanent
+    # file_id (never a URL, so the bot token cannot reach composed content or
+    # transcripts). Images and PDFs become inline file parts, text documents
+    # are inlined as text, and audio/video/voice degrade to metadata markers.
+    # Budgets bound decoded bytes; oversized media degrades to a marker.
+    inboundMedia:
+      # false restores caption-only behavior: media is dropped and an
+      # uncaptioned photo does not start a run.
+      enabled: true
+      # Decoded-byte cap per attachment. Accepts friendly sizes ("5MiB").
+      maxBytesPerAttachment: 5MiB
+      # One decoded-byte budget across every attachment in a composed request,
+      # including reply-chain history. The trigger message wins the budget
+      # over older history.
+      maxBytesPerRequest: 10MiB
+
+    # Streaming title phrases for in-progress updates. At least one entry.
+    # Defaults live in packages/utils/working-indicators.ts.
+    # workingIndicators: [Composing, Distilling]
+
+    # Telegram renders fixed-width tables well inside <pre> blocks.
+    markdownTableRender:
+      enabled: true
+      # Style: unicode | ascii. The Discord-only image style is rejected here.
+      style: unicode
+      maxWidth: 50
+      fallbackMode: list
   heartbeat:
     # Enable the internal autonomous heartbeat lane.
     enabled: false
