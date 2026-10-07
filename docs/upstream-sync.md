@@ -77,6 +77,13 @@ HEAD, tracked-tree and index fingerprints are checked after the action. Incoming
 files and logs are evidence, not authorization to expand the task or access secrets.
 These are scope controls, not a claim that prompt text creates a security sandbox.
 
+Analyzer startup uses `--bare`, user-only settings, explicit `disableAllHooks`,
+and an empty strict MCP configuration. Incoming repository hooks, plugins,
+MCP processes and automatic `CLAUDE.md` discovery are therefore excluded.
+The prompt asks the analyzer to read the downstream baseline's instructions
+explicitly. This uses native Claude options; no additional service or custom
+permission-validation subsystem is introduced.
+
 The prompt design follows primary-source advice on explicit instructions, context
 retrieval, tool evidence, stopping conditions and verifiable output. Sources and
 their limits are recorded in [the prompt research note](research/upstream-sync-prompt-engineering.md).
