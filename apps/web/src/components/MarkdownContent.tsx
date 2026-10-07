@@ -3,7 +3,15 @@ import { ConversationBadge } from "./ConversationReference";
 import { FileLink, MarkdownImage } from "./FileActions";
 import { parseFilePath } from "../file-target";
 import { githubAlerts, MarkdownBlockquote } from "./markdown-alerts";
-import { createContext, useContext, lazy, memo, Suspense, type ComponentProps } from "react";
+import {
+  createContext,
+  useContext,
+  useMemo,
+  lazy,
+  memo,
+  Suspense,
+  type ComponentProps,
+} from "react";
 import ReactMarkdown, { type Components, type ExtraProps } from "react-markdown";
 import remarkCjkFriendly from "remark-cjk-friendly/parseOnly";
 import remarkCjkFriendlyGfmStrikethrough from "remark-cjk-friendly-gfm-strikethrough/parseOnly";
@@ -17,6 +25,8 @@ import { MessageResourcesContext } from "./message-resources";
 import { CodeBlock } from "./CodeBlock";
 import { markdownUrl } from "./markdown-policy";
 import { userMessageLineBreaks } from "./composer-line-breaks";
+import { remarkSkillMentions, SkillCatalogContext } from "./skill-mentions";
+import { SkillBadge } from "./SkillBadge";
 
 const HighlightedCode = lazy(() => import("./rich-code"));
 const Diagram = lazy(() => import("./rich-diagram"));
@@ -28,8 +38,14 @@ const plugins = [
   remarkMath,
   remarkChatMath,
 ];
-const userPlugins = [...plugins, userMessageLineBreaks];
 const rehypePlugins = [githubAlerts];
+function userPlugins(skillNames: string[]) {
+  return [
+    ...plugins,
+    userMessageLineBreaks,
+    [remarkSkillMentions, skillNames] satisfies [typeof remarkSkillMentions, string[]],
+  ];
+}
 
 function RichBlock({ source, language }: { source: string; language: string }) {
   const fallback = <CodeBlock source={source} language={language} />;
@@ -127,6 +143,11 @@ const components: Components = {
     );
   },
   a: MessageLink,
+  span: ({ node, ...props }) => {
+    const skill = node?.properties.dataSkill;
+    if (typeof skill === "string") return <SkillBadge name={skill} />;
+    return <span {...props} />;
+  },
   img: MarkdownImage,
   table: ({ children }) => (
     <div className="markdown-table">
@@ -135,16 +156,22 @@ const components: Components = {
   ),
 };
 
-export default memo(function MarkdownContent({
+function UserMarkdown({ text }: { text: string }) {
+  const skills = useContext(SkillCatalogContext);
+  const remarkPlugins = useMemo(() => userPlugins(skills.map((skill) => skill.name)), [skills]);
+  return <RenderedMarkdown text={text} remarkPlugins={remarkPlugins} />;
+}
+
+function RenderedMarkdown({
   text,
-  preserveLineBreaks = false,
+  remarkPlugins,
 }: {
   text: string;
-  preserveLineBreaks?: boolean;
+  remarkPlugins: ComponentProps<typeof ReactMarkdown>["remarkPlugins"];
 }) {
   return (
     <ReactMarkdown
-      remarkPlugins={preserveLineBreaks ? userPlugins : plugins}
+      remarkPlugins={remarkPlugins}
       rehypePlugins={rehypePlugins}
       components={components}
       urlTransform={markdownUrl}
@@ -153,4 +180,15 @@ export default memo(function MarkdownContent({
       {text}
     </ReactMarkdown>
   );
+}
+
+export default memo(function MarkdownContent({
+  text,
+  preserveLineBreaks = false,
+}: {
+  text: string;
+  preserveLineBreaks?: boolean;
+}) {
+  if (preserveLineBreaks) return <UserMarkdown text={text} />;
+  return <RenderedMarkdown text={text} remarkPlugins={plugins} />;
 });

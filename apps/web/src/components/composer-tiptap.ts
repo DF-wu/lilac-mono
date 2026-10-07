@@ -13,6 +13,7 @@ import {
   composerPlainText,
 } from "./composer-document";
 import type { Attachment } from "../types";
+import { skillMentionPattern } from "./skill-mentions";
 
 export const attachmentNode = Node.create({
   name: "composer_attachment",
@@ -488,16 +489,15 @@ export function completeEditor(
 // Drafts store skill mentions as text. Restore badges for mentions of skills the draft selected.
 export function markEditorSkills(editor: Editor, skills: readonly ComposerSkill[]) {
   if (!skills.length) return;
-  const alternatives = skills.map(({ name }) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-  const pattern = new RegExp(
-    `(^|\\s)((?:\\$|/skill:)(${alternatives.join("|")}))(?=$|[^\\p{L}\\p{N}_-])`,
-    "gu",
-  );
+  const pattern = skillMentionPattern(skills.map((skill) => skill.name));
   const { schema, tr } = editor.state;
   editor.state.doc.descendants((node, pos) => {
     if (node.type.name === "codeBlock") return false;
     if (!node.isText || node.marks.some((mark) => mark.type.name === "code")) return;
+    const before = editor.state.doc.resolve(pos).nodeBefore;
+    const boundary = !before || before.type.name === "hardBreak";
     for (const match of node.text!.matchAll(pattern)) {
+      if (match.index === 0 && !match[1] && !boundary) continue;
       const from = pos + match.index + match[1]!.length;
       tr.replaceWith(
         tr.mapping.map(from),

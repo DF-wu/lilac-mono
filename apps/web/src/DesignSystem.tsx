@@ -51,6 +51,7 @@ import tone from "./assets/design-system/tone.wav";
 import weekendPdf from "./assets/design-system/weekend.pdf";
 import type { Attachment } from "./types";
 import type { DisplayCatalog } from "@stanley2058/lilac-client-protocol";
+import { SkillCatalogContext } from "./components/skill-mentions";
 import { AttachmentPreviewBody, ReadyAttachment } from "./components/ResourcePreview";
 import { MessageIdentityContext } from "./components/message-identity";
 import { toast } from "./components/ui/toast";
@@ -949,7 +950,9 @@ function ComposerSpecimen() {
         />
       </div>
       <Specimen title="Message preview">
-        <Markdown text={text} preserveLineBreaks />
+        <SkillCatalogContext value={composerCatalog.skills}>
+          <Markdown text={text} preserveLineBreaks />
+        </SkillCatalogContext>
       </Specimen>
       <Collapsible>
         <CollapsibleTrigger render={<Button variant="ghost" />}>

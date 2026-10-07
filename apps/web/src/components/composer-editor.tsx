@@ -4,6 +4,7 @@ import { formatBinding, ariaBinding } from "../keybindings";
 import { parseReferenceHref } from "@stanley2058/lilac-client-protocol";
 import { ConversationBadge } from "./ConversationReference";
 import { FileIcon } from "./FileIcon";
+import { SkillBadge } from "./SkillBadge";
 import { FileActions } from "./FileActions";
 import { useOptionalWorkspace } from "../workspace-context";
 import {
@@ -29,10 +30,9 @@ import {
   SquareCode,
   X,
   RotateCcw,
-  Package,
 } from "lucide-react";
 import { IconButton } from "./ui";
-import { referenceChipStyles } from "./ui/button";
+import { inlineChipStyles } from "./ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import type { Attachment } from "../types";
 
@@ -118,7 +118,7 @@ function AttachmentElement(props: NodeViewProps) {
             render={
               <span
                 data-ui="composer-attachment-chip"
-                className={`composer-attachment-chip relative inline-flex items-center gap-1 max-w-full px-2 rounded-sm whitespace-nowrap ${referenceChipStyles}`}
+                className={`composer-attachment-chip ${inlineChipStyles}`}
                 data-state={attachment?.state ?? "missing"}
               />
             }
@@ -186,30 +186,18 @@ function SkillElement(props: NodeViewProps) {
   const name = props.node.attrs.name as string;
   return (
     <NodeViewWrapper as="span" className="inline">
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <span
-              data-ui="composer-skill-chip"
-              className={`composer-attachment-chip relative inline-flex items-center gap-1 max-w-full px-2 rounded-sm whitespace-nowrap ${referenceChipStyles}`}
-            />
-          }
+      <SkillBadge name={name}>
+        <IconButton
+          label={`Remove ${name}`}
+          disabled={context.disabled}
+          onClick={() => {
+            props.deleteNode();
+            props.editor.commands.focus();
+          }}
         >
-          <Package aria-hidden="true" />
-          <span className="overflow-hidden text-ellipsis">{name}</span>
-          <IconButton
-            label={`Remove ${name}`}
-            disabled={context.disabled}
-            onClick={() => {
-              props.deleteNode();
-              props.editor.commands.focus();
-            }}
-          >
-            <X />
-          </IconButton>
-        </TooltipTrigger>
-        <TooltipContent>{`Skill: ${name}`}</TooltipContent>
-      </Tooltip>
+          <X />
+        </IconButton>
+      </SkillBadge>
     </NodeViewWrapper>
   );
 }

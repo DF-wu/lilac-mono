@@ -147,7 +147,7 @@ it("completes a skill as a badge that keeps its mention syntax", () => {
 
 it("restores badges only for exact selected skill mentions outside code", () => {
   const text =
-    "$review /skill:review $reviewer $review-next `$review` $Better Result, $a+b\n\n```\n$review\n```";
+    "$review /skill:review $reviewer $review-next `$review` **x**$review $Better Result, $a+b\n\n```\n$review\n```";
   const editor = headlessEditor(text);
   const before = writeComposerDocument(editor.state.doc);
   markEditorSkills(editor, [
