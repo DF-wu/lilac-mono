@@ -47,6 +47,32 @@ export class NativeLiveFileService {
 
   async resolve(actorId: string, threadId: string, inputPath: string, signal?: AbortSignal) {
     return Result.gen(async function* () {
+      const reference = yield* this.publish(actorId, threadId, inputPath);
+      const file = yield* Result.await(this.read(actorId, reference.id, signal, true));
+      return Result.ok({
+        path: reference.path,
+        name: file.filename,
+        mediaType: file.mediaType,
+        href: `/api/files/${reference.id}`,
+      });
+    }, this);
+  }
+
+  /** Reads a whole file under the thread's filesystem permissions, as `resolve` previews it. */
+  async readThreadFile(actorId: string, threadId: string, inputPath: string, signal?: AbortSignal) {
+    return Result.gen(async function* () {
+      const reference = yield* this.publish(actorId, threadId, inputPath);
+      const file = yield* Result.await(this.read(actorId, reference.id, signal));
+      return Result.ok({ ...file, path: reference.path });
+    }, this);
+  }
+
+  private publish(
+    actorId: string,
+    threadId: string,
+    inputPath: string,
+  ): NativeFileResult<PublishedNativePath> {
+    return Result.gen(function* () {
       const thread = yield* this.dependencies.native.authorizeThread(actorId, threadId, true);
       const actor = yield* this.dependencies.native.getUser(actorId);
       const starter = yield* this.dependencies.native.getUser(thread.starterId);
@@ -64,19 +90,7 @@ export class NativeLiveFileService {
       }).mapError(() => nativeFailure("forbidden", "File path is outside this thread's access"));
       // Restricted paths stay virtual so the existing reader applies its session sandbox mapping once.
       const path = restricted ? posix.resolve(cwd, inputPath) : resolved;
-      const reference = yield* this.dependencies.native.registerPublishedPath(
-        actorId,
-        threadId,
-        path,
-        cwd,
-      );
-      const file = yield* Result.await(this.read(actorId, reference.id, signal, true));
-      return Result.ok({
-        path,
-        name: file.filename,
-        mediaType: file.mediaType,
-        href: `/api/files/${reference.id}`,
-      });
+      return this.dependencies.native.registerPublishedPath(actorId, threadId, path, cwd);
     }, this);
   }
 

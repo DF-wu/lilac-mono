@@ -1,5 +1,19 @@
 # MIGRATIONS.md
 
+## Native HTML previews
+
+Native agent replies can show a page from a fenced `html-preview-file` block containing one file path.
+When a completed or failed turn ends, Core reads each named file under the thread's filesystem
+permissions, inlines local and `resource://` assets as data URIs, and stores the page as a published
+native upload. Native store records gain the `html-preview` kind, which maps a turn and path to that
+upload or to the reason it could not be saved. Thread deletion removes these records. No SQLite schema
+change or backfill is needed. Older strict record parsers reject the new kind, so restore a consistent
+backup before downgrading.
+
+The authenticated `GET /api/html-previews?thread=&message=&path=` route serves the saved page with
+`Content-Security-Policy: sandbox allow-scripts allow-forms allow-popups`, so remote scripts load but
+the page has an opaque origin. Update Core and web together. Older clients show these fences as code.
+
 ## Decision auto-inject configuration
 
 Rename version-2 `conversation.thread.autoInjectMode: jev` to `decision` and the `jevAutoInject`
