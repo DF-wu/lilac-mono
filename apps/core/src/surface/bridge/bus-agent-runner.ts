@@ -6098,7 +6098,7 @@ export async function startBusAgentRunner(params: {
           const skillsSection =
             runProfile === "explore"
               ? null
-              : await waitForPreAgent(maybeBuildSkillsSectionForPrimary());
+              : await waitForPreAgent(maybeBuildSkillsSectionForPrimary(next.requestClient));
 
           const sessionConfigId = parseSessionConfigIdFromRaw(next.raw) ?? sessionId;
           const discordSessionContext =

@@ -27,6 +27,9 @@ The shared discovery contract is:
 - `description` is at most 1024 characters and should state both what the skill does and when to use it.
 - `disable-model-invocation: true` omits the skill from the default model catalog. It remains available
   through `skills.list` and `skills.read`. Only the YAML boolean `true` enables this behavior.
+- `surfaces: [native]` limits a skill to requests from the listed clients, such as `native`, `discord`, or
+  `github`. Other requests omit it from the catalog, `skills.list`, and `skills.read`. Omit the field to
+  offer the skill everywhere. A value other than a non-empty list of names makes the skill invalid.
 - Other additional frontmatter fields are preserved but do not affect discovery or selection.
 - The parent directory should match `name`. A mismatch emits a warning rather than changing the skill's
   identity.

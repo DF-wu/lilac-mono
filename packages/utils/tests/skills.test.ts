@@ -8,6 +8,7 @@ import {
   discoverSkills,
   parseSkillMarkdown,
   parseSkillMarkdownResult,
+  skillAvailableOn,
 } from "../skills";
 import { formatAvailableSkillsSection } from "../skills";
 
@@ -434,6 +435,36 @@ describe("bundled skills", () => {
       expect(result.error._tag).toBe("SkillMarkdownInvalid");
       expect(result.error.issue).toBe("missing-frontmatter");
     }
+  });
+
+  it("limits a skill to the surfaces its frontmatter names", () => {
+    const scoped = parseSkillMarkdown("---\nname: a\ndescription: d\nsurfaces: [native]\n---\n");
+    expect(scoped.surfaces).toEqual(["native"]);
+    expect(skillAvailableOn(scoped, "native")).toBe(true);
+    expect(skillAvailableOn(scoped, "discord")).toBe(false);
+    expect(skillAvailableOn(scoped, undefined)).toBe(false);
+    const open = parseSkillMarkdown("---\nname: a\ndescription: d\n---\n");
+    expect(open.surfaces).toBeUndefined();
+    expect(skillAvailableOn(open, "discord")).toBe(true);
+    for (const surfaces of ["native", "[]", "[1]"]) {
+      const result = parseSkillMarkdownResult(
+        `---\nname: a\ndescription: d\nsurfaces: ${surfaces}\n---\n`,
+      );
+      expect(result.match({ ok: () => "", err: (error) => error.issue })).toBe(
+        "invalid-frontmatter",
+      );
+    }
+  });
+
+  it("ships visualize as a native-only skill", async () => {
+    const skill = parseSkillMarkdown(
+      await Bun.file(
+        path.join(import.meta.dir, "..", "builtin-skills", "visualize", "SKILL.md"),
+      ).text(),
+    );
+    expect(skill.surfaces).toEqual(["native"]);
+    expect(skill.description.length).toBeLessThanOrEqual(DEFAULT_SKILL_DESCRIPTION_MAX_CHARS);
+    expect(skill.body).toContain("```html-preview-file");
   });
 
   it("routes Lilac deployment and config work to separate references", async () => {

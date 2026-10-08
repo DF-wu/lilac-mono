@@ -14,6 +14,11 @@ The authenticated `GET /api/html-previews?thread=&message=&path=` route serves t
 `Content-Security-Policy: sandbox allow-scripts allow-forms allow-popups`, so remote scripts load but
 the page has an opaque origin. Update Core and web together. Older clients show these fences as code.
 
+The built-in `visualize` skill teaches agents the fence. Skill frontmatter accepts an optional
+`surfaces` list, and `visualize` sets `surfaces: [native]`, so only native requests see it in the skills
+index, `skills.list`, and `skills.read`. Skills without the field are unchanged. A skill whose `surfaces`
+is not a non-empty list of names is now reported as invalid and skipped.
+
 ## Decision auto-inject configuration
 
 Rename version-2 `conversation.thread.autoInjectMode: jev` to `decision` and the `jevAutoInject`
