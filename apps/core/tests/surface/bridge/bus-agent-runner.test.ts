@@ -12037,7 +12037,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Decision lane", ()
     const shortlistInputs: ShortlistInput[] = [];
     const { evaluator, calls } = jevModel({
       asks_to_recall: 0.92,
-      candidate_0: 0.3,
+      candidate_0: 0.05,
       candidate_1: 0.81,
     });
     const { usage, finished, jev } = usageRecorder();
@@ -12075,7 +12075,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Decision lane", ()
     expect(shortlistInputs).toEqual([
       expect.objectContaining({
         text: "what did we pick for retries?",
-        limit: 30,
+        limit: 40,
         semanticFallback: true,
         excludeThreadIds: ["native:earlier", "native:current"],
       }),
@@ -12110,7 +12110,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Decision lane", ()
         candidateCount: 2,
         gate: "recall",
         selected: [{ index: 1, threadId: "native:retries", probability: 0.81 }],
-        highestRejected: { index: 0, threadId: "native:garden", probability: 0.3 },
+        highestRejected: { index: 0, threadId: "native:garden", probability: 0.05 },
       }),
     ]);
     expect(jev).toEqual([{ model: "jev-test", inputTokens: 700 }]);
@@ -12159,13 +12159,15 @@ describe("maybeBuildAutoInjectedThreadSearchMessages with the Decision lane", ()
     expect(finished).toEqual([{ status: "abstained" }]);
   });
 
-  it("abstains when the Decision gate stays closed", async () => {
+  it("honors an explicitly enabled Decision message gate", async () => {
+    const cfg = jevCfg();
+    cfg.conversation.thread.decisionAutoInject.jev.recallMinProbability = 0.7;
     const { evaluator } = jevModel({ casual: 0.95, durable_subject: 0.9, candidate_0: 0.99 });
     const { usage, finished } = usageRecorder();
     const events: Array<{ gate: string | null; entries: readonly unknown[] }> = [];
 
     const messages = await maybeBuildAutoInjectedThreadSearchMessages({
-      cfg: jevCfg(),
+      cfg,
       requestId: "casual",
       userMessages: [{ role: "user", content: "lol nice, thanks" }],
       conversationThreads: threadService(async () =>

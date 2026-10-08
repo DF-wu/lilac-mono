@@ -1,5 +1,20 @@
 # MIGRATIONS.md
 
+## Decision auto-inject F1 defaults
+
+Decision auto-inject defaults now select useful prior facts without requiring a recall/durable
+message gate. Both scoped `recallMinProbability` defaults are zero; setting a positive recall threshold
+still enables the existing gate. The default shortlist has up to 40 candidates, Jev relevance defaults
+to 0.2, and Luna relevance defaults to 0.1. Luna uses a usefulness question and no longer truncates
+the configured shortlist to ten. Existing explicit configuration values retain precedence.
+
+With `semanticFallback: true`, retrieval now reserves half the candidate budget for lexical matches
+and half for semantic matches, merging duplicate threads. Semantic search runs even when lexical
+matches exist. Missing embeddings or embedding failure retain lexical retrieval; false keeps lexical-only
+retrieval. The latest message and up to three recent authored user messages inform retrieval and scoring.
+Generated recall and assistant messages are excluded from that context. Debug decision events can now
+report `source: "hybrid"`. No configuration fields, schema version, or stored data are added.
+
 ## Native HTML previews
 
 Native agent replies can show a page from a fenced `html-preview-file` block containing one file path.

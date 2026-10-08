@@ -544,17 +544,17 @@ const toolsSchema = z
   });
 
 const jevDecisionProbabilitiesV2 = {
-  recallMinProbability: 0.7,
+  recallMinProbability: 0,
   durableSubjectMinProbability: 0.6,
   casualMaxProbability: 0.6,
-  relevanceMinProbability: 0.6,
+  relevanceMinProbability: 0.2,
 };
 
 const lunaDecisionProbabilitiesV2 = {
-  recallMinProbability: 0.5,
+  recallMinProbability: 0,
   durableSubjectMinProbability: 0.5,
   casualMaxProbability: 0.3,
-  relevanceMinProbability: 0.6,
+  relevanceMinProbability: 0.1,
 };
 
 const decisionProbabilityOverridesSchemaV2 = z.object({
@@ -567,7 +567,7 @@ const decisionProbabilityOverridesSchemaV2 = z.object({
 const decisionAutoInjectDefaultsV2 = {
   model: ["typesafe/jev-1.13.0"],
   limit: 3,
-  candidateLimit: 30,
+  candidateLimit: 40,
   semanticFallback: true,
   jev: jevDecisionProbabilitiesV2,
   luna: lunaDecisionProbabilitiesV2,

@@ -3546,7 +3546,7 @@ describe("conversation thread store", () => {
     threadStore.close();
   });
 
-  it("shortlists auto-inject candidates by any term with a semantic fallback", async () => {
+  it("merges lexical and semantic auto-inject candidates even when a word matches", async () => {
     const dbPath = await createDbPath();
     const searchStore = new DiscordSearchStore(dbPath);
     const threadStore = new ConversationThreadStore(dbPath);
@@ -3602,9 +3602,26 @@ describe("conversation thread store", () => {
 
     // One matching word is enough; the planner-style search would require every token.
     const lexical = await shortlist({ text: "what did we decide on sqlite pragmas last week?" });
-    expect(lexical.source).toBe("lexical");
-    expect(lexical.results.map((result) => result.title)).toEqual(["Database storage"]);
+    expect(lexical.source).toBe("hybrid");
+    expect(lexical.results.map((result) => result.title)).toContain("Database storage");
+    expect(new Set(lexical.results.map((result) => result.threadId)).size).toBe(
+      lexical.results.length,
+    );
+    expect(lexical.results.length).toBeLessThanOrEqual(5);
     expect(lexical.results[0]?.timeRange).toBeDefined();
+
+    const combined = await shortlist({ text: "sqlite yellow fruit", limit: 2 });
+    expect(combined.source).toBe("hybrid");
+    expect(combined.results.map((result) => result.title)).toEqual([
+      "Database storage",
+      "Dessert planning",
+    ]);
+    const oneSemantic = await shortlist({ text: "yellow fruit", limit: 1 });
+    expect(oneSemantic.source).toBe("semantic");
+    expect(oneSemantic.results.map((result) => result.title)).toEqual(["Dessert planning"]);
+    expect((await shortlist({ text: "sqlite yellow fruit", limit: 1 })).results).toHaveLength(1);
+    const lexicalOnly = await shortlist({ text: "sqlite yellow fruit", semanticFallback: false });
+    expect(lexicalOnly.results.map((result) => result.title)).toEqual(["Database storage"]);
 
     const excluded = await shortlist({
       text: "sqlite yellow fruit",

@@ -1227,7 +1227,7 @@
                       "maximum": 10
                     },
                     "candidateLimit": {
-                      "default": 30,
+                      "default": 40,
                       "type": "integer",
                       "exclusiveMinimum": 0,
                       "maximum": 50
@@ -1292,7 +1292,7 @@
                       "maximum": 10
                     },
                     "candidateLimit": {
-                      "default": 30,
+                      "default": 40,
                       "type": "integer",
                       "exclusiveMinimum": 0,
                       "maximum": 50

@@ -1,3 +1,4 @@
+import { decisionAutoInjectContext } from "./bus-agent-runner/text-units";
 import {
   buildGeneratedMessage,
   generatedMessageMetadata,
@@ -1094,7 +1095,7 @@ type AutoInjectedThreadSearchAppendedEvent = {
 type DecisionAutoInjectedThreadSearchEvent = {
   toolCallId: string;
   model: string;
-  source: "lexical" | "semantic";
+  source: "lexical" | "semantic" | "hybrid";
   candidateCount: number;
   participantFilterUserCount: number;
   gate: DecisionAutoInjectDecision["gate"];
@@ -1377,8 +1378,9 @@ async function maybeBuildDecisionAutoInjectedThreadSearchMessages(
   if (!shortlist) return [];
 
   // Attachment marker lines would add filename and MIME words to the shortlist query.
-  const message = latestUserInput(params.userMessages).authoredText;
-  if (measureMeaningfulTextUnits(message) === 0) return [];
+  const authoredText = latestUserInput(params.userMessages).authoredText;
+  if (measureMeaningfulTextUnits(authoredText) === 0) return [];
+  const message = decisionAutoInjectContext(authoredText, params.previousMessages ?? []);
 
   const excludeThreadIds = [...collectAutoInjectedThreadIds(params.previousMessages ?? [])];
   if (params.surface === "native" && params.sessionId) excludeThreadIds.push(params.sessionId);
