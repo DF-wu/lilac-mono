@@ -16,7 +16,12 @@ import { ConnectionLoading } from "./components/ui/connection-loading";
 import { ReconnectionDemo } from "./components/ReconnectionDemo";
 import { ConversationBadge, ConversationIcon } from "./components/ConversationReference";
 import lilacLogo from "./assets/logo.svg";
-import { ActivityItem } from "./components/ActivityLog";
+import { ActivityItem, RequestActiveContext } from "./components/ActivityLog";
+import {
+  HtmlPreviewBlock,
+  HtmlPreviewFrame,
+  HtmlPreviewMessageContext,
+} from "./components/HtmlPreview";
 import { LinkPreviewAnchor } from "./components/LinkWithFavicon";
 import { SidebarEmptyState } from "./components/SidebarEmptyState";
 import { ConversationStatus } from "./components/ConversationStatus";
@@ -51,6 +56,7 @@ import tone from "./assets/design-system/tone.wav";
 import weekendPdf from "./assets/design-system/weekend.pdf";
 import type { Attachment } from "./types";
 import type { DisplayCatalog } from "@stanley2058/lilac-client-protocol";
+import { HTML_PREVIEW_BOOTSTRAP_MARKUP } from "@stanley2058/lilac-client-protocol";
 import { SkillCatalogContext } from "./components/skill-mentions";
 import { AttachmentPreviewBody, ReadyAttachment } from "./components/ResourcePreview";
 import { MessageIdentityContext } from "./components/message-identity";
@@ -861,6 +867,16 @@ function Messages() {
         </Specimen>
       </div>
       <ThinkingSpinnerDemo />
+      <Specimen title="HTML preview">
+        <div className="ds-stack">
+          <HtmlPreviewFrame src={galleryPreviewSrc} title="weekly-runs.html" />
+          <HtmlPreviewMessageContext value={{ threadId: "gallery", messageId: "gallery" }}>
+            <RequestActiveContext value>
+              <HtmlPreviewBlock source="/work/weekly-runs.html" />
+            </RequestActiveContext>
+          </HtmlPreviewMessageContext>
+        </div>
+      </Specimen>
       <Specimen title="Markers">
         <div className="ds-stack">
           <ThinkingIndicator />
@@ -878,6 +894,24 @@ function Messages() {
     </Section>
   );
 }
+const galleryPreviewBars = [
+  ["Mon", 42],
+  ["Tue", 68],
+  ["Wed", 55],
+  ["Thu", 81],
+  ["Fri", 34],
+] as const;
+// The same bootstrap the preview route adds, so the sample follows the theme and reports its height.
+const galleryPreviewSrc = `data:text/html;charset=utf-8,${encodeURIComponent(
+  `<!doctype html><html><head>${HTML_PREVIEW_BOOTSTRAP_MARKUP}<style>.bars{display:flex;align-items:end;gap:12px;height:160px}.bar{flex:1;border-radius:var(--radius) var(--radius) 0 0}.labels{display:flex;gap:12px;margin-top:6px;color:var(--muted-foreground);font-size:12px}.labels span{flex:1;text-align:center}h4{margin:0 0 12px;font-weight:600}</style></head><body><h4>Runs this week</h4><div class="bars">${galleryPreviewBars
+    .map(
+      ([, value], index) =>
+        `<div class="bar" style="height:${value * 1.8}px;background:var(--chart-${index + 1})"></div>`,
+    )
+    .join("")}</div><div class="labels">${galleryPreviewBars
+    .map(([day]) => `<span>${day}</span>`)
+    .join("")}</div></body></html>`,
+)}`;
 const composerCatalog: DisplayCatalog = {
   revision: "design-system",
   models: [],
