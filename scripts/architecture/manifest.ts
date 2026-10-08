@@ -3758,6 +3758,13 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               identity: { module: "src/references.ts", exportName: "parseReferenceHref" },
               category: "wire" as const,
             },
+            {
+              identity: {
+                module: "src/html-preview.ts",
+                exportName: "decodeHtmlPreviewFrameMessage",
+              },
+              category: "wire" as const,
+            },
           ]
         : []),
       ...(root === "apps/web"
