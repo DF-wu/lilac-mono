@@ -870,6 +870,19 @@ function Messages() {
       <Specimen title="HTML preview">
         <HtmlPreviewFrame src={galleryPreviewSrc} title="weekly-runs.html" />
       </Specimen>
+      <Specimen title="HTML file preview">
+        <div className="h-96">
+          <FileSource
+            name="weekly-runs.html"
+            href={galleryPreviewSrc}
+            text={{
+              status: "ready",
+              text: decodeURIComponent(galleryPreviewSrc.split(",")[1] ?? ""),
+              truncated: false,
+            }}
+          />
+        </div>
+      </Specimen>
       <Specimen title="HTML preview loading">
         <HtmlPreviewMessageContext value={{ threadId: "gallery", messageId: "gallery" }}>
           <RequestActiveContext value>

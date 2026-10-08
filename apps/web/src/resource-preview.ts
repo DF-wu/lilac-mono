@@ -57,3 +57,27 @@ export async function loadResourcePreview(
     return decodeResourcePreview(body);
   });
 }
+
+export async function loadHtmlFile(
+  href: string,
+  signal: AbortSignal,
+): Promise<Result<string, WebRequestFailed>> {
+  return Result.gen(async function* () {
+    const response = yield* Result.await(
+      Result.tryPromise({
+        try: () => fetch(href, { signal, credentials: "same-origin", cache: "no-store" }),
+        catch: () =>
+          new WebRequestFailed({ code: "unavailable", message: "This file is unavailable." }),
+      }),
+    );
+    if (!response.ok)
+      return Result.err(
+        new WebRequestFailed({ code: "unavailable", message: "This file is unavailable." }),
+      );
+    return await Result.tryPromise({
+      try: () => response.text(),
+      catch: () =>
+        new WebRequestFailed({ code: "unavailable", message: "This file is unavailable." }),
+    });
+  });
+}

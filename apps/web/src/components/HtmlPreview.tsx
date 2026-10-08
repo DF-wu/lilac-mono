@@ -83,7 +83,15 @@ function clampHeight(height: number) {
   return Math.min(HTML_PREVIEW_MAX_HEIGHT, Math.max(HTML_PREVIEW_MIN_HEIGHT, Math.ceil(height)));
 }
 
-export function HtmlPreviewFrame({ src, title }: { src: string; title: string }) {
+export function HtmlPreviewFrame({
+  src,
+  title,
+  fill = false,
+}: {
+  src: string;
+  title: string;
+  fill?: boolean;
+}) {
   const frameRef = useRef<HTMLIFrameElement>(null);
   const applied = useAppliedTheme();
   // The URL carries only the first theme; changing it would reload the page, so later themes are posted.
@@ -103,6 +111,7 @@ export function HtmlPreviewFrame({ src, title }: { src: string; title: string })
       if (!frame || event.source !== frame) return;
       const message = decodeHtmlPreviewFrameMessage(event.data);
       if (message?.kind === "size") {
+        if (fill) return;
         setHeight(clampHeight(message.height));
         return;
       }
@@ -112,9 +121,14 @@ export function HtmlPreviewFrame({ src, title }: { src: string; title: string })
     }
     window.addEventListener("message", receive);
     return () => window.removeEventListener("message", receive);
-  }, []);
+  }, [fill]);
   return (
-    <div className="relative w-(--ui-chat-width) max-w-full" aria-busy={!loaded}>
+    <div
+      className={
+        fill ? "relative flex-1 min-h-0 w-full h-full" : "relative w-(--ui-chat-width) max-w-full"
+      }
+      aria-busy={!loaded}
+    >
       {!loaded ? <HtmlPreviewSkeleton /> : null}
       <iframe
         ref={frameRef}
@@ -131,7 +145,7 @@ export function HtmlPreviewFrame({ src, title }: { src: string; title: string })
         data-ui="html-preview"
         data-loaded={loaded}
         className="block w-full border-0 bg-transparent data-[loaded=false]:absolute data-[loaded=false]:inset-0 data-[loaded=false]:invisible"
-        style={{ height, colorScheme: applied.kind }}
+        style={{ height: fill ? "100%" : height, colorScheme: applied.kind }}
       />
     </div>
   );
