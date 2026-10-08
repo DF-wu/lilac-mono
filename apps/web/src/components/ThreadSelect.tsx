@@ -4,6 +4,7 @@ import { LoadingSpinner } from "./ui/loading-spinner";
 import { useWorkspace } from "../workspace-context";
 import { useQuery } from "@tanstack/react-query";
 import { participantOptions, useNativeOnline } from "../queries";
+import { sidebarPreferencesOptions } from "../sidebar-queries";
 import { useEffect, useState, type ComponentType, type ReactNode } from "react";
 import {
   SquarePen,
@@ -18,7 +19,7 @@ import {
   MessageCircleQuestion,
 } from "lucide-react";
 import type { NativeThread, NativeUser } from "@stanley2058/lilac-client-protocol";
-import { relativeThreadTime } from "../thread-metadata";
+import { defaultAutoSettleDays, relativeThreadTime, threadAge } from "../thread-metadata";
 import { Button } from "./ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { AvatarGroup } from "./ui/avatar";
@@ -42,6 +43,7 @@ export function ThreadCard({
   starterIcon,
   updatedAt,
   now,
+  settleDays,
   state,
   selected,
   pinned,
@@ -57,6 +59,7 @@ export function ThreadCard({
   starterIcon?: ReactNode;
   updatedAt?: number;
   now?: number;
+  settleDays?: number;
   state: ThreadDisplayState;
   selected?: boolean;
   pinned?: boolean;
@@ -153,7 +156,12 @@ export function ThreadCard({
                 </span>
               ) : null}
               {draft !== "new" && updatedAt !== undefined ? (
-                <ThreadTime updatedAt={updatedAt} now={now} />
+                <ThreadTime
+                  updatedAt={updatedAt}
+                  now={now}
+                  settleDays={settleDays}
+                  counting={!settled && !pinned}
+                />
               ) : null}
             </span>
           </span>
@@ -174,16 +182,31 @@ export function ThreadCard({
   );
 }
 
-function ThreadTime({ updatedAt, now }: { updatedAt: number; now?: number }) {
+function ThreadTime({
+  updatedAt,
+  now,
+  settleDays = defaultAutoSettleDays,
+  counting,
+}: {
+  updatedAt: number;
+  now?: number;
+  settleDays?: number;
+  counting: boolean;
+}) {
   const [clock, setClock] = useState(Date.now);
   useEffect(() => {
     if (now !== undefined) return;
     const timer = window.setInterval(() => setClock(Date.now()), 60_000);
     return () => window.clearInterval(timer);
   }, [now]);
+  const current = now ?? clock;
   return (
-    <time dateTime={new Date(updatedAt).toISOString()}>
-      {relativeThreadTime(updatedAt, now ?? clock)}
+    <time
+      dateTime={new Date(updatedAt).toISOString()}
+      data-age={counting ? threadAge(updatedAt, current, settleDays) : undefined}
+      className="tabular-nums data-[age=fresh]:font-semibold data-[age=fresh]:text-primary data-[age=recent]:text-primary data-[age=aging]:text-[color-mix(in_srgb,var(--color-primary)_45%,var(--color-muted-foreground))]"
+    >
+      {relativeThreadTime(updatedAt, current)}
     </time>
   );
 }
@@ -220,6 +243,10 @@ export function ThreadSelect({
     ...participantOptions(client, thread.id),
     enabled: online && open && !participantNames,
   });
+  const { data: settleDays } = useQuery({
+    ...sidebarPreferencesOptions(client, online),
+    select: (preferences) => preferences.autoSettleDays,
+  });
   const names = participantNames ?? data?.items.map(({ user }) => user.displayName);
   const starter =
     thread.starterId === viewer.id
@@ -238,6 +265,7 @@ export function ThreadSelect({
           }
           updatedAt={thread.updatedAt}
           now={now}
+          settleDays={settleDays}
           state={state}
           selected={selected}
           pinned={pinned}

@@ -80,9 +80,7 @@
   .thread-card-actions .thread-settle-button {
     width: auto;
     gap: var(--ui-space-unit);
-    padding-inline: calc(var(--ui-space-unit) * 1.5);
-    background: var(--ui-surface-raised);
-    color: var(--ui-surface-raised-foreground);
+    padding-inline: var(--ui-space-unit);
     font-size: var(--ui-text-xs);
   }
   .thread-card:has(.thread-card-actions) .thread-card-status,
