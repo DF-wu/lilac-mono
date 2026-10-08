@@ -868,14 +868,14 @@ function Messages() {
       </div>
       <ThinkingSpinnerDemo />
       <Specimen title="HTML preview">
-        <div className="ds-stack">
-          <HtmlPreviewFrame src={galleryPreviewSrc} title="weekly-runs.html" />
-          <HtmlPreviewMessageContext value={{ threadId: "gallery", messageId: "gallery" }}>
-            <RequestActiveContext value>
-              <HtmlPreviewBlock source="/work/weekly-runs.html" />
-            </RequestActiveContext>
-          </HtmlPreviewMessageContext>
-        </div>
+        <HtmlPreviewFrame src={galleryPreviewSrc} title="weekly-runs.html" />
+      </Specimen>
+      <Specimen title="HTML preview loading">
+        <HtmlPreviewMessageContext value={{ threadId: "gallery", messageId: "gallery" }}>
+          <RequestActiveContext value>
+            <HtmlPreviewBlock source="/work/weekly-runs.html" />
+          </RequestActiveContext>
+        </HtmlPreviewMessageContext>
       </Specimen>
       <Specimen title="Markers">
         <div className="ds-stack">

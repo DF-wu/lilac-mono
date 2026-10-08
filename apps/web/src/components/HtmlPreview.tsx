@@ -14,6 +14,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import { useAppliedTheme } from "../theme/theme";
 import { RequestActiveContext } from "./ActivityLog";
 import { CodeBlock } from "./CodeBlock";
+import { Skeleton } from "./ui/skeleton";
 
 export const HtmlPreviewMessageContext = createContext<{
   threadId: string;
@@ -56,6 +57,18 @@ const THEME_VARIABLES = [
 
 const DEFAULT_HEIGHT = 240;
 
+export function HtmlPreviewSkeleton() {
+  return (
+    <Skeleton
+      data-ui="html-preview-pending"
+      role="status"
+      aria-label="Loading preview"
+      className="w-(--ui-chat-width) max-w-full"
+      style={{ height: DEFAULT_HEIGHT }}
+    />
+  );
+}
+
 function readTheme(appearance: HtmlPreviewTheme["appearance"]): HtmlPreviewTheme {
   const style = getComputedStyle(document.documentElement);
   const variables: Record<string, string> = {};
@@ -76,6 +89,7 @@ export function HtmlPreviewFrame({ src, title }: { src: string; title: string })
   // The URL carries only the first theme; changing it would reload the page, so later themes are posted.
   const [initialSrc] = useState(() => `${src}${htmlPreviewThemeFragment(readTheme(applied.kind))}`);
   const [height, setHeight] = useState(DEFAULT_HEIGHT);
+  const [loaded, setLoaded] = useState(false);
   const postTheme = useCallback(() => {
     frameRef.current?.contentWindow?.postMessage(
       htmlPreviewThemeMessage(readTheme(applied.kind)),
@@ -100,19 +114,26 @@ export function HtmlPreviewFrame({ src, title }: { src: string; title: string })
     return () => window.removeEventListener("message", receive);
   }, []);
   return (
-    <iframe
-      ref={frameRef}
-      src={initialSrc}
-      title={title}
-      // Never allow-same-origin: the opaque origin keeps the page out of the app's session.
-      // A frame has no content width, so it asks for the chat width and the reply card clamps it.
-      sandbox="allow-scripts allow-forms allow-popups"
-      loading="lazy"
-      onLoad={postTheme}
-      data-ui="html-preview"
-      className="block w-(--ui-chat-width) max-w-full border-0 bg-transparent"
-      style={{ height, colorScheme: applied.kind }}
-    />
+    <div className="relative w-(--ui-chat-width) max-w-full" aria-busy={!loaded}>
+      {!loaded ? <HtmlPreviewSkeleton /> : null}
+      <iframe
+        ref={frameRef}
+        src={initialSrc}
+        title={title}
+        // Never allow-same-origin: the opaque origin keeps the page out of the app's session.
+        // A frame has no content width, so it asks for the chat width and the reply card clamps it.
+        sandbox="allow-scripts allow-forms allow-popups"
+        loading="eager"
+        onLoad={() => {
+          postTheme();
+          setLoaded(true);
+        }}
+        data-ui="html-preview"
+        data-loaded={loaded}
+        className="block w-full border-0 bg-transparent data-[loaded=false]:absolute data-[loaded=false]:inset-0 data-[loaded=false]:invisible"
+        style={{ height, colorScheme: applied.kind }}
+      />
+    </div>
   );
 }
 
@@ -122,12 +143,7 @@ export function HtmlPreviewBlock({ source }: { source: string }) {
   const path = htmlPreviewPath(source);
   if (!message || path === undefined)
     return <CodeBlock source={source} language={HTML_PREVIEW_LANGUAGE} />;
-  if (active)
-    return (
-      <p data-ui="html-preview-pending" className="text-sm text-muted-foreground">
-        Preview loads when the response ends
-      </p>
-    );
+  if (active) return <HtmlPreviewSkeleton />;
   const href = htmlPreviewHref({ ...message, path });
   return <HtmlPreviewFrame key={href} src={href} title={path.split("/").at(-1) || path} />;
 }

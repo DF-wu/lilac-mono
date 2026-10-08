@@ -4,6 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import MarkdownContent from "../src/components/MarkdownContent";
+import { Markdown } from "../src/components/Markdown";
 import MathExpression, { sanitizeMathTree } from "../src/components/rich-math";
 import { highlightCode } from "../src/components/rich-code";
 import { remarkChatMath } from "../src/components/remark-chat-math";
@@ -375,7 +376,7 @@ describe("html previews", () => {
     renderToStaticMarkup(
       <HtmlPreviewMessageContext value={message ? { threadId: "t1", messageId: "m1" } : null}>
         <RequestActiveContext value={active}>
-          <MarkdownContent text={fence} />
+          <Markdown text={fence} />
         </RequestActiveContext>
       </HtmlPreviewMessageContext>,
     );
@@ -395,13 +396,19 @@ describe("html previews", () => {
       `src="/api/html-previews?thread=t1&amp;message=m1&amp;path=%2Fwork%2Fchart.html#lilac-theme=`,
     );
     expect(html).toContain('title="chart.html"');
+    expect(html).toContain('loading="eager"');
+    expect(html).toContain('aria-label="Loading preview"');
+    expect(html).toContain("height:240px");
+    expect(html).not.toContain("```html-preview-file");
     expect(decodeURIComponent(html)).toContain(
       '{"appearance":"dark","variables":{"--background":"#101010"}}',
     );
   });
 
   test("waits for a running turn and shows code outside native replies", () => {
-    expect(render(true)).toContain("Preview loads when the response ends");
+    expect(render(true)).toContain('aria-label="Loading preview"');
+    expect(render(true)).toContain("height:240px");
+    expect(render(true)).not.toContain("/work/chart.html");
     expect(render(true)).not.toContain("<iframe");
     expect(render(false, false)).not.toContain("<iframe");
     expect(render(false, false)).toContain("/work/chart.html");
