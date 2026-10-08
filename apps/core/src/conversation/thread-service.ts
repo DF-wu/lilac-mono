@@ -249,7 +249,7 @@ export type ConversationThreadToolService = {
 };
 
 export type ConversationThreadAutoInjectShortlist = {
-  source: "lexical" | "semantic" | "none";
+  source: "lexical" | "semantic" | "hybrid" | "none";
   results: ConversationThreadSearchResult["results"];
 };
 
@@ -2096,6 +2096,15 @@ export class ConversationThreadService {
     const cfg = await this.params.getConfig();
     const filters = buildSearchFilters(input);
     const allowlist = buildSearchAllowlist(cfg);
+    const semanticLimit = Math.max(1, Math.floor(input.limit / 2));
+    const semantic = input.semanticFallback
+      ? this.searchAutoInjectSemanticFallback({
+          ...input,
+          limit: semanticLimit,
+          filters,
+          allowlist,
+        })
+      : Promise.resolve(Result.ok<ConversationThreadSearchHit[]>([]));
     // Over-fetch so stale native summaries dropped by the filter do not take candidate slots.
     const lexical = this.params.store
       .searchAnyTerm({
@@ -2106,18 +2115,26 @@ export class ConversationThreadService {
         excludeThreadIds: input.excludeThreadIds,
       })
       .map((hits) => this.filterCurrentAutoInjectHits(cfg, hits).slice(0, input.limit));
+    const semanticResult = await semantic;
     const lexicalError = resultErrorOrNull(lexical);
     if (lexicalError) return Result.err(lexicalError);
-    const lexicalHits = selectResultValue(lexical);
-    if (lexicalHits.length > 0) return Result.ok(this.formatShortlist("lexical", lexicalHits));
-    if (!input.semanticFallback) return Result.ok({ source: "none", results: [] });
-
-    const semantic = await this.searchAutoInjectSemanticFallback({ ...input, filters, allowlist });
-    const semanticError = resultErrorOrNull(semantic);
+    const semanticError = resultErrorOrNull(semanticResult);
     if (semanticError) return Result.err(semanticError);
-    const semanticHits = this.filterCurrentAutoInjectHits(cfg, selectResultValue(semantic));
-    if (semanticHits.length === 0) return Result.ok({ source: "none", results: [] });
-    return Result.ok(this.formatShortlist("semantic", semanticHits));
+    const lexicalHits = selectResultValue(lexical);
+    const semanticHits = this.filterCurrentAutoInjectHits(cfg, selectResultValue(semanticResult));
+    if (semanticHits.length === 0) {
+      if (lexicalHits.length === 0) return Result.ok({ source: "none", results: [] });
+      return Result.ok(this.formatShortlist("lexical", lexicalHits));
+    }
+    if (lexicalHits.length === 0) return Result.ok(this.formatShortlist("semantic", semanticHits));
+    const merged = new Map<string, ConversationThreadSearchHit>();
+    for (const hit of [
+      ...lexicalHits.slice(0, Math.max(1, input.limit - semanticLimit)),
+      ...semanticHits,
+    ]) {
+      if (!merged.has(hit.threadId)) merged.set(hit.threadId, hit);
+    }
+    return Result.ok(this.formatShortlist("hybrid", [...merged.values()].slice(0, input.limit)));
   }
 
   private async searchAutoInjectSemanticFallback(input: {
@@ -2180,7 +2197,7 @@ export class ConversationThreadService {
   }
 
   private formatShortlist(
-    source: "lexical" | "semantic",
+    source: "lexical" | "semantic" | "hybrid",
     hits: readonly ConversationThreadSearchHit[],
   ): ConversationThreadAutoInjectShortlist {
     return { source, results: hits.map((hit) => this.formatSearchHit(hit, true)) };

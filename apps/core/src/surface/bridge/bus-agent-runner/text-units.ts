@@ -90,3 +90,17 @@ export function shouldRunAutoInjectedThreadSearch(input: {
 }): boolean {
   return measureMeaningfulTextUnits(input.text) >= input.minTextUnits;
 }
+
+export function decisionAutoInjectContext(
+  message: string,
+  previousMessages: readonly ModelMessage[],
+): string {
+  const current = message.slice(0, 4000);
+  const recent = previousMessages
+    .filter((item) => item.role === "user" && !isGeneratedMessage(item))
+    .slice(-3)
+    .map((item) => latestUserInput([item]).authoredText.slice(-800))
+    .filter(Boolean);
+  if (recent.length === 0) return current;
+  return `Recent user messages, oldest first:\n${recent.join("\n")}\nCurrent message:\n${current}`;
+}

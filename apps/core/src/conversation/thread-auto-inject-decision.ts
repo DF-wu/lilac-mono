@@ -79,8 +79,8 @@ export class DecisionAutoInjectEvaluationFailed extends TaggedError(
   readonly message: string;
 }> {}
 
-// Keep the message cap used to evaluate the original Jev thresholds.
-const DECISION_MESSAGE_MAX_CHARS = 4000;
+// The caller bounds the latest message to 4,000 characters and three prior messages to 800 each.
+const DECISION_MESSAGE_MAX_CHARS = 6500;
 
 const GATE_QUESTIONS = {
   asks_to_recall: "`message` asks to find or recall something discussed in a past conversation",
@@ -92,12 +92,8 @@ const GATE_QUESTIONS = {
 
 const CANDIDATE_QUESTION = "Would reading `candidate_thread` help respond to `message`?";
 
-// Luna scores each question independently and ranked lower lexical matches poorly. Asking whether the
-// thread concerns the same subject and evaluating only the top shortlist entries raised precision
-// in the production replay documented in docs/decision-auto-inject-benchmark.md.
 const OPENAI_CANDIDATE_QUESTION =
-  "Is `candidate_thread` about the same specific project, problem, or item that `message` is about?";
-const OPENAI_MAX_CANDIDATES = 10;
+  "Does this past conversation contain specific facts, preferences, decisions, or prior work that would materially help answer the current message? Shared tools, broad topics, or keywords alone are insufficient. A past conversation can be useful even if the message does not explicitly ask to recall it. Greetings and acknowledgements alone do not need past context.";
 
 function candidateQuestionId(index: number): string {
   return `candidate_${index}`;
@@ -228,7 +224,6 @@ export function createDecisionAutoInjectEvaluator(input: {
     return Result.ok({
       model: `openai/${modelId}`,
       supportsImages: true,
-      maxCandidates: OPENAI_MAX_CANDIDATES,
       async evaluate(evaluateInput) {
         const model = createOpenAIDecisionModel({
           apiKey,
@@ -250,8 +245,8 @@ export function createDecisionAutoInjectEvaluator(input: {
 }
 
 // Luna refuses individual questions on benign security or network vocabulary, and experimental_decide
-// rejects the whole call when any answer is a refusal. Treat a refusal as "no" so it can neither
-// select a candidate nor open a gate. A refused casual question counts as casual for the same reason.
+// rejects the whole call when any answer is a refusal. Treat refused relevance as "no" so it cannot
+// select that candidate. Refused message questions also count against explicitly configured gates.
 function answerRefusalsAsNo(result: DecisionResult): DecisionResult {
   const answers = Object.fromEntries(
     Object.entries(result.answers).map(([questionId, answer]) => [

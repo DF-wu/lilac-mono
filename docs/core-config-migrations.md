@@ -47,10 +47,10 @@ select Luna. This is routing, not a retry or failure fallback chain. Only the se
 credentials. A single string and bare Jev model IDs remain supported as legacy input. TypeSafe uses `TYPESAFE_AI_API_KEY` and optional `TYPESAFE_AI_BASE_URL`; OpenAI uses
 `OPENAI_API_KEY` and optional `OPENAI_BASE_URL`. The endpoint must support `/v1/decisions`.
 Missing credentials and evaluation failures continue without injected metadata. A refused question
-counts as "no", so it cannot open a gate or select a candidate.
+counts as "no" for that question. A zero recall threshold disables message gating.
 
 OpenAI receives attached images as native inline image parts, independently of the primary agent's
-image support. Jev evaluates text only. Shortlisting still uses the latest authored text; image-only
+image support. Jev evaluates text only. Shortlisting uses the latest authored text and up to three recent authored user messages; image-only
 messages do not run automatic recall. Image preparation uses existing scoped resource access and inline
 media limits. Images are kept in memory. No transcript or database migration is needed.
 
@@ -58,8 +58,10 @@ media limits. Images are kept in memory. No transcript or database migration is 
 probability thresholds now live under `decisionAutoInject.jev` and `decisionAutoInject.luna`.
 TypeSafe Jev IDs use the `jev` scope; OpenAI Luna IDs use `luna`. Each scope has independent defaults.
 Legacy flat thresholds apply to both scopes, and explicit scoped fields override them individually.
-The default model list contains Jev only. The provisional Luna defaults and their benchmark limits are
-recorded in [the production benchmark](decision-auto-inject-benchmark.md).
+The default model list contains Jev only. Both recall thresholds default to zero, and relevance
+thresholds default to 0.2 for Jev and 0.1 for Luna. The default candidate budget is 40. With
+`semanticFallback: true`, lexical and semantic retrieval share that budget even when lexical matches
+exist. Set it to false for lexical-only retrieval. Explicit configured values retain precedence.
 
 ## Native title model
 

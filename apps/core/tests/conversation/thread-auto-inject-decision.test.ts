@@ -12,7 +12,12 @@ import {
 
 const config = parseCoreConfigV2ToUniversal({ configVersion: 2 }).conversation.thread
   .decisionAutoInject;
-const options = { ...config.jev, limit: config.limit };
+const options = {
+  ...config.jev,
+  recallMinProbability: 0.7,
+  relevanceMinProbability: 0.5,
+  limit: config.limit,
+};
 
 const candidates: DecisionAutoInjectCandidate[] = [
   { threadId: "t0", title: "Router retries", brief: "Retry policy for the router." },
@@ -25,7 +30,7 @@ function answers(input: Partial<DecisionAutoInjectAnswers>): DecisionAutoInjectA
     asksToRecall: 0,
     durableSubject: 0,
     casual: 0,
-    relevance: [0.9, 0.2, 0.7],
+    relevance: [0.9, 0.05, 0.7],
     ...input,
   };
 }
@@ -40,6 +45,18 @@ function booleanAnswers(probabilities: Record<string, number>) {
 }
 
 describe("Decision auto-inject", () => {
+  it("uses candidate usefulness by default even when message gates reject the request", () => {
+    for (const modelOptions of [config.jev, config.luna]) {
+      const decision = decideDecisionAutoInject({
+        answers: answers({ asksToRecall: 0, durableSubject: 0, casual: 1 }),
+        candidates,
+        options: { ...modelOptions, limit: config.limit },
+      });
+
+      expect(decision.selected.map((candidate) => candidate.threadId)).toEqual(["t0", "t2"]);
+    }
+  });
+
   it("opens the gate on recall requests or durable non-casual subjects", () => {
     expect(
       decideDecisionAutoInject({ answers: answers({ asksToRecall: 0.7 }), candidates, options })
@@ -84,9 +101,9 @@ describe("Decision auto-inject", () => {
   });
 
   it("asks gate and per-candidate questions in one call", () => {
-    const call = buildDecisionAutoInjectCall({ message: "x".repeat(5000), candidates });
+    const call = buildDecisionAutoInjectCall({ message: "x".repeat(7000), candidates });
 
-    expect(call.state).toEqual({ message: "x".repeat(4000) });
+    expect(call.state).toEqual({ message: "x".repeat(6500) });
     expect(Object.keys(call.questions)).toEqual([
       "asks_to_recall",
       "durable_subject",
@@ -185,7 +202,7 @@ describe("Decision auto-inject", () => {
     ).toBe(true);
   });
 
-  it("asks Luna whether each candidate covers the same subject and caps its candidates", async () => {
+  it("asks Luna about useful facts without overriding the configured shortlist", async () => {
     const requests: Array<{ questions: Array<{ name: string; instructions: string }> }> = [];
     const fetch = Object.assign(
       async (_request: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
@@ -209,20 +226,28 @@ describe("Decision auto-inject", () => {
     });
     if (created.isErr()) throw created.error;
 
-    const result = await created.value.evaluate({ message: "router retries", candidates });
+    const shortlisted = Array.from({ length: 20 }, (_, index) => ({
+      ...candidates[index % candidates.length]!,
+      threadId: `t${index}`,
+    }));
+    const result = await created.value.evaluate({
+      message: "router retries",
+      candidates: shortlisted,
+    });
 
-    expect(created.value.maxCandidates).toBe(10);
-    expect(result.isOk()).toBe(true);
+    expect(created.value.maxCandidates).toBeUndefined();
+    expect(result.isOk() ? result.value.relevance.length : result.error).toBe(20);
+    expect(requests[0]?.questions).toHaveLength(23);
     const candidateQuestion = requests[0]?.questions.find(
       (question) => question.name === "candidate_0",
     );
     expect(JSON.parse(candidateQuestion?.instructions ?? "{}")).toMatchObject({
       question:
-        "Is `candidate_thread` about the same specific project, problem, or item that `message` is about?",
+        "Does this past conversation contain specific facts, preferences, decisions, or prior work that would materially help answer the current message? Shared tools, broad topics, or keywords alone are insufficient. A past conversation can be useful even if the message does not explicitly ask to recall it. Greetings and acknowledgements alone do not need past context.",
     });
   });
 
-  it("treats refused questions as answers that cannot open a gate or select a candidate", async () => {
+  it("treats refused questions as negative evidence for selection and configured gates", async () => {
     const evaluator = createDecisionAutoInjectEvaluatorForModel({
       modelId: "test",
       doDecide: async () => ({

@@ -130,29 +130,29 @@ conversation:
       model: [typesafe/jev-1.13.0]
       # Max thread titles to inject.
       limit: 3
-      # Threads shortlisted for the decision model to judge.
-      candidateLimit: 30
-      # Shortlisting uses authored text; images help judge the resulting shortlist.
-      # Image-only messages do not run automatic recall.
-      # Search summary embeddings once when no summary shares a word with the
-      # message, for example CJK text. Needs conversation.thread.embedding.
+      # Maximum unique candidates. With embeddings, reserve half the slots for
+      # lexical search and half for semantic search, then merge duplicates.
+      candidateLimit: 40
+      # Use the latest authored message and up to three recent authored user
+      # messages. Images help judge the shortlist; image-only input still skips recall.
+      # Enables concurrent semantic retrieval even when lexical matches exist.
+      # False keeps lexical-only retrieval. Needs conversation.thread.embedding.
       semanticFallback: true
       jev:
-        # Inject when P(message asks to recall a past conversation) reaches this...
-        recallMinProbability: 0.7
-        # ...or when P(message is about a lasting subject) reaches this and
-        # P(message is casual chatter) stays below casualMaxProbability.
+        # Zero disables the message gate: select by candidate usefulness alone.
+        # A positive value enables recall OR durable/non-casual message gating.
+        recallMinProbability: 0
+        # Used only when the recall threshold is positive and is not met.
         durableSubjectMinProbability: 0.6
         casualMaxProbability: 0.6
         # Minimum P(reading the thread helps respond) for each injected thread.
-        relevanceMinProbability: 0.6
+        relevanceMinProbability: 0.2
       luna:
-        # Tuned text preset; image thresholds need further evaluation.
-        # See docs/decision-auto-inject-benchmark.md.
-        recallMinProbability: 0.5
+        # F1-tuned text preset; image thresholds need further evaluation.
+        recallMinProbability: 0
         durableSubjectMinProbability: 0.5
         casualMaxProbability: 0.3
-        relevanceMinProbability: 0.6
+        relevanceMinProbability: 0.1
 
 surface:
   native:

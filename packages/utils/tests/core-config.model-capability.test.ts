@@ -111,19 +111,19 @@ describe("coreConfigSchema models.capability", () => {
     const expectedDecision = {
       model: ["typesafe/jev-1.13.0"],
       limit: 3,
-      candidateLimit: 30,
+      candidateLimit: 40,
       semanticFallback: true,
       jev: {
-        recallMinProbability: 0.7,
+        recallMinProbability: 0,
         durableSubjectMinProbability: 0.6,
         casualMaxProbability: 0.6,
-        relevanceMinProbability: 0.6,
+        relevanceMinProbability: 0.2,
       },
       luna: {
-        recallMinProbability: 0.5,
+        recallMinProbability: 0,
         durableSubjectMinProbability: 0.5,
         casualMaxProbability: 0.3,
-        relevanceMinProbability: 0.6,
+        relevanceMinProbability: 0.1,
       },
     };
 
