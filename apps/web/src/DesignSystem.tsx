@@ -507,7 +507,16 @@ function Threads() {
             title="Fix search pagination"
             starterName="GitHub"
             starterIcon={<ConversationIcon surface="github" />}
-            updatedAt={now - 3 * 86_400_000}
+            updatedAt={now - 30 * 3_600_000}
+            now={now}
+            state="idle"
+            onSelect={() => {}}
+          />
+          <ThreadCard
+            title="Archive release notes"
+            starterName="GitHub"
+            starterIcon={<ConversationIcon surface="github" />}
+            updatedAt={now - 40 * 86_400_000}
             now={now}
             state="idle"
             onSelect={() => {}}

@@ -22,6 +22,13 @@ export function settledCountOptions(client: NativeClient, online: boolean) {
     refetchOnWindowFocus: true,
   });
 }
+export function sidebarPreferencesOptions(client: NativeClient, online: boolean) {
+  return queryOptions({
+    queryKey: ["sidebar-preferences"],
+    enabled: online,
+    queryFn: ({ signal }) => client.rpc!.sidebar.preferences({}, { signal }),
+  });
+}
 export async function refreshSidebar(queries: QueryClient) {
   await queries.cancelQueries({ queryKey: ["sidebar"] });
   await queries.invalidateQueries({ queryKey: ["sidebar"] });

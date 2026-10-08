@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { SidebarPreferences as Preferences } from "@stanley2058/lilac-client-protocol";
-import { refreshSidebar } from "../sidebar-queries";
+import { refreshSidebar, sidebarPreferencesOptions } from "../sidebar-queries";
+import { defaultAutoSettleDays } from "../thread-metadata";
 import { useWorkspace } from "../workspace-context";
 import { useNativeOnline } from "../queries";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
@@ -16,22 +17,19 @@ export function SidebarPreferences() {
   const { client } = useWorkspace();
   const online = useNativeOnline(client);
   const queries = useQueryClient();
-  const preferences = useQuery({
-    queryKey: ["sidebar-preferences"],
-    enabled: online,
-    queryFn: ({ signal }) => client.rpc!.sidebar.preferences({}, { signal }),
-  });
+  const options = sidebarPreferencesOptions(client, online);
+  const preferences = useQuery(options);
   const update = useMutation({
     mutationFn: (value: Preferences) => client.rpc!.sidebar.configure(value),
-    onMutate: () => queries.cancelQueries({ queryKey: ["sidebar-preferences"] }),
+    onMutate: () => queries.cancelQueries({ queryKey: options.queryKey }),
     onSuccess: (value) => {
-      queries.setQueryData(["sidebar-preferences"], value);
+      queries.setQueryData(options.queryKey, value);
       void refreshSidebar(queries);
     },
   });
   const current = update.isPending
     ? update.variables.autoSettleDays
-    : (preferences.data?.autoSettleDays ?? 3);
+    : (preferences.data?.autoSettleDays ?? defaultAutoSettleDays);
   return (
     <>
       <div className="settings-row flex items-start justify-between gap-6 mb-8">
