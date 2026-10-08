@@ -1,6 +1,7 @@
 import { lazy, Suspense, useState, useLayoutEffect, type ReactNode } from "react";
 import { Eye, Code, WrapText } from "lucide-react";
 import { IconButton } from "./ui";
+import { HtmlFilePreview } from "./HtmlFilePreview";
 import { Markdown } from "./Markdown";
 import { fileLanguage, type FileTarget } from "../file-target";
 import type { TextPreviewState } from "./ResourcePreview";
@@ -10,6 +11,7 @@ const FileCode = lazy(() => import("./FileCode"));
 
 export function FileSource({
   name,
+  href,
   text,
   line,
   endLine,
@@ -17,6 +19,7 @@ export function FileSource({
   heading,
 }: {
   name: string;
+  href?: string;
   text: TextPreviewState;
   line?: number;
   endLine?: number;
@@ -29,13 +32,15 @@ export function FileSource({
     if (line) setPreview(false);
   }, [line, endLine, navigation]);
   const markdown = /\.(md|markdown|mdx)$/i.test(name);
+  const html = /\.html?$/i.test(name) && !!href;
+  const htmlPreview = preview && html;
   return (
     <div data-ui="file-source" className="file-source flex flex-col flex-1 min-w-0 min-h-0 h-full">
       <div className="file-source-toolbar flex items-center flex-none justify-end py-1 px-2 gap-1">
         {heading ? <div className="file-source-heading flex-1 min-w-0">{heading}</div> : null}
-        {markdown ? (
+        {markdown || html ? (
           <IconButton
-            label={preview ? "Show source" : "Preview Markdown"}
+            label={preview ? "Show source" : `Preview ${html ? "HTML" : "Markdown"}`}
             aria-pressed={preview}
             onClick={() => setPreview(!preview)}
           >
@@ -48,7 +53,8 @@ export function FileSource({
           </IconButton>
         ) : null}
       </div>
-      {text.status === "loading" ? (
+      {htmlPreview ? <HtmlFilePreview key={href} href={href} name={name} /> : null}
+      {!htmlPreview && text.status === "loading" ? (
         <div
           className="file-status grid place-content-center flex-1 p-4 text-sm text-muted-foreground"
           role="status"
@@ -56,7 +62,7 @@ export function FileSource({
           Loading file…
         </div>
       ) : null}
-      {text.status === "error" ? (
+      {!htmlPreview && text.status === "error" ? (
         <div
           className="file-status grid place-content-center flex-1 p-4 error-text text-danger text-sm"
           role="status"
@@ -64,7 +70,7 @@ export function FileSource({
           {text.message}
         </div>
       ) : null}
-      {text.status === "ready" ? (
+      {!htmlPreview && text.status === "ready" ? (
         <>
           {preview && markdown ? (
             <div className="file-markdown flex-1 min-h-0 overflow-auto p-3">

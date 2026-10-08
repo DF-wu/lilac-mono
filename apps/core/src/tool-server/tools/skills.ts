@@ -11,6 +11,7 @@ import { defineServerTool, type ServerTool, type ServerToolCallOptions } from ".
 import {
   discoverSkills,
   parseSkillMarkdownResult,
+  skillAvailableOn,
   type DiscoveredSkill,
   env,
 } from "@stanley2058/lilac-utils";
@@ -97,8 +98,9 @@ function requireSkillByName(
 }
 
 async function loadSkillsForToolHost(
-  cwd: string,
+  opts: ServerToolCallOptions | undefined,
 ): Promise<ResultType<Awaited<ReturnType<typeof discoverSkills>>, ServerToolFailure>> {
+  const cwd = skillDiscoveryCwd(opts);
   return Result.gen(async function* () {
     const discovered = yield* Result.await(
       Result.tryPromise({
@@ -114,16 +116,20 @@ async function loadSkillsForToolHost(
         }),
       ),
     );
-    return Result.ok(discovered);
+    const requestClient = opts?.context?.requestClient;
+    return Result.ok({
+      ...discovered,
+      skills: discovered.skills.filter((skill) => skillAvailableOn(skill, requestClient)),
+    });
   });
 }
 
 async function readSkillForToolHost(
   input: z.output<typeof readInputSchema>,
-  cwd: string,
+  opts: ServerToolCallOptions | undefined,
 ): Promise<ServerToolResult> {
   return Result.gen(async function* () {
-    const { skills } = yield* Result.await(loadSkillsForToolHost(cwd));
+    const { skills } = yield* Result.await(loadSkillsForToolHost(opts));
     const found = yield* requireSkillByName(skills, input.name);
     const raw = yield* Result.await(
       Result.tryPromise({
@@ -167,26 +173,24 @@ export class Skills implements ServerTool {
         validation: "zod",
         primaryPositional: "query",
         async run(input, opts) {
-          return (await loadSkillsForToolHost(skillDiscoveryCwd(opts))).map(
-            ({ skills, warnings }) => {
-              let filtered = skills;
-              if (input.sources && input.sources.length > 0) {
-                const allowed = new Set(input.sources);
-                filtered = filtered.filter((skill) => allowed.has(skill.source));
-              }
+          return (await loadSkillsForToolHost(opts)).map(({ skills, warnings }) => {
+            let filtered = skills;
+            if (input.sources && input.sources.length > 0) {
+              const allowed = new Set(input.sources);
+              filtered = filtered.filter((skill) => allowed.has(skill.source));
+            }
 
-              const ranked = scoreAndFilter(filtered, input.query, input.limit);
-              return {
-                skills: ranked.map((skill) => ({
-                  name: skill.name,
-                  description: skill.description,
-                  source: skill.source,
-                  location: skill.location,
-                })),
-                warnings,
-              };
-            },
-          );
+            const ranked = scoreAndFilter(filtered, input.query, input.limit);
+            return {
+              skills: ranked.map((skill) => ({
+                name: skill.name,
+                description: skill.description,
+                source: skill.source,
+                location: skill.location,
+              })),
+              warnings,
+            };
+          });
         },
       }),
       "skills.read": callable({
@@ -196,7 +200,7 @@ export class Skills implements ServerTool {
         inputSchema: readInputSchema,
         validation: "zod",
         primaryPositional: "name",
-        run: (input, opts) => readSkillForToolHost(input, skillDiscoveryCwd(opts)),
+        run: (input, opts) => readSkillForToolHost(input, opts),
       }),
     }),
   });

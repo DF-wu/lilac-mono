@@ -102,6 +102,14 @@ export const nativeUploadRecordSchema = z.strictObject({
   revision,
   published: z.boolean(),
 });
+export const nativeHtmlPreviewRecordSchema = z.strictObject({
+  id,
+  threadId: id,
+  turnId: id,
+  path: z.string().min(1).max(4096),
+  uploadId: id.optional(),
+  error: z.string().max(1024).optional(),
+});
 const mutationResultSchema = z.strictObject({
   threadId: id,
   inputId: id.optional(),
@@ -136,11 +144,13 @@ export const nativeRecordSchema = z.discriminatedUnion("kind", [
     kind: z.literal("path"),
     value: z.strictObject({ id, threadId: id, path: z.string(), cwd: z.string().optional() }),
   }),
+  z.strictObject({ kind: z.literal("html-preview"), value: nativeHtmlPreviewRecordSchema }),
 ]);
 export type NativeUser = z.infer<typeof nativeUserSchema>;
 export type NativeThreadRecord = z.infer<typeof nativeThreadRecordSchema>;
 export type NativeInputRecord = z.infer<typeof nativeInputRecordSchema>;
 export type NativeUploadRecord = z.infer<typeof nativeUploadRecordSchema>;
+export type NativeHtmlPreviewRecord = z.infer<typeof nativeHtmlPreviewRecordSchema>;
 export type NativeRecord = z.infer<typeof nativeRecordSchema>;
 export type NativeMutationResult = z.infer<typeof mutationResultSchema>;
 export type NativePersistedRow = {

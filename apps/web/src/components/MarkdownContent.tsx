@@ -1,4 +1,4 @@
-import { parseReferenceHref } from "@stanley2058/lilac-client-protocol";
+import { HTML_PREVIEW_LANGUAGE, parseReferenceHref } from "@stanley2058/lilac-client-protocol";
 import { ConversationBadge } from "./ConversationReference";
 import { FileLink, MarkdownImage } from "./FileActions";
 import { parseFilePath } from "../file-target";
@@ -23,6 +23,7 @@ import { LinkWithFavicon } from "./LinkWithFavicon";
 import { AttachmentReference } from "./AttachmentReference";
 import { MessageResourcesContext } from "./message-resources";
 import { CodeBlock } from "./CodeBlock";
+import { HtmlPreviewBlock } from "./HtmlPreview";
 import { markdownUrl } from "./markdown-policy";
 import { userMessageLineBreaks } from "./composer-line-breaks";
 import { remarkSkillMentions, SkillCatalogContext } from "./skill-mentions";
@@ -48,6 +49,7 @@ function userPlugins(skillNames: string[]) {
 }
 
 function RichBlock({ source, language }: { source: string; language: string }) {
+  if (language === HTML_PREVIEW_LANGUAGE) return <HtmlPreviewBlock source={source} />;
   const fallback = <CodeBlock source={source} language={language} />;
   let content = <HighlightedCode source={source} language={language} />;
   if (language === "mermaid") content = <Diagram source={source} />;

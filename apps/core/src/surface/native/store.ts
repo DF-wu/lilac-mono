@@ -33,6 +33,7 @@ import { configureSqliteConnection } from "../../shared/sqlite";
 import { nativeThreadCapabilities, type NativeThreadGrant } from "./authority";
 import {
   decodeNativeRecord,
+  type NativeHtmlPreviewRecord,
   type NativeInputRecord,
   type NativeMutationResult,
   type NativePersistedRow,
@@ -69,6 +70,10 @@ export function nativeStoreTransaction<T>(
 
 function fingerprint(value: object): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function htmlPreviewKey(turnId: string, path: string): string {
+  return fingerprint({ kind: "html-preview", turnId, path });
 }
 
 function commandKey(actorId: string, commandId: string): string {
@@ -2411,6 +2416,35 @@ export class NativeStore {
     );
   }
 
+  saveHtmlPreview(value: Omit<NativeHtmlPreviewRecord, "id">): NativeStoreResult<void> {
+    return nativeStoreTransaction(this.db, () => {
+      const id = htmlPreviewKey(value.turnId, value.path);
+      this.writeRecord(id, { kind: "html-preview", value: { ...value, id } }, value.threadId);
+      return Result.ok(undefined);
+    });
+  }
+
+  readHtmlPreview(
+    actorId: string,
+    target: { threadId: string; messageId: string; path: string },
+  ): NativeStoreResult<NativeHtmlPreviewRecord> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        yield* this.authorizeThread(actorId, target.threadId);
+        const turn = this.db
+          .query<{ id: string }, [string, string]>(
+            "SELECT r.id FROM native_records r,json_each(r.data_json,'$.value.messages') m WHERE r.kind='turn' AND r.thread_id=? AND json_extract(m.value,'$.id')=? LIMIT 1",
+          )
+          .get(target.threadId, target.messageId);
+        if (!turn) return Result.err(nativeFailure("not-found", "Message is unavailable"));
+        const record = yield* this.readRecord("html-preview", htmlPreviewKey(turn.id, target.path));
+        if (record?.kind !== "html-preview" || record.value.threadId !== target.threadId)
+          return Result.err(nativeFailure("not-found", "Preview is unavailable"));
+        return Result.ok(record.value);
+      }, this),
+    );
+  }
+
   private boundedTurn(slot: ReadyTurnSlot): ReadyTurnSlot {
     const indexed = slot.messages.map((message, position) => ({
       ...message,
@@ -2797,7 +2831,7 @@ export class NativeStore {
       }
       this.db
         .query(
-          "DELETE FROM native_records WHERE thread_id=? AND kind IN ('turn','upload','path','message')",
+          "DELETE FROM native_records WHERE thread_id=? AND kind IN ('turn','upload','path','message','html-preview')",
         )
         .run(thread.id);
       this.db.query("DELETE FROM native_changes WHERE thread_id=?").run(thread.id);

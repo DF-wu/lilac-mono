@@ -33,6 +33,8 @@ export type DiscoveredSkill = {
   baseDir: string;
   source: SkillSource;
   disableModelInvocation?: boolean;
+  /** Request clients the skill is offered to; absent means every client. */
+  surfaces?: readonly string[];
 };
 
 export type SkillWarning = {
@@ -197,6 +199,7 @@ const skillFrontmatterSchema = z
   .object({
     name: z.string().trim().min(1),
     description: z.string().trim().min(1),
+    surfaces: z.array(z.string().trim().min(1)).min(1).optional(),
   })
   .loose();
 
@@ -216,6 +219,7 @@ export type ParsedSkillFile = {
   name: string;
   description: string;
   disableModelInvocation: boolean;
+  surfaces?: readonly string[];
   body: string;
 };
 
@@ -261,7 +265,8 @@ export function parseSkillMarkdownResult(
       new SkillMarkdownInvalid({
         issue: "invalid-frontmatter",
         cause: parsed.error,
-        message: "YAML frontmatter must be an object with non-empty name and description",
+        message:
+          "YAML frontmatter must be an object with non-empty name and description, and surfaces must be a non-empty list of names",
       }),
     );
   }
@@ -271,6 +276,7 @@ export function parseSkillMarkdownResult(
     name: parsed.data.name,
     description: parsed.data.description,
     disableModelInvocation: parsed.data["disable-model-invocation"] === true,
+    ...(parsed.data.surfaces ? { surfaces: parsed.data.surfaces } : {}),
     body: parts.body.trimStart(),
   });
 }
@@ -456,6 +462,14 @@ function truncateWithEllipsis(raw: string, maxChars: number): string {
   return `${s.slice(0, maxChars - 3)}...`;
 }
 
+export function skillAvailableOn(
+  skill: Pick<DiscoveredSkill, "surfaces">,
+  requestClient: string | undefined,
+): boolean {
+  if (!skill.surfaces) return true;
+  return requestClient !== undefined && skill.surfaces.includes(requestClient);
+}
+
 /**
  * Build a compact skills index suitable for appending to a system prompt.
  * Returns null when no skills are provided.
@@ -624,6 +638,7 @@ export async function discoverSkills(params: {
         baseDir: skillBaseDir,
         source: root.source,
         disableModelInvocation: parsed.disableModelInvocation,
+        ...(parsed.surfaces ? { surfaces: parsed.surfaces } : {}),
       });
       if (params.maxSkills !== undefined && byName.size >= params.maxSkills) {
         warnings.push({

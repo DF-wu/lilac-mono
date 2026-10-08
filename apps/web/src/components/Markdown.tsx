@@ -1,8 +1,7 @@
-import { Component, lazy, memo, Suspense, type ReactNode } from "react";
+import { Component, memo, type ReactNode } from "react";
 
 import { MarkdownWrapContext } from "./markdown-layout";
-
-const MarkdownContent = lazy(() => import("./MarkdownContent"));
+import MarkdownContent from "./MarkdownContent";
 
 export class RichRenderBoundary extends Component<
   { children: ReactNode; fallback: ReactNode; resetKey?: string },
@@ -35,9 +34,7 @@ export const Markdown = memo(function Markdown({
     <div className="markdown" data-wrap={wrap}>
       <MarkdownWrapContext value={wrap}>
         <RichRenderBoundary resetKey={text} fallback={fallback}>
-          <Suspense fallback={fallback}>
-            <MarkdownContent text={text} preserveLineBreaks={preserveLineBreaks} />
-          </Suspense>
+          <MarkdownContent text={text} preserveLineBreaks={preserveLineBreaks} />
         </RichRenderBoundary>
       </MarkdownWrapContext>
     </div>

@@ -4,11 +4,14 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import MarkdownContent from "../src/components/MarkdownContent";
+import { Markdown } from "../src/components/Markdown";
 import MathExpression, { sanitizeMathTree } from "../src/components/rich-math";
 import { highlightCode } from "../src/components/rich-code";
 import { remarkChatMath } from "../src/components/remark-chat-math";
 import { diagramSourceAllowed, markdownUrl } from "../src/components/markdown-policy";
 import { SkillCatalogContext } from "../src/components/skill-mentions";
+import { HtmlPreviewMessageContext } from "../src/components/HtmlPreview";
+import { RequestActiveContext } from "../src/components/ActivityLog";
 
 describe("markdown", () => {
   test("renders exact catalog skill mentions in user messages as badges", () => {
@@ -364,5 +367,50 @@ describe("rich renderers", () => {
     expect(highlightCode("let cached = true", "typescript")).toBe(
       highlightCode("let cached = true", "typescript"),
     );
+  });
+});
+
+describe("html previews", () => {
+  const fence = "```html-preview-file\n/work/chart.html\n```";
+  const render = (active: boolean | undefined, message = true) =>
+    renderToStaticMarkup(
+      <HtmlPreviewMessageContext value={message ? { threadId: "t1", messageId: "m1" } : null}>
+        <RequestActiveContext value={active}>
+          <Markdown text={fence} />
+        </RequestActiveContext>
+      </HtmlPreviewMessageContext>,
+    );
+
+  test("frames the saved page once the turn ends", () => {
+    const globals = globalThis as { document?: unknown; getComputedStyle?: unknown };
+    const saved = { document: globals.document, getComputedStyle: globals.getComputedStyle };
+    globals.document = { documentElement: {} };
+    globals.getComputedStyle = () => ({
+      getPropertyValue: (name: string) => (name === "--ui-background" ? " #101010" : ""),
+    });
+    const html = render(false);
+    Object.assign(globals, saved);
+    expect(html).toContain('data-ui="html-preview"');
+    expect(html).toContain('sandbox="allow-scripts allow-forms allow-popups"');
+    expect(html).toContain(
+      `src="/api/html-previews?thread=t1&amp;message=m1&amp;path=%2Fwork%2Fchart.html#lilac-theme=`,
+    );
+    expect(html).toContain('title="chart.html"');
+    expect(html).toContain('loading="eager"');
+    expect(html).toContain('aria-label="Loading preview"');
+    expect(html).toContain("height:240px");
+    expect(html).not.toContain("```html-preview-file");
+    expect(decodeURIComponent(html)).toContain(
+      '{"appearance":"dark","variables":{"--background":"#101010"}}',
+    );
+  });
+
+  test("waits for a running turn and shows code outside native replies", () => {
+    expect(render(true)).toContain('aria-label="Loading preview"');
+    expect(render(true)).toContain("height:240px");
+    expect(render(true)).not.toContain("/work/chart.html");
+    expect(render(true)).not.toContain("<iframe");
+    expect(render(false, false)).not.toContain("<iframe");
+    expect(render(false, false)).toContain("/work/chart.html");
   });
 });

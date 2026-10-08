@@ -48,6 +48,7 @@ import { ResourceAttachment } from "./ResourceAttachment";
 import { ActorAvatar, type ActorIdentity } from "./ActorAvatar";
 import { MessageIdentityContext } from "./message-identity";
 import { MessageResourcesContext } from "./message-resources";
+import { HtmlPreviewMessageContext } from "./HtmlPreview";
 import { Bubble, BubbleContent } from "./ui/bubble";
 import "./message-presentation.css";
 import { Markdown } from "./Markdown";
@@ -1120,6 +1121,13 @@ const MessageBody = memo(function MessageBody(
       ),
     [attachments, resourceUrl],
   );
+  const previewMessage = useMemo(
+    () =>
+      timeline && message.role === "assistant"
+        ? { threadId: timeline.threadId, messageId: message.id }
+        : null,
+    [timeline, message.role, message.id],
+  );
   const time =
     message.metadata?.createdAt !== undefined ? (
       <time dateTime={new Date(message.metadata.createdAt).toISOString()}>
@@ -1166,84 +1174,86 @@ const MessageBody = memo(function MessageBody(
           <AuthorAvatar author={author} role={authorRole} self={self} message={message} />
         ) : null}
         <MessageResourcesContext value={resources}>
-          <MessageContent>
-            {cards.map((group, index) => {
-              if (group.kind === "content")
-                return (
-                  <MessageCard
-                    key={index}
-                    arrivalId={`${props.renderKey ?? message.id}:content:${index}`}
-                    content={group}
-                    self={self}
-                    collapsible={message.role === "user"}
-                    streaming={message.role === "assistant" && !!props.live}
-                    reactions={
-                      index === lastContent ? (
-                        <MessageReactions messageId={message.id} items={reactions} />
-                      ) : null
-                    }
-                  />
-                );
-              if (group.kind === "activity") return <Activity key={index} parts={group.parts} />;
-              const part = group.part;
-              switch (part.type) {
-                case "data-compaction":
+          <HtmlPreviewMessageContext value={previewMessage}>
+            <MessageContent>
+              {cards.map((group, index) => {
+                if (group.kind === "content")
                   return (
-                    <Marker variant="separator" className="compaction" key={part.id}>
-                      <MarkerContent>
-                        Context compaction {part.data.state}
-                        {part.data.beforeCount !== undefined && part.data.afterCount !== undefined
-                          ? ` · ${part.data.beforeCount} → ${part.data.afterCount}`
-                          : ""}
-                      </MarkerContent>
-                    </Marker>
-                  );
-                case "data-input-state":
-                  return part.data.state === "admitted" || part.data.state === "queued" ? null : (
-                    <Marker className="input-state" key={part.id}>
-                      <MarkerContent>{part.data.reason ?? part.data.state}</MarkerContent>
-                    </Marker>
-                  );
-                case "data-actions":
-                  return (
-                    <div className="action-list" key={part.id}>
-                      {part.data.actions.map((action) => (
-                        <Button
-                          key={action.actionId}
-                          type="button"
-                          disabled={!canEdit || action.disabled}
-                          variant={action.style === "danger" ? "destructive" : "secondary"}
-                          onClick={() => onAction(message.id, part, action.actionId)}
-                        >
-                          {action.label}
-                        </Button>
-                      ))}
-                    </div>
-                  );
-                case "data-workflow":
-                  return (
-                    <WorkflowCard
-                      key={part.id}
-                      messageId={message.id}
-                      card={part.data}
-                      actions={message.parts.find((item) => item.type === "data-actions")}
+                    <MessageCard
+                      key={index}
+                      arrivalId={`${props.renderKey ?? message.id}:content:${index}`}
+                      content={group}
+                      self={self}
+                      collapsible={message.role === "user"}
+                      streaming={message.role === "assistant" && !!props.live}
+                      reactions={
+                        index === lastContent ? (
+                          <MessageReactions messageId={message.id} items={reactions} />
+                        ) : null
+                      }
                     />
                   );
-                case "data-reactions":
-                  return lastContent < 0 ? (
-                    <Bubble
-                      key={part.id}
-                      variant={self ? "tinted" : "muted"}
-                      className="message-bubble"
-                    >
-                      <BubbleContent>
-                        <MessageReactions messageId={message.id} items={part.data.items} />
-                      </BubbleContent>
-                    </Bubble>
-                  ) : null;
-              }
-            })}
-          </MessageContent>
+                if (group.kind === "activity") return <Activity key={index} parts={group.parts} />;
+                const part = group.part;
+                switch (part.type) {
+                  case "data-compaction":
+                    return (
+                      <Marker variant="separator" className="compaction" key={part.id}>
+                        <MarkerContent>
+                          Context compaction {part.data.state}
+                          {part.data.beforeCount !== undefined && part.data.afterCount !== undefined
+                            ? ` · ${part.data.beforeCount} → ${part.data.afterCount}`
+                            : ""}
+                        </MarkerContent>
+                      </Marker>
+                    );
+                  case "data-input-state":
+                    return part.data.state === "admitted" || part.data.state === "queued" ? null : (
+                      <Marker className="input-state" key={part.id}>
+                        <MarkerContent>{part.data.reason ?? part.data.state}</MarkerContent>
+                      </Marker>
+                    );
+                  case "data-actions":
+                    return (
+                      <div className="action-list" key={part.id}>
+                        {part.data.actions.map((action) => (
+                          <Button
+                            key={action.actionId}
+                            type="button"
+                            disabled={!canEdit || action.disabled}
+                            variant={action.style === "danger" ? "destructive" : "secondary"}
+                            onClick={() => onAction(message.id, part, action.actionId)}
+                          >
+                            {action.label}
+                          </Button>
+                        ))}
+                      </div>
+                    );
+                  case "data-workflow":
+                    return (
+                      <WorkflowCard
+                        key={part.id}
+                        messageId={message.id}
+                        card={part.data}
+                        actions={message.parts.find((item) => item.type === "data-actions")}
+                      />
+                    );
+                  case "data-reactions":
+                    return lastContent < 0 ? (
+                      <Bubble
+                        key={part.id}
+                        variant={self ? "tinted" : "muted"}
+                        className="message-bubble"
+                      >
+                        <BubbleContent>
+                          <MessageReactions messageId={message.id} items={part.data.items} />
+                        </BubbleContent>
+                      </Bubble>
+                    ) : null;
+                }
+              })}
+            </MessageContent>
+          </HtmlPreviewMessageContext>
         </MessageResourcesContext>
         {conversational &&
         (props.showControls ??

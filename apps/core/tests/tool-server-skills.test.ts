@@ -125,4 +125,23 @@ ${"Complete instructions.\n".repeat(12_000)}Last instruction.
       await fs.rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it("offers surface-scoped skills only to requests from those clients", async () => {
+    const native = { context: { cwd: process.cwd(), requestClient: "native" } };
+    const discord = { context: { cwd: process.cwd(), requestClient: "discord" } };
+    const tool = new Skills();
+    const names = async (opts: typeof native) => {
+      const listed = await tool.call("skills.list", { sources: "lilac-builtin" }, opts);
+      if (listed.status !== "ok") throw new Error(listed.error.message);
+      return (listed.value as { skills: { name: string }[] }).skills.map((skill) => skill.name);
+    };
+    expect(await names(native)).toContain("visualize");
+    expect(await names(discord)).not.toContain("visualize");
+    expect(await names(discord)).toContain("coding-agent");
+    expect((await tool.call("skills.read", { name: "visualize" }, native)).status).toBe("ok");
+    expect(await tool.call("skills.read", { name: "visualize" }, discord)).toMatchObject({
+      status: "error",
+      error: { kind: "not_found" },
+    });
+  });
 });

@@ -471,6 +471,24 @@ export class NativeResourceService {
     ).mapError(() => nativeFailure("not-found", "File bytes are unavailable"));
   }
 
+  async readBytes(
+    actorId: string,
+    uri: string,
+  ): Promise<NativeResult<{ bytes: Uint8Array; mediaType: string }>> {
+    return Result.gen(async function* () {
+      const read = yield* Result.await(this.open(actorId, uri));
+      const bytes = yield* Result.await(
+        consumeVerifiedResourceRead(read).then((result) =>
+          result.mapError(() => nativeFailure("invalid", "File verification failed")),
+        ),
+      );
+      return Result.ok({
+        bytes,
+        mediaType: read.classification.mediaType ?? "application/octet-stream",
+      });
+    }, this);
+  }
+
   scopedAccess(actorId: string): ResourceAccess {
     const verify = (uri: string) =>
       this.authorize(actorId, uri).mapError(

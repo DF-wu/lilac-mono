@@ -199,7 +199,7 @@ export function createDiscordContextReportProvider(params: {
     const additionalSessionPrompts = await resolveSessionAdditionalPrompts({
       entries: sessionConfig.additionalPrompts,
     });
-    const skillsSection = await maybeBuildSkillsSectionForPrimary();
+    const skillsSection = await maybeBuildSkillsSectionForPrimary("discord");
     const safetyMode = resolveSessionSafetyMode(
       request.config,
       request.sessionId,

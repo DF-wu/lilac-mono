@@ -46,6 +46,7 @@ import type { NativeInstallation } from "./installation";
 import { nativeThreadId } from "./native-protocol";
 import { createNativeOutputPublisher, createNativeBusOutputSink } from "./output";
 import { projectNativeOutput } from "./output-projection";
+import { HtmlPreviewReply, NativeHtmlPreviews } from "./html-preview";
 import { NativeResourceService } from "./resources";
 import { NativeLiveFileService, rewriteNativePublishedFileLinks } from "./resources-live";
 import { createNativeRpcServices, nativeViewer } from "./rpc-services";
@@ -164,6 +165,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     toolRoot: options.workspaceRoot,
     remoteDenyPaths: options.denyPaths,
   });
+  const htmlPreviews = new NativeHtmlPreviews({ store, files: liveFiles, resources });
   const execution = createNativeExecution({
     expandReferences: (userId, text) =>
       references.expand(userId, text, new URL(options.getConfig().surface.native.publicUrl).origin),
@@ -330,7 +332,11 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     getViewer: (id) => store.getUser(id).map(nativeViewer),
     resources: {
       async handle(request, actorId) {
-        return (await resources.handle(request, actorId)) ?? liveFiles.handle(request, actorId);
+        return (
+          (await resources.handle(request, actorId)) ??
+          (await htmlPreviews.handle(request, actorId)) ??
+          liveFiles.handle(request, actorId)
+        );
       },
     },
     webRoot: path.resolve(import.meta.dir, "../../../../web/dist"),
@@ -622,19 +628,53 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   }) {
     if (input.requestClient !== "native") return undefined;
     const attempt = nativeRuntimeResultToHost(store.beginOutputAttempt(input.requestId));
+    const mode = deployment().outputStreaming;
     const publisher = createNativeOutputPublisher({
       ...attempt,
       requestId: input.requestId,
-      mode: deployment().outputStreaming,
+      mode,
       publish: publishDurableOutput,
       recoveryFrontier: input.recoveryOutputFrontier,
     });
     const active = { publisher, threadId: attempt.threadId };
     activeOutputs.set(input.requestId, active);
+    const reply = new HtmlPreviewReply(attempt.attemptId);
+    let snapshotted = false;
+    async function snapshotPreviews(state: Parameters<NativeOutputPublisher["terminal"]>[0]) {
+      if (snapshotted || state === "canceled") return;
+      snapshotted = true;
+      await htmlPreviews.snapshot({
+        threadId: attempt.threadId,
+        turnId: attempt.turnId,
+        texts: reply.texts(),
+      });
+    }
     return {
       ...publisher,
+      textStart: (part: Parameters<NativeOutputPublisher["textStart"]>[0]) => {
+        publisher.textStart(part);
+        reply.start(part.partId, part.stepId);
+      },
+      textDelta: (partId: string, delta: string) => {
+        publisher.textDelta(partId, delta);
+        reply.append(partId, delta);
+      },
+      textEnd: (partId: string) => {
+        publisher.textEnd(partId);
+        // Paragraph mode publishes a part at its end, so a reused part ID starts a new message.
+        if (mode === "paragraph") reply.end(partId);
+      },
+      stepEnd: (reason: Parameters<NativeOutputPublisher["stepEnd"]>[0]) => {
+        publisher.stepEnd(reason);
+        reply.endStep();
+      },
+      reset: (nextAttemptId: string, stepId?: string) => {
+        publisher.reset(nextAttemptId, stepId);
+        reply.reset(nextAttemptId, stepId);
+      },
       terminal: async (state: Parameters<NativeOutputPublisher["terminal"]>[0]) => {
         if (activeOutputs.get(input.requestId) === active) activeOutputs.delete(input.requestId);
+        await snapshotPreviews(state);
         return publisher.terminal(state);
       },
     };
