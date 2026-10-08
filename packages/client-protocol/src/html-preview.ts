@@ -50,9 +50,10 @@ export const HTML_PREVIEW_OPEN_LINK_METHOD = "ui/open-link";
 
 // The frame scrolls a page taller than itself, but a scrollbar inside the reply reads as a box
 // within the thread, so it stays hidden.
+// Inset content from the frame's clip edge, where fractional display scaling can cut off borders.
 const BASE_CSS =
   "html{background:transparent;color:var(--foreground);font-family:var(--font-sans);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;scrollbar-width:none}" +
-  "html::-webkit-scrollbar{display:none}body{margin:0}code,kbd,pre,samp{font-family:var(--font-mono)}";
+  "html::-webkit-scrollbar{display:none}body{margin:1px}code,kbd,pre,samp{font-family:var(--font-mono)}";
 
 // Runs in <head> before the page's own styles, so the first paint already has the theme from the
 // URL fragment. It rewrites its own <style> element, so a page's later :root rules still win.
