@@ -368,10 +368,7 @@ const discordSurfaceSchema = z
     outputPreviewModeFinalText: z.enum(["flat", "reply-chain"]).default("flat"),
     outputNotification: z.boolean().default(true),
     attachmentCache: discordAttachmentCacheSchema,
-    workingIndicators: z
-      .array(z.string().trim().min(1))
-      .min(1)
-      .default(cloneDefaultWorkingIndicators()),
+    workingIndicators: z.array(z.string().trim().min(1)).min(1).optional(),
     markdownTableRender: discordMarkdownTableRenderSchema,
     markdownMathRender: discordMarkdownMathRenderSchema,
   })
@@ -385,7 +382,6 @@ const discordSurfaceSchema = z
     outputPreviewModeFinalText: "flat",
     outputNotification: true,
     attachmentCache: { ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
-    workingIndicators: cloneDefaultWorkingIndicators(),
     markdownTableRender: {
       enabled: true,
       style: "unicode",
@@ -637,6 +633,7 @@ const conversationSchemaV2 = z
           .object({
             enabled: z.boolean().default(false),
             model: z.string().trim().min(1).default("openai/text-embedding-3-small"),
+            queryModel: z.string().trim().min(1).optional(),
           })
           .default({ enabled: false, model: "openai/text-embedding-3-small" }),
         autoInject: z
@@ -884,6 +881,10 @@ export const coreConfigInputSchemaV2 = z.object({
 
   surface: z
     .object({
+      workingIndicators: z
+        .array(z.string().trim().min(1))
+        .min(1)
+        .default(() => cloneDefaultWorkingIndicators()),
       native: nativeSurfaceSchema,
       router: routerSchema,
       discord: discordSurfaceSchema,
@@ -893,6 +894,7 @@ export const coreConfigInputSchemaV2 = z.object({
     // Lazy: a literal default object is built once at module load and handed
     // out by reference, so every config would share the same nested arrays.
     .default(() => ({
+      workingIndicators: cloneDefaultWorkingIndicators(),
       native: defaultNativeSurfaceConfig(),
       router: {
         defaultMode: "mention" as const,
@@ -910,7 +912,6 @@ export const coreConfigInputSchemaV2 = z.object({
         outputPreviewModeFinalText: "flat" as const,
         outputNotification: true,
         attachmentCache: { ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
-        workingIndicators: cloneDefaultWorkingIndicators(),
         markdownTableRender: {
           enabled: true,
           style: "unicode" as const,
@@ -1054,6 +1055,7 @@ function coreConfigV2ToUniversal(
       ...isolated.surface,
       discord: {
         ...discord,
+        workingIndicators: discord.workingIndicators ?? isolated.surface.workingIndicators,
         attachmentCache: {
           ttlMs: retentionLimit(attachmentCache.ttl),
         },

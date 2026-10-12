@@ -125,6 +125,8 @@ function fixture() {
     native,
     streamingMode: () => "paragraph",
     workflows: {
+      getOperationByRequestId: (id) =>
+        Result.ok(operations.find((operation) => operation.requestId === id) ?? null),
       getRun: (id) => {
         workflowReads++;
         return Result.ok(id === run.runId ? run : null);
@@ -304,7 +306,9 @@ test("transcript pagination bounds large messages and omits private provider dat
   expect(new Set(messages.map((message) => message.id)).size).toBe(27);
   for (const message of messages)
     expect(displayMessageSchema.safeParse(message).success).toBe(true);
-  expect(JSON.stringify(messages)).not.toContain("PRIVATE");
+  expect(JSON.stringify(messages)).not.toContain("PRIVATE SYSTEM");
+  expect(JSON.stringify(messages)).toContain("PRIVATE REASONING");
+  expect(JSON.stringify(messages)).toContain("PRIVATE INPUT");
   expect(JSON.stringify(messages)).toContain("search");
   expect(subagentMessages([{ role: "assistant", content: "hello" }])).toHaveLength(1);
 });
@@ -314,10 +318,10 @@ test("live reasoning and tools keep their working state until completion", () =>
     { role: "assistant" as const, content: [{ type: "reasoning" as const, text: "private" }] },
   ];
   expect(subagentMessages(reasoning, true)[0]?.parts[0]).toMatchObject({
-    data: { label: "Thinking…", state: "running" },
+    data: { label: "Thinking", state: "running" },
   });
   expect(subagentMessages(reasoning)[0]?.parts[0]).toMatchObject({
-    data: { label: "Thought", state: "complete" },
+    data: { label: "Thinking", state: "complete", detail: "private" },
   });
   const tool = { toolCallId: "tool", toolName: "search" };
   const messages = [

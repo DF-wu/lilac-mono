@@ -37,7 +37,7 @@ test("agent preview uses an agent avatar and readable profile and work title, wi
   );
   expect(html).toContain('data-agent-profile="explore"');
   expect(html).toContain("Explore Agent");
-  expect(html).toContain(agent.title);
+  expect(html).toContain(agent.title.replaceAll("&", "&amp;").replaceAll('"', "&quot;"));
   expect(html).not.toContain("subagent (explore;");
   expect(html).not.toMatch(/\sdisabled(?:=|\s|>)/);
   const unresolved = renderToStaticMarkup(<ActivityItem part={part} />);

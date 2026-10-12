@@ -1,5 +1,31 @@
 # MIGRATIONS.md
 
+## Sidebar working time
+
+Native thread summaries gain an optional `workingSince` field while a thread is working. Core reads it
+from the latest turn's start time, or from its first message's creation time before output begins.
+Native web shows the elapsed time in place of the last-activity time. No stored data changes.
+Update Core and web together because older strict thread validators reject the new field.
+
+## Shared working indicators
+
+Version-2 configuration adds `surface.workingIndicators`, the status phrases shown while a request
+runs. It defaults to the built-in list. `surface.discord.workingIndicators` no longer has a default
+and now overrides the shared list for Discord only; existing Discord values keep their behavior.
+Version-1 configurations use the built-in list for native web. No schema version or stored-data change is required.
+
+The native bootstrap reply gains an optional `workingIndicators` field. Native web rotates the
+phrases in place of "Working" and shows the past tense of the final phrase in place of "Worked".
+Every client derives the phrase from the turn ID and elapsed time, so reloads show the same word.
+Update Core and web together because older strict bootstrap validators reject the new field.
+
+## Separate thread query embeddings
+
+`conversation.thread.embedding.queryModel` optionally selects the search-query encoder.
+It defaults to `embedding.model`, which remains the document encoder and stored embedding ID.
+Both encoders must share a vector space and dimensions. Changing the document model requires
+re-embedding existing summary facets. No schema-version or database change is required.
+
 ## Decision auto-inject F1 defaults
 
 Decision auto-inject defaults now select useful prior facts without requiring a recall/durable
@@ -88,6 +114,31 @@ redacted command in `detail`, and edit and patch activities list every changed p
 per line. Stored turns
 need no backfill: older activities render without these details, and thinking rows without reasoning
 text are hidden. Update Core and web together because older strict validators reject the new fields.
+
+## Native agent streams
+
+Native v1 adds `streams.sync`, `streams.watch`, `streams.hydrate`, and `streams.turnPage`. Their target
+selects either a native thread or a subagent owned by that thread. Both targets use the existing
+display-message, turn, replay-checkpoint, and subscription event schemas. Core and web must be updated
+together. The existing thread and paged subagent RPCs remain available.
+
+Native SQLite `user_version` advances from 1 to 2 without rewriting existing records. The native record
+codec adds `agent-stream` metadata; child display turns, replay deltas, projection provenance, and
+deduplication receipts reuse the existing native tables. Older binaries reject version 2. Rollback
+requires a pre-upgrade backup. New child runs publish through the same durable semantic output path
+as primary runs, including recovery-frontier resets, reasoning details, redacted tool arguments and
+results, text phases, and terminal state.
+
+Existing completed children are projected lazily from retained transcripts when opened. Those
+transcripts cannot recover original timing or text-phase events. System prompts, opaque provider
+state, and encrypted reasoning remain excluded. This replaces the original subagent inspection
+policy that omitted all tool arguments and reasoning text.
+
+Child access follows the verified workflow ancestry to a canonical native parent request. Parent
+rewind or deletion invalidates discarded descendants and removes their native display records.
+Minimal deleted stream metadata remains so retained late output events are acknowledged as stale.
+Grant revocation ends child subscriptions and purges their cached display data. Child display streams
+do not create sidebar conversations or grant permission to edit, rewind, or submit input to children.
 
 ## Native computer viewer
 

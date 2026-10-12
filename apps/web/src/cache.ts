@@ -419,17 +419,34 @@ export class WebNativeCache implements NativeCache {
     this.epoch++;
     await this.memory.remove(scope, threadId);
     const key = threadKey(scope, threadId);
-    this.residentThreads.delete(key);
+    const scopeKey = cacheScopeKey(scope);
+    for (const [id, row] of this.residentThreads) {
+      if (
+        cacheScopeKey(row.scope) === scopeKey &&
+        (row.threadId === threadId || row.threadId.startsWith(`subagent:${threadId}:`))
+      )
+        this.residentThreads.delete(id);
+    }
     await this.attempt(async (db) => {
       const tx = db.transaction(["threads", "slots", "drafts"], "readwrite");
       const done = completed(tx);
-      tx.objectStore("threads").delete(key);
+      const threads = tx.objectStore("threads");
+      const values = await idbRequest(threads.index("scope").getAll(scopeKey));
+      const rows = Array.isArray(values)
+        ? values.map(decodeThread).filter((row) => row !== undefined)
+        : [];
+      for (const row of rows) {
+        if (row.threadId !== threadId && !row.threadId.startsWith(`subagent:${threadId}:`))
+          continue;
+        threads.delete(row.key);
+        await deleteIndex(tx.objectStore("slots"), "thread", row.key);
+      }
       tx.objectStore("drafts").delete(key);
-      await deleteIndex(tx.objectStore("slots"), "thread", key);
       await assertCommitted(done);
     });
     this.drafts.delete(key);
   }
+
   async purge(scope: CacheScope): Promise<void> {
     this.epoch++;
     await this.memory.purge(scope);

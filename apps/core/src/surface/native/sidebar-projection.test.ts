@@ -19,7 +19,7 @@ function fixture() {
       .upsertUser({ id, providerId: id, displayName: `${id} display`, role, toolMode: "full" })
       .unwrap();
   const thread = store.createThread("alice", { commandId: "create" }).unwrap();
-  function turn(commandId: string, state: ReadyTurnSlot["state"] = "complete") {
+  function turn(commandId: string, state: ReadyTurnSlot["state"] = "complete", startedAt?: number) {
     const receipt = store
       .acceptInput("alice", {
         threadId: thread.id,
@@ -39,6 +39,7 @@ function fixture() {
           slot: {
             ...slot,
             state,
+            startedAt,
             messages: [
               ...slot.messages,
               {
@@ -74,6 +75,17 @@ describe("native sidebar display projection", () => {
     expect(f.store.getThread("alice", f.thread.id).unwrap().displayStatus).toBe("error");
     f.turn("canceled", "canceled");
     expect(f.store.getThread("alice", f.thread.id).unwrap().displayStatus).toBe("idle");
+    f.store.close();
+  });
+
+  test("projects the latest turn start while working", () => {
+    const f = fixture();
+    f.turn("first");
+    expect(f.store.getThread("alice", f.thread.id).unwrap().workingSince).toBeUndefined();
+    f.turn("running", "running", 1_000);
+    const working = f.store.getThread("alice", f.thread.id).unwrap();
+    expect(working.displayStatus).toBe("working");
+    expect(working.workingSince).toBe(1_000);
     f.store.close();
   });
 

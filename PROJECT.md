@@ -98,6 +98,12 @@ cover. Rewind fences the discarded generation, waits for runner cancellation, re
 transcript references and finishes its persisted mutation before admitting new work. Startup resumes
 unfinished mutations before recovering native requests. See [native migrations](MIGRATIONS.md#native-output-recovery-frontier).
 
+Native thread and subagent views subscribe through `streams.*` with a display target and replay
+checkpoint. Both reuse the semantic output publisher, display projection, native replay tables,
+client store, and web turn renderer. Child `agent-stream` records hold workflow identity and a
+canonical parent request; they are excluded from the sidebar and inherit read access through verified
+workflow ancestry. Completed legacy children are projected from retained transcripts on first open.
+
 - `packages/coding-tools`: shared coding-tool schemas and implementations, patch/edit behavior, instruction discovery, and tool guardrails.
 - `packages/computer-use-runner`: pinned CUA desktop image, Chromium seccomp profile, persistent Python runtime, and runner checks.
 - `packages/event-bus`: event catalog, codecs, typed bus, delivery policy, dead letters, and Redis Streams transport.

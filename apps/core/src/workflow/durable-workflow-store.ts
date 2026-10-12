@@ -1138,10 +1138,16 @@ export class DurableWorkflowStore {
   ): ResultType<WorkflowRun[], DurableWorkflowReadError> {
     return captureWorkflowRead("list-subagent-runs", () => {
       const rows = this.persistedRows(
-        `SELECT * FROM workflow_runs
-         WHERE json_extract(completion_target_json, '$.kind') = 'live_parent'
-           AND json_extract(completion_target_json, '$.parentSessionId') = ?
-         ORDER BY created_at DESC, run_id DESC LIMIT 101 OFFSET ?`,
+        `WITH RECURSIVE descendants(run_id, child_session_id) AS (
+           SELECT run_id,json_extract(completion_target_json,'$.childSessionId') FROM workflow_runs
+           WHERE json_extract(completion_target_json,'$.kind')='live_parent'
+             AND json_extract(completion_target_json,'$.parentSessionId')=?
+           UNION
+           SELECT r.run_id,json_extract(r.completion_target_json,'$.childSessionId') FROM workflow_runs r
+           JOIN descendants p ON json_extract(r.completion_target_json,'$.parentSessionId')=p.child_session_id
+           WHERE json_extract(r.completion_target_json,'$.kind')='live_parent'
+         ) SELECT r.* FROM workflow_runs r JOIN descendants d ON d.run_id=r.run_id
+         ORDER BY r.created_at DESC,r.run_id DESC LIMIT 101 OFFSET ?`,
       ).all(parentSessionId, offset);
       return this.decodeRows(rows, decodeWorkflowRunRow);
     });

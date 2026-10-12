@@ -82,6 +82,7 @@ function fixture(
       });
     },
     installationId: "fixture",
+    workingIndicators: () => ["Brewing", "Steeping"],
     surface,
     catalogs: {
       subscribe: (listener) => {
@@ -118,6 +119,7 @@ function fixture(
       cancel: async () => Result.ok(),
       deleteThread: async () => Result.ok(),
       rewind: async () => Result.err(nativeFailure("invalid", "Not used")),
+      validateCommand: () => Result.ok(),
     },
     resources: { reserve: (actor, input) => store.reserveUpload(actor, input) },
     search: new NativeSearchStore({ db, store }),
@@ -447,6 +449,12 @@ describe("native RPC service projection", () => {
       .unwrap();
     expect((await stream.next()).value).toEqual({ kind: "revoked" });
     controller.abort();
+  });
+
+  test("bootstrap carries the configured working indicators", async () => {
+    using state = fixture();
+    const bootstrap = (await state.services.bootstrap.get(principal, {})).unwrap();
+    expect(bootstrap.workingIndicators).toEqual(["Brewing", "Steeping"]);
   });
 
   test("catalog watcher coalesces a large burst and emits static catalog invalidation", async () => {
