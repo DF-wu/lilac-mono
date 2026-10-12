@@ -183,8 +183,10 @@ Detailed source checks are recorded in [the research note](research/claude-actio
 
 ## Execution limits
 
-The agent runs only for conflict review, with at most **150 turns and 20 minutes**
-per analysis. Prepare has a 30-minute job limit. CI and main-update decisions
+The agent runs only for conflict review, with at most **150 turns and 45 minutes**
+per analysis. Prepare has a 60-minute job limit. The step limit was raised from
+20 minutes after the 2026-10-12 analysis of five conflicting files timed out
+without a brief; the turn limit still bounds cost. CI and main-update decisions
 run independently of the agent; model prose cannot mark checks successful.
 
 A minimal live Claude Code 2.1.291 test on 2026-10-07 used this gateway, model,

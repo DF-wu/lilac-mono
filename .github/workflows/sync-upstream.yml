@@ -22,7 +22,8 @@ jobs:
   prepare:
     if: github.repository == 'DF-wu/lilac-mono'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 需涵蓋 45 分鐘衝突分析與其前後步驟。
+    timeout-minutes: 60
     outputs:
       mode: ${{ steps.merge.outputs.mode }}
       candidate_sha: ${{ steps.merge.outputs.candidate_sha }}
@@ -163,7 +164,8 @@ jobs:
       - name: Analyze conflicts for the reviewer without modifying code
         if: steps.merge.outputs.mode == 'conflict'
         id: claude
-        timeout-minutes: 20
+        # 2026-10-12 五檔衝突分析在 20 分鐘逾時；turn 上限仍限制成本。
+        timeout-minutes: 45
         # PR 已先建立；gateway 或模型失敗不會阻止人工接手。
         continue-on-error: true
         # 最新版 v1.0.243（2026-10-06）；固定 SHA，升級時一併更新此註解。
