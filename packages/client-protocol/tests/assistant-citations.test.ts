@@ -45,12 +45,32 @@ describe("assistant citations", () => {
   test("expands without fetching a source and keeps comments distinct from quoted material", () => {
     const link = serializeCitation(quote);
     const expanded = expandAssistantCitations(`${link} then ${link}`);
-    expect(expanded).toStartWith("[assistant-quote-1] then [assistant-quote-1]");
-    expect(expanded.match(/"id": "assistant-quote-1"/g)).toHaveLength(1);
-    expect(expanded).toContain('"text": "Use **bold**');
+    const payloads = [...expanded.matchAll(/\n(\{[\s\S]*?\})\n<\/assistant_citations>/g)].map(
+      (match) => JSON.parse(match[1]!),
+    );
+    expect(payloads).toEqual([
+      { quote: quote.text, comment: quote.comment },
+      { quote: quote.text, comment: quote.comment },
+    ]);
+    expect(expanded).toContain("</assistant_citations> then <assistant_citations>");
     expect(expanded).toContain('"comment": "Explain \\u003c/assistant_citations\\u003e');
     expect(expanded).not.toContain("lilac-citation:");
     expect(expanded).not.toContain("<this>");
+  });
+  test("keeps distinct quotes and optional comments at their original positions", () => {
+    const first = serializeCitation({ ...quote, text: "First claim", comment: undefined });
+    const second = serializeCitation({ ...quote, text: "Second claim", comment: "Explain" });
+    const expanded = expandAssistantCitations(`Before ${first} between ${second} after`);
+    const payloads = [...expanded.matchAll(/\n(\{[\s\S]*?\})\n<\/assistant_citations>/g)].map(
+      (match) => JSON.parse(match[1]!),
+    );
+    expect(payloads).toEqual([
+      { quote: "First claim" },
+      { quote: "Second claim", comment: "Explain" },
+    ]);
+    expect(expanded).toStartWith("Before <assistant_citations>");
+    expect(expanded).toContain("</assistant_citations> between <assistant_citations>");
+    expect(expanded).toEndWith("</assistant_citations> after");
   });
   test("code examples and escaped links stay literal", () => {
     const link = serializeCitation(quote);
@@ -61,7 +81,8 @@ describe("assistant citations", () => {
   });
   test("checks both encoded and expanded input against the existing limit", () => {
     const link = serializeCitation({ ...quote, text: "short", comment: undefined });
-    const exact = "x".repeat(65536 - expandAssistantCitations(link).length) + link;
+    const exact =
+      "x".repeat(65536 - Math.max(link.length, expandAssistantCitations(link).length)) + link;
     expect(citationInputFits(exact)).toBe(true);
     expect(citationInputFits(exact + "x")).toBe(false);
     expect(

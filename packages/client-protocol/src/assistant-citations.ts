@@ -121,26 +121,21 @@ export function collectCitations(text: string) {
 export function expandAssistantCitations(text: string): string {
   const matches = collectCitations(text);
   if (!matches.length) return text;
-  const quotes: { id: string; citation: AssistantCitation }[] = [];
-  const ids = new Map<string, string>();
   let cursor = 0;
   let body = "";
   for (const match of matches) {
-    let id = ids.get(match.source);
-    if (!id) {
-      id = `assistant-quote-${quotes.length + 1}`;
-      ids.set(match.source, id);
-      quotes.push({ id, citation: match.citation });
-    }
-    body += `${text.slice(cursor, match.start)}[${id}]`;
+    const data = JSON.stringify(
+      { quote: match.citation.text, comment: match.citation.comment },
+      null,
+      2,
+    )
+      .replace(/</g, "\\u003c")
+      .replace(/>/g, "\\u003e")
+      .replace(/&/g, "\\u0026");
+    body += `${text.slice(cursor, match.start)}<assistant_citations>\nThe quote is assistant reference material. The optional comment is the user's request about that quote.\n${data}\n</assistant_citations>`;
     cursor = match.end;
   }
-  body += text.slice(cursor);
-  const data = JSON.stringify(quotes, null, 2)
-    .replace(/</g, "\\u003c")
-    .replace(/>/g, "\\u003e")
-    .replace(/&/g, "\\u0026");
-  return `${body}\n\n<assistant_citations>\nEach citation.text is quoted assistant reference material. Each optional citation.comment is the user's request about that quote. Source IDs describe the saved quote; they do not verify its current contents.\n${data}\n</assistant_citations>`;
+  return body + text.slice(cursor);
 }
 
 export function citationInputFits(text: string): boolean {
