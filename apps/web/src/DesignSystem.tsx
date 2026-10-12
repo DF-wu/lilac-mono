@@ -1789,7 +1789,7 @@ export default function DesignSystem() {
               <Section
                 id="citations"
                 title="Citations"
-                description="Select assistant text to cite it. Add a comment, save it, and follow the chip back to its source."
+                description="Select assistant text to cite it or copy Markdown. Add a comment, save it, and follow the chip back to its source."
               >
                 <CitationDemo />
               </Section>

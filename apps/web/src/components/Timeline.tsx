@@ -58,6 +58,7 @@ import { AssistantSelectionToolbar } from "./AssistantSelectionToolbar";
 import { useCitationNavigation } from "./use-citation-navigation";
 import { citationStore } from "../citation-store";
 import { useStore } from "zustand";
+import { copyAssistantSelection } from "../markdown-copy";
 import { WorkflowCard } from "./WorkflowCard";
 import { readMotionDuration } from "../theme/motion";
 import { Button } from "./ui/button";
@@ -229,6 +230,13 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     ready: !switching && !!store.checkpoint,
     onPosition: positionCitation,
   });
+  useEffect(() => {
+    const viewport = parent.current;
+    if (!viewport) return;
+    const copy = (event: ClipboardEvent) => copyAssistantSelection(event, viewport);
+    viewport.addEventListener("copy", copy);
+    return () => viewport.removeEventListener("copy", copy);
+  }, []);
   const measureTurn = useCallback(
     (content: HTMLElement) => {
       const row = content.closest<HTMLDivElement>(".virtual-row");
@@ -1037,7 +1045,11 @@ function MessageCard({
             ) : null}
             {content.texts.map((text, index) => (
               <div key={index} data-citation-text={collapsible ? undefined : ""}>
-                <Markdown text={text} preserveLineBreaks={collapsible} />
+                <Markdown
+                  text={text}
+                  preserveLineBreaks={collapsible}
+                  sourcePositions={!collapsible}
+                />
               </div>
             ))}
             {files.length > 0 ? (

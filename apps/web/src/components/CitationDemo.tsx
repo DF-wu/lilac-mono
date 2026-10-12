@@ -30,7 +30,7 @@ export function CitationDemo() {
               parts: [
                 {
                   type: "text",
-                  text: "Select part of this reply and **Cite** it.\n\nThe comment stays beside the selected text. Your saved quote survives changes to its source.\n\n- Keep the quote and your comment together.\n- Follow [the source](https://example.com).\n\n```ts\nconst reply = { quoted: true };\n```",
+                  text: 'Select part of this reply and __Cite__ it, or copy it as Markdown.\n\nCopy keeps __original delimiters__, escaped \\*stars\\*, &amp;, and [reference links][demo].\n\n> A quote across\n> two lines.\n\n- Keep the quote and your comment together.\n- Follow [the source](https://example.com).\n\n| Surface | Output |\n| :------ | -----: |\n| Web | **Rich** |\n\n```ts\nconst reply = { quoted: true };\n```\n\n[demo]: https://example.com "Source"',
                 },
               ],
             },

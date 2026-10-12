@@ -9,7 +9,10 @@ type MarkdownNode = {
   type: string;
   children?: MarkdownNode[];
   data?: { hProperties?: { className?: string[] } };
-  position?: { start: { offset?: number }; end: { offset?: number } };
+  position?: {
+    start: { offset?: number; line?: number; column?: number };
+    end: { offset?: number; line?: number; column?: number };
+  };
 };
 type Code = number | null;
 type State = (code: Code) => State | undefined;
@@ -157,23 +160,58 @@ function markDisplayMath(node: MarkdownNode, source: string) {
   node.data.hProperties = { className: ["language-math", "math-display"] };
 }
 
+function restoreSourcePositions(tree: MarkdownNode, original: string, offsets: number[]) {
+  const lines = [0];
+  for (const match of original.matchAll(/\r\n|\r|\n/g)) lines.push(match.index + match[0].length);
+  const point = (offset: number) => {
+    let left = 0;
+    let right = lines.length;
+    while (left + 1 < right) {
+      const middle = Math.floor((left + right) / 2);
+      if (lines[middle]! > offset) right = middle;
+      else left = middle;
+    }
+    return { offset, line: left + 1, column: offset - lines[left]! + 1 };
+  };
+  const visit = (node: MarkdownNode) => {
+    const start = node.position?.start.offset;
+    const end = node.position?.end.offset;
+    if (start !== undefined && end !== undefined)
+      node.position = { start: point(offsets[start]!), end: point(offsets[end]!) };
+    node.children?.forEach(visit);
+  };
+  visit(tree);
+}
+
 export const remarkChatMath: RemarkPlugin = function () {
   // remark-parse registers micromarkExtensions on unified's Data, but its types are not visible here.
   const data: { settings?: object; micromarkExtensions?: object[] } = this.data();
   data.micromarkExtensions = [...(data.micromarkExtensions ?? []), bracketMath];
   return (tree: MarkdownNode, file: { toString(): string }) => {
-    let source = file.toString();
+    const original = file.toString();
+    let source = original;
+    let offsets: number[] | undefined;
     let parsed = tree;
     while (true) {
       const edits = literalEdits(parsed, source);
       if (!edits.length) break;
+      offsets ??= Array<number>(original.length + 1)
+        .fill(0)
+        .map((_offset, index) => index);
       for (const edit of edits.toSorted((left, right) => right.offset - left.offset)) {
+        offsets = [
+          ...offsets.slice(0, edit.offset),
+          ...Array<number>(edit.insert.length).fill(offsets[edit.offset]!),
+          ...offsets.slice(edit.offset + edit.remove),
+        ];
         source = `${source.slice(0, edit.offset)}${edit.insert}${source.slice(edit.offset + edit.remove)}`;
       }
       // Reparse the document so emphasis and links spanning literal markers stay intact.
       parsed = this.parse(source);
     }
     markDisplayMath(parsed, source);
+    // Reparsing escaped currency changes offsets; renderer metadata must still refer to the original Markdown.
+    if (offsets) restoreSourcePositions(parsed, original, offsets);
     tree.children = parsed.children;
   };
 };
