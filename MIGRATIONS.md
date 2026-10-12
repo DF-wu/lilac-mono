@@ -1,5 +1,12 @@
 # MIGRATIONS.md
 
+## Sidebar working time
+
+Native thread summaries gain an optional `workingSince` field while a thread is working. Core reads it
+from the latest turn's start time, or from its first message's creation time before output begins.
+Native web shows the elapsed time in place of the last-activity time. No stored data changes.
+Update Core and web together because older strict thread validators reject the new field.
+
 ## Shared working indicators
 
 Version-2 configuration adds `surface.workingIndicators`, the status phrases shown while a request

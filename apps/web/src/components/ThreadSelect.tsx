@@ -19,7 +19,12 @@ import {
   MessageCircleQuestion,
 } from "lucide-react";
 import type { NativeThread, NativeUser } from "@stanley2058/lilac-client-protocol";
-import { defaultAutoSettleDays, relativeThreadTime, threadAge } from "../thread-metadata";
+import {
+  defaultAutoSettleDays,
+  relativeThreadTime,
+  threadAge,
+  workingDuration,
+} from "../thread-metadata";
 import { Button } from "./ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { AvatarGroup } from "./ui/avatar";
@@ -42,6 +47,7 @@ export function ThreadCard({
   starterAvatarUrl,
   starterIcon,
   updatedAt,
+  workingSince,
   now,
   settleDays,
   state,
@@ -58,6 +64,7 @@ export function ThreadCard({
   starterAvatarUrl?: string;
   starterIcon?: ReactNode;
   updatedAt?: number;
+  workingSince?: number;
   now?: number;
   settleDays?: number;
   state: ThreadDisplayState;
@@ -70,6 +77,7 @@ export function ThreadCard({
 }) {
   const shortcut = useThreadShortcut(shortcutId);
   const StatusIcon = states[state].icon;
+  const runningSince = state === "working" ? workingSince : undefined;
   return (
     <div
       className={`thread-card relative min-w-0 rounded-md ${selected ? "selected" : ""}`}
@@ -155,7 +163,18 @@ export function ThreadCard({
                   {actions}
                 </span>
               ) : null}
-              {draft !== "new" && updatedAt !== undefined ? (
+              {state === "working" ? (
+                <span
+                  data-ui="thread-working-label"
+                  className="hidden text-primary [@media(hover:none)]:inline"
+                >
+                  Working
+                </span>
+              ) : null}
+              {draft !== "new" && runningSince !== undefined ? (
+                <WorkingTime since={runningSince} now={now} />
+              ) : null}
+              {draft !== "new" && runningSince === undefined && updatedAt !== undefined ? (
                 <ThreadTime
                   updatedAt={updatedAt}
                   now={now}
@@ -207,6 +226,27 @@ function ThreadTime({
       className="tabular-nums data-[age=fresh]:font-semibold data-[age=fresh]:text-primary data-[age=recent]:text-primary data-[age=aging]:text-[color-mix(in_srgb,var(--color-primary)_45%,var(--color-muted-foreground))]"
     >
       {relativeThreadTime(updatedAt, current)}
+    </time>
+  );
+}
+
+function WorkingTime({ since, now }: { since: number; now?: number }) {
+  const [clock, setClock] = useState(Date.now);
+  useEffect(() => {
+    if (now !== undefined) return;
+    // The label drops seconds after the first minute, so wake only when its text changes.
+    const elapsed = Math.max(0, clock - since);
+    const step = elapsed < 60_000 ? 1000 : 60_000;
+    const timer = window.setTimeout(() => setClock(Date.now()), step - (elapsed % step));
+    return () => window.clearTimeout(timer);
+  }, [now, clock, since]);
+  return (
+    <time
+      dateTime={new Date(since).toISOString()}
+      data-ui="thread-working-time"
+      className="tabular-nums font-semibold text-primary"
+    >
+      {workingDuration(since, now ?? clock)}
     </time>
   );
 }
@@ -264,6 +304,7 @@ export function ThreadSelect({
             thread.starterId === viewer.id ? viewer.avatarUrl : thread.starterAvatarUrl
           }
           updatedAt={thread.updatedAt}
+          workingSince={thread.workingSince}
           now={now}
           settleDays={settleDays}
           state={state}

@@ -270,6 +270,7 @@ export function ThreadQueue({
                 starterName={drag.thread.source?.starterDisplayName ?? ""}
                 starterAvatarUrl={drag.thread.source?.starterAvatarUrl}
                 updatedAt={drag.thread.source?.updatedAt ?? 0}
+                workingSince={drag.thread.source?.workingSince}
                 state={drag.thread.source?.displayStatus ?? "idle"}
                 onSelect={() => {}}
               />
