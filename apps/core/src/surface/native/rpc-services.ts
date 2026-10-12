@@ -15,6 +15,7 @@ import type {
   NativeThread,
   ResourceDisplay,
   ThreadEvent,
+  DisplayStreamTarget,
 } from "@stanley2058/lilac-client-protocol";
 import { Result } from "better-result";
 import type { DurableResolvedModelRequest } from "@stanley2058/lilac-utils";
@@ -37,7 +38,7 @@ export type NativeRpcServiceOptions = {
   computer?: Pick<NativeComputer, "read">;
   references?: Pick<NativeReferences, "resolve" | "read" | "range">;
   files?: Pick<NativeLiveFileService, "resolve">;
-  subagents?: Pick<NativeSubagents, "list" | "read">;
+  subagents?: Pick<NativeSubagents, "list" | "read" | "stream">;
   store: NativeStore;
   auth: NativeAuthenticator;
   installationId: string;
@@ -260,6 +261,78 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
     return store
       .sync(principal.userId, input.threadId, input.checkpoint)
       .andThen((reply) => personalizeReplay(principal, input.threadId, reply));
+  }
+
+  function pageThread(principal: NativePrincipal, input: NativeRpcInputs["threads"]["turnPage"]) {
+    return Result.gen(function* () {
+      const page = yield* store.turnPage(principal.userId, input);
+      const messages = yield* Result.all(
+        page.messages.map((message) =>
+          options.surface.personalizeMessage(principal.userId, input.threadId, message),
+        ),
+      );
+      if (!page.chunks) return Result.ok({ ...page, messages });
+      const chunks = yield* Result.all(
+        page.chunks.map((chunk) =>
+          options.surface
+            .personalizePart(principal.userId, input.threadId, chunk.messageId, chunk.part)
+            .map((part) => ({ ...chunk, part })),
+        ),
+      );
+      return Result.ok({ ...page, messages, chunks });
+    });
+  }
+
+  function resolveStream(principal: NativePrincipal, target: DisplayStreamTarget) {
+    if (target.kind === "thread")
+      return store.authorizeThread(principal.userId, target.threadId).map((thread) => thread.id);
+    return (
+      options.subagents?.stream(principal.userId, target) ??
+      Result.err(nativeFailure("not-found", "Subagents unavailable"))
+    ).map((stream) => stream.id);
+  }
+
+  function syncStream(principal: NativePrincipal, input: NativeRpcInputs["streams"]["sync"]) {
+    if (input.target.kind === "thread")
+      return syncThreadReplay(principal, {
+        threadId: input.target.threadId,
+        checkpoint: input.checkpoint,
+      });
+    return resolveStream(principal, input.target).andThen((id) =>
+      store.syncAgentStream(principal.userId, input.target.threadId, id, input.checkpoint),
+    );
+  }
+
+  async function* watchAgentStream(
+    principal: NativePrincipal,
+    input: NativeRpcInputs["streams"]["watch"],
+    id: string,
+    signal?: AbortSignal,
+  ): AsyncGenerator<ThreadEvent> {
+    using wake = new CoalescedWake(
+      (notify) =>
+        store.subscribe((changed) => {
+          if (!changed || changed === id || changed === input.target.threadId) notify();
+        }),
+      signal,
+    );
+    let checkpoint = input.checkpoint;
+    let first = true;
+    while (!signal?.aborted) {
+      await wake.wait();
+      if (signal?.aborted) return;
+      const reply = Result.gen(function* () {
+        yield* auth.checkSession(principal);
+        return syncStream(principal, { target: input.target, checkpoint });
+      }).match({ ok: (value) => value, err: () => null });
+      if (!reply) {
+        yield { kind: "revoked" };
+        return;
+      }
+      checkpoint = reply.checkpoint;
+      if (first || reply.kind !== "unchanged") yield { kind: "replay", reply };
+      first = false;
+    }
   }
 
   function selectedThread(
@@ -497,6 +570,51 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
 
   const success = () => ({ ok: true as const });
   return {
+    streams: {
+      sync: syncStream,
+      watch(principal, input, signal) {
+        if (input.target.kind === "thread")
+          return store
+            .authorizeThread(principal.userId, input.target.threadId)
+            .map(() =>
+              watchThread(
+                principal,
+                { threadId: input.target.threadId, checkpoint: input.checkpoint },
+                signal,
+              ),
+            );
+        return resolveStream(principal, input.target).map((id) =>
+          watchAgentStream(principal, input, id, signal),
+        );
+      },
+      hydrate(principal, input) {
+        if (input.target.kind === "thread")
+          return store
+            .hydrate(principal.userId, { ...input, threadId: input.target.threadId })
+            .andThen((hydration) =>
+              personalizeSlots(principal, input.target.threadId, hydration.slots).map((slots) => ({
+                ...hydration,
+                slots,
+              })),
+            );
+        return resolveStream(principal, input.target).andThen((id) =>
+          store.hydrateAgentStream(principal.userId, input.target.threadId, id, {
+            ...input,
+            threadId: id,
+          }),
+        );
+      },
+      turnPage(principal, input) {
+        if (input.target.kind === "thread")
+          return pageThread(principal, { ...input, threadId: input.target.threadId });
+        return resolveStream(principal, input.target).andThen((id) =>
+          store.pageAgentStream(principal.userId, input.target.threadId, id, {
+            ...input,
+            threadId: id,
+          }),
+        );
+      },
+    },
     links: {
       async preview(_principal, input, signal) {
         return Result.ok(await resolveLinkPreview(input.url, signal));
@@ -625,25 +743,7 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
           })),
         );
       },
-      turnPage(principal, input) {
-        return Result.gen(function* () {
-          const page = yield* store.turnPage(principal.userId, input);
-          const messages = yield* Result.all(
-            page.messages.map((message) =>
-              options.surface.personalizeMessage(principal.userId, input.threadId, message),
-            ),
-          );
-          if (!page.chunks) return Result.ok({ ...page, messages });
-          const chunks = yield* Result.all(
-            page.chunks.map((chunk) =>
-              options.surface
-                .personalizePart(principal.userId, input.threadId, chunk.messageId, chunk.part)
-                .map((part) => ({ ...chunk, part })),
-            ),
-          );
-          return Result.ok({ ...page, messages, chunks });
-        });
-      },
+      turnPage: pageThread,
       async rewind(principal, input) {
         return Result.gen(async function* () {
           const rewound = yield* Result.await(

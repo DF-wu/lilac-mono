@@ -2931,6 +2931,8 @@ export async function startBusAgentRunner(params: {
     readonly raw: AgentRunnerRaw | undefined;
     readonly recovering: boolean;
     readonly recoveryOutputFrontier?: NativeOutputFrontier;
+    readonly workflowRunId?: string;
+    readonly prompt: string;
   }) => NativeOutputPublisher | undefined;
   nativeExecution?: NativeRunnerLifecycle;
   nativeResourceAccess?: (
@@ -5261,6 +5263,18 @@ export async function startBusAgentRunner(params: {
       raw: next.raw,
       recovering: next.recovery !== undefined,
       recoveryOutputFrontier: next.recovery?.nativeOutputFrontier,
+      workflowRunId: workflowHint?.runId,
+      prompt: next.messages
+        .filter((message) => message.role === "user")
+        .map((message) =>
+          typeof message.content === "string"
+            ? message.content
+            : message.content
+                .filter((part) => part.type === "text")
+                .map((part) => part.text)
+                .join(""),
+        )
+        .join("\n\n"),
     });
     let nativeStep = 0;
     let nativeHasText = false;

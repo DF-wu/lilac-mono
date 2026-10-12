@@ -124,10 +124,28 @@ const commandSchema = z.strictObject({
   fingerprint: z.string(),
   result: mutationResultSchema,
 });
+export const nativeAgentStreamRecordSchema = z.strictObject({
+  id,
+  state: z.enum(["running", "complete", "failed", "canceled"]).default("running"),
+  title: z.string().max(256).default("Thinking…"),
+  parentThreadId: id,
+  parentRequestId: z.string().min(1),
+  runId: z.string().min(1),
+  requestId: z.string().min(1),
+  turnId: id,
+  attemptId: id.optional(),
+  previousAttemptId: id.optional(),
+  historyGeneration: revision,
+  revision,
+  updatedAt: revision,
+  deleted: z.boolean(),
+  mutationPending: z.boolean(),
+});
 export const nativeRecordSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("deployment"), value: nativeDeploymentDocumentSchema }),
   z.strictObject({ kind: z.literal("user"), value: nativeUserSchema }),
   z.strictObject({ kind: z.literal("thread"), value: nativeThreadRecordSchema }),
+  z.strictObject({ kind: z.literal("agent-stream"), value: nativeAgentStreamRecordSchema }),
   z.strictObject({
     kind: z.literal("turn"),
     value: readyTurnSlotSchema.extend({
@@ -148,6 +166,7 @@ export const nativeRecordSchema = z.discriminatedUnion("kind", [
 ]);
 export type NativeUser = z.infer<typeof nativeUserSchema>;
 export type NativeThreadRecord = z.infer<typeof nativeThreadRecordSchema>;
+export type NativeAgentStreamRecord = z.infer<typeof nativeAgentStreamRecordSchema>;
 export type NativeInputRecord = z.infer<typeof nativeInputRecordSchema>;
 export type NativeUploadRecord = z.infer<typeof nativeUploadRecordSchema>;
 export type NativeHtmlPreviewRecord = z.infer<typeof nativeHtmlPreviewRecordSchema>;

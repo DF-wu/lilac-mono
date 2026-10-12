@@ -63,6 +63,16 @@ export const threadSyncInputSchema = threadIdInput.extend({
   checkpoint: replayCheckpointSchema.optional(),
 });
 
+export const displayStreamTargetSchema = z.discriminatedUnion("kind", [
+  threadIdInput.extend({ kind: z.literal("thread") }),
+  threadIdInput.extend({ kind: z.literal("subagent"), agentId: runIdentitySchema }),
+]);
+export type DisplayStreamTarget = z.infer<typeof displayStreamTargetSchema>;
+const displayStreamInputSchema = z.strictObject({ target: displayStreamTargetSchema });
+const displayStreamSyncSchema = displayStreamInputSchema.extend({
+  checkpoint: replayCheckpointSchema.optional(),
+});
+
 export const nativeSyncContract = {
   threads: {
     sync: procedure.input(threadSyncInputSchema).output(replayReplySchema),
@@ -130,6 +140,29 @@ export const turnPageSchema = z
     },
   );
 export const nativeContract = {
+  streams: {
+    sync: procedure.input(displayStreamSyncSchema).output(replayReplySchema),
+    watch: procedure.input(displayStreamSyncSchema).output(eventIterator(threadEventSchema)),
+    hydrate: procedure
+      .input(
+        displayStreamInputSchema.extend({
+          slotId: identitySchema,
+          historyGeneration: revisionSchema,
+          projectionRevision: revisionSchema,
+        }),
+      )
+      .output(hydrationSchema),
+    turnPage: procedure
+      .input(
+        displayStreamInputSchema.extend({
+          turnId: identitySchema,
+          historyGeneration: revisionSchema,
+          projectionRevision: revisionSchema,
+          cursor: identitySchema,
+        }),
+      )
+      .output(turnPageSchema),
+  },
   computer: {
     read: procedure.input(threadIdInput).output(
       z.strictObject({

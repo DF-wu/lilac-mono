@@ -108,6 +108,31 @@ per line. Stored turns
 need no backfill: older activities render without these details, and thinking rows without reasoning
 text are hidden. Update Core and web together because older strict validators reject the new fields.
 
+## Native agent streams
+
+Native v1 adds `streams.sync`, `streams.watch`, `streams.hydrate`, and `streams.turnPage`. Their target
+selects either a native thread or a subagent owned by that thread. Both targets use the existing
+display-message, turn, replay-checkpoint, and subscription event schemas. Core and web must be updated
+together. The existing thread and paged subagent RPCs remain available.
+
+Native SQLite `user_version` advances from 1 to 2 without rewriting existing records. The native record
+codec adds `agent-stream` metadata; child display turns, replay deltas, projection provenance, and
+deduplication receipts reuse the existing native tables. Older binaries reject version 2. Rollback
+requires a pre-upgrade backup. New child runs publish through the same durable semantic output path
+as primary runs, including recovery-frontier resets, reasoning details, redacted tool arguments and
+results, text phases, and terminal state.
+
+Existing completed children are projected lazily from retained transcripts when opened. Those
+transcripts cannot recover original timing or text-phase events. System prompts, opaque provider
+state, and encrypted reasoning remain excluded. This replaces the original subagent inspection
+policy that omitted all tool arguments and reasoning text.
+
+Child access follows the verified workflow ancestry to a canonical native parent request. Parent
+rewind or deletion invalidates discarded descendants and removes their native display records.
+Minimal deleted stream metadata remains so retained late output events are acknowledged as stale.
+Grant revocation ends child subscriptions and purges their cached display data. Child display streams
+do not create sidebar conversations or grant permission to edit, rewind, or submit input to children.
+
 ## Native computer viewer
 
 Native RPC adds `computer.read`. Deploy Core and web together, and rebuild the optional computer-use

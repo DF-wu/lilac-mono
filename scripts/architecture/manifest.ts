@@ -2854,7 +2854,7 @@ const CORE_NATIVE_RECORD_PERSISTED_CONSUMERS = [
   ...[
     "NativeStore.readRecord",
     "NativeStore.readRows",
-    "NativeStore.sync",
+    "NativeStore.replay",
     "NativeStore.displayStatus",
   ].map((exportName) => ({
     module: "src/surface/native/store.ts",
@@ -3961,6 +3961,13 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             },
             {
               identity: {
+                module: "src/surface/native/subagents.ts",
+                exportName: "transcriptActivity",
+              },
+              category: "projection" as const,
+            },
+            {
+              identity: {
                 module: "src/surface/native/auth-clerk.ts",
                 exportName: "decodeNativeClerkClaims.gen.<callback@1>",
               },
@@ -4755,6 +4762,20 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "NativeStore.listQueuedInputs",
               "NativeStore.removeQueuedInput",
               "NativeStore.beginOutputAttempt",
+              "NativeStore.ensureAgentStream",
+              "NativeStore.findAgentStream",
+              "NativeStore.settleAgentStream",
+              "NativeStore.beginAgentOutput",
+              "NativeStore.getOutputConversation",
+              "NativeStore.getDisplayThread",
+              "NativeStore.authorizeAgentStream",
+              "NativeStore.syncAgentStream",
+              "NativeStore.hydrateAgentStream",
+              "NativeStore.pageAgentStream",
+              "NativeStore.replay",
+              "NativeStore.hydrateConversation",
+              "NativeStore.pageConversation",
+              "NativeStore.cleanupAgentStreams",
               "NativeStore.projectTurn",
               "NativeStore.postMessage",
               "NativeStore.acceptSurfaceInput",

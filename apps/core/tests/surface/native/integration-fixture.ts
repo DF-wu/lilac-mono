@@ -470,6 +470,7 @@ export async function createNativeIntegrationFixture(
     dataDir,
     workspaceRoot,
     store,
+    workflows: subagentWorkflows,
     runtime,
     runner,
     blobs,

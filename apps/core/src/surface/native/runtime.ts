@@ -287,17 +287,18 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     registry: options.mcpRegistry,
   });
   const nativeConfig = options.getConfig().surface.native;
+  const subagents = new NativeSubagents({
+    native: store,
+    workflows: options.workflows,
+    transcripts: options.transcript,
+    live: options.runner,
+    streamingMode: () => deployment().outputStreaming,
+  });
   const services = createNativeRpcServices({
     computer: new NativeComputer(store, options.mcpRegistry),
     references,
     files: liveFiles,
-    subagents: new NativeSubagents({
-      native: store,
-      workflows: options.workflows,
-      transcripts: options.transcript,
-      live: options.runner,
-      streamingMode: () => deployment().outputStreaming,
-    }),
+    subagents,
     store,
     auth,
     installationId: nativeConfig.installationId ?? "operator",
@@ -393,6 +394,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     });
   }
   let output: NativeOutputSubscription | undefined;
+  let workflowOutput: NativeOutputSubscription | undefined;
   let outputStopping = false;
   let unsubscribe: (() => void) | undefined;
   const nativeAdapterForContext: NonNullable<CoreToolPluginRuntime["nativeAdapterForContext"]> = (
@@ -480,8 +482,19 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     });
   }
 
+  function observeOutput(handle: NativeOutputSubscription) {
+    void handle.done.then((done) =>
+      done.match({
+        ok: () => undefined,
+        err: (error) => {
+          if (!outputStopping) options.reportFatalError(error);
+        },
+      }),
+    );
+  }
+
   async function startOutput(): Promise<
-    ResultType<void, NativeStoreError | EventDeliveryStartFailed>
+    ResultType<void, NativeStoreError | EventDeliveryStartFailed | EventDeliveryStopFailed>
   > {
     outputStopping = false;
     return Result.gen(async function* () {
@@ -505,12 +518,12 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
                 Result.gen(function* () {
                   const event = message.data;
                   if (event.payload.type === "resource") {
-                    const thread = yield* store.getThreadRecord(event.threadId);
+                    const thread = yield* store.getDisplayThread(event.threadId);
                     yield* store.publishUpload(thread.starterId, event.payload.resourceId);
                   }
                   if (event.payload.type !== "text")
                     return Result.ok(projectNativeOutput(slot, event, projection));
-                  const thread = yield* store.getThreadRecord(event.threadId);
+                  const thread = yield* store.getDisplayThread(event.threadId);
                   const text = yield* rewriteNativePublishedFileLinks({
                     text: event.payload.text,
                     threadId: thread.id,
@@ -551,17 +564,28 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
         (error) =>
           error._tag === "NativeStoreFailure" && error.code === "stale" ? "commit" : "retry",
       );
-      return started.map((handle) => {
-        output = handle;
-        void handle.done.then((done) =>
-          done.match({
-            ok: () => undefined,
-            err: (error) => {
-              if (!outputStopping) options.reportFatalError(error);
-            },
-          }),
-        );
-      });
+      const handle = yield* started;
+      output = handle;
+      observeOutput(handle);
+      const workflowStarted = await options.bus.subscribeTopic(
+        "evt.workflow",
+        { mode: "tail", offset: { type: "now" } },
+        async (message) =>
+          message.type === lilacEventTypes.EvtWorkflowRunChanged
+            ? subagents.reconcile(message.data.runId)
+            : Result.ok(undefined),
+        () => "retry",
+      );
+      const workflowError = workflowStarted.match({ ok: () => null, err: (error) => error });
+      if (workflowError) {
+        yield* Result.await(handle.stop());
+        output = undefined;
+        return Result.err(workflowError);
+      }
+      const workflowHandle = yield* workflowStarted;
+      workflowOutput = workflowHandle;
+      observeOutput(workflowHandle);
+      return Result.ok(undefined);
     });
   }
 
@@ -574,7 +598,16 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     return published;
   }
 
-  const activeOutputs = new Map<string, { publisher: NativeOutputPublisher; threadId: string }>();
+  const activeOutputs = new Map<
+    string,
+    {
+      publisher: NativeOutputPublisher;
+      threadId: string;
+      streamId: string;
+      sessionId: string;
+      delegated: boolean;
+    }
+  >();
   const attachmentOutput: NativeAttachmentOutput = async (context, input) => {
     const failure = (message: string) =>
       serverToolFailure({
@@ -584,16 +617,25 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
         retryable: false,
       });
     return Result.gen(async function* () {
-      yield* nativeAdapterForContext(context).mapError((error) => failure(error.message));
       const sourceThreadId = nativeThreadId(
         context.requestInitiatorSessionId ?? context.sessionId ?? "",
       );
       const active = activeOutputs.get(context.requestId ?? "");
-      if (!active || sourceThreadId !== active.threadId)
+      if (
+        !active ||
+        sourceThreadId !== active.threadId ||
+        (active.delegated && context.sessionId !== active.sessionId)
+      )
         return Result.err(
           failure("Native attachment requires an active response in the originating thread"),
         );
-      const principalId = context.requestInitiator!.userId;
+      if (!active.delegated)
+        yield* nativeAdapterForContext(context).mapError((error) => failure(error.message));
+      const principal = context.requestInitiator;
+      if (principal?.platform !== "native")
+        return Result.err(failure("Native attachment requires native starter authority"));
+      yield* store.getDisplayThread(active.streamId).mapError((error) => failure(error.message));
+      const principalId = principal.userId;
       const thread = yield* store
         .authorizeThread(principalId, active.threadId)
         .mapError((error) => failure(error.message));
@@ -622,13 +664,37 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     });
   };
 
+  function prepareChildOutput(input: {
+    workflowRunId?: string;
+    requestId: string;
+    sessionId: string;
+    prompt: string;
+  }) {
+    if (!input.workflowRunId) return Result.ok(null);
+    return subagents
+      .prepareOutput({ ...input, runId: input.workflowRunId })
+      .andThen((stream) =>
+        stream ? store.beginAgentOutput(stream.id, input.requestId) : Result.ok(null),
+      );
+  }
+
   function createOutput(input: {
     requestId: string;
     requestClient: string;
     recoveryOutputFrontier?: NativeOutputFrontier;
+    sessionId: string;
+    workflowRunId?: string;
+    prompt: string;
   }) {
-    if (input.requestClient !== "native") return undefined;
-    const attempt = nativeRuntimeResultToHost(store.beginOutputAttempt(input.requestId));
+    const prepared =
+      input.requestClient === "native"
+        ? store
+            .beginOutputAttempt(input.requestId)
+            .map((attempt) => ({ ...attempt, parentThreadId: attempt.threadId }))
+        : prepareChildOutput(input);
+    const preparedAttempt = nativeRuntimeResultToHost(prepared);
+    if (!preparedAttempt) return undefined;
+    const attempt = preparedAttempt;
     const mode = deployment().outputStreaming;
     const publisher = createNativeOutputPublisher({
       ...attempt,
@@ -637,7 +703,13 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       publish: publishDurableOutput,
       recoveryFrontier: input.recoveryOutputFrontier,
     });
-    const active = { publisher, threadId: attempt.threadId };
+    const active = {
+      publisher,
+      threadId: attempt.parentThreadId,
+      streamId: attempt.threadId,
+      sessionId: input.sessionId,
+      delegated: input.requestClient !== "native",
+    };
     activeOutputs.set(input.requestId, active);
     const reply = new HtmlPreviewReply(attempt.attemptId);
     let snapshotted = false;
@@ -645,7 +717,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       if (snapshotted || state === "canceled") return;
       snapshotted = true;
       await htmlPreviews.snapshot({
-        threadId: attempt.threadId,
+        threadId: attempt.parentThreadId,
         turnId: attempt.turnId,
         texts: reply.texts(),
       });
@@ -717,7 +789,10 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     outputStopping = true;
     const active = output;
     output = undefined;
-    if (active) nativeRuntimeResultToHost(await active.stop());
+    const workflowActive = workflowOutput;
+    workflowOutput = undefined;
+    const stopped = await Promise.all([active?.stop(), workflowActive?.stop()]);
+    for (const result of stopped) if (result) nativeRuntimeResultToHost(result);
   }
   async function updateCatalog() {
     skills = (
