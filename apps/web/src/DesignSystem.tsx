@@ -490,6 +490,7 @@ function Threads() {
                 title={title}
                 starterName={index % 2 ? "Morgan Lee" : "Alex Chen"}
                 updatedAt={now - index * 3_600_000}
+                workingSince={state === "working" ? now - 72_000 : undefined}
                 now={now}
                 state={state}
                 selected={selected === state}

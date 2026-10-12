@@ -624,24 +624,30 @@ export class NativeStore {
   private displayStatus(
     user: NativeUser,
     thread: NativeThreadRecord,
-  ): NativeStoreResult<NonNullable<NativeThread["displayStatus"]>> {
-    if (thread.activeRunId) return Result.ok("working");
+  ): NativeStoreResult<Pick<NativeThread, "displayStatus" | "workingSince">> {
     // The sidebar needs turn state and the read frontier, never transcript bodies.
     const row = this.db
-      .query<NativePersistedRow & { last_message_index: number }, [string]>(
-        `SELECT format_version,json_object('kind','turn','value',json_set(json_extract(data_json,'$.value'),'$.messages',json('[]'))) AS data_json,json_array_length(data_json,'$.value.messages')-1 AS last_message_index FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 1`,
+      .query<
+        NativePersistedRow & { last_message_index: number; first_created_at: number | null },
+        [string]
+      >(
+        `SELECT format_version,json_object('kind','turn','value',json_set(json_extract(data_json,'$.value'),'$.messages',json('[]'))) AS data_json,json_array_length(data_json,'$.value.messages')-1 AS last_message_index,json_extract(data_json,'$.value.messages[0].metadata.createdAt') AS first_created_at FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 1`,
       )
       .get(thread.id);
-    if (!row) return Result.ok("idle");
+    if (!row) return Result.ok({ displayStatus: thread.activeRunId ? "working" : "idle" });
     const db = this.db;
     return Result.gen(function* () {
       const { value: record } = yield* decodeNativeRecord(row);
       if (record.kind !== "turn")
         return Result.err(nativeFailure("invalid", "Thread display projection is not a turn"));
       const turn = record.value;
-      if (turn.state === "failed") return Result.ok("error" as const);
-      if (turn.state === "running") return Result.ok("working" as const);
-      if (turn.state !== "complete") return Result.ok("idle" as const);
+      if (thread.activeRunId || turn.state === "running")
+        return Result.ok({
+          displayStatus: "working" as const,
+          workingSince: turn.startedAt ?? row.first_created_at ?? undefined,
+        });
+      if (turn.state === "failed") return Result.ok({ displayStatus: "error" as const });
+      if (turn.state !== "complete") return Result.ok({ displayStatus: "idle" as const });
       const read = db
         .query<{ position: number; message_index: number }, [string, string, number]>(
           "SELECT position,message_index FROM native_surface_read WHERE thread_id=? AND reader_id=? AND generation=?",
@@ -651,7 +657,7 @@ export class NativeStore {
         read !== null &&
         (read.position > turn.position ||
           (read.position === turn.position && read.message_index >= row.last_message_index));
-      return Result.ok<NonNullable<NativeThread["displayStatus"]>>(checked ? "idle" : "completed");
+      return Result.ok({ displayStatus: checked ? ("idle" as const) : ("completed" as const) });
     });
   }
 
@@ -667,14 +673,14 @@ export class NativeStore {
   private summary(user: NativeUser, thread: NativeThreadRecord): NativeStoreResult<NativeThread> {
     return Result.gen(function* () {
       const starter = yield* this.getUser(thread.starterId);
-      const displayStatus = yield* this.displayStatus(user, thread);
+      const status = yield* this.displayStatus(user, thread);
       return Result.ok({
         id: thread.id,
         title: thread.title,
         starterId: thread.starterId,
         starterDisplayName: starter.displayName,
         starterAvatarUrl: nativeUserDisplay(starter).avatarUrl,
-        displayStatus,
+        ...status,
         archived: thread.archived,
         updatedAt: thread.updatedAt,
         revision: thread.revision,
