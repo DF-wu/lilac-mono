@@ -4,8 +4,9 @@
 six hours and can also be started from **Actions → Sync Upstream → Run workflow**.
 Clean merges update `main` only after the existing full CI passes. **Only Git
 conflicts create a review PR. Claude analyzes conflicts but never repairs code
-or resolves them.** No local agent service, GitHub App, or additional access
-token is required.
+or resolves them.** No local agent service or GitHub App is required. Only the
+conflict review branch needs one extra repository secret,
+[`SYNC_UPSTREAM_TOKEN`](#review-branch-token).
 
 ## Workflow
 
@@ -22,22 +23,23 @@ token is required.
    ordinary push, explicitly dispatch `build-image.yml`, and delete this run's
    candidate branch. If `main` moved, stop and retain the candidate for a later
    run to re-evaluate. Branch rules still apply to this push.
-4. **Git conflict:** push original upstream commits to
-   `automation/sync-upstream` and open one PR against `main`. The PR preserves
+4. **Git conflict:** write original upstream commits to
+   `automation/sync-upstream` with `SYNC_UPSTREAM_TOKEN` and open one PR
+   against `main` with the built-in token. The PR preserves
    the conflict rather than committing conflict markers. Request review from
    **Catalina-df** and mention **@Catalina-df** in its body when creating the PR.
    Successful reruns update the bot's existing analysis comment without another
    mention or review request.
 5. **Read-only analysis:** invoke Claude Action on the pending trial merge.
    Publish only its final review brief, then abort the local trial merge.
-   If the AI/API fails, record the failure in the Action summary and preserve any
-   existing analysis comment. The PR remains available for human review. The
+   If the AI/API fails or returns a blank brief, record the failure in the Action
+   summary and preserve any existing analysis comment. The PR remains available for human review. The
    reviewer resolves conflicts and validates the integrated result.
 
 An existing conflict PR takes priority over a clean automatic update. Scheduled
 runs skip analysis when that PR already contains the pinned upstream commit;
-manual runs can request another analysis. New upstream commits use ordinary
-pushes. Human changes are never overwritten by reset or force-push; a
+manual runs can request another analysis. New upstream commits use
+fast-forward-only ref updates. Human changes are never overwritten by reset or force-push; a
 non-fast-forward rejection stops the run for manual handling. The analysis
 receives the actual review-head SHA so it can distinguish human changes from
 the raw upstream trial merge.
@@ -53,6 +55,45 @@ the conflict PR does not imply CI passed. A human must resolve it and run CI on
 the integrated result; a human branch push triggers the normal PR CI, and
 `ci.yml` also supports manual dispatch. GitHub must permit Actions to create
 PRs. Protected-branch rules can block automatic main updates.
+
+## Review branch token
+
+The `permissions` key cannot grant `GITHUB_TOKEN` the `workflows` permission.
+GitHub does not document the exact comparison, but this repository's runs match
+community measurements: a `GITHUB_TOKEN` ref write is refused when the target
+commit carries a workflow file that is not byte-identical to the same path on
+some current branch tip, and tags do not count. Upstream's
+`.github/workflows/ci.yml` differs from the fork's, so creating
+`automation/sync-upstream` at a raw upstream commit fails with `refusing to allow
+a GitHub App to create or update workflow ... without workflows permission`.
+Earlier successful runs relied on an unrelated branch that happened to carry
+upstream's workflow files.
+
+The conflict step therefore creates the branch with `POST git/refs` and updates
+it with `PATCH git/refs` (`force=false`) using the repository Actions Secret
+**`SYNC_UPSTREAM_TOKEN`**. The secret is exposed only in that step's
+environment. It is not written to Git configuration and is not available to the
+Claude step. PR creation, comments, branch deletion, clean candidates and `main`
+updates still use the built-in token. Unlike built-in-token writes, ref writes
+made with this token emit events. No workflow in the fork or upstream trees runs
+on pushes to `automation/sync-upstream`; a fast-forward of an open PR can start
+its normal `pull_request` CI, which GitHub skips while the PR has merge conflicts.
+
+The workflow needs access only to `DF-wu/lilac-mono`. Prefer a fine-grained
+personal access token with **Repository access** set to **Only select
+repositories**, selecting `DF-wu/lilac-mono`, and **Contents: Read and write**
+and **Workflows: Read and write** permissions. Set an expiry.
+
+A classic token with `repo` and `workflow` scopes also works, but cannot be
+restricted to this repository: it can access other repositories available to
+its owner under those scopes. Storing it as this repository's Actions Secret
+does not narrow the token's permissions. See
+[GitHub's personal access token documentation](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-personal-access-token-classic).
+
+To rotate, run
+`gh secret set SYNC_UPSTREAM_TOKEN -R DF-wu/lilac-mono`. If the secret is missing
+or expired, a conflict run that needs to create or advance the branch fails at
+the ref write before Claude starts.
 
 ## Prompt and authority
 
@@ -150,8 +191,10 @@ Detailed source checks are recorded in [the research note](research/claude-actio
 
 ## Execution limits
 
-The agent runs only for conflict review, with at most **150 turns and 20 minutes**
-per analysis. Prepare has a 30-minute job limit. CI and main-update decisions
+The agent runs only for conflict review, with at most **150 turns and 45 minutes**
+per analysis. Prepare has a 60-minute job limit. The step limit was raised from
+20 minutes after the 2026-10-12 analysis of five conflicting files timed out
+without a brief; the turn limit still bounds cost. CI and main-update decisions
 run independently of the agent; model prose cannot mark checks successful.
 
 A minimal live Claude Code 2.1.291 test on 2026-10-07 used this gateway, model,

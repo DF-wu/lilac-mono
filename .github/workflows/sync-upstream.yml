@@ -22,7 +22,8 @@ jobs:
   prepare:
     if: github.repository == 'DF-wu/lilac-mono'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 需涵蓋 45 分鐘衝突分析與其前後步驟。
+    timeout-minutes: 60
     outputs:
       mode: ${{ steps.merge.outputs.mode }}
       candidate_sha: ${{ steps.merge.outputs.candidate_sha }}
@@ -108,6 +109,8 @@ jobs:
           UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
           BASELINE_SHA: ${{ steps.merge.outputs.baseline_sha }}
           EXISTING_PR: ${{ steps.merge.outputs.existing_pr }}
+          # 僅供本步驟寫入 review ref；不放入 job env、git config 或 Claude 步驟。
+          REF_TOKEN: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
         run: |
           # PR head 使用原始 upstream 提交，保留未解衝突供 reviewer 處理。
           # 不提交 conflict markers，不 reset，不 force push，也不覆蓋人工修復。
@@ -118,9 +121,15 @@ jobs:
               git push origin --delete "$SYNC_BRANCH"
             fi
           fi
-          if ! git show-ref --verify --quiet "refs/remotes/origin/$SYNC_BRANCH" ||
-             ! git merge-base --is-ancestor "$UPSTREAM_SHA" "origin/$SYNC_BRANCH"; then
-            git push origin "$UPSTREAM_SHA:refs/heads/$SYNC_BRANCH"
+          # GITHUB_TOKEN 只能寫入 workflow 檔與某個分支 tip 完全相同的 ref；upstream 的
+          # workflow 與 fork 不同，故 review ref 改用具 workflows 權限的 token 經 REST 寫入。
+          # PATCH force=false 只允許快轉；人工提交造成的非快轉仍會停止執行。
+          if ! git show-ref --verify --quiet "refs/remotes/origin/$SYNC_BRANCH"; then
+            GH_TOKEN="$REF_TOKEN" gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f "ref=refs/heads/$SYNC_BRANCH" -f "sha=$UPSTREAM_SHA" --silent
+          elif ! git merge-base --is-ancestor "$UPSTREAM_SHA" "origin/$SYNC_BRANCH"; then
+            GH_TOKEN="$REF_TOKEN" gh api --method PATCH "repos/$GH_REPO/git/refs/heads/$SYNC_BRANCH" \
+              -f "sha=$UPSTREAM_SHA" -F force=false --silent
           fi
           git fetch --no-tags origin "$SYNC_BRANCH"
           echo "review_sha=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
@@ -155,7 +164,8 @@ jobs:
       - name: Analyze conflicts for the reviewer without modifying code
         if: steps.merge.outputs.mode == 'conflict'
         id: claude
-        timeout-minutes: 20
+        # 2026-10-12 五檔衝突分析在 20 分鐘逾時；turn 上限仍限制成本。
+        timeout-minutes: 45
         # PR 已先建立；gateway 或模型失敗不會阻止人工接手。
         continue-on-error: true
         # 最新版 v1.0.243（2026-10-06）；固定 SHA，升級時一併更新此註解。
@@ -309,9 +319,9 @@ jobs:
           test "$(git diff --binary HEAD | sha256sum | cut -d ' ' -f 1)" = "$EXPECTED_TREE"
           test "$(git ls-files --stage | sha256sum | cut -d ' ' -f 1)" = "$EXPECTED_INDEX"
           # 只抽取成功執行的最終 review brief，不發布完整對話或工具 transcript。
-          # 分析失敗只記錄 summary，不用失敗文字覆蓋 reviewer 已有的分析。
+          # 分析失敗或 brief 空白只記錄 summary，不用失敗文字覆蓋 reviewer 已有的分析。
           if [ "$CLAUDE_OUTCOME" != "success" ] || [ ! -f "$EXECUTION_FILE" ] ||
-             ! review_brief=$(jq -er '[.[] | select(.type == "result" and .subtype == "success" and .is_error == false)][-1].result // empty' "$EXECUTION_FILE"); then
+             ! review_brief=$(jq -er '[.[] | select(.type == "result" and .subtype == "success" and .is_error == false)][-1].result // empty | select(test("\\S"))' "$EXECUTION_FILE"); then
             echo "AI analysis did not complete for PR #$PR_NUMBER. Existing analysis is unchanged; conflicts remain for human review." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
