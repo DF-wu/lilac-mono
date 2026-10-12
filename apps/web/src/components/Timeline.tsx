@@ -15,6 +15,7 @@ import { copyMessage, messageClipboard } from "../message-clipboard";
 import { MessageArrivals } from "../message-arrivals";
 import { MessageArrivalsContext, LiveMessageContext, useMessageArrival } from "./message-arrivals";
 import {
+  DisplayStreamContext,
   MessageServicesContext,
   useMessageServices,
   type MessageServices,
@@ -1056,6 +1057,7 @@ const MessageBody = memo(function MessageBody(
   const { message } = props;
   const conversation = useConversation();
   const timeline = useContext(TimelineContext);
+  const displayStream = useContext(DisplayStreamContext);
   const reference =
     message.metadata?.reference ??
     (timeline
@@ -1124,12 +1126,13 @@ const MessageBody = memo(function MessageBody(
       ),
     [attachments, resourceUrl],
   );
+  const previewThreadId = timeline?.threadId ?? displayStream?.threadId;
   const previewMessage = useMemo(
     () =>
-      timeline && message.role === "assistant"
-        ? { threadId: timeline.threadId, messageId: message.id }
+      previewThreadId && message.role === "assistant"
+        ? { threadId: previewThreadId, messageId: message.id }
         : null,
-    [timeline, message.role, message.id],
+    [previewThreadId, message.role, message.id],
   );
   const time =
     message.metadata?.createdAt !== undefined ? (
