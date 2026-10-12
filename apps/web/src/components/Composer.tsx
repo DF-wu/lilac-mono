@@ -268,7 +268,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     }
     props.onSubmit({
       text: input.current?.submissionText() ?? text,
-      ...(attachments.length ? { attachmentText: text } : {}),
+      ...(attachments.length ? { attachmentText: input.current?.draftText() ?? text } : {}),
       skillIds,
       mode: delivery.mode === "prompt" ? mode : delivery.mode,
       modelId: delivery.modelId,
@@ -584,6 +584,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
             onPrefix={setPrefix}
             onKeyDown={editorKeyDown}
             onPaste={editorPaste}
+            onSubmit={submit}
             placeholder={placeholder}
             expanded={menuSize > 0}
             activeDescendant={highlighted >= 0 ? `completion-${highlighted}` : undefined}

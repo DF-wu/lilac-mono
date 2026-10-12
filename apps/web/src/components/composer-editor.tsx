@@ -1,7 +1,16 @@
 import { Kbd } from "./ui/kbd";
 import { shortcutOverlayOpen } from "../shortcuts";
 import { formatBinding, ariaBinding } from "../keybindings";
-import { parseReferenceHref } from "@stanley2058/lilac-client-protocol";
+import {
+  parseReferenceHref,
+  parseCitationHref,
+  citationHref,
+  citationInputFits,
+  withCitationComment,
+} from "@stanley2058/lilac-client-protocol";
+import { registerCitationComposer } from "../citation-store";
+import type { CitationAnchor } from "../assistant-selection";
+import { CitationChip } from "./CitationChip";
 import { ConversationBadge } from "./ConversationReference";
 import { FileIcon } from "./FileIcon";
 import { SkillBadge } from "./SkillBadge";
@@ -49,6 +58,8 @@ import {
   composerExtensions,
   attachmentNode,
   referenceNode,
+  citationNode,
+  insertEditorCitation,
   skillNode,
   markEditorSkills,
   readComposerDocument,
@@ -83,6 +94,74 @@ export {
 } from "./composer-document";
 const emptyAttachments: readonly Attachment[] = [];
 const emptySkills: readonly ComposerSkill[] = [];
+type OpenCitation = { key: string; anchor?: CitationAnchor; fresh?: { before: boolean } };
+const CitationEditorContext = createContext<{
+  open?: OpenCitation;
+  setOpen: (open: OpenCitation | undefined) => void;
+  send: () => void;
+}>({ setOpen() {}, send() {} });
+
+function CitationElement(props: NodeViewProps) {
+  const context = useContext(CitationEditorContext);
+  const citation = parseCitationHref(props.node.attrs.url as string);
+  const key = props.node.attrs.citationKey as string;
+  if (!citation) return <NodeViewWrapper as="span">Assistant quote</NodeViewWrapper>;
+  const open = context.open?.key === key ? context.open : undefined;
+  const position = () => props.getPos();
+  const save = (comment: string): boolean => {
+    const pos = position();
+    if (!props.editor.isEditable || pos === undefined) return false;
+    const node = props.editor.state.doc.nodeAt(pos);
+    if (!node || node.type.name !== "composer_citation") return false;
+    const transaction = props.editor.state.tr.setNodeMarkup(pos, undefined, {
+      ...node.attrs,
+      url: citationHref(withCitationComment(citation, comment)),
+    });
+    if (!citationInputFits(writeComposerDocument(transaction.doc))) return false;
+    props.editor.view.dispatch(transaction);
+    return true;
+  };
+  return (
+    <NodeViewWrapper as="span" className="inline" data-composer-badge="" contentEditable={false}>
+      <CitationChip
+        citation={citation}
+        editing={{
+          open: !!open,
+          anchor: open?.anchor,
+          onOpen: (opened) => context.setOpen(opened ? { key } : undefined),
+          onSave: save,
+          onSaveAndSend: (comment) => {
+            if (!save(comment)) return false;
+            context.send();
+            return true;
+          },
+          onCancel: () => {
+            const pos = position();
+            if (open?.fresh && props.editor.isEditable && pos !== undefined) {
+              const { doc } = props.editor.state;
+              const end = pos + props.node.nodeSize;
+              const from =
+                open.fresh.before && pos > 0 && doc.textBetween(pos - 1, pos) === " "
+                  ? pos - 1
+                  : pos;
+              const to =
+                end < doc.content.size && doc.textBetween(end, end + 1) === " " ? end + 1 : end;
+              props.editor.commands.deleteRange({ from, to });
+            }
+            context.setOpen(undefined);
+          },
+          onRestoreFocus: () => {
+            const pos = position();
+            if (props.editor.isEditable)
+              props.editor.commands.focus(
+                pos === undefined ? undefined : pos + props.node.nodeSize,
+              );
+          },
+        }}
+      />
+    </NodeViewWrapper>
+  );
+}
 const AttachmentContext = createContext<{
   attachments: readonly Attachment[];
   disabled: boolean;
@@ -211,6 +290,7 @@ export type ComposerEditorHandle = {
     range?: CompletionRange,
   ) => void;
   submissionText: () => string;
+  draftText: () => string;
   hasMissingAttachments: () => boolean;
 };
 export type ComposerEditorProps = {
@@ -230,10 +310,12 @@ export type ComposerEditorProps = {
   onPrefix: (prefix: string) => void;
   onKeyDown: (event: globalThis.KeyboardEvent) => void;
   onPaste: (event: ClipboardEvent) => void;
+  onSubmit?: () => void;
   expanded: boolean;
   activeDescendant?: string;
 };
 const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) {
+  const [openCitation, setOpenCitation] = useState<OpenCitation>();
   const current = useRef(props);
   current.current = props;
   const lastText = useRef(props.text);
@@ -248,6 +330,12 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
     shouldRerenderOnTransaction: false,
     extensions: [
       ...composerExtensions,
+      citationNode.extend({
+        addNodeView: () =>
+          ReactNodeViewRenderer(CitationElement, {
+            attrs: { contenteditable: "inherit", "data-composer-badge": "" },
+          }),
+      }),
       Placeholder.configure({ placeholder: () => current.current.placeholder }),
       attachmentNode.extend({
         addNodeView: () =>
@@ -347,6 +435,21 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
     },
     onSelectionUpdate: ({ editor }) => current.current.onPrefix(composerCompletionPrefix(editor)),
   });
+  useEffect(() => {
+    if (!editor || !props.documentKey || props.disabled || props.loadingDraft) return;
+    return registerCitationComposer(props.documentKey, (citation, anchor) => {
+      if (!editor.isEditable) return false;
+      const inserted = insertEditorCitation(editor, citation);
+      if (!inserted) return false;
+      setOpenCitation({
+        key: inserted.key,
+        anchor,
+        fresh: { before: inserted.before },
+      });
+      return true;
+    });
+  }, [editor, props.documentKey, props.disabled, props.loadingDraft]);
+  useEffect(() => setOpenCitation(undefined), [props.documentKey]);
   useLayoutEffect(() => {
     if (!editor || props.loadingDraft) return;
     const switched = documentKey.current !== props.documentKey;
@@ -414,6 +517,7 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
     () => ({
       capturePaste: () => (editor ? captureEditorPaste(editor) : { cancel() {}, insert() {} }),
       submissionText: () => (editor ? writeComposerDocument(editor.state.doc, false) : props.text),
+      draftText: () => (editor ? writeComposerDocument(editor.state.doc) : props.text),
       hasMissingAttachments: () =>
         !!editor &&
         [...editorAttachmentKeys(editor.state.doc)].some(
@@ -449,8 +553,16 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
     <AttachmentContext
       value={{ attachments, disabled: props.disabled, retry: props.onRetryAttachment }}
     >
-      <ComposerFormatting editor={editor} disabled={props.disabled} />
-      <EditorContent editor={editor} />
+      <CitationEditorContext
+        value={{
+          open: openCitation,
+          setOpen: setOpenCitation,
+          send: () => current.current.onSubmit?.(),
+        }}
+      >
+        <ComposerFormatting editor={editor} disabled={props.disabled} />
+        <EditorContent editor={editor} />
+      </CitationEditorContext>
     </AttachmentContext>
   );
 });

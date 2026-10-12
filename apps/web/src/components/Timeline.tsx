@@ -54,6 +54,10 @@ import { HtmlPreviewMessageContext } from "./HtmlPreview";
 import { Bubble, BubbleContent } from "./ui/bubble";
 import "./message-presentation.css";
 import { Markdown } from "./Markdown";
+import { AssistantSelectionToolbar } from "./AssistantSelectionToolbar";
+import { useCitationNavigation } from "./use-citation-navigation";
+import { citationStore } from "../citation-store";
+import { useStore } from "zustand";
 import { WorkflowCard } from "./WorkflowCard";
 import { readMotionDuration } from "../theme/motion";
 import { Button } from "./ui/button";
@@ -144,6 +148,12 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   const tailSnapshot = useCallback(() => store.at(store.size - 1)?.kind !== "deferred", [store]);
   const tailHydrated = useSyncExternalStore(subscribeTail, tailSnapshot, tailSnapshot);
   const parent = useRef<HTMLDivElement>(null);
+  const [citationViewport, setCitationViewport] = useState<HTMLDivElement | null>(null);
+  const bindViewport = useCallback((element: HTMLDivElement | null) => {
+    parent.current = element;
+    setCitationViewport(element);
+  }, []);
+  const citationIndexRef = useRef<number | undefined>(undefined);
   const headerRef = useRef<HTMLDivElement>(null);
   const footerRef = useRef<HTMLDivElement>(null);
   const [insets, setInsets] = useState({ top: 0, bottom: 0 });
@@ -196,11 +206,28 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       Math.round(entry?.borderBoxSize?.[0]?.blockSize ?? element.offsetHeight),
     overscan: 3,
     rangeExtractor: (range) => {
+      if (citationIndexRef.current !== undefined && citationIndexRef.current > 0)
+        return [...new Set([...defaultRangeExtractor(range), citationIndexRef.current])].sort(
+          (a, b) => a - b,
+        );
       if (tailRenderedThread === props.threadId) return defaultRangeExtractor(range);
       const tail: number[] = [];
       for (let index = Math.max(0, range.count - 5); index < range.count; index++) tail.push(index);
       return tail;
     },
+  });
+  const positionCitation = useCallback(
+    () => setReadingDisclosure(props.threadId),
+    [props.threadId],
+  );
+  citationIndexRef.current = useCitationNavigation({
+    threadId: props.threadId,
+    store,
+    client: props.client,
+    viewport: parent,
+    virtual,
+    ready: !switching && !!store.checkpoint,
+    onPosition: positionCitation,
   });
   const measureTurn = useCallback(
     (content: HTMLElement) => {
@@ -284,7 +311,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
         <MessageServicesContext value={services}>
           <div
             className="timeline overflow-auto min-h-0 flex-1 [overflow-anchor:none] chat-scroll relative overflow-y-auto overflow-x-hidden"
-            ref={parent}
+            ref={bindViewport}
             onScroll={(event) => {
               setReadingDisclosure(undefined);
               const viewport = event.currentTarget;
@@ -311,6 +338,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
             aria-label="Conversation"
             tabIndex={0}
           >
+            <AssistantSelectionToolbar viewport={citationViewport} threadId={props.threadId} />
             <div
               ref={measureHeader}
               data-index={0}
@@ -475,6 +503,13 @@ function AgentTurn(props: TurnProps) {
   const { canEdit, rewindDisabled } = useMessageServices();
   const { slot } = props;
   const [expanded, setExpanded] = useState(false);
+  const citedMessage = useStore(citationStore, (state) => {
+    const id = state.navigation?.citation.messageId;
+    return props.slot.messages.some((message) => message.id === id) ? id : undefined;
+  });
+  useEffect(() => {
+    if (citedMessage) setExpanded(true);
+  }, [citedMessage]);
   const firstUser = slot.messages.find(
     (message) => message.role === "user" && message.metadata?.inputMode !== "steer",
   );
@@ -1001,7 +1036,9 @@ function MessageCard({
               </div>
             ) : null}
             {content.texts.map((text, index) => (
-              <Markdown key={index} text={text} preserveLineBreaks={collapsible} />
+              <div key={index} data-citation-text={collapsible ? undefined : ""}>
+                <Markdown text={text} preserveLineBreaks={collapsible} />
+              </div>
             ))}
             {files.length > 0 ? (
               <div
@@ -1175,6 +1212,14 @@ const MessageBody = memo(function MessageBody(
         align={self ? "end" : "start"}
         className={`message leading-normal ${conversational ? "py-1" : "py-0"} px-0 wrap-anywhere message-${message.role} native-message text-base`}
         data-message-id={message.id}
+        data-citation-source={
+          message.role === "assistant" &&
+          reference?.surface === "native" &&
+          displayStream?.kind !== "subagent"
+            ? message.id
+            : undefined
+        }
+        data-citation-thread={reference?.surface === "native" ? reference.sessionId : undefined}
       >
         {(props.showAvatar ?? conversational) ? (
           <AuthorAvatar author={author} role={authorRole} self={self} message={message} />

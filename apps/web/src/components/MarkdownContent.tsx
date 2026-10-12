@@ -1,4 +1,9 @@
-import { HTML_PREVIEW_LANGUAGE, parseReferenceHref } from "@stanley2058/lilac-client-protocol";
+import {
+  HTML_PREVIEW_LANGUAGE,
+  parseReferenceHref,
+  parseCitationHref,
+} from "@stanley2058/lilac-client-protocol";
+import { CitationChip } from "./CitationChip";
 import { ConversationBadge } from "./ConversationReference";
 import { FileLink, MarkdownImage } from "./FileActions";
 import { parseFilePath } from "../file-target";
@@ -101,6 +106,8 @@ function TaskCheckbox({ checked }: ComponentProps<"input">) {
 
 function MessageLink({ children, href }: ComponentProps<"a">) {
   const resources = useContext(MessageResourcesContext);
+  const citation = href ? parseCitationHref(href) : undefined;
+  if (citation) return <CitationChip citation={citation} />;
   const reference = href
     ? parseReferenceHref(href, typeof location === "undefined" ? undefined : location.origin)
     : undefined;

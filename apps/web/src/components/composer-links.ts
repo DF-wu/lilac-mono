@@ -1,4 +1,4 @@
-import { parseReferenceHref } from "@stanley2058/lilac-client-protocol";
+import { parseReferenceHref, parseCitationHref } from "@stanley2058/lilac-client-protocol";
 import { markdownToAstProcessor, type MdRootContent, type unistLib } from "@platejs/markdown";
 import type { PlateEditor } from "platejs/react";
 import { KEYS, NodeApi, TextApi, type Descendant, type TText } from "platejs";
@@ -18,6 +18,7 @@ export function editableComposerLinks(resourceUrls?: ReadonlySet<string>) {
         if (node.type === "link") {
           if (
             (node.url && parseReferenceHref(node.url)) ||
+            (node.url && parseCitationHref(node.url)) ||
             node.url?.startsWith("attachment:") ||
             (node.url && resourceUrls?.has(node.url))
           )

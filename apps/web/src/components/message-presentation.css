@@ -217,3 +217,8 @@
     animation: none;
   }
 }
+::highlight(lilac-citation-comment),
+::highlight(lilac-citation-source) {
+  background-color: var(--ui-selection);
+  color: var(--ui-selection-foreground);
+}

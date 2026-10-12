@@ -11,6 +11,8 @@ import {
   composerExtensions,
   attachmentNode,
   referenceNode,
+  citationNode,
+  insertEditorCitation,
   skillNode,
   markEditorSkills,
   editorSkillIds,
@@ -21,11 +23,61 @@ import {
   composerBadgeSelection,
 } from "../src/components/composer-tiptap";
 import { createComposerEditor, composerMarkdown } from "../src/components/composer-document";
+import {
+  serializeCitation,
+  collectCitations,
+  type AssistantCitation,
+} from "@stanley2058/lilac-client-protocol";
+
+const citation: AssistantCitation = {
+  version: 1,
+  threadId: "thread",
+  messageId: "response",
+  text: "A saved quote",
+  start: 0,
+  end: 13,
+  prefix: "",
+  suffix: "",
+};
+
+it("inserts a citation at the caret, round-trips through drafts and submission, and supports undo", () => {
+  const editor = headlessEditor("before after");
+  editor.registerPlugin(history());
+  editor.commands.setTextSelection(7);
+  expect(insertEditorCitation(editor, citation)).toBeDefined();
+  const markdown = writeComposerDocument(editor.state.doc);
+  expect(collectCitations(markdown).map((match) => match.citation)).toEqual([citation]);
+  expect(writeComposerDocument(editor.state.doc, false)).toBe(markdown);
+  expect(writeComposerDocument(readComposerDocument(markdown))).toBe(markdown);
+  expect(composerText(editor.state.doc)).toContain("A saved quote");
+  undo(editor.state, editor.view.dispatch);
+  expect(writeComposerDocument(editor.state.doc)).toBe("before after");
+  editor.destroy();
+});
+
+it("rejects a citation that would exceed the encoded draft limit without changing the document", () => {
+  const editor = headlessEditor("x".repeat(65500));
+  const before = writeComposerDocument(editor.state.doc);
+  expect(insertEditorCitation(editor, citation)).toBeUndefined();
+  expect(writeComposerDocument(editor.state.doc)).toBe(before);
+  editor.destroy();
+});
+
+it("restores copied citation chips and leaves citation examples in code literal", () => {
+  const link = serializeCitation(citation);
+  const doc = readComposerDocument(`Quote ${link}\n\n\`${link}\``);
+  const types: string[] = [];
+  doc.descendants((node) => {
+    types.push(node.type.name);
+  });
+  expect(types.filter((type) => type === "composer_citation")).toHaveLength(1);
+  expect(writeComposerDocument(doc)).toContain(link);
+});
 
 function headlessEditor(text: string) {
   const editor = new Editor({
     element: null,
-    extensions: [...composerExtensions, attachmentNode, referenceNode, skillNode],
+    extensions: [...composerExtensions, attachmentNode, referenceNode, skillNode, citationNode],
     content: readComposerDocument(text).toJSON(),
   });
   // Tiptap treats an unmounted editor as destroyed even though its transactions work headlessly.
