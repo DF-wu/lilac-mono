@@ -3779,6 +3779,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       ...(root === "packages/client-protocol"
         ? [
             {
+              identity: { module: "src/assistant-citations.ts", exportName: "parseCitationHref" },
+              category: "wire" as const,
+            },
+            {
               identity: { module: "src/references.ts", exportName: "parseReferenceHref" },
               category: "wire" as const,
             },

@@ -6,3 +6,4 @@ export * from "./domain.ts";
 export * from "./references.ts";
 
 export * from "./html-preview.ts";
+export * from "./assistant-citations.ts";

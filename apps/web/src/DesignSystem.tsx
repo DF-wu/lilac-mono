@@ -109,6 +109,7 @@ import { ThreadSettleButton } from "./components/ThreadSettleButton";
 import { ThreadQueueDemo } from "./components/ThreadQueueDemo";
 import { DeploymentSettingsForm } from "./components/DeploymentSettings";
 import { AgentWorkDemo } from "./components/AgentWorkDemo";
+import { CitationDemo } from "./components/CitationDemo";
 import { WorkingIndicatorsContext } from "./components/WorkVerb";
 import { SidebarSearch } from "./components/SidebarSearch";
 import { AgentDiscordLink } from "./components/AgentIdentity";
@@ -128,6 +129,7 @@ const sections = [
   ["keybindings", "Keybindings"],
   ["deployment", "Deployment settings"],
   ["composer", "Composer"],
+  ["citations", "Citations"],
   ["reconnection", "Reconnection"],
   ["attachments", "Attachments"],
   ["content", "Rich content"],
@@ -1784,6 +1786,13 @@ export default function DesignSystem() {
                 />
               </Section>
               <ComposerSpecimen />
+              <Section
+                id="citations"
+                title="Citations"
+                description="Select assistant text to cite it or copy Markdown. Add a comment, save it, and follow the chip back to its source."
+              >
+                <CitationDemo />
+              </Section>
               <Section
                 id="reconnection"
                 title="Reconnection"

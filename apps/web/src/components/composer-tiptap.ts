@@ -2,9 +2,15 @@ import { Extension, Node, getSchema, type Editor, type JSONContent } from "@tipt
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
 import { Slice, type Node as DocumentNode, type ResolvedPos, type Schema } from "@tiptap/pm/model";
-import { EditorState, TextSelection } from "@tiptap/pm/state";
+import { EditorState, TextSelection, Plugin } from "@tiptap/pm/state";
 import type { EditorView } from "@tiptap/pm/view";
-import { parseReferenceHref, referenceHref } from "@stanley2058/lilac-client-protocol";
+import {
+  parseReferenceHref,
+  referenceHref,
+  citationHref,
+  citationInputFits,
+  type AssistantCitation,
+} from "@stanley2058/lilac-client-protocol";
 import { KEYS, NodeApi } from "platejs";
 import {
   createComposerEditor,
@@ -43,6 +49,52 @@ export const referenceNode = Node.create({
     HTMLAttributes.url,
   ],
 });
+export const citationNode = Node.create({
+  name: "composer_citation",
+  group: "inline",
+  inline: true,
+  atom: true,
+  selectable: false,
+  addAttributes: () => ({ url: { default: "" }, citationKey: { default: "" } }),
+  parseHTML: () => [{ tag: "span[data-composer-citation]" }],
+  renderHTML: ({ HTMLAttributes }) => [
+    "span",
+    { ...HTMLAttributes, "data-composer-citation": "", contenteditable: "false" },
+    "Assistant quote",
+  ],
+  addProseMirrorPlugins: () => [
+    new Plugin({
+      filterTransaction: (transaction) => {
+        if (!transaction.docChanged) return true;
+        let containsCitation = false;
+        transaction.doc.descendants((node) => {
+          if (node.type.name === "composer_citation") containsCitation = true;
+        });
+        return !containsCitation || citationInputFits(writeComposerDocument(transaction.doc));
+      },
+    }),
+  ],
+});
+
+export function insertEditorCitation(editor: Editor, citation: AssistantCitation) {
+  const key = crypto.randomUUID();
+  const { from, to } = editor.state.selection;
+  const before = from > 1 && /\S/.test(editor.state.doc.textBetween(from - 1, from));
+  const node = editor.schema.nodes.composer_citation!.create({
+    url: citationHref(citation),
+    citationKey: key,
+  });
+  const transaction = editor.state.tr;
+  const nodes = [...(before ? [editor.schema.text(" ")] : []), node, editor.schema.text(" ")];
+  const inserted = editor.schema.nodes.paragraph!.create(null, nodes).content;
+  transaction.replaceWith(from, to, inserted);
+  if (!citationInputFits(writeComposerDocument(transaction.doc))) return;
+  transaction.setSelection(
+    TextSelection.create(transaction.doc, from + (before ? 1 : 0) + node.nodeSize + 1),
+  );
+  editor.view.dispatch(transaction);
+  return { key, before };
+}
 export const skillNode = Node.create({
   name: "composer_skill",
   group: "inline",
@@ -165,6 +217,7 @@ export const composerSchema = getSchema([
   attachmentNode,
   referenceNode,
   skillNode,
+  citationNode,
 ]);
 export { Placeholder };
 
@@ -204,6 +257,8 @@ function inline(nodes: ComposerNode[]): JSONContent[] {
     if (node.type === "composer_attachment")
       return [{ type: node.type, attrs: { attachmentKey: node.attachmentKey, name: node.name } }];
     if (node.type === "composer_reference") return [{ type: node.type, attrs: { url: node.url } }];
+    if (node.type === "composer_citation")
+      return [{ type: node.type, attrs: { url: node.url, citationKey: crypto.randomUUID() } }];
     return inline(node.children);
   });
 }

@@ -1,4 +1,11 @@
-import { parseReferenceHref, referenceHref } from "@stanley2058/lilac-client-protocol";
+import {
+  parseReferenceHref,
+  referenceHref,
+  parseCitationHref,
+  citationHref,
+  citationLabel,
+  serializeCitation,
+} from "@stanley2058/lilac-client-protocol";
 import type { Attachment } from "../types";
 import {
   ParagraphPlugin,
@@ -46,6 +53,11 @@ import { editableComposerLinks, protectComposerLinks } from "./composer-links";
 import { composerParagraphSpacing } from "./composer-line-breaks";
 const attachmentType = "composer_attachment";
 const referenceType = "composer_reference";
+const citationType = "composer_citation";
+const CitationPlugin = createPlatePlugin({
+  key: citationType,
+  node: { isElement: true, isInline: true, isVoid: true },
+});
 const AttachmentPlugin = createPlatePlugin({
   key: attachmentType,
   node: { isElement: true, isInline: true, isVoid: true },
@@ -110,6 +122,7 @@ export function insertComposerAttachment(
 const composerMarkdownSyntax = [remarkGfm, remarkCjkFriendly, remarkCjkFriendlyGfmStrikethrough];
 
 export const composerPlugins = [
+  CitationPlugin,
   AttachmentPlugin,
   ReferencePlugin,
   ParagraphPlugin,
@@ -179,6 +192,10 @@ function deserializeComposer(editor: PlateEditor, text: string) {
     }
   }
   return mapComposerValue(value, (node) => {
+    const citation =
+      node.type === KEYS.a ? parseCitationHref(projectComposerNode(node).url ?? "") : undefined;
+    if (citation)
+      return { type: citationType, url: citationHref(citation), children: [{ text: "" }] };
     const target =
       node.type === KEYS.a ? parseReferenceHref(projectComposerNode(node).url ?? "") : undefined;
     if (target)
@@ -221,6 +238,10 @@ function trimEmptyInlineText(nodes: Descendant[]): Descendant[] {
 
 function serializeComposer(editor: PlateEditor, references: boolean): string {
   const value = mapComposerValue(editor.children, (node) => {
+    if (node.type === citationType) {
+      const citation = parseCitationHref(projectComposerNode(node).url ?? "");
+      return { text: citation ? serializeCitation(citation) : "Assistant quote" };
+    }
     if (node.type === referenceType) {
       const target = parseReferenceHref(projectComposerNode(node).url ?? "");
       if (target)
@@ -375,6 +396,10 @@ export function remapComposerAttachments(text: string, keys: ReadonlyMap<string,
 
 export function composerPlainText(editor: PlateEditor): string {
   return mapComposerValue(editor.children, (node) => {
+    if (node.type === citationType) {
+      const citation = parseCitationHref(projectComposerNode(node).url ?? "");
+      return { text: citation ? citationLabel(citation) : "Assistant quote" };
+    }
     if (node.type === attachmentType) return { text: projectComposerNode(node).name };
     if (node.type === referenceType) return { text: projectComposerNode(node).url ?? "" };
     return node;
