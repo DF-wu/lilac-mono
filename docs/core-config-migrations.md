@@ -1,5 +1,12 @@
 # Core Config Migrations
 
+## Separate thread query embeddings
+
+`conversation.thread.embedding.queryModel` optionally selects the search-query encoder.
+It defaults to `embedding.model`, which remains the document encoder and stored embedding ID.
+Both encoders must share a vector space and dimensions. Changing the document model requires
+re-embedding existing summary facets. No schema-version or database change is required.
+
 This guide records manual `core-config.yaml` changes between config versions. The current field-level
 reference is
 [`packages/utils/config-templates/core-config.example.yaml`](../packages/utils/config-templates/core-config.example.yaml).
@@ -151,6 +158,13 @@ Heartbeat's default output accepts only `discord/<channel ID or alias>` or
 not accepted by this field. The GitHub thread and adapter access must exist; parsing the prefix alone
 is not an access check. See [heartbeat schema](../packages/utils/core-config/v1.ts) and
 [`github-ids.ts`](../apps/core/src/github/github-ids.ts).
+
+## Shared working indicators
+
+Version 2 adds `surface.workingIndicators`. Native web and Discord use this shared list by default.
+`surface.discord.workingIndicators` remains valid and overrides it for Discord only. To use one
+custom list everywhere, move it from `surface.discord` to `surface`. Configs that set neither field
+use the built-in list on both surfaces.
 
 ## Native web port
 

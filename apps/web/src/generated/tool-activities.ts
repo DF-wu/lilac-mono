@@ -327,7 +327,12 @@ export const subagentTranscripts: Record<
           {
             type: "data-activity",
             id: "child_1_0",
-            data: { kind: "thinking", label: "Thought", state: "complete" },
+            data: {
+              kind: "thinking",
+              label: "Thinking",
+              state: "complete",
+              detail: "Check the original source before summarizing.",
+            },
           },
         ],
       },
@@ -338,7 +343,12 @@ export const subagentTranscripts: Record<
           {
             type: "data-activity",
             id: "child_1_1",
-            data: { kind: "tool", label: "bash", state: "complete" },
+            data: {
+              kind: "tool",
+              label: 'bash tools web.search "Kyoto weather Saturday"',
+              state: "complete",
+              detail: 'bash tools web.search "Kyoto weather Saturday"',
+            },
           },
         ],
       },
@@ -349,7 +359,12 @@ export const subagentTranscripts: Record<
           {
             type: "data-activity",
             id: "child_1_2",
-            data: { kind: "tool", label: "read", state: "running" },
+            data: {
+              kind: "tool",
+              label: 'read {"path":"~/notes/riverside-path.md"}',
+              state: "running",
+              detail: 'read {"path":"~/notes/riverside-path.md"}',
+            },
           },
         ],
       },
@@ -369,7 +384,12 @@ export const subagentTranscripts: Record<
           {
             type: "data-activity",
             id: "child_1_0",
-            data: { kind: "thinking", label: "Thought", state: "complete" },
+            data: {
+              kind: "thinking",
+              label: "Thinking",
+              state: "complete",
+              detail: "Check the original source before summarizing.",
+            },
           },
         ],
       },
@@ -380,7 +400,12 @@ export const subagentTranscripts: Record<
           {
             type: "data-activity",
             id: "child_1_1",
-            data: { kind: "tool", label: "bash", state: "complete" },
+            data: {
+              kind: "tool",
+              label: 'bash tools web.search "Kyoto weather Saturday"',
+              state: "complete",
+              detail: 'bash tools web.search "Kyoto weather Saturday"',
+            },
           },
         ],
       },
@@ -391,7 +416,12 @@ export const subagentTranscripts: Record<
           {
             type: "data-activity",
             id: "child_1_2",
-            data: { kind: "tool", label: "read", state: "complete" },
+            data: {
+              kind: "tool",
+              label: 'read {"path":"~/notes/riverside-path.md"}',
+              state: "complete",
+              detail: 'read {"path":"~/notes/riverside-path.md"}',
+            },
           },
         ],
       },
@@ -423,7 +453,12 @@ export const subagentTranscripts: Record<
           {
             type: "data-activity",
             id: "child_1_0",
-            data: { kind: "thinking", label: "Thought", state: "complete" },
+            data: {
+              kind: "thinking",
+              label: "Thinking",
+              state: "complete",
+              detail: "Check the original source before summarizing.",
+            },
           },
         ],
       },
@@ -434,7 +469,12 @@ export const subagentTranscripts: Record<
           {
             type: "data-activity",
             id: "child_1_1",
-            data: { kind: "tool", label: "bash", state: "running" },
+            data: {
+              kind: "tool",
+              label: 'bash tools web.search "Kyoto museum Saturday hours"',
+              state: "running",
+              detail: 'bash tools web.search "Kyoto museum Saturday hours"',
+            },
           },
         ],
       },
@@ -445,7 +485,12 @@ export const subagentTranscripts: Record<
           {
             type: "data-activity",
             id: "child_1_2",
-            data: { kind: "tool", label: "bash", state: "running" },
+            data: {
+              kind: "tool",
+              label: 'bash tools web.search "Kyoto museum tickets"',
+              state: "running",
+              detail: 'bash tools web.search "Kyoto museum tickets"',
+            },
           },
         ],
       },
@@ -465,7 +510,12 @@ export const subagentTranscripts: Record<
           {
             type: "data-activity",
             id: "child_1_0",
-            data: { kind: "thinking", label: "Thought", state: "complete" },
+            data: {
+              kind: "thinking",
+              label: "Thinking",
+              state: "complete",
+              detail: "Check the original source before summarizing.",
+            },
           },
         ],
       },
@@ -476,7 +526,12 @@ export const subagentTranscripts: Record<
           {
             type: "data-activity",
             id: "child_1_1",
-            data: { kind: "tool", label: "bash", state: "complete" },
+            data: {
+              kind: "tool",
+              label: 'bash tools web.search "Kyoto museum Saturday hours"',
+              state: "complete",
+              detail: 'bash tools web.search "Kyoto museum Saturday hours"',
+            },
           },
         ],
       },
@@ -487,7 +542,12 @@ export const subagentTranscripts: Record<
           {
             type: "data-activity",
             id: "child_1_2",
-            data: { kind: "tool", label: "bash", state: "complete" },
+            data: {
+              kind: "tool",
+              label: 'bash tools web.search "Kyoto museum tickets"',
+              state: "complete",
+              detail: 'bash tools web.search "Kyoto museum tickets"',
+            },
           },
         ],
       },

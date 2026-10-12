@@ -109,6 +109,7 @@ import { ThreadSettleButton } from "./components/ThreadSettleButton";
 import { ThreadQueueDemo } from "./components/ThreadQueueDemo";
 import { DeploymentSettingsForm } from "./components/DeploymentSettings";
 import { AgentWorkDemo } from "./components/AgentWorkDemo";
+import { WorkingIndicatorsContext } from "./components/WorkVerb";
 import { SidebarSearch } from "./components/SidebarSearch";
 import { AgentDiscordLink } from "./components/AgentIdentity";
 import { ExternalMessages } from "./components/ExternalMessages";
@@ -489,6 +490,7 @@ function Threads() {
                 title={title}
                 starterName={index % 2 ? "Morgan Lee" : "Alex Chen"}
                 updatedAt={now - index * 3_600_000}
+                workingSince={state === "working" ? now - 72_000 : undefined}
                 now={now}
                 state={state}
                 selected={selected === state}
@@ -666,6 +668,7 @@ function Threads() {
     </Section>
   );
 }
+const demoWorkingIndicators = ["Brewing", "Photosynthesizing", "Tiptoeing", "Tuning", "Waltzing"];
 const reactionDemoNames = ["Morgan Lee", "Sam Rivera", "Jo Park", "Taylor Kim", "Casey Jones"];
 
 function Messages() {
@@ -936,7 +939,25 @@ const composerCatalog: DisplayCatalog = {
       source: "user",
     },
   ],
-  commands: [],
+  commands: [
+    {
+      id: "custom:tarot",
+      name: "tarot",
+      description: "Draw tarot cards",
+      kind: "custom",
+      argumentHint: "<count> [spread] [reversed]",
+      arguments: [
+        { key: "count", type: "number", required: true, description: "Cards to draw" },
+        {
+          key: "spread",
+          type: "string",
+          required: false,
+          choices: ["single", "past-present-future", "celtic cross"],
+        },
+        { key: "reversed", type: "boolean", required: false, description: "Allow reversed cards" },
+      ],
+    },
+  ],
 };
 function ComposerSpecimen() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -959,7 +980,7 @@ function ComposerSpecimen() {
     <Section
       id="composer"
       title="Composer"
-      description="Try the formatting toolbar, Markdown shortcuts, and multiline input."
+      description="Try the formatting toolbar, Markdown shortcuts, multiline input, and /tarot arguments."
     >
       <div className="ds-row flex items-center flex-wrap gap-2">
         <Button variant="secondary" onClick={() => setDisabled((value) => !value)}>
@@ -1735,7 +1756,9 @@ export default function DesignSystem() {
                 title="Agent work"
                 description="Choose a stage to inspect, or play through the examples. Expand work summaries and tool details. These use the conversation renderer with local sample data."
               >
-                <AgentWorkDemo />
+                <WorkingIndicatorsContext value={demoWorkingIndicators}>
+                  <AgentWorkDemo />
+                </WorkingIndicatorsContext>
               </Section>
               <Section id="appearance" title="Appearance">
                 <div className="max-w-2xl">

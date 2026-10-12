@@ -15,6 +15,7 @@ import { copyMessage, messageClipboard } from "../message-clipboard";
 import { MessageArrivals } from "../message-arrivals";
 import { MessageArrivalsContext, LiveMessageContext, useMessageArrival } from "./message-arrivals";
 import {
+  DisplayStreamContext,
   MessageServicesContext,
   useMessageServices,
   type MessageServices,
@@ -44,6 +45,7 @@ import type {
 } from "@stanley2058/lilac-client-protocol";
 import { IconButton, attempt } from "./ui";
 import { WorkingText } from "./ui/working-text";
+import { WorkVerb, useSettledWorkVerb } from "./WorkVerb";
 import { ResourceAttachment } from "./ResourceAttachment";
 import { ActorAvatar, type ActorIdentity } from "./ActorAvatar";
 import { MessageIdentityContext } from "./message-identity";
@@ -495,6 +497,7 @@ function AgentTurn(props: TurnProps) {
     startedAt !== undefined && slot.settledAt !== undefined
       ? Math.max(0, slot.settledAt - startedAt)
       : undefined;
+  const settledVerb = useSettledWorkVerb(slot.turnId, duration);
   const active = slot.state === "pending" || slot.state === "running";
   const waiting = active && !remaining.some((message) => message.role === "assistant");
   // A running turn always ends in a live row: the trailing activity run, or Thinking after text.
@@ -549,7 +552,8 @@ function AgentTurn(props: TurnProps) {
                     "Working…"
                   ) : (
                     <span>
-                      Working for <ElapsedTime since={startedAt} />
+                      <WorkVerb seed={slot.turnId} startedAt={startedAt} /> for{" "}
+                      <ElapsedTime since={startedAt} />
                     </span>
                   )}
                   <TurnParticipants messages={slot.messages} />
@@ -569,8 +573,8 @@ function AgentTurn(props: TurnProps) {
                     <span className="work-summary-label flex min-w-0 flex-wrap items-center gap-2">
                       <span>
                         {duration === undefined
-                          ? "Worked"
-                          : `Worked for ${formatDuration(duration)}`}
+                          ? settledVerb
+                          : `${settledVerb} for ${formatDuration(duration)}`}
                       </span>
                       <TurnParticipants messages={slot.messages} />
                     </span>
@@ -1053,6 +1057,7 @@ const MessageBody = memo(function MessageBody(
   const { message } = props;
   const conversation = useConversation();
   const timeline = useContext(TimelineContext);
+  const displayStream = useContext(DisplayStreamContext);
   const reference =
     message.metadata?.reference ??
     (timeline
@@ -1121,12 +1126,13 @@ const MessageBody = memo(function MessageBody(
       ),
     [attachments, resourceUrl],
   );
+  const previewThreadId = timeline?.threadId ?? displayStream?.threadId;
   const previewMessage = useMemo(
     () =>
-      timeline && message.role === "assistant"
-        ? { threadId: timeline.threadId, messageId: message.id }
+      previewThreadId && message.role === "assistant"
+        ? { threadId: previewThreadId, messageId: message.id }
         : null,
-    [timeline, message.role, message.id],
+    [previewThreadId, message.role, message.id],
   );
   const time =
     message.metadata?.createdAt !== undefined ? (

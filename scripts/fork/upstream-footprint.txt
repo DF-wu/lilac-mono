@@ -74,6 +74,8 @@ apps/core/package.json  # grammY dependency
 # --- Conversation memory: Telegram as a third source (projection lives in surface/telegram/telegram-conversation-source.ts)
 apps/core/src/conversation/thread-store.ts  # telegram source branch, telegram_thread kind, chat allowlist clause
 apps/core/src/conversation/thread-service.ts  # telegram surface labels and chat allowlist checks
+apps/core/src/conversation/thread-search-protocol.ts  # carries Telegram filters, allowlists, source paths, and hits across the search worker boundary
+apps/core/src/conversation/thread-search-worker.ts  # opens the Telegram conversation source in each search worker
 apps/core/src/conversation/thread-summarization-worker-protocol.ts  # telegram surface enum and source path fields
 apps/core/src/conversation/thread-summarization-worker.ts  # opens the telegram source and bot name in the worker
 apps/core/src/conversation/thread-worker.ts  # forwards the telegram source and hydrates telegram refs
@@ -128,6 +130,7 @@ packages/agent/agent-run-idle-watchdog.ts  # idle watchdog restart gap fix
 packages/event-bus/redis-streams-bus.ts  # single-flight subscription cleanup
 
 # --- Upstream tests extended for fork behavior
+apps/core/tests/conversation/cross-surface.test.ts  # preserves current source revisions with the Telegram-aware search worker integration
 apps/core/tests/heartbeat/heartbeat-service.test.ts  # machine-independent quiet-hours timezone test
 apps/core/tests/runtime/compose-builtin-surface-runtimes.test.ts  # covers the Telegram runtime entry
 apps/core/tests/surface/authenticated-request.test.ts  # Telegram principals

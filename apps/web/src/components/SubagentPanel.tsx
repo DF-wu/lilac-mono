@@ -1,8 +1,16 @@
 import { AgentAvatar } from "./AgentAvatar";
 import { LoadingSpinner } from "./ui/loading-spinner";
 import { defaultRightPanel } from "../panel-store";
-import { useContext, useMemo, useEffect, type ReactNode } from "react";
-import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useContext,
+  useMemo,
+  useEffect,
+  useCallback,
+  useSyncExternalStore,
+  useState,
+  type ReactNode,
+} from "react";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import { useStore } from "zustand";
 import {
   ArrowLeft,
@@ -16,18 +24,18 @@ import type {
   DisplayMessage,
   ReadyTurnSlot,
   SubagentSummary,
+  DisplayStreamTarget,
 } from "@stanley2058/lilac-client-protocol";
 import { useWorkspace } from "../workspace-context";
-import {
-  subagentsOptions,
-  subagentTranscriptOptions,
-  subagentHistoryOptions,
-  useNativeOnline,
-} from "../queries";
+import { subagentsOptions, useNativeOnline } from "../queries";
 import { SubagentContext, subagentProfileName } from "./subagent-context";
 import { MessageIdentityContext } from "./message-identity";
-import { Turn } from "./Timeline";
-import { MessageServicesContext, type MessageServices } from "./message-services";
+import { Turn, useSlot, useSlotIds } from "./Timeline";
+import {
+  DisplayStreamContext,
+  MessageServicesContext,
+  type MessageServices,
+} from "./message-services";
 import { Button } from "./ui/button";
 import { IconButton } from "./ui";
 import { WorkingText } from "./ui/working-text";
@@ -90,10 +98,10 @@ export function NativeSubagentPanel({
   foreground: boolean;
   embedded?: boolean;
 }) {
-  const { client, panels } = useWorkspace();
+  const { client, panels, resourceUrl } = useWorkspace();
   const open = useStore(panels, (state) => (state.threads.get(threadId) ?? defaultRightPanel).open);
   const selection = useStore(panels, (state) => state.selection);
-  const queries = useQueryClient();
+
   const targetId = selection?.threadId === threadId ? selection.agentId : "";
   const online = useNativeOnline(client);
   const list = useInfiniteQuery({
@@ -127,54 +135,83 @@ export function NativeSubagentPanel({
     list.error,
     list.fetchNextPage,
   ]);
-  const transcript = useQuery({
-    ...subagentTranscriptOptions(client, queries, threadId, agentId),
-    enabled: open && online && foreground && !!agentId,
-    refetchInterval: (query) => {
-      if (!open || !foreground || !query.state.data) return false;
-      const page = query.state.data;
-      if (page.offset + page.messages.length < page.total) return 100;
-      return page.agent.state === "running" ? 1000 : false;
+  const targetStream = useMemo<DisplayStreamTarget>(
+    () => ({ kind: "subagent", threadId, agentId }),
+    [threadId, agentId],
+  );
+  const store = useMemo(() => client.stream(targetStream), [client, targetStream]);
+  useEffect(() => {
+    if (!open || !foreground || !agentId) return;
+    return client.observeStream(targetStream);
+  }, [client, targetStream, open, foreground, agentId]);
+  const slotIds = useSlotIds(store);
+  const slot = useSlot(store, slotIds.at(-1));
+  const subscribe = useCallback(
+    (listener: () => void) => {
+      const stopStore = store.subscribe(listener);
+      const stopClient = client.subscribe((event) => {
+        if (event.kind === "removed" || event.kind === "connection") listener();
+      });
+      return () => {
+        stopStore();
+        stopClient();
+      };
     },
-  });
-  const page = transcript.data;
-  const history = useInfiniteQuery({
-    ...subagentHistoryOptions(client, threadId, agentId, page?.nextBefore),
-    enabled: false,
-  });
-  const selected = page?.agent ?? target;
-  const messages = useMemo(() => {
-    const entries = [
-      ...(history.data?.pages.toReversed().flatMap((page) => page.messages) ?? []),
-      ...(page?.messages ?? []),
-    ];
-    return [...new Map(entries.map((message) => [message.id, message])).values()];
-  }, [history.data, page?.messages]);
-  const loading = resolving || (agentId ? transcript.isPending : list.isPending);
+    [client, store],
+  );
+  const getError = useCallback(() => client.streamError(targetStream), [client, targetStream]);
+  const streamError = useSyncExternalStore(subscribe, getError, getError);
+  const checkpoint = useCallback(() => !!store.checkpoint, [store]);
+  const ready = useSyncExternalStore(subscribe, checkpoint, checkpoint);
+  const turn = slot?.kind === "ready" ? slot : undefined;
+  const selected = streamAgentSummary(target, turn);
+  const loading = resolving || (agentId ? !ready && !streamError : list.isPending);
   const missing =
     targetId && !target && !resolving ? "Subagent is no longer available." : undefined;
-  const error =
-    list.error?.message ?? transcript.error?.message ?? history.error?.message ?? missing;
-  const moreHistory = history.data ? history.hasNextPage : page?.nextBefore !== undefined;
+  const error = list.error?.message ?? streamError ?? missing;
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const moreHistory = !!turn?.partsCursor;
+  const loadHistory = () => {
+    if (!turn || loadingHistory) return;
+    setLoadingHistory(true);
+    void client
+      .loadStreamTurnPage(targetStream, turn.slotId)
+      .finally(() => setLoadingHistory(false));
+  };
   const actions = panels.getState();
   return (
     <SubagentPanelView
       embedded={embedded}
       items={items}
       selected={selected}
-      messages={messages}
+      messages={turn?.messages}
+      streamedTurn={turn}
+      resourceUrl={resourceUrl}
+      streamTarget={targetStream}
       loading={loading}
       error={error}
-      unavailable={page?.unavailable}
       onSelect={(id) => actions.select(threadId, id)}
       onBack={actions.back}
       hasMore={agentId ? moreHistory : list.hasNextPage}
-      loadingMore={agentId ? history.isFetchingNextPage : list.isFetchingNextPage}
+      loadingMore={agentId ? loadingHistory : list.isFetchingNextPage}
       onMore={() => {
-        void (agentId ? history.fetchNextPage() : list.fetchNextPage());
+        if (agentId) loadHistory();
+        else void list.fetchNextPage();
       }}
     />
   );
+}
+
+function streamAgentSummary(agent: SubagentSummary | undefined, turn: ReadyTurnSlot | undefined) {
+  if (!agent || !turn) return agent;
+  const state = turn.state === "pending" || !turn.state ? "running" : turn.state;
+  const titles = {
+    complete: "Completed",
+    failed: "Failed",
+    canceled: "Canceled",
+    running: agent.title,
+  };
+  return { ...agent, state, title: titles[state] };
 }
 
 export function SubagentPanelView({
@@ -182,6 +219,9 @@ export function SubagentPanelView({
   items,
   selected,
   messages = [],
+  streamedTurn,
+  streamTarget,
+  resourceUrl = transcriptServices.resourceUrl,
   loading,
   error,
   unavailable,
@@ -195,6 +235,9 @@ export function SubagentPanelView({
   items: readonly SubagentSummary[];
   selected?: SubagentSummary;
   messages?: readonly DisplayMessage[];
+  streamedTurn?: ReadyTurnSlot;
+  streamTarget?: DisplayStreamTarget;
+  resourceUrl?: MessageServices["resourceUrl"];
   loading?: boolean;
   error?: string;
   unavailable?: boolean;
@@ -204,6 +247,7 @@ export function SubagentPanelView({
   loadingMore?: boolean;
   onMore?: () => void;
 }) {
+  const services = useMemo(() => ({ ...transcriptServices, resourceUrl }), [resourceUrl]);
   const identity = useContext(MessageIdentityContext);
   const transcriptIdentity = useMemo(
     () => ({
@@ -218,6 +262,7 @@ export function SubagentPanelView({
     [identity, selected?.profile],
   );
   const turn = useMemo<ReadyTurnSlot | undefined>(() => {
+    if (streamedTurn) return streamedTurn;
     if (!selected) return undefined;
     // The transcript splits long prompts into consecutive user messages.
     const firstResponse = messages.findIndex((message) => message.role !== "user");
@@ -247,12 +292,13 @@ export function SubagentPanelView({
           : message,
       ),
     };
-  }, [selected, messages]);
-  const more = hasMore ? (
-    <Button variant="ghost" disabled={loadingMore} onClick={onMore}>
-      {selected ? "Load older messages" : "Load more agents"}
-    </Button>
-  ) : null;
+  }, [selected, messages, streamedTurn]);
+  const more =
+    hasMore && !streamedTurn ? (
+      <Button variant="ghost" disabled={loadingMore} onClick={onMore}>
+        {selected ? "Load older messages" : "Load more agents"}
+      </Button>
+    ) : null;
   return (
     <aside
       className="subagent-panel flex flex-col min-w-0 h-full bg-sidebar text-sidebar-foreground"
@@ -307,19 +353,21 @@ export function SubagentPanelView({
                 Waiting for the first message…
               </p>
             ) : null}
-            <MessageIdentityContext value={transcriptIdentity}>
-              <MessageServicesContext value={transcriptServices}>
-                {turn && messages.length > 0 ? (
-                  <Turn
-                    key={turn.turnId}
-                    slot={turn}
-                    animateArrivals={false}
-                    onRewind={ignoreTurnAction}
-                    onLoadMore={ignoreTurnAction}
-                  />
-                ) : null}
-              </MessageServicesContext>
-            </MessageIdentityContext>
+            <DisplayStreamContext value={streamTarget}>
+              <MessageIdentityContext value={transcriptIdentity}>
+                <MessageServicesContext value={services}>
+                  {turn && messages.length > 0 ? (
+                    <Turn
+                      key={turn.turnId}
+                      slot={turn}
+                      animateArrivals={false}
+                      onRewind={ignoreTurnAction}
+                      onLoadMore={onMore ?? ignoreTurnAction}
+                    />
+                  ) : null}
+                </MessageServicesContext>
+              </MessageIdentityContext>
+            </DisplayStreamContext>
           </div>
         </div>
       ) : (

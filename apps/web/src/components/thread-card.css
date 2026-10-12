@@ -77,6 +77,12 @@
     opacity: 1;
     pointer-events: auto;
   }
+  /* Touch rows show actions inline; a running thread shows its status there instead. */
+  .thread-card[data-state="working"]:not([data-settled]) .thread-settle-button,
+  .thread-card[data-state="working"]:not([data-settled])
+    .thread-card-actions:not(:has(> :not(.thread-settle-button))) {
+    display: none;
+  }
   .thread-card-actions .thread-settle-button {
     width: auto;
     gap: var(--ui-space-unit);

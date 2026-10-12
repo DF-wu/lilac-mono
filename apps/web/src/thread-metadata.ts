@@ -26,3 +26,12 @@ export function relativeThreadTime(updatedAt: number, now: number): string {
     ...(date.getFullYear() === new Date(now).getFullYear() ? {} : { year: "numeric" }),
   });
 }
+
+export function workingDuration(since: number, now: number): string {
+  const seconds = Math.floor(Math.max(0, now - since) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h${minutes % 60 ? ` ${minutes % 60}m` : ""}`;
+}

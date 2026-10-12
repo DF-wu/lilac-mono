@@ -1,5 +1,5 @@
 import { createContext, useContext } from "react";
-import type { DisplayPart } from "@stanley2058/lilac-client-protocol";
+import type { DisplayPart, DisplayStreamTarget } from "@stanley2058/lilac-client-protocol";
 import type { AppProps } from "../types";
 
 export type MessageServices = Pick<AppProps, "resourceUrl"> & {
@@ -14,6 +14,7 @@ export type MessageServices = Pick<AppProps, "resourceUrl"> & {
   onReaction: (messageId: string, emoji: string, active: boolean) => void;
 };
 export const MessageServicesContext = createContext<MessageServices | undefined>(undefined);
+export const DisplayStreamContext = createContext<DisplayStreamTarget | undefined>(undefined);
 export function useMessageServices() {
   return useContext(MessageServicesContext)!;
 }

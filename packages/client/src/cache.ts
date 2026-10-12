@@ -72,7 +72,10 @@ export class MemoryNativeCache implements NativeCache {
   }
 
   async remove(scope: CacheScope, threadId: string): Promise<void> {
-    this.scopes.get(cacheScopeKey(scope))?.delete(threadId);
+    const threads = this.scopes.get(cacheScopeKey(scope));
+    for (const key of threads?.keys() ?? []) {
+      if (key === threadId || key.startsWith(`subagent:${threadId}:`)) threads?.delete(key);
+    }
   }
 
   async purge(scope: CacheScope): Promise<void> {

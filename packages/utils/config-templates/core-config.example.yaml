@@ -157,6 +157,8 @@ conversation:
       enabled: false
       # Provider/model ref or models.def alias for an AI SDK embedding model.
       model: openai/text-embedding-3-small
+      # Optional query encoder; must share the document model's vector space and dimensions.
+      # queryModel: openai-compatible/voyage-4-nano-query
     autoInject:
       # Enable automatic injection of related thread title metadata before answers
       # to long, meaningful user messages.
@@ -231,6 +233,11 @@ conversation:
         relevanceMinProbability: 0.1
 
 surface:
+  # Status phrases rotated while a request is running. Native web shows them in place of
+  # "Working" and their past tense in place of "Worked".
+  # Defaults live in packages/utils/working-indicators.ts.
+  # workingIndicators: []
+
   native:
     # Startup listener/auth/identity settings require restart: enabled, host, port,
     # publicUrl, installationId, allowedOrigins, auth and auth environment secrets.
@@ -363,7 +370,7 @@ surface:
 
     # Streaming embed title phrases for in-progress updates.
     # A random entry is selected and rotated periodically while the request is running.
-    # Defaults live in packages/utils/working-indicators.ts.
+    # Overrides surface.workingIndicators for Discord only.
     # workingIndicators: []
 
     # Discord-only markdown output features.

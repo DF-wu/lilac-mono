@@ -780,6 +780,7 @@ function coreConfigV1ToUniversal(
     },
     surface: {
       ...parsed.surface,
+      workingIndicators: cloneDefaultWorkingIndicators(),
       native: defaultNativeSurfaceConfig(),
       discord: {
         ...discordRest,

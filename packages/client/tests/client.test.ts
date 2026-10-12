@@ -6,6 +6,8 @@ import {
   nativeContract,
   type BootstrapReply,
   type NativeInput,
+  type NativeRpcInputs,
+  type ThreadEvent,
 } from "@stanley2058/lilac-client-protocol";
 import { NativeClient, type ClientEvent } from "../src/client.ts";
 import { MemoryNativeCache, type CacheScope } from "../src/cache.ts";
@@ -53,6 +55,10 @@ afterEach(async () => {
 
 function harness(
   options: {
+    streamWatch?: (
+      input: NativeRpcInputs["streams"]["watch"],
+      signal?: AbortSignal,
+    ) => AsyncGenerator<ThreadEvent>;
     delayedSubmit?: Promise<void>;
     prepareConnection?: (request: { fresh: boolean }) => Promise<void>;
     getCatalog?: (signal?: AbortSignal) => Promise<void>;
@@ -69,12 +75,19 @@ function harness(
   const watching = Promise.withResolvers<void>();
   const submitting = Promise.withResolvers<void>();
   const fetchingCatalog = Promise.withResolvers<void>();
-  const watch = implement(nativeContract.threads.watch).handler(async function* ({
+  const watch = implement(nativeContract.streams.watch).handler(async function* ({
     input,
     signal,
   }) {
-    watches.push(input);
+    watches.push({
+      threadId: input.target.threadId,
+      ...(input.checkpoint ? { checkpoint: input.checkpoint } : {}),
+    });
     watching.resolve();
+    if (options.streamWatch && input.target.kind === "subagent") {
+      yield* options.streamWatch(input, signal);
+      return;
+    }
     yield { kind: "replay" as const, reply: { kind: "unchanged" as const, checkpoint } };
     await new Promise<void>((resolve) => {
       if (signal?.aborted) return resolve();
@@ -109,7 +122,7 @@ function harness(
   );
   const handler = new RPCHandler({
     connection: { reauthenticate },
-    threads: { watch },
+    streams: { watch },
     bootstrap: { watch: catalog },
     inputs: { submit },
     catalogs: { get: getCatalog },
@@ -769,4 +782,67 @@ test("a send waiting on a replaced socket settles as uncertain", async () => {
   await state.submitting;
   state.client.reconnect();
   expect(await sending).toEqual({ kind: "uncertain", commandId: input.commandId });
+});
+
+test("a child shares the client store and reconnects from its checkpoint while the parent stays selected", async () => {
+  const childCheckpoint = { ...checkpoint, cursor: "child_checkpoint" };
+  const childInputs: NativeRpcInputs["streams"]["watch"][] = [];
+  const reattached = Promise.withResolvers<void>();
+  const h = harness({
+    streamWatch: async function* (input, signal) {
+      childInputs.push(input);
+      if (childInputs.length === 2) reattached.resolve();
+      yield {
+        kind: "replay",
+        reply: input.checkpoint
+          ? { kind: "unchanged", checkpoint: childCheckpoint }
+          : {
+              kind: "window",
+              checkpoint: childCheckpoint,
+              slots: [
+                {
+                  kind: "ready",
+                  slotId: "child_slot",
+                  turnId: "child_turn",
+                  position: 0,
+                  state: "complete",
+                  messages: [
+                    {
+                      id: "child_answer",
+                      role: "assistant",
+                      metadata: { phase: "final" },
+                      parts: [{ type: "text", text: "Child answer" }],
+                    },
+                  ],
+                },
+              ],
+            },
+      };
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) return resolve();
+        signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+    },
+  });
+  await h.client.start("thread");
+  await h.watching;
+  const target = { kind: "subagent" as const, threadId: "thread", agentId: "wfrun:child" };
+  const child = h.client.stream(target);
+  const loaded = Promise.withResolvers<void>();
+  const stop = child.subscribe(() => {
+    if (child.checkpoint) loaded.resolve();
+  });
+  const unobserve = h.client.observeStream(target);
+  await loaded.promise;
+  stop();
+  expect(child.at(0)).toMatchObject({ state: "complete" });
+  expect(h.client.thread("thread").get("slot")).toBeDefined();
+  h.client.reconnect();
+  await reattached.promise;
+  expect(childInputs[1]?.checkpoint).toEqual(childCheckpoint);
+  expect(h.client.stream(target)).toBe(child);
+  await h.client.revoke("thread");
+  expect(child.size).toBe(0);
+  expect(await h.cache.read(scope, "subagent:thread:wfrun:child")).toBeUndefined();
+  unobserve();
 });

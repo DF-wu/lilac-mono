@@ -79,10 +79,18 @@ made with this token emit events. No workflow in the fork or upstream trees runs
 on pushes to `automation/sync-upstream`; a fast-forward of an open PR can start
 its normal `pull_request` CI, which GitHub skips while the PR has merge conflicts.
 
-Required access is limited to `DF-wu/lilac-mono`: a fine-grained personal
-access token with **Contents: Read and write** and **Workflows: Read and write**,
-or a classic token with `repo` and `workflow` scopes. Prefer the fine-grained
-token and an expiry. To rotate, run
+The workflow needs access only to `DF-wu/lilac-mono`. Prefer a fine-grained
+personal access token with **Repository access** set to **Only select
+repositories**, selecting `DF-wu/lilac-mono`, and **Contents: Read and write**
+and **Workflows: Read and write** permissions. Set an expiry.
+
+A classic token with `repo` and `workflow` scopes also works, but cannot be
+restricted to this repository: it can access other repositories available to
+its owner under those scopes. Storing it as this repository's Actions Secret
+does not narrow the token's permissions. See
+[GitHub's personal access token documentation](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-personal-access-token-classic).
+
+To rotate, run
 `gh secret set SYNC_UPSTREAM_TOKEN -R DF-wu/lilac-mono`. If the secret is missing
 or expired, a conflict run that needs to create or advance the branch fails at
 the ref write before Claude starts.

@@ -126,6 +126,21 @@ claiming the earlier latency or size for a newer build.
 
 ## Reproducing checks
 
+Shared native agent streams were verified on 2026-10-12. Socket regressions cover common thread/child
+replay schemas, resumed checkpoints, completed history, nested ancestry, cancellation before output,
+discarded-child late events, and preservation of an earlier child during a later parent rewind.
+The attachment regression uses the real tool server to construct an internal delegated context with
+`serverOwnedRequest: false`, and verifies native resource publication and retained HTML previews.
+Client and IndexedDB tests cover reconnecting a child while its parent remains selected and purging
+child caches across cache instances and principal scopes.
+
+The synthetic subagent browser fixture verified reasoning titles, formatted commands, completion,
+history after reload, and the retained HTML preview in the production panel. Existing activity DOM
+elements stayed mounted during a streamed update, and the transcript scroll position stayed at its
+previous position. The completed panel also passed a 390-pixel layout check without horizontal overflow.
+Both standards and spec reviews reported no blockers after fixes. `bun run check` and
+`bun run build:web` passed against the final code.
+
 Use the root scripts `bun run check`, `bun run build:web`, and
 `bun run test:installer`. The test graph includes Core, protocol/client, web, terminal, persistence
 codecs and architecture checks. Full repository checks are repeated before implementation commits.
