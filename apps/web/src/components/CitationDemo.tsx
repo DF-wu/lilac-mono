@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { NativeThreadStore } from "@stanley2058/lilac-client";
+import { serializeCitation } from "@stanley2058/lilac-client-protocol";
 import { Timeline } from "./Timeline";
 import { Composer } from "./Composer";
 
@@ -31,6 +32,36 @@ export function CitationDemo() {
                 {
                   type: "text",
                   text: 'Select part of this reply and __Cite__ it, or copy it as Markdown.\n\nCopy keeps __original delimiters__, escaped \\*stars\\*, &amp;, and [reference links][demo].\n\n> A quote across\n> two lines.\n\n- Keep the quote and your comment together.\n- Follow [the source](https://example.com).\n\n| Surface | Output |\n| :------ | -----: |\n| Web | **Rich** |\n\n```ts\nconst reply = { quoted: true };\n```\n\n[demo]: https://example.com "Source"',
+                },
+              ],
+            },
+          ],
+        },
+        {
+          kind: "ready",
+          slotId: "citation-demo-follow-up",
+          turnId: "citation-demo-follow-up",
+          position: 1,
+          state: "complete",
+          messages: [
+            {
+              id: "citation-demo-follow-up",
+              role: "user",
+              metadata: { authorId: "demo_user" },
+              parts: [
+                {
+                  type: "text",
+                  text: `${serializeCitation({
+                    version: 1,
+                    threadId: "citation-demo",
+                    messageId: "citation-demo-message",
+                    text: "Keep the quote and your comment together.",
+                    start: 0,
+                    end: 41,
+                    prefix: "",
+                    suffix: "",
+                    comment: "Show both in the sent message.",
+                  })} How does this look after sending?`,
                 },
               ],
             },

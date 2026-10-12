@@ -15,8 +15,9 @@ export function AssistantSelectionToolbar({
   threadId: string;
 }) {
   const [selection, setSelection] = useState<ReturnType<typeof captureAssistantSelection>>();
-  const [point, setPoint] = useState<{ x: number; y: number }>();
+  const [point, setPoint] = useState<{ x: number; top: number; bottom: number }>();
   const button = useRef<HTMLButtonElement>(null);
+  const toolbar = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!viewport) return;
     let dragging = false;
@@ -28,7 +29,7 @@ export function AssistantSelectionToolbar({
       dismissed = true;
       clear();
     };
-    const capture = (pointer?: { x: number; y: number }) => {
+    const capture = () => {
       const captured = captureAssistantSelection(viewport, document.getSelection());
       if (!captured || captured.anchor.source.dataset.citationThread !== threadId) {
         clear();
@@ -40,13 +41,15 @@ export function AssistantSelectionToolbar({
         clear();
         return;
       }
-      setPoint(
-        pointer ?? { x: captured.anchor.backwards ? rect.left : rect.right, y: rect.bottom + 4 },
-      );
+      setPoint({
+        x: captured.anchor.backwards ? rect.left : rect.right,
+        top: Math.max(rect.top, bounds.top),
+        bottom: Math.min(rect.bottom, bounds.bottom),
+      });
       setSelection(captured);
     };
     const down = (event: PointerEvent) => {
-      if (button.current?.contains(event.target instanceof Node ? event.target : null)) return;
+      if (toolbar.current?.contains(event.target instanceof Node ? event.target : null)) return;
       const target = event.target instanceof Element ? event.target : undefined;
       dragging =
         event.button === 0 &&
@@ -64,7 +67,7 @@ export function AssistantSelectionToolbar({
       multiClick = setTimeout(
         () => {
           multiClick = undefined;
-          capture({ x: event.clientX, y: event.clientY });
+          capture();
         },
         event.detail > 1 ? 500 : 0,
       );
@@ -113,44 +116,53 @@ export function AssistantSelectionToolbar({
     };
   }, [viewport, threadId]);
   useLayoutEffect(() => {
-    if (!button.current || !point) return;
-    const rect = button.current.getBoundingClientRect();
-    button.current.style.left = `${Math.max(8, Math.min(point.x, innerWidth - rect.width - 8))}px`;
-    button.current.style.top = `${Math.max(8, Math.min(point.y, innerHeight - rect.height - 8))}px`;
+    const element = toolbar.current;
+    if (!element || !point) return;
+    const rect = element.getBoundingClientRect();
+    const above = point.top - rect.height - 6;
+    const fitsAbove = above >= 8;
+    const top = fitsAbove ? above : point.bottom + 6;
+    const left = point.x - rect.width / 2;
+    element.style.left = `${Math.max(8, Math.min(left, innerWidth - rect.width - 8))}px`;
+    element.style.top = `${Math.max(8, Math.min(top, innerHeight - rect.height - 8))}px`;
+    element.dataset.side = fitsAbove ? "top" : "bottom";
   }, [point, selection]);
   if (!selection || !point) return null;
   const tooLong = selection.selector.text.length > CITATION_TEXT_LIMIT;
   return createPortal(
-    <Button
-      ref={button}
-      size="sm"
-      variant="secondary"
-      className="fixed z-50 shadow-md"
-      data-ui="cite-selection"
-      style={{ left: point.x, top: point.y }}
-      disabled={tooLong}
-      aria-label={tooLong ? "Selection is too long to cite" : "Cite selection"}
+    <div
+      ref={toolbar}
+      className="fixed z-50 flex rounded-lg bg-popover p-0.5 text-popover-foreground shadow-md ring-1 ring-border motion-safe:animate-in motion-safe:fade-in-0 motion-safe:zoom-in-95 data-[side=bottom]:motion-safe:slide-in-from-top-1 data-[side=top]:motion-safe:slide-in-from-bottom-1"
+      style={{ left: point.x, top: point.top }}
       onPointerDown={(event) => event.preventDefault()}
-      onClick={() => {
-        const cite = citationStore.getState().composers.get(threadId);
-        const messageId = selection.anchor.source.dataset.citationSource;
-        if (
-          !messageId ||
-          !cite?.({ version: 1, threadId, messageId, ...selection.selector }, selection.anchor)
-        ) {
-          toast.add({
-            title: "The composer is unavailable or the quote is too long.",
-            type: "error",
-          });
-          return;
-        }
-        document.getSelection()?.removeAllRanges();
-        setSelection(undefined);
-      }}
     >
-      <Quote />
-      {tooLong ? "Shorten selection" : "Cite"}
-    </Button>,
+      <Button
+        ref={button}
+        size="sm"
+        variant="ghost"
+        data-ui="cite-selection"
+        disabled={tooLong}
+        onClick={() => {
+          const cite = citationStore.getState().composers.get(threadId);
+          const messageId = selection.anchor.source.dataset.citationSource;
+          if (
+            !messageId ||
+            !cite?.({ version: 1, threadId, messageId, ...selection.selector }, selection.anchor)
+          ) {
+            toast.add({
+              title: "The composer is unavailable or the quote is too long.",
+              type: "error",
+            });
+            return;
+          }
+          document.getSelection()?.removeAllRanges();
+          setSelection(undefined);
+        }}
+      >
+        <Quote />
+        {tooLong ? "Selection too long to cite" : "Cite"}
+      </Button>
+    </div>,
     document.body,
   );
 }

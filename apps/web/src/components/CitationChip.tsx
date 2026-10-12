@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState, type MouseEvent } from "react";
-import { Pencil, Quote, ArrowUpRight } from "lucide-react";
+import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { ArrowUpRight, MessageSquareText, Quote } from "lucide-react";
 import {
   citationHref,
   citationLabel,
@@ -10,17 +10,18 @@ import {
 import {
   highlightCitation,
   resolveCitationRange,
-  selectionEndRect,
   type CitationAnchor,
 } from "../assistant-selection";
 import { revealCitation } from "../citation-store";
 import { Button } from "./ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { Textarea } from "./ui/textarea";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
 export type CitationEditing = {
   open: boolean;
   anchor?: CitationAnchor;
+  discardOnCancel?: boolean;
   onOpen: (open: boolean) => void;
   onSave: (comment: string) => boolean;
   onCancel: () => void;
@@ -39,6 +40,13 @@ function sourceAnchor(citation: AssistantCitation): CitationAnchor | undefined {
   return range ? { source, range, backwards: false } : undefined;
 }
 
+const chip = (
+  <Button
+    variant="reference"
+    className="h-auto max-w-full gap-1 rounded-sm px-2 [font-weight:inherit] aria-expanded:bg-surface-raised [&_svg:not([class*='size-'])]:size-[1em]"
+  />
+);
+
 export function CitationChip({
   citation,
   editing,
@@ -47,7 +55,6 @@ export function CitationChip({
   editing?: CitationEditing;
 }) {
   const [preview, setPreview] = useState(false);
-  const [anchor, setAnchor] = useState<CitationAnchor>();
   const draftComment = useRef<string | undefined>(undefined);
   const label = citationLabel(citation);
   const href = `/threads/${encodeURIComponent(citation.threadId)}#${new URLSearchParams({ citation: citationHref(citation) })}`;
@@ -61,26 +68,20 @@ export function CitationChip({
       event.preventDefault();
       revealCitation(citation);
       setPreview(false);
+      editing?.onOpen(false);
     }
   };
   useEffect(() => {
-    if (!editing?.open) {
-      setAnchor(undefined);
-      return;
-    }
+    if (!editing?.open) return;
     const current = editing.anchor ?? sourceAnchor(citation);
     if (!current) return;
-    setAnchor(current);
     let release = highlightCitation(current.range, "lilac-citation-comment");
     const update = () => {
       release();
       const range = current.source.isConnected
         ? resolveCitationRange(current.source, citation)
         : undefined;
-      if (!range) {
-        setAnchor(undefined);
-        return;
-      }
+      if (!range) return;
       current.range = range;
       release = highlightCitation(range, "lilac-citation-comment");
     };
@@ -93,133 +94,132 @@ export function CitationChip({
       release();
     };
   }, [editing?.open, editing?.anchor, citation]);
-  const virtualAnchor = anchor
-    ? {
-        contextElement: anchor.source,
-        getBoundingClientRect: () => {
-          const rect = selectionEndRect(anchor);
-          return new DOMRect(anchor.backwards ? rect.left : rect.right, rect.top, 0, rect.height);
-        },
-      }
-    : undefined;
-  const link = (
-    <a
-      href={href}
-      onClick={goToSource}
-      className="inline-flex min-w-0 items-center gap-1 text-inherit no-underline"
-      aria-label={`View cited text: ${label}`}
-    >
-      <Quote className="size-3.5 shrink-0" />
-      <span className="max-w-64 truncate">{label}</span>
-    </a>
+  const content = (
+    <>
+      <Quote aria-hidden="true" />
+      <span className="max-w-56 truncate">{label}</span>
+      {citation.comment ? <MessageSquareText aria-label="Has comment" /> : null}
+    </>
+  );
+  const goToSourceButton = (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            nativeButton={false}
+            variant="ghost"
+            size="icon-xs"
+            className="-my-0.5 -mr-1 shrink-0 text-muted-foreground"
+            aria-label="Go to source"
+            render={<a href={href} onClick={goToSource} />}
+          />
+        }
+      >
+        <ArrowUpRight className="size-3.5" />
+      </TooltipTrigger>
+      <TooltipContent>Go to source</TooltipContent>
+    </Tooltip>
   );
   if (editing)
     return (
-      <span
-        data-ui="citation-chip"
-        className="inline-flex max-w-full items-center gap-1 rounded-sm bg-selection px-1 text-sm text-selection-foreground align-baseline"
-      >
-        {link}
-        <Popover
-          open={editing.open}
-          onOpenChange={(open, details) => {
-            if (!open && details.reason === "escape-key") {
-              editing.onCancel();
+      <Popover
+        open={editing.open}
+        onOpenChange={(open, details) => {
+          if (!open && details.reason === "escape-key") {
+            editing.onCancel();
+            return;
+          }
+          if (
+            !open &&
+            draftComment.current !== undefined &&
+            draftComment.current.trim() !== (citation.comment ?? "").trim()
+          ) {
+            if (
+              draftComment.current.length > CITATION_COMMENT_LIMIT ||
+              !editing.onSave(draftComment.current)
+            ) {
+              details.cancel();
               return;
             }
-            if (
-              !open &&
-              draftComment.current !== undefined &&
-              draftComment.current.trim() !== (citation.comment ?? "").trim()
-            ) {
-              if (
-                draftComment.current.length > CITATION_COMMENT_LIMIT ||
-                !editing.onSave(draftComment.current)
-              ) {
-                details.cancel();
-                return;
-              }
-            }
-            draftComment.current = undefined;
-            editing.onOpen(open);
+          }
+          draftComment.current = undefined;
+          editing.onOpen(open);
+        }}
+      >
+        <PopoverTrigger
+          data-ui="citation-chip"
+          render={chip}
+          aria-label={`${citation.comment ? "Edit" : "Add"} comment on quote: ${label}`}
+        >
+          {content}
+        </PopoverTrigger>
+        <PopoverContent
+          side="top"
+          align="start"
+          className="w-96 max-w-[calc(100vw-1rem)] p-2"
+          onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+          initialFocus={() =>
+            document.querySelector<HTMLTextAreaElement>(
+              '[data-ui="citation-comment-editor"] textarea',
+            )
+          }
+          finalFocus={() => {
+            const active = document.activeElement;
+            if (active === document.body || active?.closest('[data-slot="popover-content"]'))
+              editing.onRestoreFocus();
+            return false;
           }}
         >
-          <PopoverTrigger
-            render={
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-label={citation.comment ? "Edit citation comment" : "Add citation comment"}
-              />
-            }
-          >
-            <Pencil />
-          </PopoverTrigger>
-          <PopoverContent
-            anchor={virtualAnchor}
-            side={anchor ? "bottom" : "top"}
-            align="end"
-            className="w-80 max-w-[calc(100vw-1rem)] p-3"
-            onClick={(event) => event.stopPropagation()}
-            onKeyDown={(event) => event.stopPropagation()}
-            initialFocus={() =>
-              document.querySelector<HTMLTextAreaElement>(
-                '[data-ui="citation-comment-editor"] textarea',
-              )
-            }
-            finalFocus={() => {
-              const active = document.activeElement;
-              if (active === document.body || active?.closest('[data-slot="popover-content"]'))
-                editing.onRestoreFocus();
-              return false;
+          <CitationComment
+            key={serializeCitation(citation)}
+            citation={citation}
+            editing={editing}
+            goToSource={goToSourceButton}
+            onDraft={(value) => {
+              draftComment.current = value;
             }}
-          >
-            <CitationComment
-              key={serializeCitation(citation)}
-              citation={citation}
-              editing={editing}
-              onDraft={(value) => {
-                draftComment.current = value;
-              }}
-            />
-          </PopoverContent>
-        </Popover>
-      </span>
+          />
+        </PopoverContent>
+      </Popover>
     );
   return (
     <Popover open={preview} onOpenChange={setPreview}>
-      <PopoverTrigger data-ui="citation-chip" render={<Button variant="reference" size="inline" />}>
-        <Quote />
-        <span className="max-w-64 truncate">{label}</span>
+      <PopoverTrigger data-ui="citation-chip" render={chip}>
+        {content}
       </PopoverTrigger>
-      <PopoverContent className="w-80 max-w-[calc(100vw-1rem)] p-3">
-        <blockquote className="max-h-48 overflow-auto border-l-2 border-border pl-3 whitespace-pre-wrap wrap-anywhere text-muted-foreground">
-          {citation.text}
-        </blockquote>
+      <PopoverContent align="start" className="w-96 max-w-[calc(100vw-1rem)] gap-2.5 p-3">
+        <CitationQuote text={citation.text}>{goToSourceButton}</CitationQuote>
         {citation.comment ? (
-          <p className="whitespace-pre-wrap wrap-anywhere">{citation.comment}</p>
+          <p className="max-h-48 overflow-auto whitespace-pre-wrap wrap-anywhere">
+            {citation.comment}
+          </p>
         ) : null}
-        <Button
-          nativeButton={false}
-          variant="secondary"
-          size="sm"
-          render={<a href={href} onClick={goToSource} />}
-        >
-          <ArrowUpRight />
-          Go to source
-        </Button>
       </PopoverContent>
     </Popover>
+  );
+}
+
+function CitationQuote({ text, children }: { text: string; children: ReactNode }) {
+  return (
+    <div className="flex items-start gap-2">
+      <blockquote className="max-h-48 min-w-0 flex-1 overflow-auto border-l-2 border-primary pl-2.5 whitespace-pre-wrap wrap-anywhere text-muted-foreground">
+        {text}
+      </blockquote>
+      {children}
+    </div>
   );
 }
 
 function CitationComment({
   citation,
   editing,
+  goToSource,
   onDraft,
 }: {
   citation: AssistantCitation;
   editing: CitationEditing;
+  goToSource: ReactNode;
   onDraft: (value: string) => void;
 }) {
   const [comment, setComment] = useState(citation.comment ?? "");
@@ -244,9 +244,10 @@ function CitationComment({
       }}
     >
       <Textarea
-        aria-label="Comment on selected text"
-        placeholder="Add an optional comment…"
-        rows={2}
+        aria-label="Comment on quote"
+        placeholder="Add an optional comment"
+        rows={3}
+        className="max-h-48 min-h-20 resize-none border-0 bg-transparent px-1.5 py-1 focus-visible:ring-0 aria-invalid:ring-0"
         value={comment}
         aria-invalid={tooLong || error || undefined}
         onChange={(event) => {
@@ -266,14 +267,14 @@ function CitationComment({
           }
         }}
       />
-      {tooLong || error ? (
-        <p role="status" className="text-xs text-destructive">
-          {tooLong ? "Shorten the comment." : "Shorten the quote, comment, or message."}
+      <div className="flex items-center gap-2 pl-1">
+        {goToSource}
+        <p role="status" className="mr-auto text-xs text-destructive">
+          {tooLong && "Shorten the comment."}
+          {!tooLong && error && "Shorten the quote, comment, or message."}
         </p>
-      ) : null}
-      <div className="flex justify-end gap-2">
-        <Button size="sm" variant="secondary" onClick={editing.onCancel}>
-          Cancel
+        <Button size="sm" variant="outline" onClick={editing.onCancel}>
+          {editing.discardOnCancel ? "Remove" : "Cancel"}
         </Button>
         <Button size="sm" disabled={tooLong} onClick={() => save()}>
           Save

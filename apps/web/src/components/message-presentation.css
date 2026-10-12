@@ -219,6 +219,5 @@
 }
 ::highlight(lilac-citation-comment),
 ::highlight(lilac-citation-source) {
-  background-color: var(--ui-selection);
-  color: var(--ui-selection-foreground);
+  background-color: color-mix(in srgb, var(--ui-primary) 32%, transparent);
 }

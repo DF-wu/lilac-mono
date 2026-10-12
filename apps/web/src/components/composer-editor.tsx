@@ -128,6 +128,7 @@ function CitationElement(props: NodeViewProps) {
         editing={{
           open: !!open,
           anchor: open?.anchor,
+          discardOnCancel: !!open?.fresh,
           onOpen: (opened) => context.setOpen(opened ? { key } : undefined),
           onSave: save,
           onSaveAndSend: (comment) => {
