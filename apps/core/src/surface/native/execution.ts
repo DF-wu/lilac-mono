@@ -1,4 +1,9 @@
 import { isDeepStrictEqual } from "node:util";
+import {
+  expandAssistantCitations,
+  collectCitations,
+  CITATION_INPUT_LIMIT,
+} from "@stanley2058/lilac-client-protocol";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import {
   EventPublishContractInvalid,
@@ -189,7 +194,12 @@ export function createNativeExecution(options: {
             Promise.resolve(options.expandReferences(thread.starterId, input.text)),
           )
         : input.text;
-      const body = skillText ? `${skillText}\n\n${expanded}` : expanded;
+      const cited = expandAssistantCitations(expanded);
+      if (collectCitations(input.text).length && cited.length > CITATION_INPUT_LIMIT)
+        return Result.err(
+          nativeFailure("invalid", "Quoted input is too long. Shorten the quote or comment."),
+        );
+      const body = skillText ? `${skillText}\n\n${cited}` : cited;
       const text = `${header}\n${escapeSurfaceMetadataTags(body)}`;
       const parts: Extract<StoredMessageV1, { role: "user" }>["content"] = [{ type: "text", text }];
       for (const attachmentId of input.attachmentIds) {

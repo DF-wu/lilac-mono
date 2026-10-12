@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { identitySchema, revisionSchema, runIdentitySchema } from "./replay.ts";
+import { citationInputFits } from "./assistant-citations.ts";
 
 export const catalogIdentifierSchema = z.string().min(1).max(512);
 
@@ -113,6 +114,9 @@ export const nativeInputSchema = z
     command: z
       .strictObject({ id: catalogIdentifierSchema, arguments: z.string().max(65_536) })
       .optional(),
+  })
+  .refine((input) => citationInputFits(input.text), {
+    message: "Quoted input is too long. Shorten the quote or comment.",
   })
   .refine(
     (input) =>

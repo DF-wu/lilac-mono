@@ -1,5 +1,17 @@
 # MIGRATIONS.md
 
+## Native assistant citations version 1
+
+Native message and draft text can contain `[Assistant quote](lilac-citation://v1/quote?...)`
+links. The query contains `thread`, `message`, `text`, `start`, `end`, `prefix`, `suffix`, and
+an optional `comment`. Selectors use whitespace-normalized rendered assistant text and UTF-16
+offsets. The quote and comment remain usable when the source is changed or removed.
+
+Core expands valid links into quoted model context for prompts, follow-ups, and steering.
+Display history and drafts retain their links. Both encoded and expanded input must fit the
+existing 65,536-character input limit. No database schema or RPC fields change. Older clients
+cannot render the chips, and older Core versions do not expand them. Update Core and web together.
+
 ## Sidebar working time
 
 Native thread summaries gain an optional `workingSince` field while a thread is working. Core reads it

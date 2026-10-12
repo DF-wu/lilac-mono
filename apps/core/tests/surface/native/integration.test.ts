@@ -13,6 +13,63 @@ import {
   nativeFixtureTextResponse,
 } from "./integration-fixture";
 import type { NativeStore } from "../../../src/surface/native/store";
+import { serializeCitation } from "@stanley2058/lilac-client-protocol";
+
+test.each(["prompt", "followup"] as const)(
+  "%s expands saved citations for the model while retaining the original display input",
+  async (mode) => {
+    const prompts: string[] = [];
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const fixture = await createNativeIntegrationFixture({
+      model: new MockLanguageModelV4({
+        modelId: "citation-fixture",
+        doStream: async ({ prompt }) => {
+          prompts.push(JSON.stringify(prompt));
+          if (mode === "followup" && prompts.length === 1) {
+            started.resolve();
+            await release.promise;
+          }
+          return nativeFixtureTextResponse("Quoted reply.");
+        },
+      }),
+    });
+    try {
+      const { client } = fixture.connect();
+      const thread = await client.threads.create({
+        commandId: crypto.randomUUID(),
+        title: "Citations",
+      });
+      if (mode === "followup") {
+        await client.inputs.submit(nativePrompt(thread.id, "Begin"));
+        await started.promise;
+      }
+      const link = serializeCitation({
+        version: 1,
+        threadId: thread.id,
+        messageId: "removed-response",
+        text: "The original saved claim.",
+        comment: "Explain this claim.",
+        start: 0,
+        end: 25,
+        prefix: "",
+        suffix: "",
+      });
+      const receipt = await client.inputs.submit(nativePrompt(thread.id, link, mode));
+      release.resolve();
+      await completed(fixture.store, receipt.inputId);
+      expect(prompts).toHaveLength(mode === "prompt" ? 1 : 2);
+      expect(prompts.at(-1)).toContain("The original saved claim.");
+      expect(prompts.at(-1)).toContain("Explain this claim.");
+      expect(prompts.at(-1)).toContain("assistant_citations");
+      expect(prompts.at(-1)).not.toContain("lilac-citation:");
+      expect(fixture.store.getInput(receipt.inputId).unwrap().text).toBe(link);
+    } finally {
+      release.resolve();
+      await fixture.close();
+    }
+  },
+);
 
 function waitForStore(store: NativeStore, predicate: () => boolean): Promise<void> {
   if (predicate()) return Promise.resolve();
