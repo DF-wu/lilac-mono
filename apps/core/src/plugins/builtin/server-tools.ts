@@ -1,4 +1,5 @@
 import { ToolPluginSkipError, type ServerTool } from "@stanley2058/lilac-plugin-runtime";
+import { getCoreConfig } from "@stanley2058/lilac-utils";
 
 import {
   Attachment,
@@ -116,7 +117,18 @@ export function createBuiltinCodexPlugin(): CoreToolPlugin {
 }
 
 export function createBuiltinGeneratePlugin(): CoreToolPlugin {
-  return singletonLevel2("generate", () => new Generate());
+  return {
+    meta: {
+      id: "generate",
+    },
+    create({ runtime }) {
+      const config = runtime.config;
+      const getConfig = runtime.getConfig ?? (config ? async () => config : () => getCoreConfig());
+      return {
+        level2: [new Generate({ getConfig })],
+      };
+    },
+  };
 }
 
 export function createBuiltinContentInspectPlugin(): CoreToolPlugin {

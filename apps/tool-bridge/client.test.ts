@@ -258,6 +258,7 @@ describe("tool-bridge CLI runtime", () => {
           LILAC_REQUEST_ID: "request-123",
           LILAC_REQUEST_DELIVERY_ID: "delivery-234",
           LILAC_SESSION_ID: "session-456",
+          LILAC_ORIGIN_SESSION_ID: "origin-session-789",
           LILAC_REQUEST_CLIENT: "test-client",
           LILAC_CWD: "/stale/workspace/project",
         },
@@ -278,6 +279,7 @@ describe("tool-bridge CLI runtime", () => {
       expect(request.headers.get("x-lilac-request-id")).toBe("request-123");
       expect(request.headers.get("x-lilac-request-delivery-id")).toBe("delivery-234");
       expect(request.headers.get("x-lilac-session-id")).toBe("session-456");
+      expect(request.headers.get("x-lilac-origin-session-id")).toBe("origin-session-789");
       expect(request.headers.get("x-lilac-request-client")).toBe("test-client");
       expect(request.headers.get("x-lilac-cwd")).toBe(invocationCwd);
       expect(request.body).toEqual({

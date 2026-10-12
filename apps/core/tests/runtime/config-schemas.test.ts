@@ -34,6 +34,37 @@ test("Core schemas accept both versions, friendly units, and legacy web inputs",
     { configVersion: 2, tools: { web: { firecrawl: { queueTtl: "2s" } } } },
     { configVersion: 2, tools: { web: { search: { provider: "exa" } } } },
     { configVersion: 1, tools: { web: { extract: { provider: "exa" } } } },
+    {
+      configVersion: 2,
+      surface: {
+        telegram: {
+          enabled: true,
+          allowedChatIds: ["-100123"],
+          inboundMedia: { enabled: true, maxBytesPerRequest: "4MiB" },
+        },
+      },
+    },
+    {
+      configVersion: 2,
+      tools: {
+        generate: {
+          image: {
+            provider: "openai-compatible",
+            models: ["nanobanana-2"],
+            routes: { "nanobanana-2": "openai/gpt-image-2" },
+          },
+        },
+      },
+    },
+    {
+      configVersion: 2,
+      tools: {
+        web: {
+          extract: { providers: ["openai"] },
+          openai: { model: "openai/gpt-5-mini", searchContextSize: "high" },
+        },
+      },
+    },
     { configVersion: 2, plugins: { config: { test: { arbitrary: [1, true, null] } } } },
   ];
   for (const input of cases) {
@@ -58,6 +89,8 @@ test("Core editor diagnostics reject wrong versions, fields, types, and units", 
     { configVersion: "2" },
     { configVersion: null },
     { configVersion: 2, typo: true },
+    { configVersion: 2, tools: { generate: { image: { openaiCompatible: null } } } },
+    { configVersion: 2, tools: { generate: { image: { openaiCompatible: {} } } } },
     { tools: { output: { artifactTtl: "3h" } } },
     { configVersion: 2, tools: { output: { artifactTtl: true } } },
     { configVersion: 2, tools: { output: { artifactTtl: "3MB" } } },

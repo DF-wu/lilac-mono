@@ -14,12 +14,14 @@ import {
   modelCapabilityLimitPatchSchema,
   modelCapabilityModalitiesPatchSchema,
   migrateWebConfigValue,
+  migrateWebExtractConfigValue,
   routerSchema,
   statsForNerdsSchema,
-  webExtractConfigValueSchema,
   webFetchModeSchema,
 } from "./v1";
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
+import { defaultGenerateToolsConfig, generateToolsSchema } from "./generate-image";
+import { cloneDefaultTelegramSurface, telegramSurfaceSchema } from "./telegram-surface";
 import { defaultNativeSurfaceConfig, MODEL_REASONING_EFFORTS } from "./types";
 
 import type {
@@ -396,11 +398,25 @@ const discordSurfaceSchema = z
 const byteSizeSchema = z.preprocess(parseFriendlyByteSize, z.number().int().positive());
 const durationMsSchema = z.preprocess(parseFriendlyDurationMs, z.number().int().positive());
 
+// v2 accepts `openai` (OpenAI Responses `web_search`) as a search-only provider;
+// the frozen v1 enum stays unchanged.
+const webExtractProviderSchemaV2 = z.enum(["tavily", "exa", "firecrawl", "openai"]);
+const webExtractConfigValueSchemaV2 = z.preprocess(
+  migrateWebExtractConfigValue,
+  z.object({
+    providers: z
+      .array(webExtractProviderSchemaV2)
+      .min(1)
+      .transform((providers) => [...new Set(providers)])
+      .default(["tavily"]),
+  }),
+);
+
 const webConfigSchemaV2 = z
   .preprocess(
     migrateWebConfigValue,
     z.object({
-      extract: webExtractConfigValueSchema.default({
+      extract: webExtractConfigValueSchemaV2.default({
         providers: ["tavily"],
       }),
       fetch: z
@@ -414,6 +430,12 @@ const webConfigSchemaV2 = z
         .object({
           maxConcurrency: z.number().int().positive().default(2),
           queueTtl: durationMsSchema.default(3_000),
+        })
+        .optional(),
+      openai: z
+        .object({
+          model: z.string().trim().min(1).default("openai/gpt-5-mini"),
+          searchContextSize: z.enum(["low", "medium", "high"]).default("medium"),
         })
         .optional(),
     }),
@@ -430,6 +452,7 @@ const webConfigSchemaV2 = z
 const toolsSchema = z
   .object({
     fsBackend: z.enum(["fff", "node-rg"]).default("fff"),
+    generate: generateToolsSchema,
     web: webConfigSchemaV2,
     inspect: z
       .object({
@@ -484,6 +507,7 @@ const toolsSchema = z
   })
   .default({
     fsBackend: "fff",
+    generate: defaultGenerateToolsConfig(),
     web: {
       extract: {
         providers: ["tavily"],
@@ -860,43 +884,47 @@ export const coreConfigInputSchemaV2 = z.object({
       workingIndicators: z
         .array(z.string().trim().min(1))
         .min(1)
-        .default(cloneDefaultWorkingIndicators()),
+        .default(() => cloneDefaultWorkingIndicators()),
       native: nativeSurfaceSchema,
       router: routerSchema,
       discord: discordSurfaceSchema,
+      telegram: telegramSurfaceSchema,
       heartbeat: heartbeatSchema,
     })
-    .default({
+    // Lazy: a literal default object is built once at module load and handed
+    // out by reference, so every config would share the same nested arrays.
+    .default(() => ({
       workingIndicators: cloneDefaultWorkingIndicators(),
       native: defaultNativeSurfaceConfig(),
       router: {
-        defaultMode: "mention",
+        defaultMode: "mention" as const,
         sessionModes: {},
         activeDebounceMs: 3000,
         activeGate: { enabled: false, timeoutMs: 2500 },
       },
       discord: {
         tokenEnv: "DISCORD_TOKEN",
-        allowedChannelIds: [],
-        allowedGuildIds: [],
+        allowedChannelIds: [] as string[],
+        allowedGuildIds: [] as string[],
         botName: "lilac",
-        outputMode: "preview",
-        outputPreviewModeFinalStyle: "plain",
-        outputPreviewModeFinalText: "flat",
+        outputMode: "preview" as const,
+        outputPreviewModeFinalStyle: "plain" as const,
+        outputPreviewModeFinalText: "flat" as const,
         outputNotification: true,
         attachmentCache: { ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
         markdownTableRender: {
           enabled: true,
-          style: "unicode",
+          style: "unicode" as const,
           maxWidth: 50,
-          fallbackMode: "list",
+          fallbackMode: "list" as const,
         },
         markdownMathRender: {
           enabled: false,
           maxWidth: 50,
-          fallbackMode: "source",
+          fallbackMode: "source" as const,
         },
       },
+      telegram: cloneDefaultTelegramSurface(),
       heartbeat: {
         enabled: false,
         cron: "*/30 * * * *",
@@ -905,7 +933,7 @@ export const coreConfigInputSchemaV2 = z.object({
         defaultOutputSession: undefined,
         softQuietHours: undefined,
       },
-    }),
+    })),
 
   agent: z
     .object({

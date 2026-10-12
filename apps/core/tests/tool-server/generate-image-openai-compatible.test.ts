@@ -1,0 +1,551 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import { env, parseCoreConfig, type CoreConfig } from "@stanley2058/lilac-utils";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { Generate } from "../../src/tool-server/tools/generate";
+
+const PNG_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+const PNG_BYTES = Buffer.from(PNG_BASE64, "base64");
+const CONFIG_ERROR =
+  "Image generation provider 'openai-compatible' requires OPENAI_COMPATIBLE_BASE_URL.";
+const ALIAS_CASES = [
+  ["gpt-image-2", "gpt-image-2"],
+  ["gpt-5-image", "gpt-image-1.5"],
+  ["nanobanana", "google/gemini-2.5-flash-image"],
+  ["nanobanana-2", "google/gemini-3.1-flash-image-preview"],
+  ["nanobanana-2-lite", "google/gemini-3.1-flash-lite-image"],
+  ["nanobanana-pro", "google/gemini-3-pro-image-preview"],
+  ["grok-imagine-image", "grok-imagine-image"],
+  ["grok-imagine-image-pro", "grok-imagine-image-pro"],
+] as const;
+
+const originalProviders = structuredClone(env.providers);
+const temporaryPaths: string[] = [];
+const servers: Bun.Server<unknown>[] = [];
+
+/** `tools.generate.image` with `provider: openai-compatible` unless overridden. */
+async function compatibleConfig(
+  image: Record<string, unknown> = {},
+): Promise<Pick<CoreConfig, "tools">> {
+  const config = await parseCoreConfig({
+    configVersion: 2,
+    tools: { generate: { image: { provider: "openai-compatible", ...image } } },
+  });
+  return config;
+}
+
+function configureCompatible(baseUrl: string | undefined): void {
+  Object.assign(env.providers.openaiCompatible, {
+    apiKey: baseUrl ? "compatible-key" : undefined,
+    baseUrl,
+  });
+}
+
+function clearOfficialProviders(): void {
+  for (const provider of [env.providers.openai, env.providers.openrouter, env.providers.xai]) {
+    Object.assign(provider, { apiKey: undefined, baseUrl: undefined });
+  }
+}
+
+function startServer(
+  fetch: (request: Request) => Response | Promise<Response>,
+): Bun.Server<unknown> {
+  const server = Bun.serve({ port: 0, fetch });
+  servers.push(server);
+  return server;
+}
+
+afterEach(async () => {
+  for (const server of servers.splice(0)) server.stop(true);
+  for (const path of temporaryPaths.splice(0)) await rm(path, { force: true, recursive: true });
+  Object.assign(env.providers.openai, originalProviders.openai);
+  Object.assign(env.providers.openrouter, originalProviders.openrouter);
+  Object.assign(env.providers.xai, originalProviders.xai);
+  Object.assign(env.providers.openaiCompatible, originalProviders.openaiCompatible);
+});
+
+describe("Generate OpenAI-compatible image routing", () => {
+  it.each(ALIAS_CASES)("routes %s to canonical model %s", async (alias, canonicalId) => {
+    // Given
+    let body: unknown;
+    const server = startServer(async (request) => {
+      body = await request.json();
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-alias-"));
+    temporaryPaths.push(outputDir);
+
+    // When
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "canonical route",
+      model: alias,
+      outputDir,
+    });
+
+    // Then
+    expect(body).toMatchObject({ model: canonicalId });
+    expect(result.unwrap()).toMatchObject({ ok: true, model: alias, mimeType: "image/png" });
+  });
+
+  it("throws a stable configuration error before default fallback", async () => {
+    // Given
+    configureCompatible(undefined);
+    Object.assign(env.providers.openai, { apiKey: "official-key", baseUrl: "http://127.0.0.1" });
+
+    // When / Then
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "no request",
+    });
+    expect(result.match({ ok: () => "", err: (error) => error.message })).toContain(CONFIG_ERROR);
+  });
+
+  it("rejects invalid compatible input before HTTP", async () => {
+    // Given
+    let requestCount = 0;
+    const server = startServer(() => {
+      requestCount += 1;
+      return Response.json({ data: [] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const generate = new Generate({ getConfig: compatibleConfig });
+
+    // When / Then
+    const unsupportedSize = await generate.call("generate.image", {
+      prompt: "invalid",
+      model: "gpt-5-image",
+      size: "512x512",
+    });
+    expect(unsupportedSize.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "Unsupported size '512x512' for gpt-5-image",
+    );
+    const unsupportedMask = await generate.call("generate.image", {
+      prompt: "invalid",
+      model: "grok-imagine-image",
+      maskImage: "mask.png",
+      inputImages: "source.png",
+    });
+    expect(unsupportedMask.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "grok-imagine-image does not support maskImage",
+    );
+    expect(requestCount).toBe(0);
+  });
+
+  it("uses the JSON generation path and preserves output PNG", async () => {
+    // Given
+    let capture:
+      | { method: string; path: string; authorization: string | null; body: unknown }
+      | undefined;
+    const server = startServer(async (request) => {
+      capture = {
+        method: request.method,
+        path: new URL(request.url).pathname,
+        authorization: request.headers.get("authorization"),
+        body: await request.json(),
+      };
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-json-"));
+    temporaryPaths.push(outputDir);
+
+    // When
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "json prompt",
+      model: "gpt-5-image",
+      size: "1024x1024",
+      outputDir,
+    });
+
+    // Then
+    expect(capture).toEqual({
+      method: "POST",
+      path: "/v1/images/generations",
+      authorization: "Bearer compatible-key",
+      body: {
+        model: "gpt-image-1.5",
+        prompt: "json prompt",
+        n: 1,
+        size: "1024x1024",
+      },
+    });
+    expect(await readFile(join(outputDir, "generated-image.png"))).toEqual(PNG_BYTES);
+    expect(result.unwrap()).toMatchObject({
+      path: join(outputDir, "generated-image.png"),
+      providerMetadata: {},
+    });
+  });
+
+  it("uses the multipart edit path with named blobs", async () => {
+    // Given
+    let capture: { method: string; path: string; fields: Record<string, string> } | undefined;
+    const server = startServer(async (request) => {
+      const fields: Record<string, string> = {};
+      for (const [key, value] of await request.formData()) {
+        fields[key] =
+          typeof value === "string" ? value : `${value.type}:${value.size}:${value.name}`;
+      }
+      capture = { method: request.method, path: new URL(request.url).pathname, fields };
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-edit-"));
+    temporaryPaths.push(outputDir);
+    await writeFile(join(outputDir, "source.png"), PNG_BYTES);
+    await writeFile(join(outputDir, "mask.png"), PNG_BYTES);
+
+    // When
+    await new Generate({ getConfig: compatibleConfig }).call(
+      "generate.image",
+      {
+        prompt: "edit prompt",
+        model: "gpt-5-image",
+        inputImages: "source.png",
+        maskImage: "mask.png",
+        outputDir,
+      },
+      { context: { cwd: outputDir } },
+    );
+
+    // Then
+    expect(capture).toEqual({
+      method: "POST",
+      path: "/v1/images/edits",
+      fields: {
+        image: "image/png:70:image.png",
+        mask: "image/png:70:mask.png",
+        model: "gpt-image-1.5",
+        n: "1",
+        prompt: "edit prompt",
+      },
+    });
+  });
+
+  it("propagates HTTP 500 after exactly one request without official fallback", async () => {
+    // Given
+    let requestCount = 0;
+    const server = startServer(() => {
+      requestCount += 1;
+      return Response.json(
+        { error: { message: "compatible failed", type: "server_error" } },
+        { status: 500 },
+      );
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    Object.assign(env.providers.openai, {
+      apiKey: "official-key",
+      baseUrl: "http://127.0.0.1:1/v1",
+    });
+
+    // When / Then
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "fail once",
+      model: "gpt-5-image",
+    });
+    expect(result.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "compatible failed",
+    );
+    expect(requestCount).toBe(1);
+  });
+
+  it("reports an abort during generation as cancelled", async () => {
+    // Given
+    const controller = new AbortController();
+    const server = startServer(() => {
+      controller.abort();
+      return new Promise<Response>(() => {});
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-cancel-"));
+    temporaryPaths.push(outputDir);
+
+    // When
+    const result = await new Generate({ getConfig: compatibleConfig }).call(
+      "generate.image",
+      { prompt: "cancel me", model: "gpt-5-image", outputDir },
+      { signal: controller.signal },
+    );
+
+    // Then
+    expect(result.match({ ok: () => "", err: (error) => error.kind })).toBe("cancelled");
+    expect(await Array.fromAsync(new Bun.Glob("*").scan({ cwd: outputDir }))).toEqual([]);
+  });
+
+  it("rejects a malformed success response after one request without output", async () => {
+    // Given
+    let requestCount = 0;
+    const server = startServer(() => {
+      requestCount += 1;
+      return Response.json({ data: [{}] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-malformed-"));
+    temporaryPaths.push(outputDir);
+
+    // When / Then
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "malformed once",
+      model: "gpt-5-image",
+      outputDir,
+    });
+    expect(result.match({ ok: () => false, err: () => true })).toBe(true);
+    expect(requestCount).toBe(1);
+    expect(await Array.fromAsync(new Bun.Glob("*").scan({ cwd: outputDir }))).toEqual([]);
+  });
+
+  it("forwards aspectRatio as a colon-form size without an unsupported warning", async () => {
+    // Given
+    let body: unknown;
+    const server = startServer(async (request) => {
+      body = await request.json();
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-aspect-"));
+    temporaryPaths.push(outputDir);
+
+    // When
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "wide shot",
+      model: "nanobanana-2",
+      aspectRatio: "16:9",
+      outputDir,
+    });
+
+    // Then
+    expect(body).toEqual({
+      model: "google/gemini-3.1-flash-image-preview",
+      prompt: "wide shot",
+      n: 1,
+      size: "16:9",
+    });
+    expect(result.unwrap()).toMatchObject({ ok: true, warnings: [] });
+  });
+
+  it("forwards grok aspect ratios as a colon-form size", async () => {
+    // Given
+    let body: unknown;
+    const server = startServer(async (request) => {
+      body = await request.json();
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-grok-aspect-"));
+    temporaryPaths.push(outputDir);
+
+    // When
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "tall shot",
+      model: "grok-imagine-image",
+      aspectRatio: "19.5:9",
+      outputDir,
+    });
+
+    // Then
+    expect(body).toEqual({
+      model: "grok-imagine-image",
+      prompt: "tall shot",
+      n: 1,
+      size: "19.5:9",
+    });
+    expect(result.unwrap()).toMatchObject({ ok: true, warnings: [] });
+  });
+
+  it("still converts aspectRatio to size for gpt aliases", async () => {
+    // Given
+    let body: unknown;
+    const server = startServer(async (request) => {
+      body = await request.json();
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-gpt-aspect-"));
+    temporaryPaths.push(outputDir);
+
+    // When
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "portrait shot",
+      model: "gpt-5-image",
+      aspectRatio: "2:3",
+      outputDir,
+    });
+
+    // Then
+    expect(body).toEqual({
+      model: "gpt-image-1.5",
+      prompt: "portrait shot",
+      n: 1,
+      size: "1024x1536",
+    });
+    expect(result.unwrap()).toMatchObject({ ok: true, warnings: [] });
+  });
+
+  it("sends the model id of an explicit openai-compatible route", async () => {
+    // Given
+    let body: unknown;
+    const server = startServer(async (request) => {
+      body = await request.json();
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-model-ids-"));
+    temporaryPaths.push(outputDir);
+    const getConfig = () =>
+      compatibleConfig({
+        routes: { "nanobanana-2": "openai-compatible/gemini-3.1-flash-image-preview" },
+      });
+
+    // When
+    const result = await new Generate({ getConfig }).call("generate.image", {
+      prompt: "override id",
+      model: "nanobanana-2",
+      outputDir,
+    });
+
+    // Then
+    expect(body).toMatchObject({ model: "gemini-3.1-flash-image-preview" });
+    expect(result.unwrap()).toMatchObject({ ok: true, model: "nanobanana-2" });
+  });
+
+  it("routes one alias to the official OpenAI endpoint while the rest stay compatible", async () => {
+    // Given
+    const requests: { server: string; model: unknown }[] = [];
+    const official = startServer(async (request) => {
+      const body = (await request.json()) as { model?: unknown };
+      requests.push({ server: "official", model: body.model });
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    const compatible = startServer(async (request) => {
+      const body = (await request.json()) as { model?: unknown };
+      requests.push({ server: "compatible", model: body.model });
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${compatible.port}/v1`);
+    Object.assign(env.providers.openai, {
+      apiKey: "official-key",
+      baseUrl: `http://127.0.0.1:${official.port}/v1`,
+    });
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-mixed-"));
+    temporaryPaths.push(outputDir);
+    const generate = new Generate({
+      getConfig: () => compatibleConfig({ routes: { "gpt-image-2": "openai/gpt-image-2" } }),
+    });
+
+    // When
+    const routed = await generate.call("generate.image", {
+      prompt: "official",
+      model: "gpt-image-2",
+      outputDir,
+    });
+    const bulk = await generate.call("generate.image", {
+      prompt: "compatible",
+      model: "nanobanana-2",
+      outputDir,
+    });
+
+    // Then
+    expect(routed.unwrap()).toMatchObject({
+      ok: true,
+      model: "gpt-image-2",
+      providerMetadata: { openai: { images: [{}] } },
+    });
+    expect(bulk.unwrap()).toMatchObject({ ok: true, model: "nanobanana-2" });
+    expect(requests).toEqual([
+      { server: "official", model: "gpt-image-2" },
+      { server: "compatible", model: "google/gemini-3.1-flash-image-preview" },
+    ]);
+  });
+
+  it("advertises an explicit route without credentials and names the missing variable", async () => {
+    // Given
+    configureCompatible(undefined);
+    clearOfficialProviders();
+    const generate = new Generate({
+      getConfig: () =>
+        compatibleConfig({
+          provider: "default",
+          routes: { "grok-imagine-image": "xai/grok-imagine-image" },
+        }),
+    });
+    const expectedError =
+      "Image route 'xai/grok-imagine-image' for 'grok-imagine-image' requires XAI_API_KEY or XAI_BASE_URL.";
+
+    // When / Then: the alias stays in the catalog so the gap is visible.
+    const entries = await generate.list();
+    expect(entries.find((entry) => entry.callableId === "generate.image")?.description).toEndWith(
+      "Available models: grok-imagine-image",
+    );
+
+    // When / Then: requesting it, or falling back onto it, reports the credential.
+    const requested = await generate.call("generate.image", {
+      prompt: "blocked",
+      model: "grok-imagine-image",
+    });
+    expect(
+      requested.match({ ok: () => "", err: (error) => `${error.kind}: ${error.message}` }),
+    ).toBe(`usage: ${expectedError}`);
+    const fallback = await generate.call("generate.image", { prompt: "blocked" });
+    expect(fallback.match({ ok: () => "", err: (error) => error.message })).toBe(expectedError);
+  });
+
+  it("hides default-route aliases without a configured provider", async () => {
+    // Given
+    configureCompatible(undefined);
+    clearOfficialProviders();
+    const generate = new Generate({ getConfig: () => compatibleConfig({ provider: "default" }) });
+
+    // When
+    const entries = await generate.list();
+    const result = await generate.call("generate.image", { prompt: "nothing configured" });
+
+    // Then
+    expect(entries.find((entry) => entry.callableId === "generate.image")).toBeUndefined();
+    expect(result.match({ ok: () => "", err: (error) => error.message })).toBe(
+      "No image generation models are configured. Configure at least one provider for image generation.",
+    );
+  });
+
+  it("restricts aliases to the configured models allowlist", async () => {
+    // Given
+    let requestCount = 0;
+    let body: unknown;
+    const server = startServer(async (request) => {
+      requestCount += 1;
+      body = await request.json();
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-allowlist-"));
+    temporaryPaths.push(outputDir);
+    const getConfig = () => compatibleConfig({ models: ["nanobanana-2"] });
+    const generate = new Generate({ getConfig });
+
+    // When / Then: a disallowed alias fails before HTTP and lists only allowed aliases.
+    const denied = await generate.call("generate.image", {
+      prompt: "denied",
+      model: "gpt-image-2",
+    });
+    expect(denied.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "Requested model 'gpt-image-2' is not available for image generation (configured: nanobanana-2).",
+    );
+    expect(requestCount).toBe(0);
+
+    // When / Then: omitting the model falls back to the allowed alias.
+    const fallback = await generate.call("generate.image", {
+      prompt: "fallback",
+      outputDir,
+    });
+    expect(fallback.unwrap()).toMatchObject({ ok: true, model: "nanobanana-2" });
+    expect(body).toMatchObject({ model: "google/gemini-3.1-flash-image-preview" });
+    expect(requestCount).toBe(1);
+
+    // When / Then: the catalog advertises only the allowlisted alias.
+    const entries = await generate.list();
+    expect(entries.find((entry) => entry.callableId === "generate.image")?.description).toEndWith(
+      "Available models: nanobanana-2",
+    );
+  });
+});

@@ -2,89 +2,367 @@
   <img src="assets/logo.svg" alt="Lilac" width="160">
 </p>
 
-# Lilac
+# Lilac Mono
+
+<p align="center">
+  <strong>Event-driven AI Agent Runtime for Web, Discord, Telegram, GitHub, and the local terminal</strong>
+</p>
 
 Lilac is an AI assistant you host yourself and use from the web, a terminal, or Discord. It can work with files, run
 commands, and use web tools. You choose its models and the channels where it can respond. Optional
 integrations add computer use and GitHub access.
 
-## Get started
+<p align="center">
+  <a href="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/stanley2058/lilac-mono"><img alt="Upstream" src="https://img.shields.io/badge/upstream-stanley2058%2Flilac--mono-6f42c1"></a>
+  <a href="./package.json"><img alt="Bun 1.4.2" src="https://img.shields.io/badge/Bun-1.4.2-14151a?logo=bun&logoColor=white"></a>
+  <a href="./LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
+</p>
 
-Before you start, have these ready:
+<p align="center">
+  <strong>Language:</strong> <a href="./README.md">English (primary / canonical)</a> · <a href="./README.zh-TW.md">繁體中文 (translation)</a>
+</p>
 
-- Docker with Compose 2.30 or newer, running Linux containers.
-- An account with a model provider or an OpenAI-compatible endpoint.
-- For the optional Discord integration, a Discord application with a bot token. See [Discord setup](docs/installation.md#discord).
+<p align="center">
+  <a href="#fork-differences">Fork differences</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#core-surfaces">Surfaces</a> ·
+  <a href="./docs/README.md">Full documentation</a> ·
+  <a href="./PROJECT.md">Architecture details</a>
+</p>
+Lilac Core is the Redis-backed, event-driven runtime for Discord, Telegram, and optional GitHub ingress.
+It owns surface routing, agent execution, output relays, durable workflows, and the internal HTTP tool
+server.
 
-See the [system requirements](docs/installation.md#system-requirements) for supported Linux and macOS
-versions. Create a directory for Lilac's files, then start setup:
+Architecture and ownership are documented in [`PROJECT.md`](./PROJECT.md). Repository rules for coding agents are in [`AGENTS.md`](./AGENTS.md).
 
-```sh
-mkdir -p lilac
-cd lilac
-curl -fsSL https://raw.githubusercontent.com/stanley2058/lilac-mono/main/install.sh | bash
+> [!IMPORTANT]
+> This is a downstream fork that continuously tracks [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) through Git history and the `upstream` remote. It is not an official upstream release. This project regularly merges upstream updates while maintaining independent Telegram, OpenAI-compatible image routing, OpenAI `web.search`, and deployment automation features.
+
+Lilac brings platform messaging, routing, model execution, tools, Skills, and recoverable workflows
+into one runtime.
+
+## Fork Differences
+
+The table below lists only behavior that still differs from upstream. GitHub reply permalinks and comment self-loop protection were accepted upstream and are no longer listed. For the full rationale, limitations, and every pull request opened against upstream, see [`docs/fork-differences.md`](./docs/fork-differences.md).
+
+| Area                            | Difference provided by this fork                                                                                                                       | Important limitations                                                                             |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| Telegram surface                | DMs, groups, forum topics, streaming HTML replies, cancellation, reactions, command menu, inbound/outbound attachments, workflow cards, same-surface tools, and Telegram history in cross-surface conversation memory | Disabled by default; long polling only; memory indexes one thread per chat or topic |
+| OpenAI-compatible image routing | Routes the existing `generate.image` aliases through an operator-specified OpenAI-compatible endpoint, with per-alias `provider/model` routes            | `configVersion: 2` only; no automatic fallback between providers                                  |
+| OpenAI `web.search` provider    | `openai` in `tools.web.extract.providers` runs `web.search` through the OpenAI Responses `web_search` tool and returns the answer's cited sources     | `configVersion: 2` only; search-only (`web.extract` skips it); date filters are model guidance only |
+| Custom media plugin             | Deployable Level 2 image/video plugin example demonstrating strict configuration and file-safety handling                                              | The plugin is trusted in-process code; restricted callers currently cannot use external callables |
+| Operations and delivery         | Upstream checks every 6 hours, GHCR publishes verified `catalina`/`claudia` tags, and CI enforces the upstream-footprint allowlist                     | Automatic merges still require manual handling when conflicts occur                               |
+
+## Architecture Overview
+
+### Core request flow
+
+```mermaid
+flowchart LR
+    Discord[Discord] --> Bus[Typed Redis Streams bus]
+    Telegram[Telegram] --> Bus
+    Bus --> Router[Surface router]
+    GitHub[GitHub webhook] --> Request[Request queue]
+    Router --> Request
+    Request --> Agent[Agent runner]
+    Agent --> L1[Level 1 local tools]
+    Agent --> L2[Level 2 HTTP tools]
+    Agent --> Skills[Level 3 skills]
+    Agent --> Output[Request-scoped output]
+    Output --> Discord
+    Output --> Telegram
+    Output --> GitHub
+    Workflow[Durable workflow engine] <--> Request
 ```
 
-Use the arrow keys and Enter to work through the wizard. It checks your machine, guides you through
-provider authentication, then offers terminal-only access, web sign-in, Discord, and optional integrations. You can skip
-those and configure them later. Review and confirm the configuration to pull the images and start Lilac.
+Core platform adapters send events to the typed bus. The router creates or updates a request, and the agent runner executes it using models, tools, and Skills. The output relay then sends the result back to the originating surface. GitHub webhooks can create requests directly.
 
-Once setup reports that Lilac is healthy, choose "Talk to Lilac now". Later, run
-`docker compose exec --user root lilac lilac-tui` for a temporary conversation, deleted on exit.
-If you enabled Web, open `http://localhost:8789` and sign in.
+The durable workflow engine uses the same request bus and stores trigger, wait, sleep, subagent, and recovery information in a SQLite journal. See [`PROJECT.md`](./PROJECT.md) for the complete topics, queue modes, permissions, and startup/shutdown order.
 
-## After installation: make Lilac your own
+### Fork maintenance flow
 
-Lilac creates prompt files in `data/prompts/` inside your installation directory. Go through these
-starter files and update them to fit how you want the assistant to work:
+```mermaid
+flowchart LR
+    Upstream[stanley2058/lilac-mono main] -->|scheduled check every 6 hours| Sync[Sync Upstream workflow]
+    Sync -->|clean merge| Fork[DF-wu/lilac-mono main]
+    Features[Fork features and fixes] --> Fork
+    Fork --> CI[CI]
+    Fork --> Images[GHCR image workflow]
+```
 
-| File | What to personalize |
-| --- | --- |
-| [USER.md](packages/utils/prompt-templates/USER.md) | Your name, timezone, language, and communication preferences. |
-| [IDENTITY.md](packages/utils/prompt-templates/IDENTITY.md) | Lilac's name, personality, voice, and style. |
-| [SOUL.md](packages/utils/prompt-templates/SOUL.md) | Values, priorities, and how Lilac relates to you. |
-| [AGENTS.md](packages/utils/prompt-templates/AGENTS.md) | Working rules, autonomy, and when to ask before acting. |
-| [TOOLS.md](packages/utils/prompt-templates/TOOLS.md) | Environment notes and conventions for using tools. |
-| [MEMORY.md](packages/utils/prompt-templates/MEMORY.md) | Decisions and lasting context you want it to remember. |
+## Quick Start
 
-You can edit the files yourself or talk to Lilac and ask it to help. For example:
+### Core: Docker Compose
 
-> Help me personalize your prompt files in `/data/prompts`. Ask me about my preferences, then update
-> the files to match. Start with `USER.md` and `IDENTITY.md`.
+Requirements: Docker Compose 2.30 or newer, Bun 1.4.2, and at least one model provider credential matching the `models.main` configuration. A valid `DISCORD_TOKEN` is required only when Discord is enabled. All surface allowlists remain fail-closed.
 
-## Manage your installation
+```bash
+git clone https://github.com/DF-wu/lilac-mono.git
+cd lilac-mono
+bun install
 
-Run these commands from the directory you chose during setup:
+cp .env.example .env
+chmod 600 .env
+mkdir -p data
+cp packages/utils/config-templates/core-config.example.yaml data/core-config.yaml
 
-| Task | Command |
-| --- | --- |
-| Change configuration or reinstall | `./bin/lilac` |
-| Check service status | `docker compose ps` |
-| Follow Lilac's logs | `docker compose logs -f lilac` |
-| Stop Lilac and its services | `docker compose stop` |
-| Start them again | `docker compose start` |
+cat > compose.override.yaml <<'YAML'
+services:
+  lilac:
+    env_file:
+      - .env
+YAML
+```
 
-The setup CLI loads your existing configuration. Updates and reinstalls preserve your data. Rerun the
-`curl` command from your installation directory to download the current setup CLI. See the
-[installation guide](docs/installation.md#files-and-subsequent-setup) for file locations, image
-selection, and troubleshooting.
+Before starting, complete these two steps:
+
+1. Set the credential for the model provider selected in `data/core-config.yaml` in `.env`. Also set `DISCORD_TOKEN` if Discord is enabled. Stock `compose.yaml` does not pass provider credentials; the `compose.override.yaml` above explicitly passes `.env` through `env_file`.
+2. Configure the Discord allowlist in `data/core-config.yaml`, and enable and restrict any other surfaces you plan to use.
+
+```bash
+docker compose up -d --build --wait --wait-timeout 120
+bun run docker:verify
+docker compose ps
+curl -fsS http://localhost:8080/readyz
+```
+
+`compose.yaml` also starts Redis and mounts `./data` at `/data`. See [`docs/docker-deployment.md`](./docs/docker-deployment.md) for production deployment, operator tokens, UID, persistence, and diagnostics.
+
+For the guided installer, provider authentication, terminal-only access, and native Web sign-in, see [`docs/installation.md`](./docs/installation.md). The temporary operator TUI is available with `docker compose exec --user root lilac lilac-tui`; when native Web is enabled, open `http://localhost:8789`.
+
+> [!WARNING]
+> Core's tool server has no general-purpose public HTTP authentication. Keep `8080` on a trusted host or network boundary; do not expose it directly to the public internet.
+
+### Core: Run from Source
+
+Install the dependencies and prepare a reachable Redis instance:
+
+```bash
+bun install
+docker run --rm -d --name lilac-source-redis -p 127.0.0.1:6380:6379 redis:7-alpine
+
+export REDIS_URL=redis://127.0.0.1:6380
+export DATA_DIR="$PWD/data"
+export LL_TOOL_SERVER_PORT=8080
+bun apps/core/src/runtime/main.ts
+```
+
+Core requires `REDIS_URL` and a valid model configuration. Set `DISCORD_TOKEN` when Discord is enabled; native-only deployments can start without Discord credentials.
+
+## Core Surfaces
+
+| Surface  | Minimum configuration                                                                                                                             | Default protection                                                                               | Documentation                                                                            |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| Native   | `surface.native.enabled: true`, installation ID, local or Clerk authentication, and provider credentials                                          | Disabled by default; authenticated owner access only                                             | [`docs/native-surface.md`](./docs/native-surface.md)                                     |
+| Discord  | `DISCORD_TOKEN`; configure `allowedChannelIds` or `allowedGuildIds`                                                                               | Ignores all Discord traffic when both allowlists are empty                                       | [`core-config.example.yaml`](./packages/utils/config-templates/core-config.example.yaml) |
+| Telegram | `configVersion: 2`, `enabled: true`, `token`, `allowedChatIds`                                                                                    | Disabled by default; ignores all chats when the chat allowlist is empty                          | [`docs/telegram-surface.md`](./docs/telegram-surface.md)                                 |
+| GitHub   | GitHub App auth, `GITHUB_WEBHOOK_SECRET`, and an HTTPS/reverse proxy reachable by GitHub; a user token is an optional preferred outbound identity | The surface does not start without the GitHub App secret; returns `401` for an invalid signature | [`docs/github-reply-permalinks.md`](./docs/github-reply-permalinks.md)                   |
+
+The GitHub webhook listens on port `8787` and path `/github/webhook` by default. Stock Compose does not forward or expose the GitHub webhook environment and port, so production deployments must provide the reverse proxy, environment, and network wiring themselves.
+
+The webhook secret only verifies inbound requests; the runtime currently uses the GitHub App secret as the condition for enabling the entire surface. Set up the App first, then add a user token as the preferred outbound identity if needed. Use operator-only onboarding to inspect both parameters:
+
+```bash
+docker compose exec -T lilac /usr/local/bin/tools --operator --help onboarding.github_app
+docker compose exec -T lilac /usr/local/bin/tools --operator --help onboarding.github_user_token
+```
+
+Telegram supports the full conversation path, workflow cards, and same-surface tools, and its request router mirrors the upstream Discord router (debounce batching, the LLM gate, steer/interrupt/follow-up, and the `!model:`, `!continue`, and `!interrupt` directives), but its platform capabilities are not identical to Discord. See [`Telegram feature status`](./docs/telegram-surface.md#10-what-works-and-what-does-not) for differences in inbound media, history, reactions, and search, and [`docs/telegram-feature-parity.md`](./docs/telegram-feature-parity.md) for the capability-by-capability comparison with Discord.
+
+## Tools, Skills, and Workflows
+
+Core divides agent capabilities into three levels:
+
+1. **Level 1**: Run-local tools such as `bash`, file I/O, search, patch, batch, and subagent delegation.
+2. **Level 2**: Callables provided by the HTTP tool server, including web, surface, workflow, MCP, attachments, generation, and SSH.
+3. **Level 3**: `SKILL.md` bundles discovered on disk and loaded on demand.
+
+Build and use the `tools` CLI:
+
+```bash
+cd apps/tool-bridge
+bun run build
+./dist/index.js --list
+./dist/index.js --help workflow.run.list
+```
+
+Connect to another backend:
+
+```bash
+TOOL_SERVER_BACKEND_URL=http://host:8080 ./apps/tool-bridge/dist/index.js --list
+```
+
+External plugins go in `DATA_DIR/plugins/<plugin-id>/`. They run in the same process as Core and have the Core process's permissions; read [`PLUGIN_AUTHORING.md`](./PLUGIN_AUTHORING.md) before developing one.
+
+## Fork-Specific Usage
+
+### Enable Telegram
+
+```yaml
+configVersion: 2
+
+surface:
+  telegram:
+    enabled: true
+    token: replace-with-botfather-token
+    allowedChatIds:
+      - "1001"
+```
+
+Keep `data/core-config.yaml` private because it contains the bot token:
+
+```bash
+chmod 600 data/core-config.yaml
+```
+
+```bash
+docker compose up -d --wait --wait-timeout 120
+curl -s localhost:8080/readyz | jq '.checks[] | select(.name == "telegram.ready")'
+```
+
+See [`docs/telegram-surface.md`](./docs/telegram-surface.md) for group privacy mode, forum topic session IDs, streaming, the command menu, and troubleshooting.
+
+### Route Image Generation to a Compatible Endpoint
+
+```yaml
+configVersion: 2
+
+tools:
+  generate:
+    image:
+      provider: openai-compatible
+```
+
+To route individual aliases, add `routes` entries as `<provider>/<model id>` with provider `openai`, `openrouter`, `xai`, or `openai-compatible`; unlisted aliases follow `provider`, and the former `openaiCompatible` block is rejected at parse time:
+
+```yaml
+tools:
+  generate:
+    image:
+      provider: openai-compatible
+      routes:
+        nanobanana-2: openai-compatible/gemini-3.1-flash-image-preview
+        gpt-image-2: openai/gpt-image-2
+```
+
+For Docker Compose, put the endpoint and credential in `.env`, which is loaded by `compose.override.yaml`:
+
+```dotenv
+OPENAI_COMPATIBLE_BASE_URL=https://provider.example.com/v1
+OPENAI_COMPATIBLE_API_KEY=replace-with-api-key
+```
+
+Then recreate the container:
+
+```bash
+docker compose up -d --force-recreate --wait --wait-timeout 120 lilac
+```
+
+When running from source, export the variables with the same names before starting Core.
+
+See [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md) for aliases, the `models` allowlist and per-alias `routes` (`<provider>/<model id>`), migration from the removed `openaiCompatible` block, generation/edit endpoints, `providerMetadata` in results, the absence of fallback behavior, and colon-form `size` aspect-ratio forwarding.
+
+### Search the Web Through OpenAI
+
+```yaml
+configVersion: 2
+
+tools:
+  web:
+    extract:
+      providers: [tavily, openai]
+    openai:
+      model: openai-compatible/gpt-5.6-terra
+      searchContextSize: medium
+```
+
+The provider list is the ordered fallback chain for `web.search`, so `openai` only runs when it is listed. `model` is the `provider/model` that runs the hosted search (default `openai/gpt-5-mini`; a bare model id means `openai/<id>`). An `openai/...` model uses `OPENAI_API_KEY` and `OPENAI_BASE_URL`; an `openai-compatible/...` model uses `OPENAI_COMPATIBLE_API_KEY` and `OPENAI_COMPATIBLE_BASE_URL`. Any gateway it points at must relay the Responses API `web_search` tool. Results carry the model's URL citations, each labeled as an OpenAI-generated summary, followed by retrieved sources that were not cited. `web.extract` skips this provider, so keep `tavily`, `exa`, or `firecrawl` in the list when you need page extraction.
+
+See [`docs/web-search-openai.md`](./docs/web-search-openai.md) for the full data flow (exactly what the mediator model receives and what the conversation model gets back), errors, and limitations, and [`docs/core-config-migrations.md`](./docs/core-config-migrations.md) for the `tools.web.openai` fields.
+
+### Use the Custom Media Plugin Example
+
+```bash
+mkdir -p data/plugins
+cp -R examples/plugins/custom-media data/plugins/custom-media
+docker compose restart lilac
+docker compose up -d --wait --wait-timeout 120 lilac
+docker compose exec -T lilac /usr/local/bin/tools --operator --list
+docker compose exec -T lilac /usr/local/bin/tools --operator --help custom-media.image
+```
+
+See [`examples/plugins/custom-media/README.md`](./examples/plugins/custom-media/README.md) for the complete build, credential, model, and file-safety contract.
+
+## Repository Map
+
+| Path                           | Purpose                                                                                        |
+| ------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `apps/core/`                   | Redis-backed Core runtime and all surface, workflow, and tool wiring                           |
+| `apps/tool-bridge/`            | `tools` CLI and standalone tool-server entrypoint                                              |
+| `apps/installer/`              | Guided Docker setup and reconfiguration CLI                                                    |
+| `apps/computer-use-gateway/`   | Optional authenticated desktop-session gateway                                                 |
+| `packages/event-bus/`          | Typed Redis Streams contract and transport                                                     |
+| `packages/agent/`              | AI SDK streaming, steering, follow-up, and interrupt control                                   |
+| `packages/plugin-runtime/`     | Level 1/Level 2 plugin contract                                                                |
+| `packages/utils/`              | Config, providers, prompts, and Skills                                                         |
+| `data/`                        | Core local runtime state; do not commit secrets                                                |
+| `ref/`                         | Vendored/reference repositories; subject to their respective licenses and treated as read-only |
+
+## Development and Verification
+
+This repo uses Bun workspaces:
+
+```bash
+bun install
+bun run ci
+```
+
+`bun run ci` checks codegen, lint, root/workspace tests, TypeScript, and formatting in sequence. Common individual commands:
+
+```bash
+bun run check
+bun run ci
+bun run test:core
+bun run test:all
+bun run typecheck
+bun run lint
+bun run fmt:check
+```
+
+`bun run check` runs the concurrent local repository gates; `bun run ci` runs the conservative serial CI sequence. The full suite includes the permanent architecture and production-syntax gates.
+
+See [`AGENTS.md`](./AGENTS.md) for each workspace's build, test, and typecheck commands; see [`PROJECT.md`](./PROJECT.md) for project terminology and the complete architecture.
+
+## Upstream Sync and Support Boundaries
+
+`.github/workflows/sync-upstream.yml` checks upstream `main` every 6 hours. A clean merge is committed on a candidate branch, verified by full CI, then fast-forwarded into `main` before image publication. Only Git conflicts open a PR requesting `Catalina-df` review; Claude Action supplies read-only analysis and never repairs code. See [workflow and prompt configuration](./docs/upstream-sync.md).
+
+- Report new fork features, deployment workflows, Telegram issues, OpenAI `web.search` issues, or OpenAI-compatible image-routing issues in [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues).
+- For an issue reproducible without fork modifications, first confirm the upstream state, then report it to [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono/issues).
+- Features historically contributed by this fork and accepted upstream are no longer listed as current differences. See [`docs/fork-differences.md`](./docs/fork-differences.md#accepted-upstream-contributions) for the list.
+- Fork behavior lives in fork-owned modules; upstream files are touched only at thin seams. `bun run fork:footprint` checks every modified upstream file against [`scripts/fork/upstream-footprint.txt`](./scripts/fork/upstream-footprint.txt), and [`docs/fork-differences.md`](./docs/fork-differences.md#fork-code-layout) maps each feature to its modules and seams.
 
 ## Documentation
 
-- [Installation and setup](docs/installation.md): providers, native sign-in, Discord, and reconfiguration.
-- [Configuration reference](packages/utils/config-templates/core-config.example.yaml): settings available in Core configuration.
-- [Configuration upgrades](docs/core-config-migrations.md): migrating an existing Core configuration.
-- [Manual Docker deployment](docs/docker-deployment.md): source builds, storage, and diagnostics.
-- [Computer use](docs/computer-use.md): desktop setup and operation.
-- [Skills](docs/skill-authoring.md): adding reusable instructions and scripts.
-- [Claude Code integration](docs/claude-code.md): manual setup for the Claude Code provider.
+- [`PROJECT.md`](./PROJECT.md): durable architecture, terminology, ownership, and where-to-change guide
+- [`core-config.example.yaml`](./packages/utils/config-templates/core-config.example.yaml): current Core configuration reference
+- [`docs/core-config-migrations.md`](./docs/core-config-migrations.md): manual Core config upgrades
+- [`plan/README.md`](./plan/README.md): active implementation plans
+- [`MIGRATIONS.md`](./MIGRATIONS.md): persisted-data, wire, and protocol migrations
+- [`docs/README.md`](./docs/README.md): deployment, surface, fork-feature, and extension index
+- [`docs/installation.md`](./docs/installation.md): guided installation, providers, and reconfiguration
+- [`docs/docker-deployment.md`](./docs/docker-deployment.md): container deployment and diagnostics
+- [`docs/native-surface.md`](./docs/native-surface.md): native Web authentication, configuration, and operation
+- [`docs/computer-use.md`](./docs/computer-use.md): optional desktop gateway and runner deployment
+- [`docs/claude-code.md`](./docs/claude-code.md): Claude Code authentication, tools, continuation, and storage
+- [`docs/skill-authoring.md`](./docs/skill-authoring.md): skill format, discovery, and authoring guidance
+- [`PLUGIN_AUTHORING.md`](./PLUGIN_AUTHORING.md): Core tool plugin contract
 
-## Development
+## License and Acknowledgements
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) to run Lilac from source, build its CLIs and containers, and run
-checks. [PROJECT.md](PROJECT.md) covers architecture, terminology, and subsystem ownership.
+This repository is released under the [MIT License](./LICENSE), retaining the original upstream authors' copyright and license text.
 
-## License
+Thanks to [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) for the original design and continued development. This fork has no affiliation with or official endorsement from the upstream maintainers.
 
-Lilac is licensed under MIT. See [LICENSE](LICENSE). Vendored projects under `ref/` retain their
-upstream license terms.
+Vendored/reference material in `ref/` is subject to its original license terms.

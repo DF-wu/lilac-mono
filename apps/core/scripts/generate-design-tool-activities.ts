@@ -385,7 +385,7 @@ export const subagentActivities = ${JSON.stringify(subagents)} as const satisfie
 
 export const subagentTranscripts: Record<keyof typeof subagentActivities, { running: DisplayMessage[]; complete: DisplayMessage[] }> = ${JSON.stringify(transcripts)};
 
-type WorkflowCardContent = { text: string; actions: Extract<DisplayPart, { type: "data-actions" }>["data"]["actions"]; attachments: []; workflow: WorkflowCard };
+type WorkflowCardContent = { text: string; format?: "markdown" | "html"; actions: Extract<DisplayPart, { type: "data-actions" }>["data"]["actions"]; attachments: []; workflow: WorkflowCard };
 export const workflowProgress = ${JSON.stringify(workflows)} as const satisfies Record<string, WorkflowCardContent & { transitions: Record<"paused" | "resumed" | "cancelled", WorkflowCardContent> }>;
 `;
   const formatted = Bun.spawnSync(["bunx", "oxfmt", "--stdin-filepath", OUTPUT_PATH], {

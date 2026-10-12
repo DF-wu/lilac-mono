@@ -1,5 +1,6 @@
 ARG BASE_IMAGE=ubuntu:24.04
 ARG NODE_MAJOR=22
+ARG CONTAINER_USER=lilac
 ARG CONTAINER_UID=1000
 
 ############################
@@ -7,7 +8,6 @@ ARG CONTAINER_UID=1000
 ############################
 FROM ${BASE_IMAGE} AS toolchain
 ARG NODE_MAJOR
-ENV LILAC_USER=lilac
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -18,18 +18,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN install -d -m 0755 /etc/apt/keyrings \
   && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-    | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+  | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
   && chmod a+r /etc/apt/keyrings/nodesource.gpg \
   && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
-    > /etc/apt/sources.list.d/nodesource.list \
+  > /etc/apt/sources.list.d/nodesource.list \
   && ARCH="$(dpkg --print-architecture)" \
   && if [ "$ARCH" = "amd64" ]; then \
-       curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
-         | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg; \
-       chmod a+r /etc/apt/keyrings/google-chrome.gpg; \
-       echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
-         > /etc/apt/sources.list.d/google-chrome.list; \
-     fi
+  curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+  | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg; \
+  chmod a+r /etc/apt/keyrings/google-chrome.gpg; \
+  echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+  > /etc/apt/sources.list.d/google-chrome.list; \
+  fi
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   bash \
@@ -65,27 +65,40 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   unzip \
   util-linux \
   vulkan-tools \
+  rsync \
   && ARCH="$(dpkg --print-architecture)" \
   && if [ "$ARCH" = "amd64" ]; then \
-       apt-get install -y --no-install-recommends google-chrome-stable; \
-     fi \
+  apt-get install -y --no-install-recommends google-chrome-stable; \
+  fi \
   && rm -rf /var/lib/apt/lists/*
 
 # Ubuntu/Debian call it "fdfind"
 RUN ln -sf /usr/bin/fdfind /usr/local/bin/fd
 
+ARG CONTAINER_USER
 ARG CONTAINER_UID
+ENV LILAC_USER=${CONTAINER_USER}
+ENV LILAC_UID=${CONTAINER_UID}
+ENV LILAC_GID=${CONTAINER_UID}
 
 # Create a dedicated regular user instead of inheriting an image account's
 # groups or account settings. Ubuntu reserves UID/GID 1000 for `ubuntu`.
-RUN case "$CONTAINER_UID" in \
+RUN case "$CONTAINER_USER" in \
+      ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) \
+        echo "CONTAINER_USER must contain only letters, digits, underscores, or hyphens" >&2; exit 1 ;; \
+    esac \
+  && case "$CONTAINER_USER" in \
+       [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_]*) ;; \
+       *) echo "CONTAINER_USER must start with a letter or underscore" >&2; exit 1 ;; \
+     esac \
+  && case "$CONTAINER_UID" in \
       ''|*[!0-9]*) echo "CONTAINER_UID must be a numeric regular-user UID" >&2; exit 1 ;; \
     esac \
   && if [ "$CONTAINER_UID" -lt 1000 ] || [ "$CONTAINER_UID" -gt 60000 ]; then \
        echo "CONTAINER_UID must be between 1000 and 60000" >&2; exit 1; \
      fi \
   && if id -u "$LILAC_USER" >/dev/null 2>&1; then \
-       userdel --remove "$LILAC_USER"; \
+       echo "CONTAINER_USER is already assigned to a base-image account" >&2; exit 1; \
      fi \
   && existing_user="$(getent passwd "$CONTAINER_UID" | cut -d: -f1 || true)" \
   && if [ -n "$existing_user" ]; then \
@@ -95,7 +108,7 @@ RUN case "$CONTAINER_UID" in \
        userdel --remove ubuntu; \
      fi \
   && if getent group "$LILAC_USER" >/dev/null 2>&1; then \
-       groupdel "$LILAC_USER"; \
+       echo "CONTAINER_USER is already assigned to a base-image group" >&2; exit 1; \
      fi \
   && existing_group="$(getent group "$CONTAINER_UID" | cut -d: -f1 || true)" \
   && if [ -n "$existing_group" ]; then \
@@ -107,7 +120,12 @@ RUN case "$CONTAINER_UID" in \
   && groupadd --gid "$CONTAINER_UID" "$LILAC_USER" \
   && useradd --create-home --uid "$CONTAINER_UID" --gid "$LILAC_USER" \
        --shell /bin/bash "$LILAC_USER" \
-  && [ "$(id -G "$LILAC_USER")" = "$CONTAINER_UID" ]
+  && [ "$(id -G "$LILAC_USER")" = "$CONTAINER_UID" ] \
+  && printf '%s\n' "$LILAC_USER" > /etc/lilac-runtime-user \
+  && chmod 0444 /etc/lilac-runtime-user
+RUN if [ "$LILAC_USER" = "Catalina" ] && [ ! -e /home/Catalinna ]; then \
+      ln -s /home/Catalina /home/Catalinna; \
+    fi
 ENV HOME=/home/${LILAC_USER}
 ENV DATA_DIR=/data
 ENV TOOL_SERVER_BACKEND_SOCKET=/run/lilac/tool-server/server.sock

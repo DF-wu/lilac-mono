@@ -14,21 +14,22 @@ import {
 import { Panic, Result, type Result as ResultType } from "better-result";
 import { preserveToolPanic } from "../../tools/tool-result-adapters";
 
-function settleCapturedError<T, E>(
+// Exported (not otherwise changed) for the fork-owned structured image tool in ./generate-image.
+export function settleCapturedError<T, E>(
   result: ResultType<T, { readonly cause: Error | Panic }>,
   resolve: (cause: Error | Panic) => E,
 ): ResultType<T, E> {
   return result.mapError(({ cause }) => resolve(cause));
 }
 
-async function settleCapturedPromise<T, E>(
+export async function settleCapturedPromise<T, E>(
   result: Promise<ResultType<T, { readonly cause: Error | Panic }>>,
   resolve: (cause: Error | Panic) => E,
 ): Promise<ResultType<T, E>> {
   return settleCapturedError(await result, resolve);
 }
 
-function captureGenerateFailure(cause: unknown): { readonly cause: Error | Panic } {
+export function captureGenerateFailure(cause: unknown): { readonly cause: Error | Panic } {
   if (Panic.is(cause)) return { cause };
   if (cause instanceof Error) return { cause };
   return { cause: new Error("Unknown image generation failure", { cause }) };
@@ -38,12 +39,7 @@ import { fileTypeFromBuffer } from "file-type";
 import fs from "node:fs/promises";
 import { dirname, extname } from "node:path";
 import { z } from "zod";
-import {
-  imageScriptInputSchema,
-  imageScriptDescription,
-  configuredImageProviders,
-  runImageScript,
-} from "./image-script";
+import { createGenerateImageCallable, type GenerateImageConfigSource } from "./generate-image";
 import {
   formatToolPathForRequestContext,
   inferExtensionFromMimeType,
@@ -51,7 +47,10 @@ import {
   resolveToolPathForRequestContext,
 } from "../../shared/attachment-utils";
 
-function generateFailure(kind: ServerToolFailure["kind"], message: string): ServerToolFailure {
+export function generateFailure(
+  kind: ServerToolFailure["kind"],
+  message: string,
+): ServerToolFailure {
   return serverToolFailure({
     kind,
     code: `generate_${kind}`,
@@ -142,7 +141,7 @@ function hasConfiguredProviderValue(config: {
   return Boolean(config.apiKey?.trim() || config.baseUrl?.trim());
 }
 
-function isConfiguredProvider(provider: GenerationProvider): boolean {
+export function isConfiguredProvider(provider: GenerationProvider): boolean {
   switch (provider) {
     case "openai":
       return hasConfiguredProviderValue(env.providers.openai);
@@ -279,7 +278,7 @@ function looksLikeSvg(bytes: Buffer): boolean {
   return prefix.startsWith("<svg") || prefix.startsWith("<?xml");
 }
 
-async function readImageDataFromPath(
+export async function readImageDataFromPath(
   path: string,
   displayPath = path,
 ): Promise<ResultType<Buffer, ServerToolFailure>> {
@@ -366,7 +365,7 @@ export async function buildVideoGenerationPrompt(
   });
 }
 
-async function writeFileWithUniqueName(
+export async function writeFileWithUniqueName(
   targetPath: string,
   bytes: Uint8Array,
 ): Promise<ResultType<string, ServerToolFailure>> {
@@ -428,22 +427,19 @@ export function generateVideoWithModel(
 export class Generate implements ServerTool {
   id = "generate";
 
+  constructor(
+    private readonly options: {
+      readonly getConfig?: GenerateImageConfigSource;
+    } = {},
+  ) {}
+
   private readonly tool = defineServerTool({
     id: this.id,
     callables: ({ callable }) => ({
-      "generate.image": callable({
-        name: "Generate Image",
-        description: imageScriptDescription(),
-        inputSchema: imageScriptInputSchema,
-        validation: "zod",
-        primaryPositional: "code",
-        catalog: () => {
-          const providers = configuredImageProviders();
-          if (Object.keys(providers).length === 0) return false;
-          return { description: imageScriptDescription(providers) };
-        },
-        run: (input, opts) => runImageScript(input, opts),
-      }),
+      // Fork: structured image generation instead of upstream's script runner.
+      "generate.image": callable(
+        createGenerateImageCallable({ getConfig: () => this.options.getConfig?.() }),
+      ),
       "generate.video": callable({
         name: "Generate Video",
         description: "Generate a video with a configured provider and write it to a local file.",

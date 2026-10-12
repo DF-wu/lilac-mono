@@ -20,6 +20,10 @@ import {
   type SurfaceRuntimeDescriptor,
 } from "../surface/runtime-descriptor";
 import { startGithubWebhookServer } from "../github/webhook/github-webhook-server";
+import {
+  createTelegramSurfaceRuntimeEntry,
+  type TelegramSurfaceRuntimeInput,
+} from "../surface/telegram/telegram-surface-runtime";
 
 type BuiltinSurfaceRuntimeLogger = {
   debug(message: string, context: Readonly<Record<string, unknown>>): void;
@@ -35,6 +39,7 @@ export type ComposeBuiltinSurfaceRuntimesInput = {
   readonly githubAdapter: SurfaceAdapter;
   readonly descriptorBoundDiscordEventSource: SurfaceAdapterEventSource;
   readonly discordHealth?: SurfaceRuntimeHealthPort;
+  readonly telegram?: TelegramSurfaceRuntimeInput;
   readonly bus: LilacBus;
   readonly blobStore: BlobStore;
   readonly subscriptionPrefix: string;
@@ -141,5 +146,16 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
         };
       },
     }),
+    ...(input.telegram
+      ? [
+          createTelegramSurfaceRuntimeEntry(input.telegram, {
+            bus: input.bus,
+            blobStore: input.blobStore,
+            subscriptionId,
+            getTranscriptStore: input.getTranscriptStore,
+            logger: input.logger,
+          }),
+        ]
+      : []),
   ]);
 }

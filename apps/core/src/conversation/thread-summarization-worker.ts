@@ -19,7 +19,7 @@ import {
   ConversationThreadService,
   type ConversationThreadAttachmentHydrator,
 } from "./thread-service";
-import { ConversationThreadStore } from "./thread-store";
+import { ConversationThreadStore, type ConversationSurface } from "./thread-store";
 import { createDiscordEntityMapper } from "../entity/entity-mapper";
 import { DiscordSurfaceStore } from "../surface/store/discord-surface-store";
 
@@ -133,7 +133,7 @@ const hydrateAttachments: ConversationThreadAttachmentHydrator = async ({ refs }
     );
   }
   const hydrated: Array<{
-    ref: { surface?: "discord" | "native"; channelId: string; messageId: string };
+    ref: { surface?: ConversationSurface; channelId: string; messageId: string };
     attachments: Array<{
       id?: string;
       data?: Uint8Array;
@@ -195,7 +195,9 @@ async function runJob(request: ThreadSummarizationWorkerRequest): Promise<void> 
       store = new ConversationThreadStore(request.searchDbPath, {
         surfaceDbPath: request.surfaceDbPath,
         nativeDbPath: request.nativeDbPath,
-        mainAgentUserNames: [cfg.surface.discord.botName],
+        telegramDbPath: request.telegramDbPath,
+        telegramBotName: request.telegramBotName,
+        mainAgentUserNames: [cfg.surface.discord.botName, cfg.surface.telegram.botName],
       });
       const entityMapper = request.surfaceDbPath
         ? (() => {

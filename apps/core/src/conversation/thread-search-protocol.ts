@@ -2,8 +2,8 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 const filters = z.strictObject({
-  surface: z.enum(["discord", "native"]).optional(),
-  participantSurface: z.enum(["discord", "native"]).optional(),
+  surface: z.enum(["discord", "native", "telegram"]).optional(),
+  participantSurface: z.enum(["discord", "native", "telegram"]).optional(),
   sessionId: z.string().optional(),
   participantId: z.string().optional(),
   participantIdsAny: z.array(z.string()).readonly().optional(),
@@ -13,6 +13,7 @@ const filters = z.strictObject({
 const allowlist = z.strictObject({
   channelIds: z.array(z.string()).readonly(),
   guildIds: z.array(z.string()).readonly(),
+  telegramChatIds: z.array(z.string()).readonly().optional(),
 });
 const scope = { filters: filters.optional(), allowlist: allowlist.optional() };
 const hit = z.object({
@@ -20,7 +21,7 @@ const hit = z.object({
   channelId: z.string(),
   guildId: z.string().optional(),
   parentChannelId: z.string().optional(),
-  kind: z.enum(["discord_thread", "inferred_channel_thread", "native_thread"]),
+  kind: z.enum(["discord_thread", "inferred_channel_thread", "native_thread", "telegram_thread"]),
   sourceRevision: z.string().optional(),
   title: z.string(),
   brief: z.string(),
@@ -104,6 +105,8 @@ const requestSchema = z.strictObject({
   searchDbPath: z.string(),
   surfaceDbPath: z.string().optional(),
   nativeDbPath: z.string().optional(),
+  telegramDbPath: z.string().optional(),
+  telegramBotName: z.string().optional(),
   botName: z.string().optional(),
   operation,
 });

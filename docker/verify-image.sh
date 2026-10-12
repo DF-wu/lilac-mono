@@ -8,9 +8,11 @@ fail() {
 
 command -v docker >/dev/null 2>&1 || fail "docker is unavailable"
 docker info >/dev/null 2>&1 || fail "cannot reach the Docker daemon"
-[[ $# -le 1 ]] || fail "usage: $0 [IMAGE]"
+[[ $# -le 3 ]] || fail "usage: $0 [IMAGE [EXPECTED_USER [EXPECTED_UID]]]"
 
 readonly image=${1:-lilac:dev}
+readonly expected_user=${2:-lilac}
+readonly expected_uid=${3:-1000}
 container_name="lilac-image-verify-$(date +%s)-$$-${RANDOM}"
 readonly container_name
 readonly log_marker="lilac-direct-output-${container_name}"
@@ -33,9 +35,15 @@ docker run --detach \
   --pids-limit 1024 \
   --stop-timeout 30 \
   --no-healthcheck \
+  --env LILAC_USER=runtime-override-must-not-win \
+  --env LILAC_UID=9999 \
+  --env LILAC_GID=9999 \
+  --env HOME=/tmp/runtime-override-must-not-win \
+  --env USER=runtime-override-must-not-win \
+  --env LOGNAME=runtime-override-must-not-win \
   --env LILAC_VERIFY_LOG_MARKER="$log_marker" \
   "$image" \
-  /bin/sh -c '(/bin/sleep 0.1 &); /bin/sleep 1; printf "%s\n" "$LILAC_VERIFY_LOG_MARKER"; printf "%s" "$LILAC_OPERATOR_TOKEN_SHA256" >/tmp/lilac-service-token-hash; exec /bin/sleep infinity' \
+  /bin/sh -c '(/bin/sleep 0.1 &); /usr/bin/env | /usr/bin/sort >/tmp/lilac-service-env; /bin/sleep 1; printf "%s\n" "$LILAC_VERIFY_LOG_MARKER"; printf "%s" "$LILAC_OPERATOR_TOKEN_SHA256" >/tmp/lilac-service-token-hash; exec /bin/sleep infinity' \
   >/dev/null
 
 readonly wait_deadline=$((SECONDS + 30))
@@ -54,7 +62,32 @@ while ((SECONDS < wait_deadline)); do
 done
 [[ $ready == true ]] || fail "timed out waiting for the entrypoint"
 
-lilac_uid=$(docker exec "$container_name" /usr/bin/id -u lilac)
+runtime_user=$(docker exec "$container_name" /usr/bin/cat /etc/lilac-runtime-user)
+[[ $runtime_user == "$expected_user" ]] ||
+  fail "runtime user is $runtime_user, expected $expected_user"
+identity_metadata=$(docker exec "$container_name" /usr/bin/stat --format='%a:%u:%g' /etc/lilac-runtime-user)
+[[ $identity_metadata == 444:0:0 ]] ||
+  fail "runtime identity is not root:root mode 0444"
+runtime_uid=$(docker exec "$container_name" /usr/bin/id -u "$runtime_user")
+runtime_gid=$(docker exec "$container_name" /usr/bin/id -g "$runtime_user")
+[[ $runtime_uid == "$expected_uid" ]] ||
+  fail "runtime UID is $runtime_uid, expected $expected_uid"
+[[ $runtime_gid == "$expected_uid" ]] ||
+  fail "runtime GID is $runtime_gid, expected $expected_uid"
+runtime_home=$(docker exec "$container_name" /usr/bin/getent passwd "$runtime_user" | /usr/bin/cut -d: -f6)
+readonly expected_home="/home/$expected_user"
+[[ $runtime_home == "$expected_home" ]] ||
+  fail "passwd home is $runtime_home, expected $expected_home"
+home_metadata=$(docker exec "$container_name" /usr/bin/stat --format='%u:%g' "$runtime_home")
+[[ $home_metadata == "$expected_uid:$expected_uid" ]] ||
+  fail "runtime home ownership is $home_metadata, expected $expected_uid:$expected_uid"
+if [[ $expected_user == Catalina ]]; then
+  catalinna_target=$(docker exec "$container_name" /usr/bin/readlink /home/Catalinna)
+  [[ $catalinna_target == /home/Catalina ]] ||
+    fail "Catalina compatibility home does not target /home/Catalina"
+elif docker exec "$container_name" /usr/bin/test -e /home/Catalinna; then
+  fail "Catalina compatibility home exists in the $expected_user image"
+fi
 pid1_uid=$(docker exec "$container_name" /usr/bin/stat --format='%u' /proc/1)
 [[ $pid1_uid == 0 ]] || fail "PID 1 does not run as root"
 pid1_name=$(docker exec "$container_name" /usr/bin/cat /proc/1/comm)
@@ -64,15 +97,31 @@ service_pids=$(docker exec "$container_name" /usr/bin/cat /proc/1/task/1/childre
   fail "tini did not reap the orphan probe (children: $service_pids)"
 service_pid=${BASH_REMATCH[1]}
 service_uid=$(docker exec "$container_name" /usr/bin/stat --format='%u' "/proc/$service_pid")
-[[ $service_uid == "$lilac_uid" ]] || fail "service process does not run as lilac"
+[[ $service_uid == "$runtime_uid" ]] || fail "service process does not run as $runtime_user"
 service_name=$(docker exec "$container_name" /bin/sh -c "tr '\0' ' ' </proc/$service_pid/cmdline")
 [[ $service_name == "/bin/sleep infinity " ]] || fail "unexpected service command: $service_name"
+service_env=$(docker exec "$container_name" /usr/bin/cat /tmp/lilac-service-env)
+for expected_env in \
+  "LILAC_USER=$expected_user" \
+  "LILAC_UID=$expected_uid" \
+  "LILAC_GID=$expected_uid" \
+  "HOME=$expected_home" \
+  "USER=$expected_user" \
+  "LOGNAME=$expected_user"; do
+  grep -Fxq "$expected_env" <<<"$service_env" ||
+    fail "service environment does not contain $expected_env"
+done
+service_path=$(grep -F 'PATH=' <<<"$service_env" | cut -d= -f2-)
+[[ :$service_path: == *":$expected_home/.local/bin:"* ]] ||
+  fail "service PATH does not include $expected_home/.local/bin"
+[[ :$service_path: == *":$expected_home/.bun/bin:"* ]] ||
+  fail "service PATH does not include $expected_home/.bun/bin"
 
 token_metadata=$(docker exec "$container_name" /usr/bin/stat --format='%a:%u:%g' \
   /run/lilac/operator-token)
 [[ $token_metadata == 600:0:0 ]] || fail "operator token is not root:root mode 0600"
-if docker exec --user lilac "$container_name" /usr/bin/test -r /run/lilac/operator-token; then
-  fail "operator token is readable by lilac"
+if docker exec --user "$runtime_user" "$container_name" /usr/bin/test -r /run/lilac/operator-token; then
+  fail "operator token is readable by $runtime_user"
 fi
 docker exec "$container_name" /bin/sh -c \
   'hash=$(/usr/bin/sha256sum /run/lilac/operator-token | /usr/bin/cut -d " " -f 1); test "$(/usr/bin/cat /tmp/lilac-service-token-hash)" = "$hash"' ||
@@ -81,7 +130,7 @@ docker exec "$container_name" /bin/sh -c \
 resolved_tools=$(docker exec "$container_name" /bin/sh -c 'command -v tools')
 [[ $resolved_tools == /usr/local/bin/tools ]] || fail "root PATH does not select trusted tools CLI"
 docker exec "$container_name" /usr/local/bin/tools --help >/dev/null || fail "tools CLI smoke failed"
-docker exec --user lilac "$container_name" /usr/local/bin/tools --help >/dev/null ||
+docker exec --user "$runtime_user" "$container_name" /usr/local/bin/tools --help >/dev/null ||
   fail "unprivileged tools CLI smoke failed"
 operator_status=0
 operator_output=$(docker exec \
@@ -89,16 +138,17 @@ operator_output=$(docker exec \
   "$container_name" /usr/local/bin/tools --operator --list 2>&1) || operator_status=$?
 [[ $operator_status -eq 6 && $operator_output == '{"status":"error","error":{"kind":"unavailable","code":"bridge_unavailable","message":"fetch tools list failed","retryable":true}}' ]] ||
   fail "operator CLI did not load its token before the expected connection failure"
-docker exec --user lilac "$container_name" /usr/local/bin/bun --version >/dev/null ||
+docker exec --user "$runtime_user" "$container_name" /usr/local/bin/bun --version >/dev/null ||
   fail "Bun smoke failed"
-docker exec --user lilac "$container_name" /usr/local/bin/bun -e \
+docker exec --user "$runtime_user" "$container_name" /usr/local/bin/bun -e \
   'await import("./apps/core/src/surface/native/runtime.ts")' >/dev/null || \
   fail "native runtime dependencies are incomplete"
 
 for path in /app /usr/local/bin/bun /usr/local/bin/tools /usr/local/bin/tools-worker \
-  /usr/local/bin/tools-build-id /usr/local/bin/tools-build-info.json; do
-  if docker exec --user lilac "$container_name" /usr/bin/test -w "$path"; then
-    fail "$path is writable by lilac"
+  /usr/local/bin/tools-build-id /usr/local/bin/tools-build-info.json \
+  /usr/local/libexec/lilac-tool-bridge; do
+  if docker exec --user "$runtime_user" "$container_name" /usr/bin/test -w "$path"; then
+    fail "$path is writable by $runtime_user"
   fi
 done
 for path in \
@@ -110,18 +160,15 @@ for path in \
   /usr/local/bin/tools-build-info.json \
   /app/packages/utils/builtin-skills/customize-lilac/SKILL.md \
   /app/packages/utils/builtin-skills/image-generation/SKILL.md \
-  /app/packages/utils/builtin-skills/image-generation/references/openai.md \
-  /app/packages/utils/builtin-skills/image-generation/references/openrouter.md \
-  /app/packages/utils/builtin-skills/image-generation/references/xai.md \
   /app/packages/utils/builtin-skills/customize-lilac/references/self-debugging.md \
   /app/packages/utils/builtin-skills/customize-lilac/references/core-config.md \
   /app/packages/utils/config-templates/core-config.example.yaml \
   /app/packages/utils/core-config.ts; do
-  docker exec --user lilac "$container_name" /usr/bin/test -r "$path" ||
-    fail "$path is not readable by lilac"
+  docker exec --user "$runtime_user" "$container_name" /usr/bin/test -r "$path" ||
+    fail "$path is not readable by $runtime_user"
 done
-docker exec --user lilac "$container_name" /usr/bin/test -w /data ||
-  fail "/data is not writable by lilac"
+docker exec --user "$runtime_user" "$container_name" /usr/bin/test -w /data ||
+  fail "/data is not writable by $runtime_user"
 
 docker exec --user root "$container_name" /usr/local/bin/lilac-tui --help >/dev/null ||
   fail "container terminal launcher failed"

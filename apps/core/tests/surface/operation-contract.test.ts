@@ -42,6 +42,8 @@ import type {
   SurfaceSelf,
   SurfaceSession,
   SurfaceSessionParticipantsResult,
+  TelegramMsgRef,
+  TelegramSessionRef,
 } from "../../src/surface/types";
 import type { RequestContext as PluginRequestContext } from "@stanley2058/lilac-plugin-runtime";
 import type { RequestContext as CoreRequestContext } from "../../src/tool-server/types";
@@ -49,12 +51,14 @@ import type { RequestContext as CoreRequestContext } from "../../src/tool-server
 const SESSION_REF_FIXTURES = {
   discord: { platform: "discord", channelId: "discord-channel" },
   github: { platform: "github", channelId: "owner/repo#1" },
+  telegram: { platform: "telegram", channelId: "-1001:42" },
   native: { platform: "native", channelId: "thread-1" },
 } as const satisfies Record<SessionRef["platform"], SessionRef>;
 
 const MESSAGE_REF_FIXTURES = {
   discord: { platform: "discord", channelId: "discord-channel", messageId: "discord-message" },
   github: { platform: "github", channelId: "owner/repo#1", messageId: "101" },
+  telegram: { platform: "telegram", channelId: "-1001:42", messageId: "84" },
   native: { platform: "native", channelId: "thread-1", messageId: "message-1" },
 } as const satisfies Record<MsgRef["platform"], MsgRef>;
 
@@ -88,6 +92,13 @@ type SurfaceOperationEntrypoint =
   | {
       readonly target: "typing-subscription";
       readonly method: "stop";
+    }
+  | {
+      // Optional capability (SurfaceAttachmentResolver), not a SurfaceAdapter
+      // method: only adapters whose platform requires credentialed downloads
+      // implement it, discovered via hasSurfaceAttachmentResolver.
+      readonly target: "attachment-resolver";
+      readonly method: "resolveAttachment";
     };
 
 type SurfaceAdapterOperationContractFixture<P extends RegisteredSurfacePlatform> = {
@@ -129,6 +140,7 @@ const DISCORD_ADAPTER_OPERATION_CONTRACT = {
     "list-reaction-details": { target: "adapter", method: "listReactionDetails" },
     "get-unread": { target: "adapter", method: "getUnRead" },
     "mark-read": { target: "adapter", method: "markRead" },
+    "resolve-attachment": { target: "attachment-resolver", method: "resolveAttachment" },
   },
   result: DISCORD_OPERATION_RESULT,
 } as const satisfies SurfaceAdapterOperationContractFixture<"discord">;
@@ -164,6 +176,7 @@ const GITHUB_ADAPTER_OPERATION_CONTRACT = {
     "list-reaction-details": { target: "adapter", method: "listReactionDetails" },
     "get-unread": { target: "adapter", method: "getUnRead" },
     "mark-read": { target: "adapter", method: "markRead" },
+    "resolve-attachment": { target: "attachment-resolver", method: "resolveAttachment" },
   },
   result: GITHUB_OPERATION_RESULT,
 } as const satisfies SurfaceAdapterOperationContractFixture<"github">;
@@ -228,7 +241,9 @@ interface SurfaceAdapterSignatureFixture {
 describe("surface operation contract", () => {
   it("keeps session and message platform sets exactly equal", () => {
     expectTypeOf<SessionRef["platform"]>().toEqualTypeOf<MsgRef["platform"]>();
-    expectTypeOf<RegisteredSurfacePlatform>().toEqualTypeOf<"discord" | "github" | "native">();
+    expectTypeOf<RegisteredSurfacePlatform>().toEqualTypeOf<
+      "discord" | "github" | "telegram" | "native"
+    >();
     expectTypeOf<
       NonNullable<PluginRequestContext["requestInitiator"]>["platform"]
     >().toEqualTypeOf<string>();
@@ -244,8 +259,10 @@ describe("surface operation contract", () => {
   it("correlates platform-specific session and message refs", () => {
     expectTypeOf<SessionRefFor<"discord">>().toEqualTypeOf<DiscordSessionRef>();
     expectTypeOf<SessionRefFor<"github">>().toEqualTypeOf<GithubSessionRef>();
+    expectTypeOf<SessionRefFor<"telegram">>().toEqualTypeOf<TelegramSessionRef>();
     expectTypeOf<MsgRefFor<"discord">>().toEqualTypeOf<DiscordMsgRef>();
     expectTypeOf<MsgRefFor<"github">>().toEqualTypeOf<GithubMsgRef>();
+    expectTypeOf<MsgRefFor<"telegram">>().toEqualTypeOf<TelegramMsgRef>();
     expectTypeOf(DISCORD_ADAPTER_OPERATION_CONTRACT.sessionRef).toMatchTypeOf<DiscordSessionRef>();
     expectTypeOf(DISCORD_ADAPTER_OPERATION_CONTRACT.messageRef).toMatchTypeOf<DiscordMsgRef>();
     expectTypeOf(DISCORD_ADAPTER_OPERATION_CONTRACT.result).toMatchTypeOf<
@@ -282,6 +299,7 @@ describe("surface operation contract", () => {
       "push-output",
       "read-message",
       "remove-reaction",
+      "resolve-attachment",
       "send-message",
       "start-output",
       "start-typing",

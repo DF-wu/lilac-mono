@@ -72,6 +72,27 @@ export {
   DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
   MODEL_REASONING_EFFORTS,
 } from "./core-config/types";
+export {
+  IMAGE_GENERATION_MODEL_ALIASES,
+  defaultGenerateToolsConfig,
+  type GenerateToolsConfig,
+  type ImageGenerationModelAlias,
+  IMAGE_ROUTE_PROVIDERS,
+  type ImageModelRoute,
+  type ImageRouteProvider,
+} from "./core-config/generate-image";
+export {
+  TELEGRAM_SURFACE_DEFAULTS,
+  cloneDefaultTelegramSurface,
+  type TelegramSurfaceConfig,
+} from "./core-config/telegram-surface";
+export {
+  TelegramTokenMissing,
+  isTelegramSurfaceUsable,
+  resolveTelegramDbPath,
+  resolveTelegramToken,
+  resolveTelegramTokenResult,
+} from "./core-config/telegram-runtime";
 export type {
   BlobStorageConfig,
   ConfiguredModelChainEntry,

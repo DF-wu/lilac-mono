@@ -62,7 +62,19 @@ export type WebProviderEnvironment = {
   firecrawl: { apiKey?: string; apiBaseUrl?: string };
   exa: { apiKey?: string; baseUrl?: string };
   tavily: { apiKey?: string; apiBaseUrl?: string };
+  openai: { apiKey?: string; baseUrl?: string };
+  /** Credentials used when `tools.web.openai.model` resolves to an openai-compatible model. */
+  openaiCompatible?: { apiKey?: string; baseUrl?: string };
 };
+
+/**
+ * Providers that can extract a page. `openai` runs a hosted web search only,
+ * so `web.extract` skips it instead of failing over a provider that cannot
+ * serve the request.
+ */
+export function supportsPageExtraction(providerId: WebSearchProviderId): boolean {
+  return providerId === "firecrawl" || providerId === "tavily" || providerId === "exa";
+}
 
 export interface ProviderPageExtractor {
   extract(

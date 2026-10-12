@@ -2638,6 +2638,7 @@ describe("permanent architecture governance", () => {
     );
     for (const required of [
       "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner:subscribeTopic",
+      "src/surface/telegram/telegram-request-router.ts#startTelegramRequestRouter:subscribeTopic",
       "src/workflow/workflow-engine.ts#WorkflowEngine.waitForAgentRequest:fetchTopic,subscribeTopic",
       "src/workflow/workflow-progress-projector.ts#WorkflowProgressProjector.startWorkflowProgressSubscriptionResult:subscribeTopic",
     ]) {

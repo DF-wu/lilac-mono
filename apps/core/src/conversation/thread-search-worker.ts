@@ -34,7 +34,12 @@ async function execute(request: ThreadSearchRequest): Promise<ThreadSearchRespon
   store ??= new ConversationThreadStore(request.searchDbPath, {
     surfaceDbPath: request.surfaceDbPath,
     nativeDbPath: request.nativeDbPath,
-    mainAgentUserNames: request.botName ? [request.botName] : undefined,
+    telegramDbPath: request.telegramDbPath,
+    telegramBotName: request.telegramBotName,
+    mainAgentUserNames: [
+      ...(request.botName ? [request.botName] : []),
+      ...(request.telegramBotName ? [request.telegramBotName] : []),
+    ],
   });
   const op = request.operation;
   switch (op.type) {

@@ -1811,6 +1811,26 @@ describe("subagent model selection", () => {
 });
 
 describe("agent run activity", () => {
+  it("fails a wait after the configured idle interval", async () => {
+    const timedOut: Error[] = [];
+    const watchdog = createAgentRunIdleWatchdog({
+      idleTimeoutMs: 30,
+      onTimeout: (error) => timedOut.push(error),
+    });
+
+    jest.useFakeTimers({ now: 0 });
+    try {
+      watchdog.start();
+      const watched = watchdog.waitFor(new Promise<void>(() => {}));
+      jest.advanceTimersByTime(30);
+      await expect(watched).rejects.toThrow("agent idle timed out after 30ms");
+      expect(timedOut).toHaveLength(1);
+    } finally {
+      watchdog.stop();
+      jest.useRealTimers();
+    }
+  });
+
   it("fails idle retry when the inner backoff Result is aborted", () => {
     expect(
       toIdleRetryDecision(

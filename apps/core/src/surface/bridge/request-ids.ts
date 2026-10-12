@@ -18,6 +18,11 @@ export type ParsedRequestId =
       interactionId: string;
     }
   | {
+      kind: "telegram_message";
+      sessionId: string;
+      messageId: string;
+    }
+  | {
       kind: "workflow";
       workflowId: string;
       sequence: number;
@@ -45,6 +50,20 @@ export function formatDiscordSlashRequestId(input: {
   return `discord:${input.channelId}:slash:${input.interactionId}`;
 }
 
+/**
+ * Telegram request id.
+ *
+ * `sessionId` may itself contain a colon for forum topics
+ * ("<chat_id>:<message_thread_id>"), so the message id is always the final
+ * segment and parsing splits on the last colon.
+ */
+export function formatTelegramMessageRequestId(input: {
+  sessionId: string;
+  messageId: string;
+}): string {
+  return `telegram:${input.sessionId}:${input.messageId}`;
+}
+
 export function formatWorkflowRequestId(input: { workflowId: string; sequence: number }): string {
   return `wf:${input.workflowId}:${input.sequence}`;
 }
@@ -52,6 +71,10 @@ export function formatWorkflowRequestId(input: { workflowId: string; sequence: n
 export function isDiscordRequestId(requestId: string): boolean {
   const parsed = parseRequestId(requestId);
   return parsed?.kind === "discord_message" || parsed?.kind === "discord_slash";
+}
+
+export function isTelegramRequestId(requestId: string): boolean {
+  return parseRequestId(requestId)?.kind === "telegram_message";
 }
 
 export function parseRequestId(requestId: string): ParsedRequestId | null {
@@ -74,6 +97,18 @@ export function parseRequestId(requestId: string): ParsedRequestId | null {
       return { kind: "discord_slash", channelId: parts[1], interactionId: parts[3] };
     }
     return null;
+  }
+
+  if (requestId.startsWith("telegram:")) {
+    const rest = requestId.slice("telegram:".length);
+    const idx = rest.lastIndexOf(":");
+    if (idx <= 0) return null;
+
+    const sessionId = rest.slice(0, idx);
+    const messageId = rest.slice(idx + 1);
+    if (!sessionId || !messageId) return null;
+
+    return { kind: "telegram_message", sessionId, messageId };
   }
 
   if (requestId.startsWith("wf:")) {
