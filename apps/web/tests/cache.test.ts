@@ -350,3 +350,19 @@ test("draft writes avoid reading all draft bodies until the storage cap requires
   const reopened = cache(factory, { maxThreads: 2 });
   expect((await reopened.listLocalDrafts(scope)).length).toBe(2);
 });
+
+test("revoking a parent removes persisted child streams across cache instances and preserves other scopes", async () => {
+  const factory = new IDBFactory();
+  const first = cache(factory);
+  const child = "subagent:thread:wfrun:child";
+  const otherScope = { ...scope, principalId: "other" };
+  await first.commit(scope, "thread", patch());
+  await first.commit(scope, child, patch(1, "Child transcript"));
+  await first.commit(otherScope, child, patch(1, "Other principal"));
+  first.close();
+  const second = cache(factory);
+  await second.remove(scope, "thread");
+  expect(await second.read(scope, "thread")).toBeUndefined();
+  expect(await second.read(scope, child)).toBeUndefined();
+  expect(await second.read(otherScope, child)).toBeDefined();
+});
