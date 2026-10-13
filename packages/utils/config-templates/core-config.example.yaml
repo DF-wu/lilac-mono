@@ -102,6 +102,16 @@ conversation:
       # Threshold after this conversation already received auto-injected
       # thread metadata. Raise it to reduce follow-up searches.
       followUpMinTextUnits: 10
+      # Optional decision gate before planning. Omit it to always plan eligible input.
+      # Shadow records search/skip decisions while still running retrieval.
+      # Enforce skips only confident negatives; failures continue to the planner.
+      # gate:
+      #   mode: shadow # off | shadow | enforce
+      #   model: [typesafe/jev-1.13.0, openai/gpt-6-luna]
+      #   skipMinProbability: 0.8
+      # Text uses the first model; images use the first OpenAI entry when present.
+      # TypeSafe uses TYPESAFE_AI_API_KEY / TYPESAFE_AI_BASE_URL.
+      # OpenAI uses OPENAI_API_KEY / OPENAI_BASE_URL. The list is not a retry chain.
       # Max thread titles to inject.
       limit: 3
       # Minimum final search score after semantic/lexical ranking and aboutness
@@ -118,43 +128,7 @@ conversation:
       # in the composed request/reply-chain context.
       # Native candidates and native-origin cross-surface recall remain global.
       filterCurrentParticipants: false
-    # Which lane decides auto-injection when autoInject.enabled is true:
-    # - llm: the length gate, planner model, and search ranking configured above.
-    # - decision: one decision call judges the latest message and a local shortlist.
-    #   TypeSafe uses TYPESAFE_AI_API_KEY and optional TYPESAFE_AI_BASE_URL.
-    #   OpenAI uses OPENAI_API_KEY and optional OPENAI_BASE_URL, with native image inputs.
-    #   Ignores the autoInject length, planner, score, and mode settings.
-    autoInjectMode: llm
-    decisionAutoInject:
-      # Ordered model list. Text uses the first entry; attached images use the first
-      # image-capable entry. Only the selected model's API key is required.
-      # Add openai/gpt-6-luna after Jev to route images to Luna. This is not a retry chain.
-      model: [typesafe/jev-1.13.0]
-      # Max thread titles to inject.
-      limit: 3
-      # Maximum unique candidates. With embeddings, reserve half the slots for
-      # lexical search and half for semantic search, then merge duplicates.
-      candidateLimit: 40
-      # Use the latest authored message and up to three recent authored user
-      # messages. Images help judge the shortlist; image-only input still skips recall.
-      # Enables concurrent semantic retrieval even when lexical matches exist.
-      # False keeps lexical-only retrieval. Needs conversation.thread.embedding.
-      semanticFallback: true
-      jev:
-        # Zero disables the message gate: select by candidate usefulness alone.
-        # A positive value enables recall OR durable/non-casual message gating.
-        recallMinProbability: 0
-        # Used only when the recall threshold is positive and is not met.
-        durableSubjectMinProbability: 0.6
-        casualMaxProbability: 0.6
-        # Minimum P(reading the thread helps respond) for each injected thread.
-        relevanceMinProbability: 0.2
-      luna:
-        # F1-tuned text preset; image thresholds need further evaluation.
-        recallMinProbability: 0
-        durableSubjectMinProbability: 0.5
-        casualMaxProbability: 0.3
-        relevanceMinProbability: 0.1
+
 
 surface:
   # Status phrases rotated while a request is running. Native web shows them in place of

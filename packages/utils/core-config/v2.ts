@@ -617,6 +617,16 @@ const conversationSchemaV2 = z
             enabled: z.boolean().default(false),
             plannerModel: z.string().trim().min(1).optional(),
             textPlannerModel: z.string().trim().min(1).optional(),
+            gate: z
+              .object({
+                mode: z.enum(["off", "shadow", "enforce"]).default("shadow"),
+                model: z
+                  .union([z.string().trim().min(1), z.array(z.string().trim().min(1)).min(1)])
+                  .transform((model) => (typeof model === "string" ? [model] : model))
+                  .default(["typesafe/jev-1.13.0"]),
+                skipMinProbability: z.number().min(0.5).max(1).default(0.8),
+              })
+              .optional(),
             minTextUnits: z.number().int().positive().default(10),
             followUpMinTextUnits: z.number().int().positive().default(10),
             limit: z.number().int().positive().max(10).default(3),
@@ -644,6 +654,19 @@ const conversationSchemaV2 = z
       })
       .transform(({ jevAutoInject, decisionAutoInject, ...thread }) => ({
         ...thread,
+        autoInject: {
+          ...thread.autoInject,
+          ...(thread.autoInject.gate || thread.autoInjectMode === "llm"
+            ? {}
+            : {
+                gate: {
+                  mode: "shadow" as const,
+                  model: (decisionAutoInject ?? jevAutoInject ?? decisionAutoInjectDefaultsV2)
+                    .model,
+                  skipMinProbability: 0.8,
+                },
+              }),
+        },
         decisionAutoInject: decisionAutoInject ??
           jevAutoInject ?? { ...decisionAutoInjectDefaultsV2 },
       }))

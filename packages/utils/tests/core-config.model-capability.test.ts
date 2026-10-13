@@ -133,6 +133,51 @@ describe("coreConfigSchema models.capability", () => {
     expect(v1.conversation.thread.decisionAutoInject).toEqual(expectedDecision);
   });
 
+  it("migrates legacy decision modes to shadow and gives explicit gates precedence", () => {
+    for (const autoInjectMode of ["decision", "jev"]) {
+      const migrated = coreConfigInputSchemaV2.parse({
+        conversation: {
+          thread: {
+            autoInjectMode,
+            decisionAutoInject: { model: "openai/gpt-6-luna", relevanceMinProbability: 0.99 },
+          },
+        },
+      });
+      expect(migrated.conversation.thread.autoInject.gate).toEqual({
+        mode: "shadow",
+        model: ["openai/gpt-6-luna"],
+        skipMinProbability: 0.8,
+      });
+      const explicit = coreConfigInputSchemaV2.parse({
+        conversation: {
+          thread: {
+            autoInjectMode,
+            autoInject: { gate: { mode: "off" } },
+          },
+        },
+      });
+      expect(explicit.conversation.thread.autoInject.gate?.mode).toBe("off");
+    }
+    const configured = coreConfigInputSchemaV2.parse({
+      conversation: {
+        thread: {
+          autoInject: { gate: { model: ["typesafe/jev-1.13.0", "openai/gpt-6-luna"] } },
+        },
+      },
+    });
+    expect(configured.conversation.thread.autoInject.gate?.mode).toBe("shadow");
+    for (const gate of [
+      { model: [] },
+      { mode: "invalid" },
+      { skipMinProbability: 0.4 },
+      { skipMinProbability: 1.1 },
+    ]) {
+      expect(() =>
+        coreConfigInputSchemaV2.parse({ conversation: { thread: { autoInject: { gate } } } }),
+      ).toThrow();
+    }
+  });
+
   it("accepts Decision auto inject mode and partial option overrides", () => {
     const parsed = coreConfigInputSchemaV2.parse({
       configVersion: 2,
