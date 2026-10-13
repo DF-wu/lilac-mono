@@ -22,8 +22,8 @@ describe("coreConfigSchema models.capability", () => {
     });
     expect(v2.conversation.thread.autoInject).toEqual({
       enabled: false,
-      minTextUnits: 80,
-      followUpMinTextUnits: 110,
+      minTextUnits: 10,
+      followUpMinTextUnits: 10,
       limit: 3,
       minScore: 0.1,
       expansionMinConfidence: 0.57,

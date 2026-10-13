@@ -1,5 +1,12 @@
 # MIGRATIONS.md
 
+## Auto-inject length floor
+
+Initial and follow-up auto-inject length defaults are now 10 meaningful text units. Explicit
+`minTextUnits` and `followUpMinTextUnits` values retain precedence. The planner now generates
+queries for the current subject, including useful personal history without explicit recall wording.
+No schema version or stored-data change is required.
+
 ## Native assistant citations version 1
 
 Native message and draft text can contain `[Assistant quote](lilac-citation://v1/quote?...)`

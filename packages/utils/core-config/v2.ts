@@ -617,8 +617,8 @@ const conversationSchemaV2 = z
             enabled: z.boolean().default(false),
             plannerModel: z.string().trim().min(1).optional(),
             textPlannerModel: z.string().trim().min(1).optional(),
-            minTextUnits: z.number().int().positive().default(80),
-            followUpMinTextUnits: z.number().int().positive().default(110),
+            minTextUnits: z.number().int().positive().default(10),
+            followUpMinTextUnits: z.number().int().positive().default(10),
             limit: z.number().int().positive().max(10).default(3),
             minScore: z.number().nonnegative().default(0.1),
             expansionMinConfidence: z.number().min(0).max(1).default(0.57),
@@ -627,8 +627,8 @@ const conversationSchemaV2 = z
           })
           .default({
             enabled: false,
-            minTextUnits: 80,
-            followUpMinTextUnits: 110,
+            minTextUnits: 10,
+            followUpMinTextUnits: 10,
             limit: 3,
             minScore: 0.1,
             expansionMinConfidence: 0.57,
@@ -658,8 +658,8 @@ const conversationSchemaV2 = z
         embedding: { enabled: false, model: "openai/text-embedding-3-small" },
         autoInject: {
           enabled: false,
-          minTextUnits: 80,
-          followUpMinTextUnits: 110,
+          minTextUnits: 10,
+          followUpMinTextUnits: 10,
           limit: 3,
           minScore: 0.1,
           expansionMinConfidence: 0.57,
@@ -682,8 +682,8 @@ const conversationSchemaV2 = z
       embedding: { enabled: false, model: "openai/text-embedding-3-small" },
       autoInject: {
         enabled: false,
-        minTextUnits: 80,
-        followUpMinTextUnits: 110,
+        minTextUnits: 10,
+        followUpMinTextUnits: 10,
         limit: 3,
         minScore: 0.1,
         expansionMinConfidence: 0.57,

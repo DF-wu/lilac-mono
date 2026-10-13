@@ -1078,8 +1078,8 @@
                 "autoInject": {
                   "default": {
                     "enabled": false,
-                    "minTextUnits": 80,
-                    "followUpMinTextUnits": 110,
+                    "minTextUnits": 10,
+                    "followUpMinTextUnits": 10,
                     "limit": 3,
                     "minScore": 0.1,
                     "expansionMinConfidence": 0.57,
@@ -1092,13 +1092,13 @@
                     "plannerModel": { "type": "string", "minLength": 1 },
                     "textPlannerModel": { "type": "string", "minLength": 1 },
                     "minTextUnits": {
-                      "default": 80,
+                      "default": 10,
                       "type": "integer",
                       "exclusiveMinimum": 0,
                       "maximum": 9007199254740991
                     },
                     "followUpMinTextUnits": {
-                      "default": 110,
+                      "default": 10,
                       "type": "integer",
                       "exclusiveMinimum": 0,
                       "maximum": 9007199254740991
