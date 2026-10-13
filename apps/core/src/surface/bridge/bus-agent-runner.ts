@@ -1,4 +1,4 @@
-import { decisionAutoInjectContext } from "./bus-agent-runner/text-units";
+import { autoInjectPlannerContext, decisionAutoInjectContext } from "./bus-agent-runner/text-units";
 import {
   buildGeneratedMessage,
   generatedMessageMetadata,
@@ -173,11 +173,9 @@ import { collectDecisionAutoInjectImages } from "../../conversation/thread-auto-
 import {
   createDecisionAutoInjectEvaluator,
   decideDecisionAutoInject,
-  decisionAutoInjectOptionsForModel,
   selectDecisionAutoInjectModel,
   DecisionAutoInjectEvaluationFailed,
   type DecisionAutoInjectAnswers,
-  type DecisionAutoInjectDecision,
   type DecisionAutoInjectEvaluator,
   type DecisionAutoInjectUnavailable,
 } from "../../conversation/thread-auto-inject-decision";
@@ -1093,16 +1091,11 @@ type AutoInjectedThreadSearchAppendedEvent = {
 };
 
 type DecisionAutoInjectedThreadSearchEvent = {
-  toolCallId: string;
-  model: string;
-  source: "lexical" | "semantic" | "hybrid";
-  candidateCount: number;
-  participantFilterUserCount: number;
-  gate: DecisionAutoInjectDecision["gate"];
-  gateProbabilities: Pick<DecisionAutoInjectAnswers, "asksToRecall" | "durableSubject" | "casual">;
-  selected: DecisionAutoInjectDecision["selected"];
-  highestRejected: DecisionAutoInjectDecision["highestRejected"];
-  entries: readonly AutoInjectedThreadSearchEntry[];
+  mode: "off" | "shadow" | "enforce";
+  outcome: "search" | "skip" | "failed" | "length-skip";
+  model?: string;
+  probabilities?: Pick<DecisionAutoInjectAnswers, "mayHelp" | "clearlyUnneeded">;
+  elapsedMs: number;
 };
 
 type AutoInjectToolStatusUpdate = {
@@ -1327,7 +1320,7 @@ function resolveDecisionAutoInjectEvaluator(
   hasImages: boolean,
 ): DecisionEvaluatorResolution {
   const model = selectDecisionAutoInjectModel(
-    params.cfg.conversation.thread.decisionAutoInject.model,
+    params.cfg.conversation.thread.autoInject.gate?.model ?? [],
     hasImages,
   );
   const create = params.createDecisionEvaluator ?? createEnvDecisionAutoInjectEvaluator;
@@ -1341,8 +1334,8 @@ async function prepareDecisionAutoInjectImages(
   params: AutoInjectedThreadSearchParams,
 ): Promise<ResultType<string[], DecisionAutoInjectEvaluationFailed>> {
   const latest = latestUserInput(params.userMessages);
-  const supportsImages = params.cfg.conversation.thread.decisionAutoInject.model.some((model) =>
-    model.startsWith("openai/"),
+  const supportsImages = (params.cfg.conversation.thread.autoInject.gate?.model ?? []).some(
+    (model) => model.startsWith("openai/"),
   );
   if (!supportsImages || (!latest.hasAttachment && !params.loadDecisionUserMessages))
     return Result.ok([]);
@@ -1369,74 +1362,21 @@ async function prepareDecisionAutoInjectImages(
   });
 }
 
-async function maybeBuildDecisionAutoInjectedThreadSearchMessages(
-  params: AutoInjectedThreadSearchParams & { conversationThreads: ConversationThreadToolService },
-): Promise<ModelMessage[]> {
-  const options = params.cfg.conversation.thread.decisionAutoInject;
-  const autoInject = params.cfg.conversation.thread.autoInject;
-  const shortlist = params.conversationThreads.shortlistAutoInjectCandidates;
-  if (!shortlist) return [];
-
-  // Attachment marker lines would add filename and MIME words to the shortlist query.
-  const authoredText = latestUserInput(params.userMessages).authoredText;
-  if (measureMeaningfulTextUnits(authoredText) === 0) return [];
-  const message = decisionAutoInjectContext(authoredText, params.previousMessages ?? []);
-
-  const excludeThreadIds = [...collectAutoInjectedThreadIds(params.previousMessages ?? [])];
-  if (params.surface === "native" && params.sessionId) excludeThreadIds.push(params.sessionId);
-  const participantIds =
-    autoInject.filterCurrentParticipants && params.surface !== "native"
-      ? getParticipantUserIdsFromRaw(params.raw)
-      : [];
-  const autoInjectUsage =
-    params.autoInjectUsage ??
-    createConversationThreadAutoInjectUsageAccumulator({ requestId: params.requestId });
-  const toolCallId = buildAutoInjectedThreadSearchToolCallId(params.requestId);
-  const display = `${AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME} auto-injected metadata`;
-  const endToolStatus = async (
-    outcome:
-      | { failure: BusAgentRunnerErrorProjection }
-      | { entries: readonly AutoInjectedThreadSearchEntry[] },
-  ) =>
-    await publishAutoInjectToolStatusBestEffort(params, {
-      toolCallId,
-      status: "end",
-      display,
-      ...("failure" in outcome
-        ? { ok: false, error: outcome.failure.message }
-        : { ok: true, output: formatAutoInjectedThreadSearchOutput(outcome.entries) }),
-    });
-
-  const shortlistStartedAt = performance.now();
-  const shortlisted = await Result.tryPromise({
-    try: async () =>
-      await shortlist({
-        text: message,
-        limit: options.candidateLimit,
-        semanticFallback: options.semanticFallback,
-        excludeThreadIds,
-        autoInjectUsage,
-        ...(participantIds.length > 0
-          ? { participantIdsAny: participantIds, participantSurface: params.surface }
-          : {}),
+async function shouldSkipAutoInjectByDecision(
+  params: AutoInjectedThreadSearchParams,
+  autoInjectUsage: ConversationThreadAutoInjectUsageAccumulator,
+): Promise<boolean> {
+  const gate = params.cfg.conversation.thread.autoInject.gate;
+  if (!gate || gate.mode === "off") return false;
+  const startedAt = performance.now();
+  const notify = (event: Omit<DecisionAutoInjectedThreadSearchEvent, "mode" | "elapsedMs">) =>
+    notifyAutoInjectObserverBestEffort(params.onError, () =>
+      params.onDecisionEvaluated?.({
+        ...event,
+        mode: gate.mode,
+        elapsedMs: performance.now() - startedAt,
       }),
-    catch: captureError,
-  });
-  autoInjectUsage.recordTiming("shortlist", performance.now() - shortlistStartedAt);
-  if (shortlisted.isErr()) {
-    params.onError(
-      "auto-injected thread shortlist failed; continuing without metadata",
-      projectBusAgentRunnerError(shortlisted.error.cause),
     );
-    autoInjectUsage.finish({ status: "failed" });
-    return [];
-  }
-  const { source, results: shortlistedResults } = shortlisted.value;
-  if (source === "none" || shortlistedResults.length === 0) {
-    autoInjectUsage.finish({ status: "abstained" });
-    return [];
-  }
-
   const prepared = (await prepareDecisionAutoInjectImages(params)).match<
     { kind: "prepared"; images: string[] } | { kind: "failed"; message: string }
   >({
@@ -1444,86 +1384,57 @@ async function maybeBuildDecisionAutoInjectedThreadSearchMessages(
     err: (error) => ({ kind: "failed", message: error.message }),
   });
   if (prepared.kind === "failed") {
+    notify({ outcome: "failed" });
     params.onError(
-      "Decision image preparation failed; continuing without metadata",
+      "Decision image preparation failed; continuing to planner",
       projectBusAgentRunnerError(new Error(prepared.message)),
     );
-    autoInjectUsage.finish({ status: "failed" });
-    return [];
+    return false;
+  }
+  const latest = latestUserInput(params.userMessages);
+  if (latest.hasAttachment && !latest.authoredText.trim() && prepared.images.length === 0) {
+    notify({ outcome: "search" });
+    return false;
   }
   const resolution = resolveDecisionAutoInjectEvaluator(params, prepared.images.length > 0);
   if (resolution.kind === "unavailable") {
+    notify({ outcome: "failed" });
     params.onError(
-      "Decision auto-inject is unavailable; continuing without metadata",
+      "Decision gate unavailable; continuing to planner",
       projectBusAgentRunnerError(new Error(resolution.message)),
     );
-    autoInjectUsage.finish({ status: "failed" });
-    return [];
+    return false;
   }
-
-  // Without a length gate most messages end here, so status is shown only once the evaluator has work.
-  await publishAutoInjectToolStatusBestEffort(params, { toolCallId, status: "start", display });
   const evaluator = resolution.evaluator;
-  const results = shortlistedResults.slice(0, evaluator.maxCandidates);
-  const decisionStartedAt = performance.now();
   const evaluated = await evaluator.evaluate({
-    message,
+    message: decisionAutoInjectContext(
+      latestUserInput(params.userMessages).authoredText,
+      params.previousMessages ?? [],
+    ),
     images: evaluator.supportsImages ? prepared.images : undefined,
-    candidates: results.map((result) => ({
-      threadId: result.threadId,
-      title: result.title,
-      brief: result.brief,
-    })),
   });
-  autoInjectUsage.recordTiming("decision", performance.now() - decisionStartedAt);
+  autoInjectUsage.recordTiming("decision", performance.now() - startedAt);
   const outcome = evaluated.match<DecisionEvaluationOutcome>({
     ok: (answers) => ({ kind: "answered", answers }),
     err: (error) => ({ kind: "failed", message: error.message }),
   });
   if (outcome.kind === "failed") {
-    const failure = projectBusAgentRunnerError(new Error(outcome.message));
-    await endToolStatus({ failure });
-    params.onError("Decision auto-inject evaluation failed; continuing without metadata", failure);
-    autoInjectUsage.finish({ status: "failed" });
-    return [];
+    notify({ outcome: "failed", model: evaluator.model });
+    params.onError(
+      "Decision gate evaluation failed; continuing to planner",
+      projectBusAgentRunnerError(new Error(outcome.message)),
+    );
+    return false;
   }
-
   const { answers } = outcome;
   autoInjectUsage.recordDecisionUsage({ model: evaluator.model, ...answers.usage });
-  const decision = decideDecisionAutoInject({
-    answers,
-    candidates: results,
-    options: decisionAutoInjectOptionsForModel(options, resolution.model),
+  const decision = decideDecisionAutoInject(answers, gate.skipMinProbability);
+  notify({
+    outcome: decision,
+    model: evaluator.model,
+    probabilities: { mayHelp: answers.mayHelp, clearlyUnneeded: answers.clearlyUnneeded },
   });
-  const entries = decision.selected.map((candidate) =>
-    formatAutoInjectedThreadSearchResult(results[candidate.index]!),
-  );
-  await endToolStatus({ entries });
-  notifyAutoInjectObserverBestEffort(params.onError, () =>
-    params.onDecisionEvaluated?.({
-      toolCallId,
-      model: evaluator.model,
-      source,
-      candidateCount: results.length,
-      participantFilterUserCount: participantIds.length,
-      gate: decision.gate,
-      gateProbabilities: {
-        asksToRecall: answers.asksToRecall,
-        durableSubject: answers.durableSubject,
-        casual: answers.casual,
-      },
-      selected: decision.selected,
-      highestRejected: decision.highestRejected,
-      entries,
-    }),
-  );
-  autoInjectUsage.finish({ status: entries.length > 0 ? "completed" : "abstained" });
-  if (entries.length === 0) return [];
-  return buildAutoInjectedThreadSearchMessages({
-    toolCallId,
-    entries,
-    note: "auto-injected for the latest user input",
-  });
+  return gate.mode === "enforce" && decision === "skip";
 }
 
 export async function maybeBuildAutoInjectedThreadSearchMessages(
@@ -1533,15 +1444,11 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(
   if (!autoInject.enabled) return [];
   if (!params.conversationThreads) return [];
   const conversationThreads = params.conversationThreads;
-  if (params.cfg.conversation.thread.autoInjectMode === "decision") {
-    return await maybeBuildDecisionAutoInjectedThreadSearchMessages({
-      ...params,
-      conversationThreads,
-    });
-  }
-
+  const autoInjectUsage =
+    params.autoInjectUsage ??
+    createConversationThreadAutoInjectUsageAccumulator({ requestId: params.requestId });
   const latestInput = latestUserInput(params.userMessages);
-  const text = latestInput.text;
+  const text = autoInjectPlannerContext(latestInput.text, params.previousMessages ?? []);
   const previouslyInjectedThreadIds = collectAutoInjectedThreadIds(params.previousMessages ?? []);
   const minTextUnits =
     previouslyInjectedThreadIds.size > 0
@@ -1554,6 +1461,18 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(
       minTextUnits,
     })
   ) {
+    notifyAutoInjectObserverBestEffort(params.onError, () =>
+      params.onDecisionEvaluated?.({
+        mode: autoInject.gate?.mode ?? "off",
+        outcome: "length-skip",
+        elapsedMs: 0,
+      }),
+    );
+    autoInjectUsage.finish({ status: "abstained" });
+    return [];
+  }
+  if (await shouldSkipAutoInjectByDecision(params, autoInjectUsage)) {
+    autoInjectUsage.finish({ status: "abstained" });
     return [];
   }
 
@@ -1562,9 +1481,6 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(
       ? getParticipantUserIdsFromRaw(params.raw)
       : [];
 
-  const autoInjectUsage =
-    params.autoInjectUsage ??
-    createConversationThreadAutoInjectUsageAccumulator({ requestId: params.requestId });
   let usageStatus: "completed" | "abstained" | "partial" | "failed" = "failed";
   let usageSearchCount = 0;
   let usageQueryCount = 0;
@@ -1582,7 +1498,13 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(
         const planningStartedAt = performance.now();
         const plan = await conversationThreads.planAutoInjectSearch({
           text,
-          content: latestInput.content,
+          content:
+            typeof latestInput.content === "string"
+              ? text
+              : [
+                  ...(text ? [{ type: "text" as const, text }] : []),
+                  ...latestInput.content.filter((part) => part.type !== "text"),
+                ],
           autoInjectUsage,
         });
         autoInjectUsage.recordTiming("planning", performance.now() - planningStartedAt);
@@ -8116,20 +8038,10 @@ export async function startBusAgentRunner(params: {
                       publishToolStatus: publishNonAgentToolStatus,
                       onError: reportAutoInjectedThreadSearchError,
                       onDecisionEvaluated: (event) => {
-                        logger.info("conversation.thread.auto_inject.decision", {
+                        logger.info("conversation.thread.auto_inject.gate", {
                           requestId: headers.request_id,
                           sessionId: headers.session_id,
-                          toolCallId: event.toolCallId,
-                          model: event.model,
-                          source: event.source,
-                          candidateCount: event.candidateCount,
-                          participantFilterUserCount: event.participantFilterUserCount,
-                          gate: event.gate,
-                          gateProbabilities: event.gateProbabilities,
-                          selected: event.selected,
-                          highestRejected: event.highestRejected,
-                          appendedCount: event.entries.length,
-                          entries: event.entries,
+                          ...event,
                         });
                       },
                       onInjected: (event) => {

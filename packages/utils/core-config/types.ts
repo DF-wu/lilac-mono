@@ -256,6 +256,11 @@ export type UniversalCoreConfig = {
         enabled: boolean;
         plannerModel?: string;
         textPlannerModel?: string;
+        gate?: {
+          mode: "off" | "shadow" | "enforce";
+          model: string[];
+          skipMinProbability: number;
+        };
         minTextUnits: number;
         followUpMinTextUnits: number;
         limit: number;
@@ -264,6 +269,7 @@ export type UniversalCoreConfig = {
         mode: "hybrid" | "semantic" | "lexical";
         filterCurrentParticipants: boolean;
       };
+      // Legacy input compatibility. Runtime uses autoInject.gate.
       autoInjectMode: "llm" | "decision";
       decisionAutoInject: {
         model: string[];

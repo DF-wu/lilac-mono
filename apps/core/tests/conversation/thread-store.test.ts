@@ -2687,10 +2687,12 @@ describe("conversation thread store", () => {
 
     expect(serialized).not.toContain("minItems");
     expect(serialized).not.toContain("maxItems");
-    expect(instructions).toContain('Return {"searches":[]} when retrieval would not help');
-    expect(instructions).toContain("Use one search for one substantive user intent");
-    expect(instructions).toContain("Use 2-3 searches only when the user explicitly asks");
-    expect(instructions).toContain("Each search must contain 1-3 non-empty query variants");
+    expect(instructions).toContain(
+      'Return {"searches":[]} when the input has no identifiable subject',
+    );
+    expect(instructions).toContain("Use one search per distinct subject");
+    expect(instructions).toContain("up to three");
+    expect(instructions).toContain("Each search contains 1-3 short query variants");
   });
 
   it("uses the text planner only for text-only auto-inject input", () => {

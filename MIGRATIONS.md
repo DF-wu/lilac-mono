@@ -1,5 +1,33 @@
 # MIGRATIONS.md
 
+## Optional auto-inject decision gate
+
+Auto-inject now always uses the query planner and search ranking. Optional
+`conversation.thread.autoInject.gate` configures `mode: off | shadow | enforce`, an ordered `model`
+list, and `skipMinProbability` (default 0.8). Omission disables the gate; a configured gate defaults
+to shadow. Shadow records decisions and continues retrieval. Enforce skips only when the negative
+score meets the cutoff and the usefulness score is at most its complement. Invalid responses,
+refusals, image preparation failures, and unavailable providers continue to the planner.
+
+Legacy `autoInjectMode: decision` or `jev` maps to a shadow gate with the existing decision model
+list. Explicit `autoInject.gate`, including `mode: off`, takes precedence. Legacy decision options
+remain accepted for configuration compatibility, but candidate limits, relevance cutoffs, and old
+message thresholds no longer affect runtime behavior. Move model settings to `autoInject.gate.model`
+and remove `autoInjectMode`, `decisionAutoInject`, and `jevAutoInject` when editing configuration.
+Existing explicit length floors still apply before the gate, so lower old 80/110 overrides to admit
+short questions. No schema version or stored-data change is required.
+
+Gate logs use `conversation.thread.auto_inject.gate`, with mode, outcome, model, probabilities, and
+elapsed time. Outcomes include `length-skip` and `failed`; shadow `skip` means the gate would skip,
+while retrieval still proceeds. Correlate with usage and appended events by request ID.
+
+## Auto-inject length floor
+
+Initial and follow-up auto-inject length defaults are now 10 meaningful text units. Explicit
+`minTextUnits` and `followUpMinTextUnits` values retain precedence. The planner now generates
+queries for the current subject, including useful personal history without explicit recall wording.
+No schema version or stored-data change is required.
+
 ## Native assistant citations version 1
 
 Native message and draft text can contain `[Assistant quote](lilac-citation://v1/quote?...)`

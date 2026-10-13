@@ -641,8 +641,18 @@ const conversationSchemaV2 = z
             enabled: z.boolean().default(false),
             plannerModel: z.string().trim().min(1).optional(),
             textPlannerModel: z.string().trim().min(1).optional(),
-            minTextUnits: z.number().int().positive().default(80),
-            followUpMinTextUnits: z.number().int().positive().default(110),
+            gate: z
+              .object({
+                mode: z.enum(["off", "shadow", "enforce"]).default("shadow"),
+                model: z
+                  .union([z.string().trim().min(1), z.array(z.string().trim().min(1)).min(1)])
+                  .transform((model) => (typeof model === "string" ? [model] : model))
+                  .default(["typesafe/jev-1.13.0"]),
+                skipMinProbability: z.number().min(0.5).max(1).default(0.8),
+              })
+              .optional(),
+            minTextUnits: z.number().int().positive().default(10),
+            followUpMinTextUnits: z.number().int().positive().default(10),
             limit: z.number().int().positive().max(10).default(3),
             minScore: z.number().nonnegative().default(0.1),
             expansionMinConfidence: z.number().min(0).max(1).default(0.57),
@@ -651,8 +661,8 @@ const conversationSchemaV2 = z
           })
           .default({
             enabled: false,
-            minTextUnits: 80,
-            followUpMinTextUnits: 110,
+            minTextUnits: 10,
+            followUpMinTextUnits: 10,
             limit: 3,
             minScore: 0.1,
             expansionMinConfidence: 0.57,
@@ -668,6 +678,19 @@ const conversationSchemaV2 = z
       })
       .transform(({ jevAutoInject, decisionAutoInject, ...thread }) => ({
         ...thread,
+        autoInject: {
+          ...thread.autoInject,
+          ...(thread.autoInject.gate || thread.autoInjectMode === "llm"
+            ? {}
+            : {
+                gate: {
+                  mode: "shadow" as const,
+                  model: (decisionAutoInject ?? jevAutoInject ?? decisionAutoInjectDefaultsV2)
+                    .model,
+                  skipMinProbability: 0.8,
+                },
+              }),
+        },
         decisionAutoInject: decisionAutoInject ??
           jevAutoInject ?? { ...decisionAutoInjectDefaultsV2 },
       }))
@@ -682,8 +705,8 @@ const conversationSchemaV2 = z
         embedding: { enabled: false, model: "openai/text-embedding-3-small" },
         autoInject: {
           enabled: false,
-          minTextUnits: 80,
-          followUpMinTextUnits: 110,
+          minTextUnits: 10,
+          followUpMinTextUnits: 10,
           limit: 3,
           minScore: 0.1,
           expansionMinConfidence: 0.57,
@@ -706,8 +729,8 @@ const conversationSchemaV2 = z
       embedding: { enabled: false, model: "openai/text-embedding-3-small" },
       autoInject: {
         enabled: false,
-        minTextUnits: 80,
-        followUpMinTextUnits: 110,
+        minTextUnits: 10,
+        followUpMinTextUnits: 10,
         limit: 3,
         minScore: 0.1,
         expansionMinConfidence: 0.57,
