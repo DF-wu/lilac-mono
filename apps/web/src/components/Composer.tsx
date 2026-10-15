@@ -146,7 +146,12 @@ export const Composer = memo(function Composer(props: ComposerProps) {
   const unambiguous = matching.length === 1 ? matching[0] : undefined;
   const command = commandId ? matching.find((entry) => entry.id === commandId) : unambiguous;
   const custom = command?.kind === "custom" ? command : undefined;
-  const delivery = inputDeliveryOptions(active, mode, props.modelId, !!custom);
+  const delivery = inputDeliveryOptions(
+    active,
+    mode,
+    props.modelId,
+    !!custom || command?.id === "compact",
+  );
   const commandArguments = custom?.arguments?.length ? custom.arguments : undefined;
   const argumentText =
     commandArguments &&
@@ -266,15 +271,18 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       setCommandId(undefined);
       return;
     }
+    let submittedCommand: { id: string; arguments: string } | undefined;
+    if (custom)
+      submittedCommand = { id: custom.id, arguments: plainText.slice(custom.name.length + 2) };
+    if (command?.id === "compact")
+      submittedCommand = { id: "compact", arguments: plainText.slice("/compact".length).trim() };
     props.onSubmit({
       text: input.current?.submissionText() ?? text,
       ...(attachments.length ? { attachmentText: input.current?.draftText() ?? text } : {}),
       skillIds,
       mode: delivery.mode === "prompt" ? mode : delivery.mode,
       modelId: delivery.modelId,
-      command: custom
-        ? { id: custom.id, arguments: plainText.slice(custom.name.length + 2) }
-        : undefined,
+      command: submittedCommand,
       attachments: [...attachments],
     });
     setSkills([]);

@@ -1,3 +1,5 @@
+import { ContextMessage, RecentContextNotice } from "./components/RecentContext";
+import { DirectThreadCard } from "./components/DirectThreadCard";
 import { ComputerViewer } from "./components/ComputerViewer";
 import computerDemoUrl from "./assets/computer-demo.html?url";
 import { AgentAvatar } from "./components/AgentAvatar";
@@ -1350,6 +1352,45 @@ function Controls() {
           <div className="ds-field flex flex-col gap-2 text-sm">
             <span>Search</span>
             <SidebarSearch onSearch={setSearch} />
+            <DirectThreadCard
+              thread={{
+                id: "demo-dm",
+                kind: "dm",
+                title: "Chat with Lilac",
+                starterId: "demo",
+                archived: false,
+                updatedAt: 0,
+                revision: 0,
+                capabilities: { read: true, edit: true, share: false },
+              }}
+              selected
+              onSelect={() => {}}
+            />
+            <ContextMessage outside>
+              <p className="px-6 text-sm">Earlier conversation, outside context.</p>
+            </ContextMessage>
+            <ContextMessage summarized>
+              <p className="px-6 text-sm">Earlier conversation, represented in the summary.</p>
+            </ContextMessage>
+            <RecentContextNotice
+              preview={{
+                historyGeneration: 0,
+                evaluatedAt: 0,
+                firstTurnPosition: 2,
+                hasSummary: false,
+                active: false,
+              }}
+            />
+            <RecentContextNotice
+              preview={{
+                historyGeneration: 0,
+                evaluatedAt: 0,
+                firstTurnPosition: 2,
+                hasSummary: true,
+                summarizedBeforePosition: 4,
+                active: true,
+              }}
+            />
             <span className="ds-muted" role="status">
               {search ? `Search: ${search}` : ""}
             </span>
@@ -1778,6 +1819,7 @@ export default function DesignSystem() {
                   value={{
                     titleModel: "fast",
                     outputStreaming: "complete",
+                    dmContextMaxAgeMs: 10_800_000,
                     oldMessageSelectionMaxAgeMs: null,
                     storageRetentionMaxAgeMs: null,
                     crossThreadSend: { triggerRun: true },

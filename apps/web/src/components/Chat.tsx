@@ -1,3 +1,4 @@
+import { RecentContextProvider } from "./RecentContext";
 import { rewindDraft } from "../rewind-draft";
 import type { OptimisticTurn } from "../optimistic-turns";
 import { useEventCallback } from "../use-event-callback";
@@ -793,23 +794,25 @@ export function Chat(props: ChatProps) {
     <MessageIdentityContext value={identities}>
       <div className="chat-workspace min-h-0 flex flex-col flex-1" data-thread-id={threadId}>
         <UploadProgressContext.Provider value={uploadProgress}>
-          <Timeline
-            optimisticTurn={optimisticTurn}
-            onOptimisticResolved={resolveOptimistic}
-            emptyContent={renderEmptyConversation()}
-            header={props.header}
-            footer={composer}
-            onLatestVisibleChange={setLatestVisible}
-            client={client}
-            threadId={threadId}
-            canEdit={editable && draftLoaded}
-            resourceUrl={messageResourceUrl}
-            upload={recoveryUpload}
-            onRewind={setRewindTarget}
-            rewindDisabled={active}
-            onAction={onAction}
-            onReaction={onReaction}
-          />
+          <RecentContextProvider thread={thread}>
+            <Timeline
+              optimisticTurn={optimisticTurn}
+              onOptimisticResolved={resolveOptimistic}
+              emptyContent={renderEmptyConversation()}
+              header={props.header}
+              footer={composer}
+              onLatestVisibleChange={setLatestVisible}
+              client={client}
+              threadId={threadId}
+              canEdit={editable && draftLoaded}
+              resourceUrl={messageResourceUrl}
+              upload={recoveryUpload}
+              onRewind={setRewindTarget}
+              rewindDisabled={active || thread?.kind === "dm"}
+              onAction={onAction}
+              onReaction={onReaction}
+            />
+          </RecentContextProvider>
         </UploadProgressContext.Provider>
 
         <Modal

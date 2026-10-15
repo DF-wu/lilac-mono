@@ -158,3 +158,33 @@ and thread IDs. Commit timing ends when the server enqueues the matching project
 it does not include network receipt or client rendering. Counters exclude TLS/WebSocket framing,
 while the older browser baseline above includes WebSocket framing. No message bodies or credentials
 are logged.
+
+
+## Permanent DM verification, 2026-10-15
+
+The production build was exercised against the isolated native browser fixture on port 8791 with
+its deterministic model. Verified first-use creation, fixed sidebar navigation, send, `/compact`,
+history preservation, summary styling, disabled rewind, absent destructive/share menus, archived-list
+round trip, and reload. Temporarily setting DM context age to 1 ms made both retained turns render
+at computed opacity 0.8. Restored the 10,800,000 ms default afterwards. The 390 × 844 mobile viewport
+had no document overflow. Desktop and mobile screenshots were captured during the check.
+
+A cached navigation comparison alternated an ordinary one-turn note and the two-turn DM 22 times,
+discarding two warmups. Click to the first animation frame containing the destination heading and
+turn DOM measured 44.8 ms p95 for the ordinary thread and 50.2 ms for the DM. This measures browser
+scheduling and DOM presence, not compositor presentation. It is a same-build comparison; no claim
+is made about production network or model latency.
+
+`dm-performance.test.ts` seeds equivalent ordinary and DM stores at 1,000, 10,000 and 100,000 turns.
+At 100,000 turns, DM versus ordinary results were: selected-input read 0.060/0.059 ms p95, initial
+window 0.214/0.189 ms p95, submission 0.313/0.342 ms, changed-input receipt read 0.120/0.094 ms,
+and Stop 0.283/0.294 ms. Windows contained five recent turns plus a deferred slot, totaling 2,331
+bytes for either kind. Reads use indexed boundaries and pending-input indexes rather than lifetime
+input decoding. These are local warm SQLite measurements with synthetic small turns; oversized
+turns and model-context size retain the existing ordinary-thread limits.
+
+The real RPC-to-runner integration test verifies manual compaction, idempotent retry, unchanged
+prior display history, retained summary on follow-up, and deletion denial. Execution tests cover
+the independent three-hour cutoff, frozen active selection, active compaction before settlement,
+and recent direct-message retention when a summary expires. Store tests cover ownership, search
+privacy, uniqueness, permanence, and retention exclusion.

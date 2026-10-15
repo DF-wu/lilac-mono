@@ -1,3 +1,4 @@
+import { ContextMessage, useRecentContext, RecentContextNotice } from "./RecentContext";
 import { LoadingSpinner } from "./ui/loading-spinner";
 import { AddReaction, MessageReactions } from "./MessageReactions";
 import { OptimisticTurns, type OptimisticTurn } from "../optimistic-turns";
@@ -353,6 +354,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
               className="chat-sticky-header sticky top-0 z-3 [background:color-mix(in_srgb,_var(--ui-background)_75%,_transparent)] [backdrop-filter:blur(16px)]"
             >
               {props.header}
+              <RecentContextNotice />
             </div>
             <div
               className="virtual-canvas relative w-full timeline-canvas max-w-[var(--ui-chat-width)] m-auto"
@@ -431,6 +433,7 @@ const SlotRow = memo(function SlotRow(props: {
   fallback?: ReadyTurnSlot;
 }) {
   const { client, threadId, onRewind } = useContext(TimelineContext)!;
+  const recentContext = useRecentContext();
   const stored = useSlot(props.store, props.slotId);
   const slot = stored?.kind === "ready" ? stored : (props.fallback ?? stored);
   useEffect(() => {
@@ -452,17 +455,34 @@ const SlotRow = memo(function SlotRow(props: {
         )}
       </div>
     );
+  const outside =
+    recentContext &&
+    recentContext.historyGeneration === props.store.checkpoint?.historyGeneration &&
+    slot.state !== "pending" &&
+    slot.state !== "running" &&
+    (recentContext.firstTurnPosition === null || slot.position < recentContext.firstTurnPosition);
+  const summarized =
+    !outside &&
+    recentContext?.summarizedBeforePosition !== undefined &&
+    slot.position < recentContext.summarizedBeforePosition;
   return (
-    <Turn
-      slot={slot}
-      optimistic={!!props.fallback && stored?.kind !== "ready"}
-      userRenderKey={
-        props.renderKey !== props.slotId || props.fallback ? props.renderKey : undefined
-      }
-      animateArrivals={!!props.fallback || props.slotId === props.store.slotIds.at(-1)}
-      onRewind={onRewind}
-      onLoadMore={() => void client.loadTurnPage(threadId, slot.slotId)}
-    />
+    <ContextMessage outside={!!outside} summarized={summarized}>
+      {recentContext?.firstTurnPosition === slot.position && slot.position > 0 ? (
+        <p className="px-6 pt-3 text-xs text-muted-foreground">
+          Earlier messages outside recent context
+        </p>
+      ) : null}
+      <Turn
+        slot={slot}
+        optimistic={!!props.fallback && stored?.kind !== "ready"}
+        userRenderKey={
+          props.renderKey !== props.slotId || props.fallback ? props.renderKey : undefined
+        }
+        animateArrivals={!!props.fallback || props.slotId === props.store.slotIds.at(-1)}
+        onRewind={onRewind}
+        onLoadMore={() => void client.loadTurnPage(threadId, slot.slotId)}
+      />
+    </ContextMessage>
   );
 });
 

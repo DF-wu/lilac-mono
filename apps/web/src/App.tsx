@@ -1,3 +1,4 @@
+import { DirectThreadCard } from "./components/DirectThreadCard";
 import { NativeComputerViewer } from "./components/ComputerViewer";
 import { FloatingChatMenu } from "./components/FloatingChatMenu";
 import { useWorkspaceViewport } from "./use-workspace-viewport";
@@ -721,7 +722,7 @@ function Workspace(props: AppProps) {
       return;
     }
     setThreads((current) => {
-      if (!cursor) return page.items;
+      if (!cursor) return [...current.filter((thread) => thread.kind === "dm"), ...page.items];
       const ids = new Set(current.map((thread) => thread.id));
       return [...current, ...page.items.filter((thread) => !ids.has(thread.id))];
     });
@@ -781,6 +782,7 @@ function Workspace(props: AppProps) {
     setConfirmDelete(undefined);
     if (activeRef.current && selectedRef.current === id) createThread();
   }
+  const directThread = threads.find((thread) => thread.kind === "dm");
   const sidebarThreads = [
     ...(!archived ? draftIds.map((id) => ({ id, source: undefined })) : []),
     ...threads
@@ -955,19 +957,19 @@ function Workspace(props: AppProps) {
                     onToggleRight={() => panels.getState().toggle(selectedId)}
                     onNewThread={createThread}
                     archived={actionThread?.archived}
-                    onShare={owner && actionThread ? () => setSharing(true) : undefined}
+                    onShare={actionThread?.capabilities.share ? () => setSharing(true) : undefined}
                     onRename={
-                      actionThread?.capabilities.edit
+                      actionThread?.capabilities.edit && actionThread.kind !== "dm"
                         ? () => setRename({ id: actionThread.id, title: actionThread.title })
                         : undefined
                     }
                     onArchive={
-                      actionThread?.capabilities.edit
+                      actionThread?.capabilities.edit && actionThread.kind !== "dm"
                         ? () => void update(actionThread.id, { archived: !actionThread.archived })
                         : undefined
                     }
                     onDelete={
-                      actionThread?.capabilities.edit
+                      actionThread?.capabilities.edit && actionThread.kind !== "dm"
                         ? () => setConfirmDelete(actionThread.id)
                         : undefined
                     }
@@ -1070,19 +1072,32 @@ function Workspace(props: AppProps) {
                           ) : (
                             <>
                               {!archived ? (
-                                <SidebarQueue
-                                  fallbackThreads={online ? undefined : threads}
-                                  draftIds={draftIds}
-                                  viewer={viewer}
-                                  external={external}
-                                  models={catalog?.models}
-                                  onThread={upsert}
-                                  onSelect={select}
-                                  onRename={renameSidebarThread}
-                                  onArchive={archiveSidebarThread}
-                                  onDelete={setConfirmDelete}
-                                  onDiscardDraft={discardDraft}
-                                />
+                                <>
+                                  {directThread ? (
+                                    <DirectThreadCard
+                                      thread={directThread}
+                                      selected={selectedId === directThread.id}
+                                      onSelect={select}
+                                    />
+                                  ) : null}
+                                  <SidebarQueue
+                                    fallbackThreads={
+                                      online
+                                        ? undefined
+                                        : threads.filter((thread) => thread.kind !== "dm")
+                                    }
+                                    draftIds={draftIds}
+                                    viewer={viewer}
+                                    external={external}
+                                    models={catalog?.models}
+                                    onThread={upsert}
+                                    onSelect={select}
+                                    onRename={renameSidebarThread}
+                                    onArchive={archiveSidebarThread}
+                                    onDelete={setConfirmDelete}
+                                    onDiscardDraft={discardDraft}
+                                  />
+                                </>
                               ) : (
                                 <VirtualList
                                   emptyState={
@@ -1151,7 +1166,7 @@ function Workspace(props: AppProps) {
                               const thread = selected ?? selectedMetadata.data;
                               const conversationActions = thread ? (
                                 <>
-                                  {owner ? (
+                                  {thread.capabilities.share ? (
                                     <IconButton
                                       label="Share conversation"
                                       tooltip="Share"
@@ -1160,7 +1175,7 @@ function Workspace(props: AppProps) {
                                       <Users />
                                     </IconButton>
                                   ) : null}
-                                  {thread.capabilities.edit ? (
+                                  {thread.capabilities.edit && thread.kind !== "dm" ? (
                                     <DropdownMenu>
                                       <DropdownMenuTrigger
                                         render={
@@ -1349,7 +1364,11 @@ function Workspace(props: AppProps) {
                       key={selectedId}
                       threadId={selectedId}
                       enabled={
-                        active && !external && !reference && !!actionThread?.capabilities.edit
+                        active &&
+                        !external &&
+                        !reference &&
+                        !!actionThread?.capabilities.edit &&
+                        actionThread.kind !== "dm"
                       }
                     />
                   ) : null}
