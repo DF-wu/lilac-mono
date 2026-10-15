@@ -25,4 +25,3 @@ export * from "./subagent-idle-timeout";
 export * from "./working-indicators";
 export * from "./server-compaction-request";
 export * from "./persistence";
-export * from "./openai-compatible-image-provider";

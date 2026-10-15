@@ -63,29 +63,7 @@ describe("core config versioning", () => {
     });
   });
 
-  it("defaults the v1 universal image provider", async () => {
-    // Given
-    const raw = { configVersion: 1 };
-
-    // When
-    const parsed = await parseCoreConfig(raw);
-
-    // Then
-    expect(parsed.tools.generate.image.provider).toBe("default");
-  });
-
-  it("defaults an omitted v2 image provider", async () => {
-    // Given
-    const raw = { configVersion: 2 };
-
-    // When
-    const parsed = await parseCoreConfig(raw);
-
-    // Then
-    expect(parsed.tools.generate.image.provider).toBe("default");
-  });
-
-  it("accepts the v2 openai-compatible image provider", async () => {
+  it("ignores the removed v2 tools.generate image routing block", async () => {
     // Given
     const raw = {
       configVersion: 2,
@@ -93,6 +71,7 @@ describe("core config versioning", () => {
         generate: {
           image: {
             provider: "openai-compatible",
+            routes: { "gpt-image-2": "openai/gpt-image-2" },
           },
         },
       },
@@ -102,24 +81,7 @@ describe("core config versioning", () => {
     const parsed = await parseCoreConfig(raw);
 
     // Then
-    expect(parsed.tools.generate.image.provider).toBe("openai-compatible");
-  });
-
-  it("rejects an unknown v2 image provider", async () => {
-    // Given
-    const raw = {
-      configVersion: 2,
-      tools: {
-        generate: {
-          image: {
-            provider: "unknown",
-          },
-        },
-      },
-    };
-
-    // When / Then
-    await expect(parseCoreConfig(raw)).rejects.toThrow();
+    expect(parsed.tools).not.toHaveProperty("generate");
   });
 
   it("accepts opt-in image table style in both config versions without changing defaults", () => {

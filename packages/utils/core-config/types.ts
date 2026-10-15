@@ -1,4 +1,3 @@
-import type { GenerateToolsConfig } from "./generate-image";
 import type { TelegramSurfaceConfig } from "./telegram-surface";
 
 export type JSONValue = null | string | number | boolean | JSONObject | JSONArray;
@@ -178,7 +177,6 @@ export type UniversalCoreConfig = {
 
   tools: {
     fsBackend: "fff" | "node-rg";
-    generate: GenerateToolsConfig;
     web: {
       extract: {
         providers: Array<"tavily" | "exa" | "firecrawl" | "openai">;

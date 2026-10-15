@@ -20,7 +20,6 @@ import {
   webFetchModeSchema,
 } from "./v1";
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
-import { defaultGenerateToolsConfig, generateToolsSchema } from "./generate-image";
 import { cloneDefaultTelegramSurface, telegramSurfaceSchema } from "./telegram-surface";
 import { defaultNativeSurfaceConfig, MODEL_REASONING_EFFORTS } from "./types";
 
@@ -456,7 +455,6 @@ const webConfigSchemaV2 = z
 const toolsSchema = z
   .object({
     fsBackend: z.enum(["fff", "node-rg"]).default("fff"),
-    generate: generateToolsSchema,
     web: webConfigSchemaV2,
     inspect: z
       .object({
@@ -511,7 +509,6 @@ const toolsSchema = z
   })
   .default({
     fsBackend: "fff",
-    generate: defaultGenerateToolsConfig(),
     web: {
       extract: {
         providers: ["tavily"],
