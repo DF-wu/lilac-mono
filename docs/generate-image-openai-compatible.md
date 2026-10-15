@@ -1,380 +1,187 @@
-# Structured `generate.image` And Provider Routing
+# `generate.image` Script Runner And The OpenAI-Compatible Provider
 
-`generate.image` is the fork's structured image tool: a prompt, a Lilac model
-alias, optional dimensions, optional input images and a mask, and an output
-directory. Upstream replaced it with a script runner; the fork keeps the
-structured contract (see [`fork-differences.md`](./fork-differences.md)) and
-lets operators route aliases: a bulk `provider` for every alias, plus
-per-alias `<provider>/<model id>` routes, including one OpenAI-compatible
-endpoint.
+`generate.image` follows upstream: the caller sends JavaScript, Lilac runs it in
+a fresh Bun process with the configured provider endpoints, and the script calls
+the provider's image API directly and writes the image to a file. Model choice
+lives in the built-in `image-generation` skill, not in code, so a new provider
+model is usable as soon as the provider serves it.
 
-This document covers how the tool is put together, how requests flow, and how
-to configure and troubleshoot routing. Routing changes the request destination
-only: aliases, input validation, image editing, and output handling stay the
-same.
+The fork adds one thing: an OpenAI-compatible gateway (for example new-api) is
+exposed to scripts as `providers.openaiCompatible`, with a recipe in the skill.
+
+Earlier fork versions replaced this runner with a structured tool (prompt, Lilac
+model alias, size, mask) and `tools.generate.image` routing. That tool and its
+configuration are removed; see [Migrating from the structured tool](#migrating-from-the-structured-tool).
 
 ## How it works
 
-Everything specific to the tool lives in fork-owned modules so upstream merges
-stay mechanical:
-
 | Module | Owns |
 | --- | --- |
-| `apps/core/src/tool-server/tools/generate-image/catalog.ts` | One capability entry per alias: upstream model ID per provider, accepted aspect ratios, the size rule, mask support, and input-image limits; the fallback order; ratio-to-size mapping |
-| `.../generate-image/validation.ts` | Checks a request against the alias's catalog entry before any HTTP request |
-| `.../generate-image/input.ts` | The zod input schema; the `size` and `aspectRatio` help text is generated from the catalog |
-| `.../generate-image/routing.ts` | Plans a route per alias from the config, resolves it against the environment, and picks the alias for a call |
-| `.../generate-image/prompt.ts` | Reads input images and the mask into the AI SDK prompt shape |
-| `.../generate-image/callable.ts` | The Level 2 callable: resolve, pick, validate, generate, write the file |
-| `packages/utils/openai-compatible-image-provider.ts` | The image client for the OpenAI-compatible endpoint |
-| `packages/utils/core-config/generate-image.ts` | The alias list (the config contract), the route grammar, and the `tools.generate` schema |
-
-The catalog is the single source of truth. Adding an alias means adding it to
-`IMAGE_GENERATION_MODEL_ALIASES` in `packages/utils/core-config/generate-image.ts`
-(so `models` and `routes` accept it) and adding one catalog entry; TypeScript
-rejects a catalog that misses an alias, and a drift test pins the fallback
-order to the alias list. `tools/generate.ts` upstream-side only registers the
-callable and exports a few shared helpers.
-
-### Request flow
+| `apps/core/src/tool-server/tools/image-script.ts` (upstream) | Input schema, provider discovery, process execution, output capture, and redaction |
+| `apps/core/src/tool-server/tools/image-script-preload.ts` (upstream) | Installs the `providers` global before the script runs |
+| `apps/core/src/tool-server/tools/image-script-openai-compatible.ts` (fork) | Builds the `openaiCompatible` provider from `OPENAI_COMPATIBLE_*` |
+| `packages/utils/builtin-skills/image-generation/` | Default models per provider and one recipe file per provider; `references/openai-compatible.md` is fork-owned |
 
 ```mermaid
 flowchart TD
-    Call["generate.image call"] --> Plan["routing.ts: plan a route per alias"]
-    Plan -->|routes.alias set| Explicit["that provider/model id"]
-    Plan -->|provider: openai-compatible| Bulk["OPENAI_COMPATIBLE_BASE_URL with the catalog model ID"]
-    Plan -->|provider: default| Default["first configured provider in openai, openrouter, xai"]
-    Explicit --> Resolve["resolve against credentials: ready or unavailable"]
-    Bulk --> Resolve
-    Default --> Resolve
-    Resolve --> Pick["pick alias: requested, else first ready in fallback order"]
-    Pick --> Validate["validation.ts: ratios, size rule, mask, input count"]
-    Validate --> Prompt["prompt.ts: read inputImages and maskImage"]
-    Prompt --> Dims["catalog: aspectRatio to size for gpt aliases"]
-    Dims --> Send["AI SDK generateImage"]
-    Send -->|no input images| Gen["POST /images/generations (JSON)"]
-    Send -->|input images| Edit["POST /images/edits (multipart)"]
-    Gen --> Write["write generated-image.ext in outputDir"]
-    Edit --> Write
+    Agent["agent reads the image-generation skill"] --> Script["adapts a provider recipe into JavaScript"]
+    Script --> Call["generate.image { code }"]
+    Call --> Guard{"restricted caller or no provider?"}
+    Guard -->|yes| Fail["typed failure, nothing runs"]
+    Guard -->|no| Spawn["fresh Bun process in the caller's cwd, providers global preloaded"]
+    Spawn --> Fetch["script fetches the provider image API"]
+    Fetch --> Write["script writes the image and prints its path"]
+    Write --> Result["stdout, stderr, exitCode, truncated (keys redacted)"]
 ```
 
-Every route shares every step except the model construction and the request
-options. A validation failure is a `usage` error naming the alias and is
-returned before any HTTP request. An alias whose route lacks credentials is
-still advertised, and a call that requests it (or falls back onto it) fails
-with a `usage` error naming the missing environment variable.
+### Contract
 
-### Routes
+- Input: `{ "code": "<JavaScript source>" }`. Any other field is rejected.
+- The script runs with top-level await, standard imports, `fetch`, `FormData`,
+  and `Bun.write`, in the caller's cwd with the container environment.
+- Output: `stdout`, `stderr`, `exitCode`, and `truncated`. A nonzero `exitCode`
+  is a script failure even though the call itself succeeded. Each stream is
+  capped at 40 KiB.
+- Execution stops after 10 minutes or on caller cancellation; the whole process
+  group is killed.
+- Configured API keys are redacted from both streams.
+- Restricted callers are denied: the script runs as trusted container code.
+- Nothing is retried, and no provider falls back to another.
 
-For each alias, in this order:
+### Providers
 
-1. `tools.generate.image.routes.<alias>`, when set, names the provider and the
-   model ID exactly.
-2. Otherwise `tools.generate.image.provider` decides: `openai-compatible` sends
-   the alias to the compatible endpoint with its catalog model ID (see
-   [Model aliases](#model-aliases)); `default` uses the built-in preference.
-3. The built-in preference is the first provider in the order `openai`,
-   `openrouter`, `xai` that both has credentials in the environment and has a
-   model ID for that alias in the catalog. An alias with no serviceable
-   provider is not advertised.
+The `providers` global contains only configured providers. Each entry has
+`baseURL` (trailing slashes removed) and an optional `apiKey`.
 
-`tools.generate.image.models`, when present, limits which aliases exist at all.
-The tool catalog lists the advertised aliases in fallback order.
+| Script key | Configured when | `baseURL` default |
+| --- | --- | --- |
+| `openai` | `OPENAI_API_KEY` or `OPENAI_BASE_URL` | `https://api.openai.com/v1` |
+| `openrouter` | `OPENROUTER_API_KEY` or `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` |
+| `xai` | `XAI_API_KEY` or `XAI_BASE_URL` | `https://api.x.ai/v1` |
+| `openaiCompatible` (fork) | `OPENAI_COMPATIBLE_BASE_URL` | none; `OPENAI_COMPATIBLE_API_KEY` is optional |
 
-### OpenAI-compatible route
+When no provider is configured, `generate.image` is hidden from the tool catalog
+and calls fail with `unavailable`. The catalog description lists the configured
+provider keys, never their endpoints or keys.
 
-Aliases routed to `openai-compatible` (by the bulk `provider` or a per-alias
-route) are served by one client built for `OPENAI_COMPATIBLE_BASE_URL` and
-`OPENAI_COMPATIBLE_API_KEY`. The client is built by the fork for image traffic
-and differs from the shared chat provider in one way: multipart uploads to
-`/images/edits` carry filenames (`image.png`, `mask.png`, ...). Bun serializes
-unnamed blobs with `filename=""`, which OpenAI-style endpoints reject, and the
-AI SDK's compatible provider does not name them. The official OpenAI provider
-receives the same fix from upstream.
+## Configure the OpenAI-compatible provider
 
-The compatible route sends exactly one attempt per call. No route falls back to
-another provider.
-
-## Requirements
-
-An OpenAI-compatible endpoint must implement:
-
-- `POST /images/generations` for image generation
-- `POST /images/edits` for image editing and masks
-
-The configured base URL is prepended to those paths. For example, a base URL of
-`https://provider.example.com/v1` results in requests to
-`https://provider.example.com/v1/images/generations`.
-
-The endpoint must accept the model IDs Lilac sends. By default these are the
-IDs listed in [Model aliases](#model-aliases); use `routes` to send a
-different ID for individual aliases.
-
-## Configuration
-
-Routing requires a v2 `core-config.yaml`. Set the fields in
-`$DATA_DIR/core-config.yaml`; `DATA_DIR` defaults to the repository's `data/`
-directory.
-
-Route every alias to the compatible endpoint:
-
-```yaml
-configVersion: 2
-
-tools:
-  generate:
-    image:
-      provider: openai-compatible
-```
-
-Restrict the served aliases and route individual aliases elsewhere or under a
-different model ID:
-
-```yaml
-tools:
-  generate:
-    image:
-      provider: openai-compatible
-      # Optional allowlist of Lilac aliases to advertise and serve.
-      # Omitted = every alias whose route is serviceable.
-      models: [nanobanana-2, gpt-image-2, grok-imagine-image]
-      # Optional per-alias routes as "<provider>/<model id>".
-      # provider: openai | openrouter | xai | openai-compatible
-      routes:
-        nanobanana-2: openai-compatible/gemini-3.1-flash-image-preview
-        gpt-image-2: openai/gpt-image-2
-        grok-imagine-image: xai/grok-imagine-image
-```
-
-The model ID is everything after the first slash, so OpenRouter slugs work as
-`openrouter/openai/gpt-image-2`. Unknown aliases, unknown providers, and values
-without a slash are rejected at config parse time.
-
-Set the compatible endpoint and API key in the environment of the core runtime
-or standalone tool bridge:
+Set the endpoint in the environment of the core runtime or standalone tool
+bridge, then restart it:
 
 ```dotenv
 OPENAI_COMPATIBLE_BASE_URL=https://provider.example.com/v1
 OPENAI_COMPATIBLE_API_KEY=replace-with-your-api-key
 ```
 
-Routes to `openai`, `openrouter`, and `xai` use the provider's usual variables
-(`OPENAI_API_KEY`/`OPENAI_BASE_URL`, `OPENROUTER_API_KEY`/`OPENROUTER_BASE_URL`,
-`XAI_API_KEY`/`XAI_BASE_URL`).
+These are the same variables the `openai-compatible` chat provider and the
+OpenAI `web.search` provider use, so setting them for either also exposes the
+endpoint to image scripts. No `core-config.yaml` field is involved.
 
-The API key is sent as an `Authorization: Bearer` header. Each endpoint is an
-operator-controlled trust boundary: image prompts, source images, and masks are
-sent to it when `generate.image` is called.
+The base URL must include the API version prefix; recipes append
+`/images/generations`, `/images/edits`, and `/models`. The API key is sent as an
+`Authorization: Bearer` header. The endpoint is an operator-controlled trust
+boundary: prompts, source images, and masks go to it.
 
-The config is read on every call, so a `core-config.yaml` change applies
-without a restart. Restart the runtime or standalone tool bridge after changing
-environment variables.
+## Models
 
-### Migrating from `openaiCompatible`
+The skill's catalog picks the first configured provider in the order `openai`,
+`openrouter`, `xai`, `openaiCompatible`, unless the user names a provider or
+model:
 
-Earlier fork versions nested the allowlist and model-ID overrides under
-`tools.generate.image.openaiCompatible`. That block is now rejected with a
-message naming the replacement:
+| Provider | Default model |
+| --- | --- |
+| `openai` | `gpt-image-2.5-sunburst`; `gpt-image-2.5-flare` for fast drafts |
+| `openrouter` | `google/gemini-3.1-flash-image-preview` (Nano Banana 2) |
+| `xai` | `grok-imagine-image-2.0` |
+| `openaiCompatible` | Whatever the gateway serves; the recipe lists `GET /models` first |
 
-```yaml
-# before
-tools:
-  generate:
-    image:
-      provider: openai-compatible
-      openaiCompatible:
-        models: [nanobanana-2]
-        modelIds:
-          nanobanana-2: gemini-3.1-flash-image-preview
+Because scripts send native request fields, provider options such as GPT Image
+2.5's `quality: "xhigh"` or `"max"` work without an SDK update. Upstream owns
+the provider recipes; update the fork's `openai-compatible.md` recipe when the
+gateway's behavior changes.
 
-# after
-tools:
-  generate:
-    image:
-      provider: openai-compatible
-      models: [nanobanana-2]
-      routes:
-        nanobanana-2: openai-compatible/gemini-3.1-flash-image-preview
-```
+### Gateway notes
 
-## Model aliases
+- An OpenAI GPT Image model behind the gateway takes the same sizes, quality
+  values, and masks as the `openai` recipe.
+- new-api maps a colon-form `size` such as `"16:9"` to Gemini's aspect ratio for
+  Gemini image models. Other gateways may reject a non-`WxH` size.
+- Gateways answer with `b64_json` or a short-lived `url`; the recipe saves both.
+- Edit uploads carry explicit multipart filenames. Bun sends unnamed blobs with
+  `filename=""`, which OpenAI-style `/images/edits` endpoints reject.
 
-Callers continue to use Lilac's existing aliases. On the OpenAI-compatible
-route without an explicit `routes` entry, Lilac sends the alias's first
-upstream model ID from the catalog, in the provider order `openai`,
-`openrouter`, `xai`:
+## Use it
 
-| Lilac alias | Default model ID sent upstream | Taken from |
-| --- | --- | --- |
-| `gpt-image-2` | `gpt-image-2` | openai |
-| `gpt-5-image` | `gpt-image-1.5` | openai |
-| `nanobanana` | `google/gemini-2.5-flash-image` | openrouter |
-| `nanobanana-2` | `google/gemini-3.1-flash-image-preview` | openrouter |
-| `nanobanana-2-lite` | `google/gemini-3.1-flash-lite-image` | openrouter |
-| `nanobanana-pro` | `google/gemini-3-pro-image-preview` | openrouter |
-| `grok-imagine-image` | `grok-imagine-image` | xai |
-| `grok-imagine-image-pro` | `grok-imagine-image-pro` | xai |
-
-A `routes` entry replaces both the provider and the model ID for that alias.
-For example, `routes: { nanobanana-2: openai-compatible/gemini-3.1-flash-image-preview }`
-sends `gemini-3.1-flash-image-preview` (without the `google/` prefix) whenever
-a caller selects `nanobanana-2`.
-
-`models` declares which aliases exist. When present, the tool catalog
-advertises only those aliases, the default fallback picks only among them, and
-requesting any other alias fails before an HTTP request is sent. When omitted,
-every alias is eligible, and the catalog advertises the serviceable ones: on the
-`default` route an alias needs a configured provider, while explicit routes and
-the bulk `openai-compatible` route are advertised even when their credentials
-are missing (see [Routes](#routes)).
-
-## Start the standalone tool server
-
-Build and start the standalone tool bridge:
+List the configured providers:
 
 ```bash
-cd apps/tool-bridge
-bun run build
-bun index.ts
+tools --help generate.image
 ```
 
-In another terminal, list the available tools and aliases:
+Adapt a recipe into a local file and submit it:
 
 ```bash
-./apps/tool-bridge/dist/index.js --list
+bun -e 'console.log(JSON.stringify({code: await Bun.file("image-request.js").text()}))' | tools generate.image --stdin
 ```
 
-Use `TOOL_SERVER_BACKEND_URL` when the bridge listens on a non-default address:
+A minimal script for the compatible endpoint:
 
-```bash
-TOOL_SERVER_BACKEND_URL=http://127.0.0.1:42069 \
-  ./apps/tool-bridge/dist/index.js --list
+```js
+const provider = providers.openaiCompatible;
+if (!provider) throw new Error("The OpenAI-compatible endpoint is not configured");
+const response = await fetch(`${provider.baseURL}/images/generations`, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    ...(provider.apiKey ? { Authorization: `Bearer ${provider.apiKey}` } : {}),
+  },
+  body: JSON.stringify({ model: "gpt-image-2.5-flare", prompt: "A rainy Taipei street at night" }),
+});
+if (!response.ok) throw new Error(`Endpoint ${response.status}: ${await response.text()}`);
+const { data } = await response.json();
+const bytes = await Bun.write("taipei.png", Buffer.from(data[0].b64_json, "base64"));
+console.log(JSON.stringify({ path: "taipei.png", bytes }));
 ```
 
-## Generate an image
+## Migrating from the structured tool
 
-```bash
-./apps/tool-bridge/dist/index.js generate.image \
-  --prompt="A rainy Taipei street at night" \
-  --model=gpt-5-image \
-  --size=1024x1024 \
-  --output-dir=./output \
-  --output=json
-```
+| Before | Now |
+| --- | --- |
+| `generate.image` with `prompt`, `model` alias, `size`/`aspectRatio`, `inputImages`, `maskImage`, `outputDir` | `generate.image` with `code`; those fields are rejected |
+| Lilac aliases such as `gpt-image-2` or `nanobanana-2` | Provider model IDs written in the script, chosen from the skill or the user's request |
+| `tools.generate.image.provider: openai-compatible` | Set `OPENAI_COMPATIBLE_BASE_URL`; scripts choose `providers.openaiCompatible` |
+| `tools.generate.image.routes.<alias>: <provider>/<model id>` | The script names the provider and model ID directly |
+| `tools.generate.image.models` allowlist | None; configure only the providers that should be reachable |
+| Validation of sizes and ratios before the request | The provider validates the request and returns its error |
+| Restricted callers could generate images | Restricted callers are denied |
+| Result with `path`, `mimeType`, `model`, `providerMetadata` | The script prints what it needs, usually path, byte count, MIME type, and usage |
 
-The command writes the generated image to the output directory and returns its
-path, byte count, MIME type, requested Lilac alias, provider warnings, and the
-provider metadata the AI SDK reports for the call (`providerMetadata`, for
-example `{ "openai": { "images": [{ "revisedPrompt": "..." }] } }`; an empty
-object when the provider reports none).
-
-Alias-specific validation still applies. For example, unsupported GPT image
-sizes and unsupported Grok mask combinations are rejected before an HTTP
-request is sent. `tools --help generate.image` prints the accepted ratios and
-size rules per alias; that text is generated from the catalog.
-
-## Edit an image
-
-For structured inputs such as source images and masks, use a JSON input file:
-
-```json
-{
-  "prompt": "Replace the background with a mountain lake",
-  "model": "gpt-5-image",
-  "inputImages": ["./input.png"],
-  "maskImage": "./mask.png",
-  "outputDir": "./output"
-}
-```
-
-Run it with:
-
-```bash
-./apps/tool-bridge/dist/index.js generate.image --input=@edit-image.json --output=json
-```
-
-Lilac sends edits as multipart requests to `/images/edits` with named parts
-(`image`, `mask`). The provider must support the selected model and edit
-operation.
-
-## Default routing
-
-To restore the built-in provider-aware routing for every alias, set:
-
-```yaml
-tools:
-  generate:
-    image:
-      provider: default
-```
-
-Omitting the field also defaults to `default`. In that mode, aliases without a
-`routes` entry use the built-in preference described in [Routes](#routes).
-
-## Errors and fallback behavior
-
-- If an alias is routed to `openai-compatible` but `OPENAI_COMPATIBLE_BASE_URL`
-  is missing, the alias stays advertised, but a `generate.image` call that
-  selects it fails before sending an HTTP request. With `provider:
-  openai-compatible` and no base URL, every call fails this way.
-- An explicit route to `openai`, `openrouter`, or `xai` without credentials
-  behaves the same and names the missing variable.
-- Provider HTTP errors and malformed responses are returned to the caller.
-- The compatible route sends one generation attempt; other providers keep the
-  AI SDK's default retries.
-- No route falls back to another provider.
-- `generate.video` remains independent of these settings.
-
-## Aspect ratio forwarding
-
-The OpenAI-compatible image API has no dedicated aspect-ratio parameter. For
-the ratio-driven aliases (`nanobanana*` and `grok-imagine-image*`) on the
-compatible route, Lilac validates `aspectRatio` against the alias and then
-forwards it as a colon-form `size` value on the wire, e.g. `"size": "16:9"`.
-No `unsupported: aspectRatio` warning is produced.
-
-How gateways handle the colon-form `size`:
-
-- new-api maps a `size` containing a colon to Gemini's `aspectRatio` for
-  Gemini image models, so `nanobanana*` aliases produce the requested ratio.
-- xAI's image API has no size parameter, so grok-via-gateway ignores the value
-  and `grok-imagine-image*` behaves as it does today.
-- Gateways that reject non-WxH `size` values fail loudly with a provider
-  error rather than silently producing the wrong ratio.
-
-For `gpt-image-2` and `gpt-5-image`, Lilac converts `aspectRatio` into an
-equivalent WxH `size` before the request on every route, so those aliases never
-send a colon-form `size`.
+A leftover `tools.generate` block in `core-config.yaml` does not fail parsing:
+Core logs `unknown core-config key ignored` for it and ignores it. Remove it.
 
 ## Troubleshooting
 
-### The provider returns model-not-found
+### `generate.image` is missing from the tool list
 
-Confirm that the provider recognizes the model ID Lilac sends: the default
-ID from the alias table, or the `routes` entry when one is configured. If the
-provider expects a different ID for an alias (for example
-`gemini-3.1-flash-image-preview` without the `google/` prefix), set a route
-for it. If the provider serves only some aliases, list them in `models` so
-unavailable aliases are not advertised or selected.
+No provider is configured in the process that serves tools. Set at least one
+provider's variables and restart the core runtime or tool bridge.
 
-### The request returns 404
+### `providers.openaiCompatible` is undefined
 
-Check whether the base URL includes the provider's API version prefix, usually
-`/v1`. Lilac appends `/images/generations` or `/images/edits` to the configured
-base URL.
+`OPENAI_COMPATIBLE_BASE_URL` is unset or empty in that process. An API key alone
+does not configure the provider because it has no default endpoint.
 
-### Image generation is not using the third-party endpoint
+### The gateway returns 404
 
-Confirm all of the following:
+Check that the base URL includes the version prefix, usually `/v1`.
 
-1. `core-config.yaml` has `configVersion: 2`.
-2. `tools.generate.image.provider` is `openai-compatible`, or the alias has a
-   `routes` entry starting with `openai-compatible/`.
-3. The runtime process received `OPENAI_COMPATIBLE_BASE_URL` and
-   `OPENAI_COMPATIBLE_API_KEY`.
-4. The runtime was restarted after changing its environment.
+### The gateway rejects the model
 
-### Image generation fails but video generation still appears
+Run the recipe's model listing, then use an ID the gateway serves. A listed ID
+can still be a text-only model.
 
-This is expected when the OpenAI-compatible image endpoint is missing or
-invalid. Image routing does not control `generate.video`.
+### The call returns `denied`
+
+The caller runs in restricted safety mode. Image scripts require trusted
+execution.

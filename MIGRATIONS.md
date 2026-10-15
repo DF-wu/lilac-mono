@@ -674,12 +674,10 @@ DF-wu fork adds these downstream-only v2 contracts:
   copy the secret to `token` in `core-config.yaml`. `allowedChatIds` fails closed, `streamEditIntervalMs`
   defaults to `1500`, and `parseMode` defaults to `html`. See
   [`docs/telegram-surface.md`](docs/telegram-surface.md).
-- `tools.generate.image.provider` selects `default` built-in routing or `openai-compatible` routing for
-  aliases without an explicit route. `tools.generate.image.models` restricts advertised aliases and
-  `tools.generate.image.routes` maps an alias to `<provider>/<model id>` (`openai`, `openrouter`, `xai`,
-  `openai-compatible`); the former `openaiCompatible` block is rejected with a migration hint. These
-  fields are v2-only; frozen v1 configs retain the built-in provider. No route falls back to another
-  provider. The `generate.image` result gained `providerMetadata`. See
+- `tools.generate` was removed together with the structured `generate.image` tool; the fork now uses
+  upstream's script runner. A leftover `tools.generate` block parses with an `unknown core-config key
+  ignored` warning and no effect. Scripts reach an OpenAI-compatible endpoint as
+  `providers.openaiCompatible` when `OPENAI_COMPATIBLE_BASE_URL` is set. See
   [`docs/generate-image-openai-compatible.md`](docs/generate-image-openai-compatible.md).
 - `surface.telegram.inboundMedia` delivers inbound Telegram photos and documents to the model. It is
   enabled by default with `maxBytesPerAttachment: 5MiB` and `maxBytesPerRequest: 10MiB`; set

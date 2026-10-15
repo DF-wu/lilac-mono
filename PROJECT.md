@@ -2,7 +2,7 @@
 
 This is the durable map of the current Lilac monorepo: product boundaries, terminology, ownership, trust boundaries, persistence categories, and the best places to make changes. It intentionally omits route inventories, configuration field catalogs, startup call order, and implementation-plan history.
 
-The DF-wu fork extends Core with a Telegram surface, the structured `generate.image` tool with OpenAI-compatible image routing, and an OpenAI `web.search` provider while preserving these upstream ownership boundaries.
+The DF-wu fork extends Core with a Telegram surface, an OpenAI-compatible provider for `generate.image` scripts, and an OpenAI `web.search` provider while preserving these upstream ownership boundaries.
 
 ## Documentation Authority
 
@@ -180,15 +180,15 @@ codes. Successfully produced report and diagnostic payloads remain successes eve
 findings are negative. See `PLUGIN_AUTHORING.md` for authoring details and `MIGRATIONS.md` for the
 clean-break migration.
 
-`generate.image` keeps the downstream structured prompt, model-alias, dimensions, input-image, mask,
-and output-directory contract; upstream replaced it with a script runner, and the fork-owned
-implementation lives in `apps/core/src/tool-server/tools/generate-image/` behind a small hook in
-`tools/generate.ts`. One alias capability catalog (`generate-image/catalog.ts`) drives input
-validation, default provider routing, OpenAI-compatible model IDs, and the schema help text. V2
-configuration routes aliases with a bulk `provider`, an alias allowlist, and per-alias
-`<provider>/<model id>` routes, with no fallback between providers; the OpenAI-compatible route uses a
-fork-owned image client in `packages/utils` so multipart edit uploads carry filenames. The built-in `image-generation` skill
-documents this contract. `generate.video` retains its model-based interface.
+`generate.image` executes caller-written JavaScript in a fresh Bun process with the caller's cwd and
+Core's container environment. Discovery lists configured OpenAI, OpenRouter, and xAI providers; the
+script's `providers` global supplies resolved endpoints and credentials. The built-in `image-generation`
+skill owns the default model catalog and native request recipes. Scripts save images and print paths;
+the tool returns bounded stdout/stderr, exit status, and truncation state. This is trusted native
+execution and is unavailable to restricted sessions. `generate.video` retains its model-based interface.
+The fork adds the OpenAI-compatible endpoint as `providers.openaiCompatible` when
+`OPENAI_COMPATIBLE_BASE_URL` is set (`tools/image-script-openai-compatible.ts`), with a gateway recipe
+in the skill.
 
 Request capabilities bind request context, cwd, profile, callable authority, and expiry. They constrain agent calls but are not general public HTTP authentication. The Core tool server belongs on a trusted host/network. Core also owns configured MCP clients process-wide; MCP tools join the run-scoped catalog only through the Core manager and profile policy.
 
@@ -420,7 +420,7 @@ These invariants matter more than a fragile numbered list. Update this section o
 - Workflow definition, runtime, persistence, scheduling, waits, or progress: the corresponding owner in `apps/core/src/workflow`; Level 2 adaptation is `apps/core/src/tool-server/tools/programmatic-workflow.ts`.
 - Core config/model/provider/prompt behavior: `packages/utils`; config version changes also require
   `docs/core-config-migrations.md`.
-- Downstream OpenAI-compatible image routing: `tools.generate.image.provider` in `packages/utils/core-config/generate-image.ts`, `apps/core/src/tool-server/tools/generate-image/routing.ts`, and `docs/generate-image-openai-compatible.md`.
+- Downstream OpenAI-compatible image provider: `apps/core/src/tool-server/tools/image-script-openai-compatible.ts`, `packages/utils/builtin-skills/image-generation/references/openai-compatible.md`, and `docs/generate-image-openai-compatible.md`.
 - Core managed opaque bytes, adapter behavior, handle/reference codecs, integrity, or expiry:
   `packages/blob-storage`; domain retention and ownership stay with the consuming Core module.
 - Architecture boundary registration or a new workspace: `scripts/architecture/manifest.ts` and its focused tests; read `scripts/architecture/README.md` first.

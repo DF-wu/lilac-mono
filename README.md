@@ -37,7 +37,7 @@ server.
 Architecture and ownership are documented in [`PROJECT.md`](./PROJECT.md). Repository rules for coding agents are in [`AGENTS.md`](./AGENTS.md).
 
 > [!IMPORTANT]
-> This is a downstream fork that continuously tracks [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) through Git history and the `upstream` remote. It is not an official upstream release. This project regularly merges upstream updates while maintaining independent Telegram, OpenAI-compatible image routing, OpenAI `web.search`, and deployment automation features.
+> This is a downstream fork that continuously tracks [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) through Git history and the `upstream` remote. It is not an official upstream release. This project regularly merges upstream updates while maintaining independent Telegram, OpenAI-compatible image generation, OpenAI `web.search`, and deployment automation features.
 
 Lilac brings platform messaging, routing, model execution, tools, Skills, and recoverable workflows
 into one runtime.
@@ -49,7 +49,7 @@ The table below lists only behavior that still differs from upstream. GitHub rep
 | Area                            | Difference provided by this fork                                                                                                                       | Important limitations                                                                             |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
 | Telegram surface                | DMs, groups, forum topics, streaming HTML replies, cancellation, reactions, command menu, inbound/outbound attachments, workflow cards, same-surface tools, and Telegram history in cross-surface conversation memory | Disabled by default; long polling only; memory indexes one thread per chat or topic |
-| OpenAI-compatible image routing | Routes the existing `generate.image` aliases through an operator-specified OpenAI-compatible endpoint, with per-alias `provider/model` routes            | `configVersion: 2` only; no automatic fallback between providers                                  |
+| OpenAI-compatible image provider | Exposes the operator's OpenAI-compatible endpoint to upstream's `generate.image` scripts as `providers.openaiCompatible`, with a gateway recipe in the `image-generation` skill | Requires `OPENAI_COMPATIBLE_BASE_URL`; restricted callers cannot run image scripts; no automatic fallback between providers |
 | OpenAI `web.search` provider    | `openai` in `tools.web.extract.providers` runs `web.search` through the OpenAI Responses `web_search` tool and returns the answer's cited sources     | `configVersion: 2` only; search-only (`web.extract` skips it); date filters are model guidance only |
 | Custom media plugin             | Deployable Level 2 image/video plugin example demonstrating strict configuration and file-safety handling                                              | The plugin is trusted in-process code; restricted callers currently cannot use external callables |
 | Operations and delivery         | Upstream checks every 6 hours, GHCR publishes verified `catalina`/`claudia` tags, and CI enforces the upstream-footprint allowlist                     | Automatic merges still require manual handling when conflicts occur                               |
@@ -223,30 +223,9 @@ curl -s localhost:8080/readyz | jq '.checks[] | select(.name == "telegram.ready"
 
 See [`docs/telegram-surface.md`](./docs/telegram-surface.md) for group privacy mode, forum topic session IDs, streaming, the command menu, and troubleshooting.
 
-### Route Image Generation to a Compatible Endpoint
+### Generate Images Through a Compatible Endpoint
 
-```yaml
-configVersion: 2
-
-tools:
-  generate:
-    image:
-      provider: openai-compatible
-```
-
-To route individual aliases, add `routes` entries as `<provider>/<model id>` with provider `openai`, `openrouter`, `xai`, or `openai-compatible`; unlisted aliases follow `provider`, and the former `openaiCompatible` block is rejected at parse time:
-
-```yaml
-tools:
-  generate:
-    image:
-      provider: openai-compatible
-      routes:
-        nanobanana-2: openai-compatible/gemini-3.1-flash-image-preview
-        gpt-image-2: openai/gpt-image-2
-```
-
-For Docker Compose, put the endpoint and credential in `.env`, which is loaded by `compose.override.yaml`:
+`generate.image` runs a JavaScript image request written by the agent from the built-in `image-generation` skill (upstream's script runner). This fork also exposes an OpenAI-compatible gateway, such as new-api, to those scripts as `providers.openaiCompatible`. No `core-config.yaml` field is needed. For Docker Compose, put the endpoint and credential in `.env`, which is loaded by `compose.override.yaml`:
 
 ```dotenv
 OPENAI_COMPATIBLE_BASE_URL=https://provider.example.com/v1
@@ -259,9 +238,9 @@ Then recreate the container:
 docker compose up -d --force-recreate --wait --wait-timeout 120 lilac
 ```
 
-When running from source, export the variables with the same names before starting Core.
+When running from source, export the variables with the same names before starting Core. The provider appears only when `OPENAI_COMPATIBLE_BASE_URL` is set; the key is optional.
 
-See [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md) for aliases, the `models` allowlist and per-alias `routes` (`<provider>/<model id>`), migration from the removed `openaiCompatible` block, generation/edit endpoints, `providerMetadata` in results, the absence of fallback behavior, and colon-form `size` aspect-ratio forwarding.
+See [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md) for the script contract, the provider table, the gateway recipe and its notes, and migration from the removed structured tool and `tools.generate.image` routing.
 
 ### Search the Web Through OpenAI
 
@@ -338,7 +317,7 @@ See [`AGENTS.md`](./AGENTS.md) for each workspace's build, test, and typecheck c
 
 `.github/workflows/sync-upstream.yml` checks upstream `main` every 6 hours and attempts to merge new commits into this fork's `main`. A clean merge triggers an image build; maintainers handle conflicts manually.
 
-- Report new fork features, deployment workflows, Telegram issues, OpenAI `web.search` issues, or OpenAI-compatible image-routing issues in [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues).
+- Report new fork features, deployment workflows, Telegram issues, OpenAI `web.search` issues, or OpenAI-compatible image provider issues in [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues).
 - For an issue reproducible without fork modifications, first confirm the upstream state, then report it to [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono/issues).
 - Features historically contributed by this fork and accepted upstream are no longer listed as current differences. See [`docs/fork-differences.md`](./docs/fork-differences.md#accepted-upstream-contributions) for the list.
 - Fork behavior lives in fork-owned modules; upstream files are touched only at thin seams. `bun run fork:footprint` checks every modified upstream file against [`scripts/fork/upstream-footprint.txt`](./scripts/fork/upstream-footprint.txt), and [`docs/fork-differences.md`](./docs/fork-differences.md#fork-code-layout) maps each feature to its modules and seams.
