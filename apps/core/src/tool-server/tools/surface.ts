@@ -1195,7 +1195,7 @@ export class Surface implements ServerTool {
           sessionId:
             "The CLI/session selector used by most surface.* tools. If omitted, surface tools default to the current request session (LILAC_SESSION_ID, or inferred from requestId when available).",
           alias:
-            "Human-friendly Discord session alias from cfg.entity.sessions.discord. Prefer aliases over raw channel ids when available.",
+            "Human-friendly session selector. Native supports dm for the authenticated requesting user’s permanent DM. Discord aliases come from cfg.entity.sessions.discord.",
           messageId:
             "A platform-specific message identifier inside a session/channel. Many surface tools can default this to the origin message when requestId is 'discord:<sessionId>:<messageId>' or 'github:<OWNER/REPO#N>:<triggerId>'.",
           conversationLinks: [

@@ -44,6 +44,7 @@ export function settleSurfaceFallback<T, E>(
 }
 
 export type SurfaceOperation =
+  | "resolve-session-alias"
   | "list-sessions"
   | "list-session-participants"
   | "start-output"
@@ -247,6 +248,8 @@ export interface SurfaceAdapter {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   getSelf(): Promise<SurfaceSelf>;
+
+  resolveSessionAlias?(alias: string): Promise<SurfaceOperationResult<SessionRef>>;
 
   listSessions(opts?: {
     limit?: number;

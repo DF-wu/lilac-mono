@@ -12,6 +12,7 @@ import type {
   StartOutputOpts,
 } from "./adapter";
 import {
+  SurfaceOperationUnsupported,
   hasCacheBurstProvider,
   hasRequestReadScopeProvider,
   hasSurfaceGuildIdResolver,
@@ -277,6 +278,28 @@ class DescriptorBoundSurfaceAdapter implements SurfaceAdapter {
       producedPlatform: self.platform,
     });
     return self;
+  }
+
+  async resolveSessionAlias(alias: string): Promise<SurfaceOperationResult<SessionRef>> {
+    if (!this.adapter.resolveSessionAlias)
+      return Result.err(
+        new SurfaceOperationUnsupported({
+          platform: this.descriptorPlatform,
+          operation: "resolve-session-alias",
+          message: "This surface does not support session aliases",
+        }),
+      );
+    const resolved = await this.adapter.resolveSessionAlias(alias);
+    requireOperationResult(
+      this.descriptorPlatform,
+      resolved,
+      "resolveSessionAlias",
+      undefined,
+      (ref) => {
+        requireProducedSessionRef(this.descriptorPlatform, ref, "resolveSessionAlias");
+      },
+    );
+    return resolved;
   }
 
   async listSessions(opts?: Parameters<SurfaceAdapter["listSessions"]>[0]) {

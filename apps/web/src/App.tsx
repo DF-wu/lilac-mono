@@ -123,7 +123,8 @@ function Workspace(props: AppProps) {
   const navigate = useNavigate();
   const router = useRouter();
   const active = useMatch({ from: "/chat", shouldThrow: false, select: () => true }) ?? false;
-  const routeThreadId = useMatch({
+  const isDmRoute = useMatch({ from: "/chat/dm", shouldThrow: false, select: () => true }) ?? false;
+  const explicitThreadId = useMatch({
     from: "/chat/threads/$threadId",
     shouldThrow: false,
     select: (match) => match.params.threadId,
@@ -138,6 +139,8 @@ function Workspace(props: AppProps) {
   const profile = useQuery({ ...profileOptions(client), enabled: online });
   const viewer = profile.data ?? initial.viewer;
   const [threads, setThreads] = useState(initial.threads.items);
+  const directThread = threads.find((thread) => thread.kind === "dm");
+  const routeThreadId = isDmRoute ? directThread?.id : explicitThreadId;
   const [workingIndicators, setWorkingIndicators] = useState(
     initial.workingIndicators ?? FALLBACK_WORKING_INDICATORS,
   );
@@ -166,6 +169,10 @@ function Workspace(props: AppProps) {
       });
       return;
     }
+    if (selectedId === directThread?.id) {
+      void navigate({ to: "/dm", search: true, hash: true, replace: true });
+      return;
+    }
     void navigate({
       to: "/threads/$threadId",
       params: { threadId: selectedId },
@@ -173,7 +180,7 @@ function Workspace(props: AppProps) {
       hash: true,
       replace: true,
     });
-  }, [active, routePathname, routeThreadId, routeDraftId, selectedId, navigate]);
+  }, [active, routePathname, routeThreadId, routeDraftId, selectedId, directThread?.id, navigate]);
   const [catalog, setCatalog] = useState<DisplayCatalog | undefined>(() =>
     initial.catalog.kind === "catalog" ? initial.catalog.catalog : client.catalogs.get(props.scope),
   );
@@ -517,6 +524,10 @@ function Workspace(props: AppProps) {
       void navigate({ to: "/", state: { draftThreadId: id }, search });
       return;
     }
+    if (id === directThread?.id) {
+      void navigate({ to: "/dm", search });
+      return;
+    }
     void navigate({ to: "/threads/$threadId", params: { threadId: id }, search });
   });
 
@@ -782,7 +793,6 @@ function Workspace(props: AppProps) {
     setConfirmDelete(undefined);
     if (activeRef.current && selectedRef.current === id) createThread();
   }
-  const directThread = threads.find((thread) => thread.kind === "dm");
   const sidebarThreads = [
     ...(!archived ? draftIds.map((id) => ({ id, source: undefined })) : []),
     ...threads

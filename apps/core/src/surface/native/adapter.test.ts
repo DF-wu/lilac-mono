@@ -719,3 +719,87 @@ test("native sends appear in recent writes and deletion removes their links", as
     transcript.close();
   }
 });
+
+test("DM aliases resolve per authenticated user and surface tools return concrete targets", async () => {
+  const f = fixture();
+  const registry = SurfaceRuntimeRegistry.create([
+    createNativeSurfaceRuntimeDescriptor({
+      adapter: f.adapter,
+      resolveWorkflowAdapter: () => Result.ok(f.scoped),
+    }),
+  ]).unwrap();
+  const tool = new Surface({
+    config: parseCoreConfigV2ToUniversal({}),
+    adapterResolver: registry.adapterResolver(),
+    nativeAdapterForContext: () => Result.ok(f.scoped),
+  });
+  const context = {
+    requestClient: "native",
+    requestId: "request",
+    sessionId: `native:${f.source.id}`,
+    requestInitiator: { platform: "native" as const, userId: "owner" },
+    requestInitiatorSessionId: f.source.id,
+    serverOwnedRequest: true,
+  };
+  const listed = (
+    await tool.call("surface.messages.list", { client: "native", sessionId: "dm" }, { context })
+  ).unwrap();
+  const ownerDm = f.store.ensureDirectThread("owner").unwrap();
+  expect(listed).toMatchObject({
+    meta: { session: { platform: "native", channelId: ownerDm.id } },
+  });
+  (
+    await tool.call(
+      "surface.messages.send",
+      { client: "native", sessionId: "dm", text: "For my DM" },
+      { context },
+    )
+  ).unwrap();
+  expect(
+    (await f.scoped.listMsg({ platform: "native", channelId: ownerDm.id }))
+      .unwrap()
+      .map((message) => message.text),
+  ).toContain("For my DM");
+  const other = f.adapter.forRequest({
+    principalId: "other",
+    sourceThreadId: f.destination.id,
+    requestId: "other-request",
+  });
+  const otherDm = (await other.resolveSessionAlias("dm")).unwrap();
+  expect(otherDm.channelId).not.toBe(ownerDm.id);
+  expect(otherDm.channelId).toBe(f.store.ensureDirectThread("other").unwrap().id);
+  expect((await f.adapter.resolveSessionAlias("dm")).isErr()).toBe(true);
+  expect((await f.scoped.resolveSessionAlias("unknown")).isErr()).toBe(true);
+  const forged = f.adapter.forRequest({
+    principalId: "other",
+    sourceThreadId: f.source.id,
+    requestId: "forged",
+  });
+  expect((await forged.resolveSessionAlias("dm")).isErr()).toBe(true);
+  expect(
+    (
+      await tool.call("surface.messages.send", {
+        client: "native",
+        sessionId: "dm",
+        text: "Denied",
+      })
+    ).isErr(),
+  ).toBe(true);
+  expect(
+    (
+      await tool.call(
+        "surface.messages.send",
+        { client: "native", sessionId: "dm", text: "Denied" },
+        {
+          context: {
+            ...context,
+            requestClient: "discord",
+            requestInitiator: { platform: "discord", userId: "owner" },
+          },
+        },
+      )
+    ).isErr(),
+  ).toBe(true);
+  const help = (await tool.call("surface.help", { client: "native" }, { context })).unwrap();
+  expect(JSON.stringify(help)).toContain('"format":"dm"');
+});

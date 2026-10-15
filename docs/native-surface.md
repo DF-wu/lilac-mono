@@ -195,6 +195,17 @@ text and strips terminal control sequences. It does not read the host clipboard.
 For source development, `bun run dev:tui` connects to the same local operator endpoint. It requires
 access to the operator token, just like the container command.
 
+## DM links and agent delivery
+
+Open `/dm` to return to your permanent DM. Its existing `/threads/<threadId>` URL remains valid
+for links to that specific conversation.
+
+From a native request, agents can use `surface.messages.send` with `client=native` and
+`sessionId=dm`. Core resolves `dm` using the authenticated requesting user. The alias is documented
+in `surface.help` and native agent instructions. Requests without native user authority cannot use it.
+For deferred delivery, call `surface.messages.list` with the same target and save the concrete
+`meta.session.channelId` returned by Core.
+
 ## Diagnostics and compatibility
 
 See [verification evidence and limits](native-surface-verification.md) for deployment, authentication,

@@ -240,6 +240,25 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
     return message;
   }
 
+  async resolveSessionAlias(alias: string): Promise<SurfaceOperationResult<SessionRef>> {
+    return Result.gen(function* () {
+      const request = yield* this.principal("resolve-session-alias");
+      if (alias !== "dm")
+        return Result.err(
+          new SurfaceInvalidInput({
+            platform: "native",
+            operation: "resolve-session-alias",
+            field: "alias",
+            message: "Unknown native session alias",
+          }),
+        );
+      const thread = yield* this.dependencies.store
+        .ensureDirectThread(request.principalId)
+        .mapError((error) => nativeSurfaceError("resolve-session-alias", error));
+      return Result.ok({ platform: "native" as const, channelId: thread.id });
+    }, this);
+  }
+
   async listSessions(opts?: {
     limit?: number;
     archived?: boolean;
