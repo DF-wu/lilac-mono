@@ -963,7 +963,7 @@ function Workspace(props: AppProps) {
               <Tooltip.Provider delay={350}>
                 <main
                   ref={viewport}
-                  className={`app-shell group/workspace relative flex h-dvh overflow-hidden ${sidebar ? "" : "sidebar-hidden"} ${rightOpen ? "" : "right-panel-hidden"}`}
+                  className={`app-shell group/workspace fixed inset-x-0 top-0 flex h-dvh overflow-hidden ${sidebar ? "" : "sidebar-hidden"} ${rightOpen ? "" : "right-panel-hidden"}`}
                   aria-label="Chat workspace"
                 >
                   <div className="sidebar-toggle fixed top-0 left-3 h-8 flex items-center z-40 [&_.icon-button]:size-[var(--ui-control-compact)]">

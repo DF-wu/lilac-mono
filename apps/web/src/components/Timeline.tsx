@@ -319,7 +319,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       <TimelineContext value={timeline}>
         <MessageServicesContext value={services}>
           <div
-            className="timeline overflow-auto min-h-0 flex-1 [overflow-anchor:none] chat-scroll relative overflow-y-auto overflow-x-hidden"
+            className="timeline overflow-auto overscroll-none min-h-0 flex-1 [overflow-anchor:none] chat-scroll relative overflow-y-auto overflow-x-hidden"
             ref={bindViewport}
             onScroll={(event) => {
               setReadingDisclosure(undefined);
