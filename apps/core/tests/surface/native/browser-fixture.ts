@@ -74,10 +74,10 @@ export async function startNativeBrowserFixture(mcpRegistry?: NativeRuntimeOptio
             : "Fixture response.\n\nReady for the next message.",
         ),
     }),
-    port: 8789,
+    port: Number(process.env.TEST_NATIVE_PORT ?? 8789),
     password: process.env.TEST_NATIVE_PASSWORD ?? "native-fixture-password",
     allowedOrigins: [
-      "http://127.0.0.1:8789",
+      `http://127.0.0.1:${process.env.TEST_NATIVE_PORT ?? 8789}`,
       "http://localhost:8789",
       "http://127.0.0.1:5173",
       "http://localhost:5173",

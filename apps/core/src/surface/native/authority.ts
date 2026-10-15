@@ -9,6 +9,8 @@ export function nativeThreadCapabilities(
   grant?: NativeThreadGrant,
 ): NativeThreadCapabilities {
   if (thread.deleted || user.role === "service") return { read: false, edit: false, share: false };
+  if (thread.kind === "dm")
+    return { read: thread.starterId === user.id, edit: thread.starterId === user.id, share: false };
   if (user.role === "owner") return { read: true, edit: true, share: true };
   if (thread.starterId === user.id) return { read: true, edit: true, share: false };
   return {

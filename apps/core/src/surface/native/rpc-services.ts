@@ -47,7 +47,7 @@ export type NativeRpcServiceOptions = {
   config: Pick<NativeConfigService, "read" | "save" | "reloadMcp">;
   execution: Pick<
     NativeExecution,
-    "kick" | "cancel" | "rewind" | "deleteThread" | "validateCommand"
+    "kick" | "cancel" | "rewind" | "deleteThread" | "validateCommand" | "context"
   >;
   resources: Pick<NativeResourceService, "reserve">;
   search: Pick<NativeSearchStore, "searchMessages">;
@@ -188,7 +188,9 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
       if (
         input.command &&
         !reply.catalog.commands.some(
-          (command) => command.kind === "custom" && command.id === input.command?.id,
+          (command) =>
+            (command.kind === "custom" || command.id === "compact") &&
+            command.id === input.command?.id,
         )
       )
         return Result.err(nativeFailure("invalid", "Selected command is unavailable"));
@@ -629,11 +631,16 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
             principal.provider === "operator"
               ? []
               : yield* store.listThreads(principal.userId, { limit: 30, excludeSettled: true });
+          const direct =
+            principal.provider === "operator"
+              ? undefined
+              : yield* store.ensureDirectThread(principal.userId);
           const lastListed = items.at(-1);
           const nextCursor =
             items.length === 30 && lastListed
               ? `${lastListed.updatedAt}_${lastListed.id}`
               : undefined;
+          if (direct) items.unshift(direct);
           const displayCatalog = yield* catalog(principal, input.catalogRevision);
           const workingIndicators = options.workingIndicators?.();
           const selected = yield* selectedThread(principal, input);
@@ -673,6 +680,9 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
       },
     },
     threads: {
+      context(principal, input) {
+        return execution.context(principal.userId, input.threadId);
+      },
       get(principal, input) {
         return auth
           .checkSession(principal)
@@ -857,6 +867,19 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
           if (existing) return Result.ok(existing);
           yield* inputSelections(principal, input);
           const thread = yield* store.authorizeThread(principal.userId, input.threadId, true);
+          if (input.command?.id === "compact") {
+            if (
+              input.mode === "steer" ||
+              input.command.arguments.trim() ||
+              input.attachmentIds.length ||
+              input.skillIds.length
+            )
+              return Result.err(nativeFailure("invalid", "Send /compact on its own as a new turn"));
+            if (!(yield* store.getLatestCanonicalRequestId(thread.id)))
+              return Result.err(
+                nativeFailure("invalid", "There is no completed context to compact"),
+              );
+          }
           const resolvedModelRequest =
             input.mode === "steer" && !input.command
               ? undefined

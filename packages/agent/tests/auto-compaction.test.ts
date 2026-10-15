@@ -2437,3 +2437,37 @@ describe("auto-compaction internals", () => {
     expect(agent.state.messages[0]?.content).toBe("small prior request");
   });
 });
+
+it("manually compacts small context once even when automatic compaction is disabled", async () => {
+  let summaries = 0;
+  const agent = new AiSdkPiAgent({
+    system: "test",
+    model: new MockLanguageModelV4({ doStream: async () => summaryResponse("answer") }),
+    modelSpecifier: "test/main",
+  });
+  await agent.prompt("Discuss project A");
+  await agent.prompt("Discuss project B");
+  const detach = await attachAutoCompaction(agent, {
+    model: "test/main",
+    modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+    enabled: false,
+    compactOnStart: true,
+    keepRecentTurns: 1,
+    resolveContextLimit: async () => ({ context: 100_000, output: 1_000 }),
+    summaryModel: new MockLanguageModelV4({
+      doStream: async () => {
+        summaries++;
+        return summaryResponse("Project A and project B discussed.");
+      },
+    }),
+  });
+  try {
+    await agent.prompt("Compact");
+    expect(summaries).toBe(1);
+    expect(JSON.stringify(agent.state.messages)).toContain("Project A and project B discussed.");
+    await agent.prompt("Next subject");
+    expect(summaries).toBe(1);
+  } finally {
+    detach();
+  }
+});

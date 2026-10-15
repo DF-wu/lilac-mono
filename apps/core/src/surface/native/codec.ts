@@ -38,6 +38,7 @@ export const nativeUserSchema = z.strictObject({
   toolMode: z.enum(["restricted", "full"]),
 });
 export const nativeThreadRecordSchema = z.strictObject({
+  kind: z.literal("dm").optional(),
   id,
   title: z.string().max(512),
   titleGeneration: z

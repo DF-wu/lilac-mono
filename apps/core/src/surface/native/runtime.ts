@@ -113,6 +113,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   const deploymentInitialized = store.initializeDeployment({
     titleModel: legacy.titleModel,
     outputStreaming: legacy.outputStreaming,
+    dmContextMaxAgeMs: 10_800_000,
     oldMessageSelectionMaxAgeMs: legacy.oldMessageSelectionMaxAgeMs,
     storageRetentionMaxAgeMs: legacy.storageRetentionMaxAgeMs,
     crossThreadSend: legacy.crossThreadSend,
@@ -178,6 +179,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     customCommands: options.customCommands,
     validateSkill: (id) => skills.some((skill) => skill.name === id),
     deliveryState: options.deliveryState,
+    getDmContextMaxAgeMs: () => deployment().dmContextMaxAgeMs,
     getOldMessageSelectionMaxAgeMs: () => deployment().oldMessageSelectionMaxAgeMs ?? undefined,
   });
   const operator = options.operatorTokenSha256

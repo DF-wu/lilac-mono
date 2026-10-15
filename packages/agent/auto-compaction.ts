@@ -977,7 +977,7 @@ type ResolvedContextWindow =
       error?: unknown;
     };
 
-type CompactionScheduleReason = "threshold" | "overflow";
+type CompactionScheduleReason = "threshold" | "overflow" | "manual";
 type PendingCompactionReason = CompactionScheduleReason;
 
 export type CompactionSummaryModel = "current" | LanguageModel | (() => LanguageModel);
@@ -1028,7 +1028,7 @@ function reconcilePendingCompactionReason(params: {
   pendingReason: PendingCompactionReason | null;
   capabilityKnown: boolean;
 }): PendingCompactionReason | null {
-  if (!params.capabilityKnown && params.pendingReason !== "overflow") {
+  if (!params.capabilityKnown && params.pendingReason === "threshold") {
     return null;
   }
   return params.pendingReason;
@@ -1390,6 +1390,7 @@ export type AutoCompactionOptions = {
 
   /** Enable/disable (default: true). */
   enabled?: boolean;
+  compactOnStart?: boolean;
 
   /** Optional hook for observability when model capability is unknown. */
   onUnknownCapability?: (params: {
@@ -1918,7 +1919,7 @@ export async function attachAutoCompaction(
   agent: AiSdkPiAgent,
   options: AutoCompactionOptions,
 ): Promise<() => void> {
-  if (options.enabled === false) return () => {};
+  if (options.enabled === false && !options.compactOnStart) return () => {};
 
   const thresholdFraction = normalizeThresholdFraction(options.thresholdFraction);
   const thresholdInputSource = options.thresholdInputSource ?? "usage";
@@ -1932,7 +1933,9 @@ export async function attachAutoCompaction(
   const overflowRecoveryMaxAttempts =
     options.overflowRecoveryMaxAttempts ?? DEFAULT_OVERFLOW_RECOVERY_MAX_ATTEMPTS;
 
-  let pendingCompactionReason: PendingCompactionReason | null = null;
+  let pendingCompactionReason: PendingCompactionReason | null = options.compactOnStart
+    ? "manual"
+    : null;
   let inCompaction = false;
   let overflowRecoveryAttempts = 0;
   let lengthCompactionScheduled = false;
@@ -2019,8 +2022,17 @@ export async function attachAutoCompaction(
       };
     }
 
-    if (params.reason !== "overflow") {
-      return null;
+    if (params.reason === "threshold") return null;
+    if (params.reason === "manual") {
+      // A manual request is not evidence of overflow. Keep the current input budget,
+      // including system/tool overhead, with room for a small summary on short chats.
+      const inputBudget = Math.max(2_048, params.estimatedInputTokens);
+      return {
+        inputBudget,
+        safeInputBudget: inputBudget,
+        earlyInputBudget: inputBudget,
+        reservedOutputTokens: 0,
+      };
     }
 
     return computeUnknownOverflowCompactionBudget({
@@ -2255,6 +2267,7 @@ export async function attachAutoCompaction(
       }
 
       if (
+        options.enabled !== false &&
         pendingCompactionReason === null &&
         evaluateThresholdWithBudget(observedInputTokens, latestBudget.inputBudget)
       ) {
@@ -2281,7 +2294,8 @@ export async function attachAutoCompaction(
     const activeBudget = resolveActiveCompactionBudget({
       capability: latestCapability,
       reason: pendingReason,
-      estimatedInputTokens: floorAwareFullViewTokens,
+      estimatedInputTokens:
+        pendingReason === "manual" ? modelInputEstimate : floorAwareFullViewTokens,
     });
     if (!activeBudget) return;
 
@@ -2364,12 +2378,12 @@ export async function attachAutoCompaction(
           serverCompaction: options.serverCompaction,
           serverCompactionEnabled: options.serverCompactionEnabled,
           onServerCompactionError: options.onServerCompactionError,
-          keepRecentTurns,
+          keepRecentTurns: pendingReason === "manual" ? 1 : keepRecentTurns,
           keepRecentTokens,
           summarySystem,
           buildSummaryPrompt,
           buildSummaryUpdatePrompt,
-          forceCompaction: pendingReason === "overflow",
+          forceCompaction: pendingReason !== "threshold",
           onProgress: options.onProgress,
           onSummaryDelta: options.onSummaryDelta,
           abortSignal: context.abortSignal,

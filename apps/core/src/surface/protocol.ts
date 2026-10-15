@@ -102,6 +102,7 @@ export type GithubNormalizedRequestMetadata = {
 };
 
 export type NativeRequestMetadata = {
+  readonly compact?: boolean;
   readonly threadId: string;
   readonly authorUserId: string;
   readonly starterUserId: string;

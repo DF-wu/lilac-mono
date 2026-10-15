@@ -89,7 +89,9 @@ uses the shared client and a principal-scoped IndexedDB cache. See [native setup
 
 Native input receipts and upload readiness commit before the existing request-delivery coordinator
 admits execution. Stable delivery identities bridge these stores; the native surface does not own a
-second model-execution queue. Starter authority and history generation are rechecked at admission.
+second model-execution queue. Each human user also has one permanent native DM, with a separate
+three-hour context window and manual compaction through the shared agent engine. DM display history
+is retained, and search/read authority remains restricted to its starter. Starter authority and history generation are rechecked at admission.
 Semantic output uses the nonexpiring `evt.native.output` topic. Projection and deduplication receipts
 commit before bus acknowledgement; WAL checkpoints wait for the output publication frontier they
 cover. Rewind fences the discarded generation, waits for runner cancellation, reconciles canonical

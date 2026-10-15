@@ -10,6 +10,7 @@ import { createNativeIntegrationFixture } from "./integration-fixture";
 const initial = {
   titleModel: "main",
   outputStreaming: "complete" as const,
+  dmContextMaxAgeMs: 10_800_000,
   oldMessageSelectionMaxAgeMs: 60000,
   storageRetentionMaxAgeMs: 86400000,
   crossThreadSend: { triggerRun: false },
@@ -81,6 +82,7 @@ test("deployment RPC imports all legacy fields and saves without touching commen
     const settings = {
       ...initial,
       titleModel: "fast",
+      dmContextMaxAgeMs: 10_800_000,
       oldMessageSelectionMaxAgeMs: null,
       storageRetentionMaxAgeMs: null,
       crossThreadSend: { triggerRun: true },
@@ -105,6 +107,7 @@ test("deployment contract rejects invalid fields and permits unlimited ages", ()
   expect(
     nativeDeploymentSettingsSchema.safeParse({
       ...initial,
+      dmContextMaxAgeMs: 10_800_000,
       oldMessageSelectionMaxAgeMs: null,
       storageRetentionMaxAgeMs: null,
     }).success,
@@ -112,7 +115,7 @@ test("deployment contract rejects invalid fields and permits unlimited ages", ()
   for (const patch of [
     { titleModel: " " },
     { outputStreaming: "invalid" },
-    { oldMessageSelectionMaxAgeMs: 0 },
+    { dmContextMaxAgeMs: 10_800_000, oldMessageSelectionMaxAgeMs: 0 },
     { storageRetentionMaxAgeMs: -1 },
     { storageRetentionMaxAgeMs: 1.5 },
     { crossThreadSend: { triggerRun: "yes" } },

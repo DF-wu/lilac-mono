@@ -274,3 +274,22 @@ fetch. Missing messages keep an external-open fallback. Existing membership and 
 history rules apply to links. The agent receives session coordinates for session links, and the
 conversation thread ID plus source message coordinates for message links when locally resolvable.
 Referenced message content is not automatically inserted into the prompt.
+
+
+## Permanent direct conversation
+
+Each human user has one private "Chat with Lilac" entry below Search, above the ordinary queues.
+Bootstrap creates it on first use. Its history stays available indefinitely. Sharing, renaming,
+archiving, deletion, rewind, and storage-retention cleanup do not apply to this conversation.
+
+Deployment settings expose "DM context max age (ms)", initially 10,800,000 ms. The age window is
+selected when a request starts and stays fixed for that reply. New requests select a fresh window.
+Older messages remain searchable by their owner. An owner account cannot browse another user's DM.
+The agent receives a brief instruction to follow the current topic in a mixed-topic conversation.
+
+The context notice describes the next request when idle and the current request while running.
+Messages outside selected history use 0.8 opacity. Messages represented by a summary have a tooltip.
+During a reply the notice refreshes once per second to reflect compaction. `/compact` summarizes
+current model context through the existing compaction engine, even when automatic compaction is off.
+It preserves the displayed messages and queues behind a running reply. It accepts no arguments,
+skills, or attachments. Recent direct messages survive age expiry of an older summary.
