@@ -86,6 +86,7 @@ function summarySignature(thread: NativeThread): string {
     thread.starterAvatarUrl,
     thread.displayStatus,
     thread.workingSince,
+    thread.preview,
   ]);
 }
 

@@ -435,6 +435,35 @@ test("DM is unique per user, private, permanent, and outside ordinary queues", (
   store.close();
 });
 
+test("DM summary previews its latest text message", () => {
+  const { store } = fixture();
+  const dm = store.ensureDirectThread("alice").unwrap();
+  expect(dm.preview).toBeUndefined();
+  const turn = store.acceptInput("alice", prompt(dm.id, "send", "Plan the\n\nlaunch")).unwrap();
+  expect(store.getThread("alice", dm.id).unwrap().preview).toEqual({
+    role: "user",
+    text: "Plan the launch",
+  });
+  store
+    .appendMessage(dm.id, 0, turn.turnId!, {
+      id: "reply",
+      role: "assistant",
+      parts: [
+        { type: "text", text: "Draft" },
+        { type: "text", text: "x".repeat(200) },
+      ],
+    })
+    .unwrap();
+  expect(store.getThread("alice", dm.id).unwrap().preview).toEqual({
+    role: "assistant",
+    text: `Draft ${"x".repeat(154)}`,
+  });
+  const thread = store.createThread("alice", { commandId: "create" }).unwrap();
+  store.acceptInput("alice", prompt(thread.id, "ordinary")).unwrap();
+  expect(store.getThread("alice", thread.id).unwrap().preview).toBeUndefined();
+  store.close();
+});
+
 test("unscoped search keeps another user's DM private from owners", () => {
   const { store, db } = fixture();
   const dm = store.ensureDirectThread("alice").unwrap();

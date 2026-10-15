@@ -1,4 +1,4 @@
-import { ContextMessage, RecentContextNotice } from "./components/RecentContext";
+import { ContextMessage } from "./components/RecentContext";
 import { DirectThreadCard } from "./components/DirectThreadCard";
 import { ComputerViewer } from "./components/ComputerViewer";
 import computerDemoUrl from "./assets/computer-demo.html?url";
@@ -51,7 +51,7 @@ import {
   RefreshCw,
   Trash2,
 } from "lucide-react";
-import type { DisplayMessage } from "@stanley2058/lilac-client-protocol";
+import type { DisplayMessage, NativeThread } from "@stanley2058/lilac-client-protocol";
 import logo from "./assets/logo.svg";
 import motion from "./assets/design-system/motion.mp4";
 import tone from "./assets/design-system/tone.wav";
@@ -140,6 +140,38 @@ const sections = [
   ["layout", "Layout"],
 ] as const;
 const now = new Date("2026-09-19T09:00:00Z").getTime();
+const directThreadBase = {
+  id: "demo-dm",
+  kind: "dm",
+  title: "Chat with Lilac",
+  starterId: "demo",
+  archived: false,
+  revision: 0,
+  capabilities: { read: true, edit: true, share: false },
+} satisfies Omit<NativeThread, "updatedAt">;
+const directThreadDemos: NativeThread[] = [
+  {
+    ...directThreadBase,
+    updatedAt: now - 3 * 60_000,
+    preview: { role: "user", text: "Let us plan the project launch for next week." },
+  },
+  {
+    ...directThreadBase,
+    displayStatus: "working",
+    workingSince: now - 42_000,
+    updatedAt: now,
+  },
+  {
+    ...directThreadBase,
+    displayStatus: "completed",
+    updatedAt: now - 2 * 3_600_000,
+    preview: {
+      role: "assistant",
+      text: "Here is a launch checklist with owners, dates, and the open risks we still need to close.",
+    },
+  },
+  { ...directThreadBase, displayStatus: "error", updatedAt: now - 3 * 86_400_000 },
+];
 const threadStates = [
   { state: "idle", label: "Idle", title: "Weekend reading list" },
   { state: "completed", label: "Completed · unread", title: "A few places to visit in Kyoto" },
@@ -1352,45 +1384,21 @@ function Controls() {
           <div className="ds-field flex flex-col gap-2 text-sm">
             <span>Search</span>
             <SidebarSearch onSearch={setSearch} />
-            <DirectThreadCard
-              thread={{
-                id: "demo-dm",
-                kind: "dm",
-                title: "Chat with Lilac",
-                starterId: "demo",
-                archived: false,
-                updatedAt: 0,
-                revision: 0,
-                capabilities: { read: true, edit: true, share: false },
-              }}
-              selected
-              onSelect={() => {}}
-            />
+            {directThreadDemos.map((thread, index) => (
+              <DirectThreadCard
+                key={thread.displayStatus ?? "idle"}
+                thread={thread}
+                selected={index === 0}
+                now={now}
+                onSelect={() => {}}
+              />
+            ))}
             <ContextMessage outside>
               <p className="px-6 text-sm">Earlier conversation, outside context.</p>
             </ContextMessage>
             <ContextMessage summarized>
               <p className="px-6 text-sm">Earlier conversation, represented in the summary.</p>
             </ContextMessage>
-            <RecentContextNotice
-              preview={{
-                historyGeneration: 0,
-                evaluatedAt: 0,
-                firstTurnPosition: 2,
-                hasSummary: false,
-                active: false,
-              }}
-            />
-            <RecentContextNotice
-              preview={{
-                historyGeneration: 0,
-                evaluatedAt: 0,
-                firstTurnPosition: 2,
-                hasSummary: true,
-                summarizedBeforePosition: 4,
-                active: true,
-              }}
-            />
             <span className="ds-muted" role="status">
               {search ? `Search: ${search}` : ""}
             </span>

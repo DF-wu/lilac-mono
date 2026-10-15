@@ -1,4 +1,4 @@
-import { DirectThreadCard } from "./components/DirectThreadCard";
+import { DirectThreadCard, DirectThreadTitle } from "./components/DirectThreadCard";
 import { NativeComputerViewer } from "./components/ComputerViewer";
 import { FloatingChatMenu } from "./components/FloatingChatMenu";
 import { useWorkspaceViewport } from "./use-workspace-viewport";
@@ -1241,7 +1241,11 @@ function Workspace(props: AppProps) {
                                   header={
                                     thread ? (
                                       <header className="thread-header flex items-center gap-2 h-8 min-h-0 px-6 py-0.5 [&_h1]:truncate [&_.icon-button]:size-[var(--ui-control-compact)] max-workspace:gap-1 max-workspace:pl-15 group-[.sidebar-hidden]/workspace:pl-15 group-[.right-panel-hidden]/workspace:pr-[calc(var(--ui-space-unit)*5+var(--ui-control-compact))]">
-                                        <h1>{thread.title || "Untitled"}</h1>
+                                        {thread.kind === "dm" ? (
+                                          <DirectThreadTitle />
+                                        ) : (
+                                          <h1>{thread.title || "Untitled"}</h1>
+                                        )}
                                         {thread.archived ? (
                                           <span className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap">
                                             Archived

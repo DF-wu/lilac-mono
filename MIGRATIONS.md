@@ -13,6 +13,8 @@ independent of ordinary-thread context age. `threads.context` reports the select
 summary boundary, generation, and expiry. The built-in `/compact` command uses the existing agent
 compactor and preserves display history. The authenticated native request envelope gains optional
 `compact`, checked against the accepted command before execution.
+DM thread summaries gain optional `preview`: the latest user or assistant text message, with
+whitespace collapsed and at most 160 characters. Ordinary thread summaries omit it.
 
 Deploy Core and web together. Older strict protocol validators may reject the new fields. Do not
 roll back Core over a database containing DM records: older code does not enforce their permanence.

@@ -41,18 +41,6 @@ export function RecentContextProvider({
   return <RecentContext value={online ? query.data : undefined}>{children}</RecentContext>;
 }
 
-export function RecentContextNotice({ preview }: { preview?: Context } = {}) {
-  const current = useRecentContext();
-  const context = preview ?? current;
-  if (!context) return null;
-  return (
-    <p className="px-6 py-1 text-xs text-muted-foreground" role="status">
-      {context.hasSummary ? "Recent context includes a summary" : "Recent conversation context"}
-      {context.active ? " · In use for this reply" : " · For your next message"}
-    </p>
-  );
-}
-
 export function ContextMessage({
   outside,
   summarized,

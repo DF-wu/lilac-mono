@@ -33,6 +33,9 @@ export const nativeThreadSchema = z.strictObject({
   revision: revisionSchema,
   capabilities: threadCapabilitiesSchema,
   modelId: catalogIdentifierSchema.optional(),
+  preview: z
+    .strictObject({ role: z.enum(["user", "assistant"]), text: z.string().min(1).max(512) })
+    .optional(),
 });
 export const participantSchema = z.strictObject({
   user: nativeUserSchema,

@@ -1,4 +1,4 @@
-import { ContextMessage, useRecentContext, RecentContextNotice } from "./RecentContext";
+import { ContextMessage, useRecentContext } from "./RecentContext";
 import { LoadingSpinner } from "./ui/loading-spinner";
 import { AddReaction, MessageReactions } from "./MessageReactions";
 import { OptimisticTurns, type OptimisticTurn } from "../optimistic-turns";
@@ -354,7 +354,6 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
               className="chat-sticky-header sticky top-0 z-3 [background:color-mix(in_srgb,_var(--ui-background)_75%,_transparent)] [backdrop-filter:blur(16px)]"
             >
               {props.header}
-              <RecentContextNotice />
             </div>
             <div
               className="virtual-canvas relative w-full timeline-canvas max-w-[var(--ui-chat-width)] m-auto"

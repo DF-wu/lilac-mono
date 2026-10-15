@@ -700,8 +700,21 @@ export class NativeStore {
         modelId: thread.modelId,
         activeRunId: thread.activeRunId,
         capabilities: this.capabilities(user, thread),
+        preview: thread.kind === "dm" ? this.latestTextPreview(thread.id) : undefined,
       });
     }, this);
+  }
+
+  private latestTextPreview(threadId: string): NativeThread["preview"] {
+    // DMs never end, so read only the newest turns instead of the whole transcript.
+    const row = this.db
+      .query<{ role: "user" | "assistant"; text: string }, [string]>(
+        `SELECT json_extract(m.value,'$.role') AS role,(SELECT group_concat(json_extract(p.value,'$.text'),' ' ORDER BY p.key) FROM json_each(m.value,'$.parts') p WHERE json_extract(p.value,'$.type')='text') AS text FROM (SELECT position,data_json FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 4) r,json_each(r.data_json,'$.value.messages') m WHERE json_extract(m.value,'$.role') IN ('user','assistant') AND EXISTS(SELECT 1 FROM json_each(m.value,'$.parts') p WHERE json_extract(p.value,'$.type')='text' AND trim(json_extract(p.value,'$.text'))<>'') ORDER BY r.position DESC,m.key DESC LIMIT 1`,
+      )
+      .get(threadId);
+    if (!row) return undefined;
+    const text = [...row.text.replace(/\s+/gu, " ").trim()].slice(0, 160).join("");
+    return { role: row.role, text };
   }
 
   getThread(actorId: string, threadId: string): NativeStoreResult<NativeThread> {
