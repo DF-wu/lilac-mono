@@ -19,6 +19,7 @@ export const threadCapabilitiesSchema = z.strictObject({
   share: z.boolean(),
 });
 export const nativeThreadSchema = z.strictObject({
+  kind: z.literal("dm").optional(),
   id: identitySchema,
   title: z.string().max(512),
   starterId: identitySchema,
@@ -32,6 +33,9 @@ export const nativeThreadSchema = z.strictObject({
   revision: revisionSchema,
   capabilities: threadCapabilitiesSchema,
   modelId: catalogIdentifierSchema.optional(),
+  preview: z
+    .strictObject({ role: z.enum(["user", "assistant"]), text: z.string().min(1).max(512) })
+    .optional(),
 });
 export const participantSchema = z.strictObject({
   user: nativeUserSchema,
@@ -255,6 +259,7 @@ export const workingIndicatorsSchema = z.array(z.string().trim().min(1)).min(1);
 export const nativeDeploymentSettingsSchema = z.strictObject({
   titleModel: z.string().trim().min(1),
   outputStreaming: z.enum(["paragraph", "complete"]),
+  dmContextMaxAgeMs: z.number().int().positive().default(10_800_000),
   oldMessageSelectionMaxAgeMs: z.number().int().positive().nullable(),
   storageRetentionMaxAgeMs: z.number().int().positive().nullable(),
   crossThreadSend: z.strictObject({ triggerRun: z.boolean() }),

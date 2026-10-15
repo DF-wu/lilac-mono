@@ -201,7 +201,7 @@ export function ThreadCard({
   );
 }
 
-function ThreadTime({
+export function ThreadTime({
   updatedAt,
   now,
   settleDays = defaultAutoSettleDays,
@@ -230,7 +230,7 @@ function ThreadTime({
   );
 }
 
-function WorkingTime({ since, now }: { since: number; now?: number }) {
+export function WorkingTime({ since, now }: { since: number; now?: number }) {
   const [clock, setClock] = useState(Date.now);
   useEffect(() => {
     if (now !== undefined) return;

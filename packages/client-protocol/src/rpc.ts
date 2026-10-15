@@ -222,6 +222,17 @@ export const nativeContract = {
       .output(eventIterator(catalogEventSchema)),
   },
   threads: {
+    context: procedure.input(threadIdInput).output(
+      z.strictObject({
+        historyGeneration: revisionSchema,
+        evaluatedAt: revisionSchema,
+        firstTurnPosition: revisionSchema.nullable(),
+        hasSummary: z.boolean(),
+        summarizedBeforePosition: revisionSchema.optional(),
+        active: z.boolean(),
+        expiresAt: revisionSchema.optional(),
+      }),
+    ),
     get: procedure.input(threadIdInput).output(nativeThreadSchema),
     list: procedure
       .input(

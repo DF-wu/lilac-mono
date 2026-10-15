@@ -168,6 +168,11 @@ export class NativeStore {
         );
       this.db
         .run(`CREATE TABLE IF NOT EXISTS native_records (kind TEXT NOT NULL, id TEXT NOT NULL, thread_id TEXT, position INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, format_version INTEGER NOT NULL, data_json TEXT NOT NULL, PRIMARY KEY(kind,id));
+        CREATE UNIQUE INDEX IF NOT EXISTS native_dm_user ON native_records(json_extract(data_json,'$.value.starterId')) WHERE kind='thread' AND json_extract(data_json,'$.value.kind')='dm';
+        CREATE INDEX IF NOT EXISTS native_input_delivery ON native_records(json_extract(data_json,'$.value.deliveryId')) WHERE kind='input';
+        CREATE INDEX IF NOT EXISTS native_input_request ON native_records(json_extract(data_json,'$.value.requestId')) WHERE kind='input';
+        CREATE INDEX IF NOT EXISTS native_pending_inputs ON native_records(thread_id,position) WHERE kind='input' AND json_extract(data_json,'$.value.completedAt') IS NULL AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted');
+        CREATE INDEX IF NOT EXISTS native_input_created ON native_records(thread_id,json_extract(data_json,'$.value.createdAt'),position) WHERE kind='input';
         CREATE INDEX IF NOT EXISTS native_records_thread_position ON native_records(kind,thread_id,position);
         CREATE INDEX IF NOT EXISTS native_records_updated ON native_records(kind,updated_at DESC,id);
         CREATE INDEX IF NOT EXISTS native_records_activity ON native_records(thread_id,kind,updated_at DESC);
@@ -258,7 +263,14 @@ export class NativeStore {
           );
         if (fingerprint(current.settings) === fingerprint(input.settings))
           return Result.ok(current);
-        const value = { settings: input.settings, revision: current.revision + 1 };
+        const value = {
+          settings: {
+            ...input.settings,
+            dmContextMaxAgeMs:
+              input.settings.dmContextMaxAgeMs ?? current.settings.dmContextMaxAgeMs,
+          },
+          revision: current.revision + 1,
+        };
         this.writeRecord("instance", { kind: "deployment", value });
         return Result.ok(value);
       }, this),
@@ -676,6 +688,7 @@ export class NativeStore {
       const status = yield* this.displayStatus(user, thread);
       return Result.ok({
         id: thread.id,
+        kind: thread.kind,
         title: thread.title,
         starterId: thread.starterId,
         starterDisplayName: starter.displayName,
@@ -687,8 +700,21 @@ export class NativeStore {
         modelId: thread.modelId,
         activeRunId: thread.activeRunId,
         capabilities: this.capabilities(user, thread),
+        preview: thread.kind === "dm" ? this.latestTextPreview(thread.id) : undefined,
       });
     }, this);
+  }
+
+  private latestTextPreview(threadId: string): NativeThread["preview"] {
+    // DMs never end, so read only the newest turns instead of the whole transcript.
+    const row = this.db
+      .query<{ role: "user" | "assistant"; text: string }, [string]>(
+        `SELECT json_extract(m.value,'$.role') AS role,(SELECT group_concat(json_extract(p.value,'$.text'),' ' ORDER BY p.key) FROM json_each(m.value,'$.parts') p WHERE json_extract(p.value,'$.type')='text') AS text FROM (SELECT position,data_json FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 4) r,json_each(r.data_json,'$.value.messages') m WHERE json_extract(m.value,'$.role') IN ('user','assistant') AND EXISTS(SELECT 1 FROM json_each(m.value,'$.parts') p WHERE json_extract(p.value,'$.type')='text' AND trim(json_extract(p.value,'$.text'))<>'') ORDER BY r.position DESC,m.key DESC LIMIT 1`,
+      )
+      .get(threadId);
+    if (!row) return undefined;
+    const text = [...row.text.replace(/\s+/gu, " ").trim()].slice(0, 160).join("");
+    return { role: row.role, text };
   }
 
   getThread(actorId: string, threadId: string): NativeStoreResult<NativeThread> {
@@ -727,7 +753,7 @@ export class NativeStore {
         if (!Number.isSafeInteger(cursorTime) || cursorTime < 0)
           return Result.err(nativeFailure("invalid", "Thread cursor is invalid"));
         const records = yield* this.readRows(
-          `SELECT r.* FROM native_records r WHERE r.kind='thread' AND (r.updated_at < ? OR (r.updated_at = ? AND r.id > ?)) AND ( ? = 'owner' OR json_extract(r.data_json,'$.value.starterId') = ? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?)) AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.archived')=? AND json_extract(r.data_json,'$.value.title') LIKE ? ESCAPE '\\' AND (?=0 OR NOT EXISTS(SELECT 1 FROM native_thread_preferences p WHERE p.user_id=? AND p.thread_id=r.id AND p.section='settled')) ORDER BY r.updated_at DESC,r.id LIMIT ?`,
+          `SELECT r.* FROM native_records r WHERE r.kind='thread' AND (r.updated_at < ? OR (r.updated_at = ? AND r.id > ?)) AND ( ? = 'owner' OR json_extract(r.data_json,'$.value.starterId') = ? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?)) AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.kind') IS NULL AND json_extract(r.data_json,'$.value.archived')=? AND json_extract(r.data_json,'$.value.title') LIKE ? ESCAPE '\\' AND (?=0 OR NOT EXISTS(SELECT 1 FROM native_thread_preferences p WHERE p.user_id=? AND p.thread_id=r.id AND p.section='settled')) ORDER BY r.updated_at DESC,r.id LIMIT ?`,
           [
             cursorTime,
             cursorTime,
@@ -813,7 +839,7 @@ export class NativeStore {
     this.db
       .query(`INSERT OR IGNORE INTO native_thread_preferences(user_id,thread_id,section,position,last_activity,touched_at)
       SELECT ?,r.id,'active',MIN(COALESCE((SELECT MIN(p.position) FROM native_thread_preferences p WHERE p.user_id=? AND p.section='active'),0),-json_extract(r.data_json,'$.value.createdAt'))-1,${sidebarActivity},0
-      FROM native_records r WHERE r.kind='thread' AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL
+      FROM native_records r WHERE r.kind='thread' AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.kind') IS NULL
       AND (?='owner' OR json_extract(r.data_json,'$.value.starterId')=? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?))
       AND NOT EXISTS(SELECT 1 FROM native_thread_preferences p WHERE p.user_id=? AND p.thread_id=r.id)${recordFilter}`)
       .run(user.id, user.id, user.role, user.id, user.id, user.id, ...threadParams);
@@ -852,7 +878,7 @@ export class NativeStore {
         if (input.cursor && (separator < 1 || !Number.isSafeInteger(position) || !cursorId))
           return Result.err(nativeFailure("invalid", "Sidebar cursor is invalid"));
         const predicate = `FROM native_thread_preferences p JOIN native_records r ON r.kind='thread' AND r.id=p.thread_id
-        WHERE p.user_id=? AND p.section=? AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.archived')=0
+        WHERE p.user_id=? AND p.section=? AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.kind') IS NULL AND json_extract(r.data_json,'$.value.archived')=0
         AND (?='owner' OR json_extract(r.data_json,'$.value.starterId')=? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?))`;
         const params = [actorId, input.section, user.role, actorId, actorId];
         const total =
@@ -886,6 +912,8 @@ export class NativeStore {
       Result.gen(function* () {
         const user = yield* this.getUser(actorId);
         const thread = yield* this.authorizeThread(actorId, input.threadId);
+        if (thread.kind === "dm")
+          return Result.err(nativeFailure("forbidden", "The DM has a fixed sidebar position"));
         if (thread.archived)
           return Result.err(nativeFailure("invalid", "Archived conversations cannot be moved"));
         if (input.beforeId === input.threadId || input.afterId === input.threadId)
@@ -1005,6 +1033,42 @@ export class NativeStore {
     return next;
   }
 
+  ensureDirectThread(actorId: string): NativeStoreResult<NativeThread> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const user = yield* this.getUser(actorId);
+        if (user.role === "service")
+          return Result.err(nativeFailure("forbidden", "Service identity cannot start a DM"));
+        const existing = yield* this.readRows(
+          "SELECT * FROM native_records WHERE kind='thread' AND json_extract(data_json,'$.value.kind')='dm' AND json_extract(data_json,'$.value.starterId')=?",
+          [actorId],
+        );
+        const record = existing[0];
+        if (record?.kind === "thread") return this.getThread(actorId, record.value.id);
+        const id = randomUUID();
+        this.bump(
+          {
+            id,
+            kind: "dm",
+            title: "Chat with Lilac",
+            starterId: actorId,
+            archived: false,
+            deleted: false,
+            createdAt: this.now(),
+            updatedAt: this.now(),
+            revision: 0,
+            historyGeneration: 0,
+            nextPosition: 0,
+            mutationPending: false,
+          },
+          "thread",
+          id,
+        );
+        return this.getThread(actorId, id);
+      }, this),
+    );
+  }
+
   createThread(
     actorId: string,
     input: {
@@ -1112,6 +1176,8 @@ export class NativeStore {
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
         const thread = yield* this.authorizeThread(actorId, input.threadId, true);
+        if (thread.kind === "dm" && (input.title !== undefined || input.archived !== undefined))
+          return Result.err(nativeFailure("forbidden", "The DM cannot be renamed or archived"));
         yield* this.command(actorId, input.commandId, { operation: "update", ...input }, () => {
           if (input.revision !== undefined && input.revision !== thread.revision)
             return Result.err(nativeFailure("stale", "Thread changed before this update"));
@@ -1220,6 +1286,8 @@ export class NativeStore {
       Result.gen(function* () {
         yield* this.requireOwner(actorId);
         const thread = yield* this.authorizeThread(actorId, input.threadId);
+        if (thread.kind === "dm")
+          return Result.err(nativeFailure("forbidden", "The DM cannot be shared"));
         yield* this.getUser(input.userId);
         if (input.grant === null)
           this.db
@@ -1439,7 +1507,7 @@ export class NativeStore {
 
   listPendingInputs(threadId?: string): NativeStoreResult<NativeInputRecord[]> {
     const sql =
-      "SELECT * FROM native_records WHERE kind='input' AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL";
+      "SELECT * FROM native_records INDEXED BY native_pending_inputs WHERE kind='input' AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL";
     return nativeStoreTransaction(this.db, () =>
       this.readRows(
         `${sql}${threadId ? " AND thread_id=?" : ""} ORDER BY position,id`,
@@ -1527,7 +1595,7 @@ export class NativeStore {
               const pendingCount =
                 this.db
                   .query<{ count: number }, [string]>(
-                    "SELECT COUNT(*) AS count FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.state') IN ('uploading','queued')",
+                    "SELECT COUNT(*) AS count FROM native_records INDEXED BY native_pending_inputs WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.completedAt') IS NULL AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.state') IN ('uploading','queued')",
                   )
                   .get(thread.id)?.count ?? 0;
               if (pendingCount >= 128)
@@ -1584,7 +1652,7 @@ export class NativeStore {
               };
               const earlierFull = this.db
                 .query(
-                  "SELECT 1 FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.mode')!='steer' AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL LIMIT 1",
+                  "SELECT 1 FROM native_records INDEXED BY native_pending_inputs WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.mode')!='steer' AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL LIMIT 1",
                 )
                 .get(thread.id);
               if (effectiveMode === "prompt" && !earlierFull)
@@ -1825,6 +1893,35 @@ export class NativeStore {
     );
   }
 
+  selectCanonicalInput(
+    threadId: string,
+    options: { since?: number; before?: number } = {},
+  ): NativeStoreResult<NativeInputRecord | null> {
+    const index =
+      options.before === undefined ? "native_input_created" : "native_records_thread_position";
+    const order =
+      options.before === undefined
+        ? "json_extract(i.data_json,'$.value.createdAt'),i.position"
+        : "i.position DESC";
+    return nativeStoreTransaction(this.db, () =>
+      this.readRows(
+        `SELECT i.* FROM native_records i INDEXED BY ${index} WHERE i.kind='input' AND i.thread_id=? AND json_extract(i.data_json,'$.value.createdAt')>=? AND i.position<? AND json_extract(i.data_json,'$.value.completedAt') IS NOT NULL AND json_extract(i.data_json,'$.value.mode')!='steer' AND json_extract(i.data_json,'$.value.state') IN ('admitted','canceled') AND EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.id=json_extract(i.data_json,'$.value.turnId')) ORDER BY ${order} LIMIT 1`,
+        [threadId, options.since ?? 0, options.before ?? Number.MAX_SAFE_INTEGER],
+      ).map((records) => {
+        const record = records[0];
+        return record?.kind === "input" ? record.value : null;
+      }),
+    );
+  }
+
+  getTurnPosition(turnId: string): NativeStoreResult<number> {
+    return this.readRecord("turn", turnId).andThen((record) =>
+      record?.kind === "turn"
+        ? Result.ok(record.value.position)
+        : Result.err(nativeFailure("not-found", "Turn is unavailable")),
+    );
+  }
+
   getLatestCanonicalRequestId(threadId: string): NativeStoreResult<string | null> {
     return nativeStoreTransaction(this.db, () =>
       this.readRows(
@@ -1866,7 +1963,7 @@ export class NativeStore {
         const targetRun = runId ?? thread.activeRunId;
         let current = thread;
         const inputs = yield* this.readRows(
-          "SELECT * FROM native_records WHERE kind='input' AND thread_id=?",
+          "SELECT * FROM native_records INDEXED BY native_pending_inputs WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.completedAt') IS NULL AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted')",
           [threadId],
         );
         for (const record of inputs) {
@@ -2138,6 +2235,8 @@ export class NativeStore {
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
         const thread = yield* this.authorizeThread(actorId, input.threadId, true);
+        if (thread.kind === "dm")
+          return Result.err(nativeFailure("forbidden", "The DM cannot be rewound"));
         return this.command(actorId, input.commandId, { operation: "rewind", ...input }, () =>
           Result.gen(function* () {
             if (
@@ -2203,6 +2302,8 @@ export class NativeStore {
       Result.gen(function* () {
         const user = yield* this.getUser(actorId);
         const thread = yield* this.getThreadRecord(input.threadId);
+        if (thread.kind === "dm")
+          return Result.err(nativeFailure("forbidden", "The DM cannot be deleted"));
         const old = yield* this.readRecord("command", commandKey(actorId, input.commandId));
         if (old?.kind === "command")
           return this.command(actorId, input.commandId, { operation: "delete", ...input }, () =>
@@ -2867,7 +2968,7 @@ export class NativeStore {
         [threadId],
       );
       const inputs = yield* this.readRows(
-        "SELECT * FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL",
+        "SELECT * FROM native_records INDEXED BY native_pending_inputs WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL",
         [threadId],
       );
       for (const record of uploads) {
@@ -2944,7 +3045,7 @@ export class NativeStore {
   listExpiredThreadIds(cutoff: number, limit = 100): NativeStoreResult<string[]> {
     return nativeStoreTransaction(this.db, () =>
       this.readRows(
-        "SELECT * FROM native_records WHERE kind='thread' AND updated_at<? AND json_extract(data_json,'$.value.deleted')=0 AND json_extract(data_json,'$.value.activeRunId') IS NULL AND json_extract(data_json,'$.value.mutationPending')=0 ORDER BY updated_at,id LIMIT ?",
+        "SELECT * FROM native_records WHERE kind='thread' AND json_extract(data_json,'$.value.kind') IS NULL AND updated_at<? AND json_extract(data_json,'$.value.deleted')=0 AND json_extract(data_json,'$.value.activeRunId') IS NULL AND json_extract(data_json,'$.value.mutationPending')=0 ORDER BY updated_at,id LIMIT ?",
         [cutoff, Math.max(1, Math.min(limit, 100))],
       ).map((records) =>
         records.flatMap((record) => (record.kind === "thread" ? [record.value.id] : [])),
@@ -2965,7 +3066,7 @@ export class NativeStore {
           return Result.ok(pending.map(inputReceipt));
         }
         const records = yield* this.readRows(
-          "SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND EXISTS(SELECT 1 FROM native_changes c WHERE c.thread_id=i.thread_id AND c.kind='input' AND c.record_id=i.id AND c.revision>?) ORDER BY i.position",
+          "SELECT i.* FROM native_records i WHERE i.kind='input' AND i.id IN (SELECT c.record_id FROM native_changes c WHERE c.thread_id=? AND c.kind='input' AND c.revision>?) ORDER BY i.position",
           [threadId, options.afterRevision],
         );
         return Result.ok(

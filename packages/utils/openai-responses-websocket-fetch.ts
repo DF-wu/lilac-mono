@@ -26,7 +26,7 @@ export type CreateOpenAIResponsesWebSocketFetchOptions = {
   turnStateHeaderName?: string;
   onTransportSelected?: (details: ResponsesTransportSelectionDetails) => void;
   onAutoFallback?: (details: {
-    reason: "websocket_connect_failed";
+    reason: "websocket_connect_failed" | "websocket_message_too_big";
     requestUrl: string;
     errorMessage?: string;
   }) => void;
@@ -202,7 +202,7 @@ export function createOpenAIResponsesWebSocketFetch(
   const reusableContinuationCache = new Map<string, ResponsesContinuationCacheEntry>();
 
   function reportAutoFallback(details: {
-    reason: "websocket_connect_failed";
+    reason: "websocket_connect_failed" | "websocket_message_too_big";
     requestUrl: URL;
     error?: unknown;
   }): void {
@@ -533,9 +533,14 @@ export function createOpenAIResponsesWebSocketFetch(
     });
     const encoder = new TextEncoder();
 
+    // Keep the HTTP response undecided so fallback retains its real status and headers.
+    const transportDecision = Promise.withResolvers<"websocket" | "sse">();
+    if (options.mode !== "auto") transportDecision.resolve("websocket");
+
     const responseStream = new ReadableStream<Uint8Array>({
       start(controller) {
         let cleanedUp = false;
+        let receivedMessage = false;
         let responseId: string | null = null;
         let outputItems: JsonObject[] = [];
         let outputItemDrafts = new Map<string, JsonObject>();
@@ -623,6 +628,8 @@ export function createOpenAIResponsesWebSocketFetch(
         };
 
         const onMessage = (event: Event) => {
+          receivedMessage = true;
+          transportDecision.resolve("websocket");
           void (async () => {
             const handled = await Result.tryPromise({
               try: async () => {
@@ -721,6 +728,7 @@ export function createOpenAIResponsesWebSocketFetch(
         };
 
         const onError = (event: Event) => {
+          transportDecision.resolve("websocket");
           canPersistContinuation = false;
           cleanup({ closeConnection: true });
           if (useReusableConnection) {
@@ -729,22 +737,33 @@ export function createOpenAIResponsesWebSocketFetch(
           signalResponsesStreamError(controller, extractWebSocketError(event));
         };
 
-        const onClose = () => {
+        const onClose = (event: Event) => {
+          const closeCode = event instanceof CloseEvent ? event.code : undefined;
+          const retryWithSse =
+            options.mode === "auto" && closeCode === 1009 && !receivedMessage && !signal?.aborted;
+          transportDecision.resolve(retryWithSse ? "sse" : "websocket");
           canPersistContinuation = false;
           cleanup({ closeConnection: true });
+          if (retryWithSse) {
+            controller.close();
+            return;
+          }
           if (useReusableConnection) {
             storeReusableTurnStateRetry(fullRequestBody, responseTurnState);
           }
           const outcome = settleSyncResult(() =>
             signalResponsesStreamError(
               controller,
-              new Error("WebSocket closed before a terminal response event"),
+              new Error(
+                `WebSocket closed before a terminal response event (code: ${closeCode ?? "unknown"})`,
+              ),
             ),
           );
           if (outcome.kind === "panic") throw outcome.panic;
         };
 
         const onAbort = () => {
+          transportDecision.resolve("websocket");
           canPersistContinuation = false;
           cleanup({ closeConnection: true });
           const outcome = settleSyncResult(() =>
@@ -772,6 +791,7 @@ export function createOpenAIResponsesWebSocketFetch(
 
         const sendOutcome = settleSyncResult(() => sendPayload(websocketPayload));
         if (sendOutcome.kind !== "value") {
+          transportDecision.resolve("websocket");
           canPersistContinuation = false;
           cleanup({ closeConnection: true });
           if (useReusableConnection) {
@@ -786,6 +806,22 @@ export function createOpenAIResponsesWebSocketFetch(
         }
       },
     });
+
+    const forwardOversizedRequestWithSse = (): Promise<Response> => {
+      reportAutoFallback({ reason: "websocket_message_too_big", requestUrl });
+      reportTransportSelected({
+        requestUrl,
+        transport: "sse",
+        optimizationEnabled: false,
+        optimizationReason: "transport_not_websocket",
+      });
+      return forwardWithSseNormalization();
+    };
+
+    const selectedTransport = await transportDecision.promise;
+    if (selectedTransport === "sse" && signal?.aborted)
+      throw projectResponsesStreamError(signal.reason);
+    if (selectedTransport === "sse") return forwardOversizedRequestWithSse();
 
     return new Response(responseStream, {
       status: 200,

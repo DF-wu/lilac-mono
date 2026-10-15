@@ -91,7 +91,9 @@ uses the shared client and a principal-scoped IndexedDB cache. See [native setup
 
 Native input receipts and upload readiness commit before the existing request-delivery coordinator
 admits execution. Stable delivery identities bridge these stores; the native surface does not own a
-second model-execution queue. Starter authority and history generation are rechecked at admission.
+second model-execution queue. Each human user also has one permanent native DM, with a separate
+three-hour context window and manual compaction through the shared agent engine. DM display history
+is retained, and search/read authority remains restricted to its starter. Starter authority and history generation are rechecked at admission.
 Semantic output uses the nonexpiring `evt.native.output` topic. Projection and deduplication receipts
 commit before bus acknowledgement; WAL checkpoints wait for the output publication frontier they
 cover. Rewind fences the discarded generation, waits for runner cancellation, reconciles canonical
@@ -363,9 +365,10 @@ input before exposing output. Codex turn state survives matching failed-request 
 continuations, but does not carry into a new user turn after a completed answer. A narrow patch to the
 pinned SDK restores the existing bridge's empty/non-object JSON tolerance and binary UTF8 JSON decoding.
 
-Auto transport may fall back to SSE only before submission; uncertain connection loss after submission
-retires and reconciles the attempt. Acceptance reserves an input, while successor creation establishes
-its canonical position. Socket, continuation, and steering state remain process-local. Existing accepted
+Auto transport may fall back to SSE before submission. The AI SDK WebSocket bridge also retries over
+SSE after a message-too-big close (1009) if no WebSocket message has arrived. Other connection loss
+after submission retires and reconciles the attempt. Acceptance reserves an input, while successor
+creation establishes its canonical position. Socket, continuation, and steering state remain process-local. Existing accepted
 controls and checkpoints provide the recovery floor. Conversion preserves AI SDK-compatible durable
 messages and provider metadata, including IDs that Codex omits from its outgoing requests.
 

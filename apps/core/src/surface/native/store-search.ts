@@ -39,7 +39,7 @@ const messageProjection = `WITH messages AS (
   FROM native_records t JOIN native_records r ON r.thread_id=t.id AND r.kind='turn'
   JOIN json_each(r.data_json,'$.value.messages') m
   WHERE t.kind='thread' AND json_extract(t.data_json,'$.value.deleted')=0 AND json_extract(t.data_json,'$.value.ephemeral') IS NULL
-    AND (?='owner' OR json_extract(t.data_json,'$.value.starterId')=? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=t.id AND g.user_id=?))
+    AND ((?='owner' AND json_extract(t.data_json,'$.value.kind') IS NULL) OR json_extract(t.data_json,'$.value.starterId')=? OR (json_extract(t.data_json,'$.value.kind') IS NULL AND EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=t.id AND g.user_id=?)))
 )`;
 
 function decodeSearchRows(rows: unknown[]): NativeStoreResult<NativeSearchMessage[]> {

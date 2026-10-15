@@ -1,5 +1,24 @@
 # MIGRATIONS.md
 
+## Permanent native DM
+
+Native thread records and summaries gain optional `kind: "dm"`. Absence retains ordinary-thread
+behavior. Bootstrap creates one private DM per human user, enforced by a unique SQLite expression
+index. DMs cannot be shared, renamed, archived, rewound, deleted, or removed by retention.
+New input indexes bound request/delivery lookup, pending work, and age selection. Initialization
+creates these indexes without rewriting existing records.
+
+Deployment settings gain `dmContextMaxAgeMs`, defaulting to 10,800,000 ms when absent. It is
+independent of ordinary-thread context age. `threads.context` reports the selected context boundary,
+summary boundary, generation, and expiry. The built-in `/compact` command uses the existing agent
+compactor and preserves display history. The authenticated native request envelope gains optional
+`compact`, checked against the accepted command before execution.
+DM thread summaries gain optional `preview`: the latest user or assistant text message, with
+whitespace collapsed and at most 160 characters. Ordinary thread summaries omit it.
+
+Deploy Core and web together. Older strict protocol validators may reject the new fields. Do not
+roll back Core over a database containing DM records: older code does not enforce their permanence.
+
 ## Optional auto-inject decision gate
 
 Auto-inject now always uses the query planner and search ranking. Optional

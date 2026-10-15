@@ -29,6 +29,7 @@ export function DeploymentSettingsForm({
 }) {
   const [titleModel, setTitleModel] = useState(value.titleModel);
   const [streaming, setStreaming] = useState(value.outputStreaming);
+  const [dmAge, setDmAge] = useState(String(value.dmContextMaxAgeMs));
   const [selectionAge, setSelectionAge] = useState(
     value.oldMessageSelectionMaxAgeMs?.toString() ?? "",
   );
@@ -46,6 +47,7 @@ export function DeploymentSettingsForm({
         onSave({
           titleModel: titleModel.trim(),
           outputStreaming: streaming,
+          dmContextMaxAgeMs: Number(dmAge),
           oldMessageSelectionMaxAgeMs: selectionAge === "" ? null : Number(selectionAge),
           storageRetentionMaxAgeMs: retentionAge === "" ? null : Number(retentionAge),
           crossThreadSend: { triggerRun },
@@ -84,6 +86,23 @@ export function DeploymentSettingsForm({
           />
         </div>
         <label className="grid gap-2">
+          <span>DM context max age (ms)</span>
+          <Input
+            type="number"
+            min={1}
+            step={1}
+            required
+            value={dmAge}
+            onChange={(event) => {
+              onEdit?.();
+              setDmAge(event.target.value);
+            }}
+          />
+          <span className="text-sm text-muted-foreground">
+            Default: 3 hours. Messages remain in your DM.
+          </span>
+        </label>
+        <label className="grid gap-2">
           <span>Old message selection max age (ms)</span>
           <Input
             type="number"
@@ -112,7 +131,7 @@ export function DeploymentSettingsForm({
             }}
           />
           <span className="text-sm text-muted-foreground">
-            Inactive threads older than this limit are deleted. Leave blank to keep them.
+            Inactive ordinary threads older than this limit are deleted. Leave blank to keep them.
           </span>
         </label>
         <div className="flex items-center justify-between gap-6">
@@ -148,6 +167,7 @@ function DeploymentEditor({ initial, online }: { initial: DeploymentDocument; on
     onSuccess: (value) => {
       setDraft(undefined);
       queries.setQueryData(["config", "deployment"], value);
+      void queries.invalidateQueries({ queryKey: ["recent-context"] });
     },
   });
   const reload = useMutation({
@@ -157,6 +177,7 @@ function DeploymentEditor({ initial, online }: { initial: DeploymentDocument; on
       setFormVersion((version) => version + 1);
       update.reset();
       queries.setQueryData(["config", "deployment"], value);
+      void queries.invalidateQueries({ queryKey: ["recent-context"] });
     },
   });
   return (

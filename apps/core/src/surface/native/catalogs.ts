@@ -17,6 +17,12 @@ export type NativeCatalogScope = {
 };
 
 const builtins: DisplayCatalog["commands"] = [
+  {
+    id: "compact",
+    name: "compact",
+    description: "Summarize active context without clearing messages",
+    kind: "builtin",
+  },
   { id: "model", name: "model", description: "Select the model for this thread", kind: "builtin" },
   { id: "cancel", name: "cancel", description: "Cancel the active run", kind: "builtin" },
 ];

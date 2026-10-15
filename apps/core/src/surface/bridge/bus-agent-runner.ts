@@ -139,6 +139,7 @@ import {
   type RequestMessageCacheOwner,
 } from "../../tool-server/request-message-cache";
 import {
+  parseNativeRequestMetadata,
   AuthenticatedRequestProjectionInvalid,
   isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid,
   projectAuthenticatedRequest,
@@ -1966,6 +1967,7 @@ export type NativeRunnerRequest = {
 };
 
 export type NativeRunnerLifecycle = {
+  compacted?(requestId: string, messages: readonly ModelMessage[]): void;
   rejected?(requestDeliveryId: string): Promise<ResultType<void, Error>>;
   validate(request: NativeRunnerRequest): ResultType<
     {
@@ -6822,6 +6824,9 @@ export async function startBusAgentRunner(params: {
             attachAutoCompaction(agent, {
               model: activeBinding.resolved.spec,
               ...agentComposition.compaction,
+              compactOnStart:
+                next.requestClient === "native" &&
+                parseNativeRequestMetadata(next.raw)?.compact === true,
               modelCapability,
               resolveCurrentModelSpecifier: () =>
                 agent.state.modelSpecifier ?? activeBinding.resolved.spec,
@@ -6955,6 +6960,8 @@ export async function startBusAgentRunner(params: {
                 };
                 if (status === "completed") {
                   completedCompactionCount += 1;
+                  if (next.requestClient === "native")
+                    params.nativeExecution?.compacted?.(next.requestId, agent.state.messages);
                   if (runProfile === "primary" && next.requestClient === "discord") {
                     const previousLineage =
                       state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;

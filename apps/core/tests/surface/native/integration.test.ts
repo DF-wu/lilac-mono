@@ -891,3 +891,49 @@ test("a custom command submitted as steering queues and executes in its own full
     await fixture.close();
   }
 });
+
+test("permanent DM compacts through the real runner without removing display history", async () => {
+  const fixture = await createNativeIntegrationFixture();
+  try {
+    const { client } = fixture.connect();
+    const bootstrap = await client.bootstrap.get({});
+    const dm = bootstrap.threads.items.find((thread) => thread.kind === "dm")!;
+    expect(dm).toBeDefined();
+    for (const text of ["Remember project A", "Now discuss dinner", "Return to project A"]) {
+      const receipt = await client.inputs.submit(nativePrompt(dm.id, text));
+      await completed(fixture.store, receipt.inputId);
+    }
+    const before = await client.threads.sync({ threadId: dm.id });
+    const command = {
+      ...nativePrompt(dm.id, "/compact"),
+      command: { id: "compact", arguments: "" },
+    };
+    const receipt = await client.inputs.submit(command);
+    await completed(fixture.store, receipt.inputId);
+    expect((await client.inputs.submit(command)).inputId).toEqual(receipt.inputId);
+    const after = await client.threads.sync({ threadId: dm.id });
+    expect(after.kind).toBe("window");
+    if (before.kind !== "window" || after.kind !== "window") throw new Error("Expected windows");
+    expect(after.slots.length).toBe(before.slots.length + 1);
+    const parts = after.slots.flatMap((slot) =>
+      slot.kind === "ready" ? slot.messages.flatMap((message) => message.parts) : [],
+    );
+    expect(
+      parts.some((part) => part.type === "data-compaction" && part.data.state === "complete"),
+    ).toBe(true);
+    expect((await client.threads.context({ threadId: dm.id })).hasSummary).toBe(true);
+    const followup = await client.inputs.submit(nativePrompt(dm.id, "Next subject"));
+    await completed(fixture.store, followup.inputId);
+    expect((await client.threads.context({ threadId: dm.id })).hasSummary).toBe(true);
+    await expect(
+      client.threads.delete({
+        threadId: dm.id,
+        commandId: crypto.randomUUID(),
+        historyGeneration: 0,
+      }),
+    ).rejects.toThrow();
+    expect(fixture.fatalErrors).toEqual([]);
+  } finally {
+    await fixture.close();
+  }
+}, 30_000);
