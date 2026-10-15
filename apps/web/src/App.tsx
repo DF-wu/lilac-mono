@@ -131,7 +131,14 @@ function Workspace(props: AppProps) {
   });
   const routePathname = useLocation({ select: (location) => location.pathname });
   const routeDraftId = useLocation({ select: (location) => location.state.draftThreadId });
-  const { pool, drafts: draftStore, panels, notifications, backgroundPush } = useWorkspace();
+  const {
+    pool,
+    drafts: draftStore,
+    panels,
+    notifications,
+    backgroundPush,
+    presence,
+  } = useWorkspace();
   const draftIds = useStore(draftStore, (state) => state.ids);
   const setLocalDrafts = draftStore.getState().setLocalDrafts;
   const { client, initial } = props;
@@ -217,7 +224,7 @@ function Workspace(props: AppProps) {
     const update = () => {
       release?.();
       release = undefined;
-      backgroundPush.view(
+      presence.view(
         active && !settings && document.visibilityState === "visible" && document.hasFocus()
           ? viewedNotificationThread
           : undefined,
@@ -239,12 +246,13 @@ function Workspace(props: AppProps) {
     window.addEventListener("blur", update);
     document.addEventListener("visibilitychange", update);
     return () => {
+      presence.view();
       release?.();
       window.removeEventListener("focus", update);
       window.removeEventListener("blur", update);
       document.removeEventListener("visibilitychange", update);
     };
-  }, [active, settings, viewedNotificationThread, notifications, backgroundPush]);
+  }, [active, settings, viewedNotificationThread, notifications, presence]);
 
   const archived = search.view === "archived";
   const external = search.view === "others" && viewer.role === "owner";

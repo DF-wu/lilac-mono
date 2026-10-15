@@ -1,3 +1,4 @@
+import { createThreadPresence } from "./thread-presence";
 import { createBackgroundPush } from "./background-push";
 import { createNotificationPreferences } from "./notifications";
 import { watchConnectionLifecycle } from "./connection-lifecycle";
@@ -21,6 +22,7 @@ type WorkspaceServices = Pick<
   drafts: ReturnType<typeof createDraftStore>;
   notifications: ReturnType<typeof createNotificationPreferences>;
   backgroundPush: ReturnType<typeof createBackgroundPush>;
+  presence: ReturnType<typeof createThreadPresence>;
   preferences: ReturnType<typeof createPreferences>;
 };
 const WorkspaceContext = createContext<WorkspaceServices | undefined>(undefined);
@@ -54,6 +56,8 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
     [client, notifications],
   );
   useEffect(() => backgroundPush.start(), [backgroundPush]);
+  const presence = useMemo(() => createThreadPresence(client), [client]);
+  useEffect(() => presence.start(), [presence]);
   useEffect(() => {
     const apply = () => {
       document.documentElement.dataset.animation = preferences.getState().animation;
@@ -77,6 +81,7 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
       drafts,
       notifications,
       backgroundPush,
+      presence,
       preferences,
       panels,
       keybindings,
@@ -92,6 +97,7 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
       drafts,
       notifications,
       backgroundPush,
+      presence,
       preferences,
       panels,
       keybindings,

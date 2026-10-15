@@ -29,10 +29,7 @@ export function allowedPushEndpoint(endpoint: string): boolean {
 }
 
 export class NativePush {
-  private readonly viewing = new Map<
-    string,
-    { userId: string; endpoint: string; threadId: string; until: number }
-  >();
+  private readonly viewing = new Map<string, { userId: string; threadId: string; until: number }>();
   private readonly working = new Map<string, NativeThread>();
   private readonly pending = new Set<Promise<void>>();
   private stopListening?: () => void;
@@ -115,20 +112,14 @@ export class NativePush {
 
   presence(userId: string, input: NativeRpcInputs["notifications"]["presence"]) {
     for (const [key, view] of this.viewing) if (view.until <= Date.now()) this.viewing.delete(key);
-    const owned = this.db
-      .query<{ user_id: string }, [string, string]>(
-        "SELECT user_id FROM native_push_subscriptions WHERE endpoint=? AND user_id=?",
-      )
-      .get(input.endpoint, userId);
-    if (!owned) return Result.ok({ ok: true as const });
+    const key = JSON.stringify([userId, input.clientId]);
     if (input.threadId)
-      this.viewing.set(`${input.endpoint}:${input.clientId}`, {
-        endpoint: input.endpoint,
+      this.viewing.set(key, {
         userId,
         threadId: input.threadId,
         until: Date.now() + 60_000,
       });
-    else this.viewing.delete(`${input.endpoint}:${input.clientId}`);
+    else this.viewing.delete(key);
     return Result.ok({ ok: true as const });
   }
 
@@ -158,6 +149,15 @@ export class NativePush {
       const previous = this.working.get(key);
       this.working.delete(key);
       if (!previous || thread.revision <= previous.revision) continue;
+      if (
+        [...this.viewing.values()].some(
+          (viewing) =>
+            viewing.userId === userId &&
+            viewing.threadId === threadId &&
+            viewing.until > Date.now(),
+        )
+      )
+        continue;
       const kind = thread.displayStatus === "error" ? "failure" : "completion";
       const payload = this.store
         .notificationContent(userId, threadId)
@@ -166,16 +166,6 @@ export class NativePush {
       if (!payload || !keys) continue;
       for (const subscription of subscriptions) {
         if (subscription.user_id !== userId || !subscription[kind]) continue;
-        if (
-          [...this.viewing.values()].some(
-            (viewing) =>
-              viewing.endpoint === subscription.endpoint &&
-              viewing.userId === userId &&
-              viewing.threadId === threadId &&
-              viewing.until > Date.now(),
-          )
-        )
-          continue;
         const delivery = this.deliver(subscription, JSON.stringify(payload), keys);
         this.pending.add(delivery);
         void delivery.finally(() => this.pending.delete(delivery));

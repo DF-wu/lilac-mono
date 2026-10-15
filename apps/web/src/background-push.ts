@@ -71,26 +71,6 @@ export function createBackgroundPush(
   preferences: ReturnType<typeof createNotificationPreferences>,
 ) {
   const store = createStore<{ busy: boolean; error?: string }>(() => ({ busy: false }));
-  const clientId = crypto.randomUUID();
-  let viewedThread: string | undefined;
-  async function presence() {
-    if (!preferences.store.getState().background || !client.rpc) return;
-    await capture(async () => {
-      const subscription = await (
-        await navigator.serviceWorker?.getRegistration()
-      )?.pushManager.getSubscription();
-      if (subscription)
-        await client.rpc?.notifications.presence({
-          endpoint: subscription.endpoint,
-          threadId: viewedThread,
-          clientId,
-        });
-    });
-  }
-  function view(threadId?: string) {
-    viewedThread = threadId;
-    void presence();
-  }
   async function apply(changes: Partial<NotificationPreferences>, requestPermission = false) {
     if (store.getState().busy) return false;
     store.setState({ busy: true, error: undefined });
@@ -134,7 +114,6 @@ export function createBackgroundPush(
     });
     const error = captured.match({ ok: () => undefined, err: (value) => value });
     store.setState({ busy: false, error });
-    if (!error) void presence();
     return !error;
   }
   async function sync() {
@@ -143,14 +122,12 @@ export function createBackgroundPush(
   }
   function start() {
     void sync();
-    const timer = window.setInterval(() => void presence(), 30_000);
     const unsubscribe = client.subscribe((event) => {
       if (event.kind === "connection" && event.state === "online") void sync();
     });
     return () => {
-      clearInterval(timer);
       unsubscribe();
     };
   }
-  return { store, apply, start, view };
+  return { store, apply, start };
 }

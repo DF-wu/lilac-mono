@@ -1081,3 +1081,12 @@ reject schema 3; rollback requires a pre-upgrade backup.
 The browser's existing three-bit notification preference accepts an optional fourth background-push
 bit. Existing preferences retain their event choices and default background push to off. Push previews
 contain at most 200 characters of assistant text. Delivery is best effort and has no replay queue.
+
+## Native thread presence independent of push
+
+The native `notifications.presence` RPC now accepts only `clientId` and optional `threadId`.
+It no longer accepts or requires a push endpoint. Deploy Core and the web client together and reload
+open tabs. Presence is scoped to the authenticated user and tab, remains in memory, and expires after
+60 seconds without a heartbeat. A focused thread suppresses that user's completion and failure pushes
+on all devices, including when push is disabled or unsupported on the viewing device. There is no
+stored-data migration.

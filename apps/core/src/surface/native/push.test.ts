@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Result } from "better-result";
 import { WebPushError, type sendNotification } from "web-push";
@@ -136,16 +136,12 @@ test.each(["disabled", "viewed", "revoked"] as const)(
     if (mode === "viewed")
       f.push
         .presence("alice", {
-          endpoint: f.subscription.endpoint,
           threadId: f.thread.id,
           clientId: "tab",
         })
         .unwrap();
     if (mode === "revoked") f.push.subscribe("bob", f.subscription).unwrap();
-    if (mode === "viewed")
-      f.push
-        .presence("alice", { endpoint: f.subscription.endpoint, clientId: "background-tab" })
-        .unwrap();
+    if (mode === "viewed") f.push.presence("alice", { clientId: "background-tab" }).unwrap();
     f.finish();
     await Promise.resolve();
     await f.push.stop();
@@ -165,6 +161,44 @@ test("expired subscriptions are removed", async () => {
   expect(f.db.query("SELECT endpoint FROM native_push_subscriptions").all()).toHaveLength(0);
   f.db.close();
 });
+
+for (const state of ["complete", "failed"] as const) {
+  test.each(["focused", "other-thread", "other-user", "cleared", "expired"] as const)(
+    `${state} push across devices with %s presence`,
+    async (mode) => {
+      const sent: string[] = [];
+      const f = fixture(async (subscription) => {
+        sent.push(subscription.endpoint);
+        return { statusCode: 201, headers: {}, body: "" };
+      });
+      const secondDevice = {
+        ...f.subscription,
+        endpoint: "https://fcm.googleapis.com/fcm/send/second-device",
+      };
+      f.push.subscribe("alice", secondDevice).unwrap();
+      await Promise.resolve();
+      const userId = mode === "other-user" ? "bob" : "alice";
+      const threadId =
+        mode === "other-thread"
+          ? f.store.createThread("alice", { commandId: "other" }).unwrap().id
+          : f.thread.id;
+      f.push.presence(userId, { threadId, clientId: "focused-tab" }).unwrap();
+      f.push.presence(userId, { clientId: "background-tab" }).unwrap();
+      f.push.presence(userId === "alice" ? "bob" : "alice", { clientId: "focused-tab" }).unwrap();
+      if (mode === "cleared") f.push.presence(userId, { clientId: "focused-tab" }).unwrap();
+      const now = Date.now();
+      const clock = spyOn(Date, "now").mockReturnValue(now + (mode === "expired" ? 60_001 : 0));
+      f.finish(state);
+      await Promise.resolve();
+      clock.mockRestore();
+      await f.push.stop();
+      expect(sent.sort()).toEqual(
+        mode === "focused" ? [] : [f.subscription.endpoint, secondDevice.endpoint].sort(),
+      );
+      f.db.close();
+    },
+  );
+}
 
 test("enabling push during a run delivers its completion", async () => {
   const f = fixture();

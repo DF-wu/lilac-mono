@@ -313,7 +313,9 @@ skills, or attachments. Recent direct messages survive age expiry of an older su
 Settings → Notifications has separate event choices and a Background push toggle. Enabling background
 push registers this browser with Core, which sends encrypted Web Push when a response finishes or a
 run fails. Notifications show Lilac, the thread title, and a short assistant-response preview. Clicking
-opens the thread. A visible, focused thread suppresses its alerts; other devices can still receive them.
+opens the thread. Viewing a visible, focused thread suppresses that user's background pushes on all
+devices, even when push is disabled or unsupported on the viewing device. Focus clears when the tab
+is hidden or blurred; disconnected tabs expire after 60 seconds without a presence heartbeat.
 
 Use HTTPS. On iOS/iPadOS 16.4 or newer, add Lilac to the Home Screen and enable notifications from the
 installed web app. Core generates and retains signing keys automatically. No Firebase project or Apple

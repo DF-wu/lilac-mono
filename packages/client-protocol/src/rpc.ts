@@ -159,7 +159,6 @@ export const nativeContract = {
     presence: procedure
       .input(
         z.strictObject({
-          endpoint: z.string().max(2048),
           threadId: identitySchema.optional(),
           clientId: identitySchema,
         }),
