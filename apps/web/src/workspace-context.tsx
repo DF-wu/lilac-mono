@@ -1,3 +1,4 @@
+import { createBackgroundPush } from "./background-push";
 import { createNotificationPreferences } from "./notifications";
 import { watchConnectionLifecycle } from "./connection-lifecycle";
 import { createPanelStore } from "./panel-store";
@@ -19,6 +20,7 @@ type WorkspaceServices = Pick<
   pool: UploadPool;
   drafts: ReturnType<typeof createDraftStore>;
   notifications: ReturnType<typeof createNotificationPreferences>;
+  backgroundPush: ReturnType<typeof createBackgroundPush>;
   preferences: ReturnType<typeof createPreferences>;
 };
 const WorkspaceContext = createContext<WorkspaceServices | undefined>(undefined);
@@ -47,6 +49,11 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
     () => createNotificationPreferences(scope),
     [scope.installationId, scope.principalId],
   );
+  const backgroundPush = useMemo(
+    () => createBackgroundPush(client, notifications),
+    [client, notifications],
+  );
+  useEffect(() => backgroundPush.start(), [backgroundPush]);
   useEffect(() => {
     const apply = () => {
       document.documentElement.dataset.animation = preferences.getState().animation;
@@ -69,6 +76,7 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
       pool,
       drafts,
       notifications,
+      backgroundPush,
       preferences,
       panels,
       keybindings,
@@ -83,6 +91,7 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
       pool,
       drafts,
       notifications,
+      backgroundPush,
       preferences,
       panels,
       keybindings,

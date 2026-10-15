@@ -1,3 +1,4 @@
+import { NativePush } from "./push";
 import { NativeComputer } from "./computer";
 import { NativeReferences } from "./references";
 import { nativeStoreTransaction, type NativeStoreError } from "./store";
@@ -296,7 +297,9 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     live: options.runner,
     streamingMode: () => deployment().outputStreaming,
   });
+  const push = new NativePush(database, store);
   const services = createNativeRpcServices({
+    push,
     computer: new NativeComputer(store, options.mcpRegistry),
     references,
     files: liveFiles,
@@ -769,6 +772,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       const operatorAddress = operatorGateway ? yield* operatorGateway.start() : undefined;
       const address = publicAddress ?? operatorAddress ?? { url: nativeConfig.publicUrl };
       unsubscribe = store.subscribeChanges(kick);
+      push.start();
       if (operator) operatorTimer = setInterval(tickOperator, 1000);
       return Result.ok(address);
     });
@@ -783,6 +787,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     await operatorMaintenance;
     await operatorGateway?.stop();
     await gateway.stop();
+    await push.stop();
     const uploads = await resources.stop();
     const publications = await execution.drainPublications();
     nativeRuntimeResultToHost(Result.all([uploads, publications]));

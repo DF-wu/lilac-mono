@@ -131,7 +131,7 @@ function Workspace(props: AppProps) {
   });
   const routePathname = useLocation({ select: (location) => location.pathname });
   const routeDraftId = useLocation({ select: (location) => location.state.draftThreadId });
-  const { pool, drafts: draftStore, panels, notifications } = useWorkspace();
+  const { pool, drafts: draftStore, panels, notifications, backgroundPush } = useWorkspace();
   const draftIds = useStore(draftStore, (state) => state.ids);
   const setLocalDrafts = draftStore.getState().setLocalDrafts;
   const { client, initial } = props;
@@ -217,6 +217,11 @@ function Workspace(props: AppProps) {
     const update = () => {
       release?.();
       release = undefined;
+      backgroundPush.view(
+        active && !settings && document.visibilityState === "visible" && document.hasFocus()
+          ? viewedNotificationThread
+          : undefined,
+      );
       if (
         active &&
         !settings &&
@@ -239,7 +244,7 @@ function Workspace(props: AppProps) {
       window.removeEventListener("blur", update);
       document.removeEventListener("visibilitychange", update);
     };
-  }, [active, settings, viewedNotificationThread, notifications]);
+  }, [active, settings, viewedNotificationThread, notifications, backgroundPush]);
 
   const archived = search.view === "archived";
   const external = search.view === "others" && viewer.role === "owner";
@@ -837,7 +842,22 @@ function Workspace(props: AppProps) {
           : { chatThreadId: selectedId },
       }),
   );
-  const logout = useEventCallback(() => void attempt(props.onLogout, setError));
+  const logout = useEventCallback(
+    () =>
+      void attempt(async () => {
+        if (
+          notifications.store.getState().background &&
+          !(await backgroundPush.apply({ background: false }))
+        ) {
+          setError(
+            backgroundPush.store.getState().error ??
+              "Could not disable background push before signing out.",
+          );
+          return;
+        }
+        await props.onLogout();
+      }, setError),
+  );
   const newThreadKeys = useShortcut("newThread");
   const settingsKeys = useShortcut("settings");
   useAppShortcuts({

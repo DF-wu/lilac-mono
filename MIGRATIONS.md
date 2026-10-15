@@ -1068,3 +1068,16 @@ resize policy version, dimensions, media type, and a separate expiring blob refe
 expire after 24 hours through existing blob maintenance, including abandoned or replaced previews.
 Missing or expired previews regenerate on demand. Original downloads remain unchanged.
 Older binaries reject schema 14; rollback requires a pre-upgrade backup.
+
+## Native schema 3: background notifications
+
+Schema 3 adds installation-owned Web Push signing keys and per-browser subscriptions to the native
+SQLite database. Existing accounts and conversation records are unchanged. Keys are generated on the
+first opt-in and retained across restarts. Subscriptions belong to the authenticated user, store the
+two event preferences, and are removed on opt-out, explicit logout, or a push service's 404/410 reply.
+Deploy Core and the web client together for the new `notifications.*` RPC methods. Older binaries
+reject schema 3; rollback requires a pre-upgrade backup.
+
+The browser's existing three-bit notification preference accepts an optional fourth background-push
+bit. Existing preferences retain their event choices and default background push to off. Push previews
+contain at most 200 characters of assistant text. Delivery is best effort and has no replay queue.

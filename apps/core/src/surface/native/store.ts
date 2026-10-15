@@ -162,7 +162,7 @@ export class NativeStore {
     return nativeStoreTransaction(this.db, () => {
       const version =
         this.db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
-      if (version > 2)
+      if (version > 3)
         return Result.err(
           nativeFailure("invalid", "Native store version is newer than this build"),
         );
@@ -186,7 +186,9 @@ export class NativeStore {
         CREATE TABLE IF NOT EXISTS native_user_preferences (user_id TEXT PRIMARY KEY,auto_settle_days INTEGER NOT NULL DEFAULT 3 CHECK(auto_settle_days IN (1,3,5,7,30)));
         CREATE TABLE IF NOT EXISTS native_thread_preferences (user_id TEXT NOT NULL,thread_id TEXT NOT NULL,section TEXT NOT NULL CHECK(section IN ('pinned','active','settled')),position INTEGER NOT NULL,last_activity INTEGER NOT NULL,touched_at INTEGER NOT NULL,PRIMARY KEY(user_id,thread_id));
         CREATE INDEX IF NOT EXISTS native_thread_preferences_order ON native_thread_preferences(user_id,section,position,thread_id);
-        PRAGMA user_version = 2;`);
+        CREATE TABLE IF NOT EXISTS native_push_keys (id INTEGER PRIMARY KEY CHECK(id=1),public_key TEXT NOT NULL,private_key TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS native_push_subscriptions (endpoint TEXT PRIMARY KEY,user_id TEXT NOT NULL,p256dh TEXT NOT NULL,auth TEXT NOT NULL,completion INTEGER NOT NULL,failure INTEGER NOT NULL);
+        PRAGMA user_version = 3;`);
       return Result.ok(undefined);
     });
   }
@@ -725,6 +727,30 @@ export class NativeStore {
         return this.summary(user, thread);
       }, this),
     );
+  }
+
+  notificationContent(actorId: string, threadId: string) {
+    return Result.gen(function* () {
+      const thread = yield* this.getThread(actorId, threadId);
+      const row = this.db
+        .query<{ text: string | null }, [string]>(
+          `SELECT (SELECT group_concat(json_extract(p.value,'$.text'),' ' ORDER BY p.key) FROM json_each(m.value,'$.parts') p WHERE json_extract(p.value,'$.type')='text') AS text FROM (SELECT data_json FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 1) r,json_each(r.data_json,'$.value.messages') m WHERE json_extract(m.value,'$.role')='assistant' AND COALESCE(json_extract(m.value,'$.metadata.phase'),'final')='final' ORDER BY m.key DESC LIMIT 1`,
+        )
+        .get(threadId);
+      const preview = (row?.text ?? "")
+        .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+        .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+        .replace(/[`*_#~]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      const body = thread.displayStatus === "error" ? "Run failed" : preview || "Response finished";
+      return Result.ok({
+        threadId,
+        title: `Lilac · ${thread.title || "Untitled thread"}`,
+        body: body.slice(0, 200).replace(/[\uD800-\uDBFF]$/, ""),
+        tag: `lilac:${threadId}:${thread.revision}`,
+      });
+    }, this);
   }
 
   listThreads(

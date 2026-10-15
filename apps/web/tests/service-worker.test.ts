@@ -30,8 +30,10 @@ function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } 
     postMessage: (value: object) => void;
     url?: string;
     focus?: () => void;
+    navigate?: (url: string) => Promise<void>;
   }[] = [];
   const opened: string[] = [];
+  const notifications: { title: string; options: NotificationOptions }[] = [];
   const cacheKey = (key: string | Request) =>
     new URL(typeof key === "string" ? key : key.url, "https://lilac.test").pathname;
   const caches = {
@@ -63,6 +65,11 @@ function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } 
         matchAll: async () => clients,
         openWindow: async (url: string) => {
           opened.push(url);
+        },
+      },
+      registration: {
+        showNotification: async (title: string, options: NotificationOptions) => {
+          notifications.push({ title, options });
         },
       },
       skipWaiting: async () => {},
@@ -97,6 +104,7 @@ function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } 
   return {
     stores,
     opened,
+    notifications,
     requests,
     requestCacheModes,
     clients,
@@ -305,6 +313,7 @@ test("notification clicks open only local thread routes and reuse matching windo
   const f = fixture();
   let closed = false;
   let focused = false;
+  let navigated = "";
   const close = () => {
     closed = true;
   };
@@ -313,8 +322,11 @@ test("notification clicks open only local thread routes and reuse matching windo
   expect(f.opened).toEqual(["https://lilac.test/threads/a%2Fb"]);
   f.clients.push({
     id: "chat",
-    url: "https://lilac.test/threads/existing",
+    url: "https://lilac.test/threads/existing?message=reply",
     postMessage() {},
+    async navigate(url: string) {
+      navigated = url;
+    },
     focus() {
       focused = true;
     },
@@ -323,7 +335,53 @@ test("notification clicks open only local thread routes and reuse matching windo
     notification: { data: { threadId: "existing" }, close },
   });
   expect(focused).toBe(true);
+  expect(navigated).toBe("https://lilac.test/threads/existing");
   expect(f.opened).toHaveLength(1);
   await f.dispatch("notificationclick", { notification: { data: { threadId: 42 }, close } });
   expect(f.opened).toHaveLength(1);
+});
+
+test("background push displays its preview with no open page and opens its thread", async () => {
+  const f = fixture();
+  await f.dispatch("push", {
+    data: {
+      json: () => ({
+        threadId: "thread",
+        title: "Lilac · Release notes",
+        body: "The release is ready.",
+        tag: "completion",
+      }),
+    },
+  });
+  expect(f.notifications).toEqual([
+    {
+      title: "Lilac · Release notes",
+      options: { body: "The release is ready.", tag: "completion", data: { threadId: "thread" } },
+    },
+  ]);
+  await f.dispatch("notificationclick", {
+    notification: { ...f.notifications[0]!.options, close() {} },
+  });
+  expect(f.opened).toEqual(["https://lilac.test/threads/thread"]);
+});
+
+test("malformed pushes cannot create arbitrary notifications", async () => {
+  const f = fixture();
+  await f.dispatch("push", {
+    data: {
+      json: () => {
+        throw new Error("invalid JSON");
+      },
+    },
+  });
+  await f.dispatch("push", { data: { json: () => ({ title: "incomplete" }) } });
+  expect(f.notifications).toHaveLength(0);
+});
+
+test("standalone design notification returns to its demo", async () => {
+  const f = fixture();
+  await f.dispatch("notificationclick", {
+    notification: { data: { designSystem: true }, close() {} },
+  });
+  expect(f.opened).toEqual(["https://lilac.test/design-system#notifications"]);
 });

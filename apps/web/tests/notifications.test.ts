@@ -5,6 +5,7 @@ import {
   notificationScope,
   notificationTransition,
   watchNotifications,
+  sendTestNotification,
 } from "../src/notifications";
 
 const working: NativeThread = {
@@ -105,7 +106,7 @@ test.each(["completed", "error"] as const)(
     expect(fixture.shown.map((item) => item.body)).toEqual([
       displayStatus === "completed" ? "Response finished" : "Run failed",
     ]);
-    expect(fixture.shown[0]?.tag).toContain(":12:");
+    expect(fixture.shown[0]?.tag).toContain(":12");
     await fixture.deliver({ kind: "thread", thread: terminal });
     await fixture.deliver({ kind: "thread", thread: { ...idle, revision: 13 } });
     await fixture.deliver({ kind: "thread", thread: { ...terminal, revision: 14 } });
@@ -213,10 +214,20 @@ test("preferences are opt-in, scoped, synchronized and tolerate corrupt or unava
     const scope = { installationId: "one", principalId: "owner" };
     const first = createNotificationPreferences(scope);
     const second = createNotificationPreferences(scope);
-    expect(first.store.getState()).toEqual({ enabled: false, completion: true, failure: true });
+    expect(first.store.getState()).toEqual({
+      enabled: false,
+      background: false,
+      completion: true,
+      failure: true,
+    });
     first.update({ enabled: true, completion: false });
     second.sync();
-    expect(second.store.getState()).toEqual({ enabled: true, completion: false, failure: true });
+    expect(second.store.getState()).toEqual({
+      enabled: true,
+      background: false,
+      completion: false,
+      failure: true,
+    });
     expect(
       createNotificationPreferences({ ...scope, principalId: "other" }).store.getState().enabled,
     ).toBe(false);
@@ -383,8 +394,8 @@ test("live delivery suppresses viewed, disabled, duplicate and reconnect events 
     releaseLookup();
     await delivery;
     expect(shown).toHaveLength(3);
-    expect(shown[2]?.title).toBe("Updated title");
-    expect(shown[2]?.tag).toContain(":14:completion");
+    expect(shown[2]?.title).toBe("Lilac · Updated title");
+    expect(shown[2]?.tag).toContain(":14");
     expect(new Set(shown.map((notification) => notification.tag)).size).toBe(3);
     registrationLookup = async () => undefined;
     stop();
@@ -401,4 +412,20 @@ test("live delivery suppresses viewed, disabled, duplicate and reconnect events 
       else Reflect.deleteProperty(globalThis, key);
     }
   }
+});
+
+test("test notification uses the service worker and preserves preferences", async () => {
+  using fixture = notificationFixture();
+  const before = fixture.preferences.store.getState();
+  Object.defineProperty(Notification, "requestPermission", {
+    configurable: true,
+    value: async () => "granted",
+  });
+  expect((await sendTestNotification("thread")).isOk()).toBe(true);
+  expect(fixture.shown).toHaveLength(1);
+  expect(fixture.shown[0]).toMatchObject({
+    body: "Your response is ready. This is a preview of the completed response.",
+    data: { threadId: "thread" },
+  });
+  expect(fixture.preferences.store.getState()).toEqual(before);
 });

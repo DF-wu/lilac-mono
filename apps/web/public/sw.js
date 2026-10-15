@@ -152,16 +152,49 @@ self.addEventListener("fetch", (event) => {
   );
 });
 
+self.addEventListener("push", (event) => {
+  event.waitUntil(
+    (async () => {
+      const payload = await bestEffort(async () => event.data?.json());
+      if (
+        !payload ||
+        typeof payload.threadId !== "string" ||
+        typeof payload.title !== "string" ||
+        typeof payload.body !== "string" ||
+        typeof payload.tag !== "string"
+      )
+        return;
+      await self.registration.showNotification(payload.title, {
+        body: payload.body,
+        tag: payload.tag,
+        data: { threadId: payload.threadId },
+      });
+    })(),
+  );
+});
+
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const threadId = event.notification.data?.threadId;
-  if (typeof threadId !== "string" || !threadId || threadId.length > 512) return;
-  const url = new URL(`/threads/${encodeURIComponent(threadId)}`, self.location.origin).href;
+  const designSystem = event.notification.data?.designSystem === true;
+  if (!designSystem && (typeof threadId !== "string" || !threadId || threadId.length > 512)) return;
+  const pathname = designSystem
+    ? "/design-system#notifications"
+    : `/threads/${encodeURIComponent(threadId)}`;
+  const url = new URL(pathname, self.location.origin).href;
   event.waitUntil(
     bestEffort(async () => {
       const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-      const existing = windows.find((client) => client.url === url);
-      if (existing) return existing.focus();
+      const existing = windows.find((client) => {
+        const current = new URL(client.url);
+        return (
+          current.origin === self.location.origin && current.pathname === new URL(url).pathname
+        );
+      });
+      if (existing) {
+        if (existing.url !== url) await existing.navigate(url);
+        return existing.focus();
+      }
       return self.clients.openWindow(url);
     }),
   );

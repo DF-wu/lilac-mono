@@ -307,3 +307,15 @@ During a reply the context refreshes once per second to reflect compaction. `/co
 current model context through the existing compaction engine, even when automatic compaction is off.
 It preserves the displayed messages and queues behind a running reply. It accepts no arguments,
 skills, or attachments. Recent direct messages survive age expiry of an older summary.
+
+### Background notifications
+
+Settings → Notifications has separate event choices and a Background push toggle. Enabling background
+push registers this browser with Core, which sends encrypted Web Push when a response finishes or a
+run fails. Notifications show Lilac, the thread title, and a short assistant-response preview. Clicking
+opens the thread. A visible, focused thread suppresses its alerts; other devices can still receive them.
+
+Use HTTPS. On iOS/iPadOS 16.4 or newer, add Lilac to the Home Screen and enable notifications from the
+installed web app. Core generates and retains signing keys automatically. No Firebase project or Apple
+developer account is required. Core needs outbound HTTPS access to the browser's push service. Delivery
+is best effort; failed transient sends are not queued. Explicit logout removes this browser's subscription.

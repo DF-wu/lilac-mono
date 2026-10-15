@@ -11,7 +11,7 @@ import { ConversationContext, CopyReferenceButton } from "./components/Conversat
 import { Switch } from "./components/ui/switch";
 import { NotificationSettings } from "./components/NotificationSettings";
 import { AppearanceSettings } from "./components/AppearanceSettings";
-import { createNotificationPreferences } from "./notifications";
+import { createNotificationPreferences, sendTestNotification } from "./notifications";
 import { SPINNERS } from "loading-dev";
 import { LoadingSpinner } from "./components/ui/loading-spinner";
 import { ConnectionLoading } from "./components/ui/connection-loading";
@@ -1938,12 +1938,26 @@ function KeybindingsDemo() {
 }
 
 function NotificationSettingsDemo() {
+  const threadId = useLocation({ select: (location) => location.state.chatThreadId });
+  const [sending, setSending] = useState(false);
+  async function testNotification() {
+    setSending(true);
+    const result = await sendTestNotification(threadId);
+    result.match({
+      ok: () => toast.add({ title: "Test notification sent", type: "success" }),
+      err: (message) => toast.add({ title: message, type: "error" }),
+    });
+    setSending(false);
+  }
   const [preferences] = useState(() =>
     createNotificationPreferences({ installationId: "design-system", principalId: "preview" }),
   );
   return (
     <div className="max-w-xl">
-      <NotificationSettings preferences={preferences} />
+      <NotificationSettings preferences={preferences} preview />
+      <Button variant="outline" disabled={sending} onClick={() => void testNotification()}>
+        <Bell /> Test notification
+      </Button>
     </div>
   );
 }
