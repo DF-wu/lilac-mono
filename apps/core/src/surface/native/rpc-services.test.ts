@@ -82,6 +82,7 @@ function fixture(
       });
     },
     installationId: "fixture",
+    workingIndicators: () => ["Brewing", "Steeping"],
     surface,
     catalogs: {
       subscribe: (listener) => {
@@ -111,6 +112,14 @@ function fixture(
       registry: { reload: async () => Result.ok([]) },
     }),
     execution: {
+      context: () =>
+        Result.ok({
+          historyGeneration: 0,
+          evaluatedAt: 0,
+          firstTurnPosition: null,
+          hasSummary: false,
+          active: false,
+        }),
       kick: async () => {
         kickCalls += 1;
         return Result.err(nativeFailure("conflict", "Canonical history unavailable"));
@@ -118,6 +127,7 @@ function fixture(
       cancel: async () => Result.ok(),
       deleteThread: async () => Result.ok(),
       rewind: async () => Result.err(nativeFailure("invalid", "Not used")),
+      validateCommand: () => Result.ok(),
     },
     resources: { reserve: (actor, input) => store.reserveUpload(actor, input) },
     search: new NativeSearchStore({ db, store }),
@@ -183,7 +193,9 @@ describe("native RPC service projection", () => {
     ).unwrap();
     expect(bootstrapReplySchema.safeParse(initial).success).toBe(true);
     expect(initial.viewer).not.toHaveProperty("providerId");
-    expect(initial.threads.items.map((thread) => thread.id)).toEqual([state.thread.id]);
+    expect(
+      initial.threads.items.filter((thread) => thread.kind !== "dm").map((thread) => thread.id),
+    ).toEqual([state.thread.id]);
     const unchanged = (
       await state.services.bootstrap.get(principal, {
         threadId: state.thread.id,
@@ -194,7 +206,7 @@ describe("native RPC service projection", () => {
     expect(unchanged.selectedThread?.kind).toBe("unchanged");
     expect(unchanged.catalog.kind).toBe("unchanged");
     const hidden = (await state.services.bootstrap.get(reader, {})).unwrap();
-    expect(hidden.threads.items).toEqual([]);
+    expect(hidden.threads.items.map((thread) => thread.starterId)).toEqual([reader.userId]);
     const unavailable = (
       await state.services.bootstrap.get(reader, { threadId: state.thread.id })
     ).unwrap();
@@ -447,6 +459,12 @@ describe("native RPC service projection", () => {
       .unwrap();
     expect((await stream.next()).value).toEqual({ kind: "revoked" });
     controller.abort();
+  });
+
+  test("bootstrap carries the configured working indicators", async () => {
+    using state = fixture();
+    const bootstrap = (await state.services.bootstrap.get(principal, {})).unwrap();
+    expect(bootstrap.workingIndicators).toEqual(["Brewing", "Steeping"]);
   });
 
   test("catalog watcher coalesces a large burst and emits static catalog invalidation", async () => {
@@ -760,11 +778,13 @@ test("bootstrap omits settled threads unless explicitly selected", async () => {
     .moveSidebarThread(principal.userId, { threadId: state.thread.id, section: "settled" })
     .unwrap();
   const initial = (await state.services.bootstrap.get(principal, {})).unwrap();
-  expect(initial.threads.items).toEqual([]);
+  expect(initial.threads.items.map((thread) => thread.kind)).toEqual(["dm"]);
   const selected = (
     await state.services.bootstrap.get(principal, { threadId: state.thread.id })
   ).unwrap();
-  expect(selected.threads.items.map((thread) => thread.id)).toEqual([state.thread.id]);
+  expect(
+    selected.threads.items.filter((thread) => thread.kind !== "dm").map((thread) => thread.id),
+  ).toEqual([state.thread.id]);
   state.store.close();
 });
 
@@ -805,7 +825,11 @@ test("catalog changes refresh settled counts without sending settled records", a
     })
     .unwrap();
   expect((await next).value).toMatchObject({ kind: "resync" });
-  expect((await state.services.bootstrap.get(principal, {})).unwrap().threads.items).toEqual([]);
+  expect(
+    (await state.services.bootstrap.get(principal, {}))
+      .unwrap()
+      .threads.items.map((thread) => thread.kind),
+  ).toEqual(["dm"]);
   controller.abort();
   await stream.return();
 });

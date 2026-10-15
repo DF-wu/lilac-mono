@@ -1,9 +1,22 @@
-import { parseReferenceHref } from "@stanley2058/lilac-client-protocol";
+import {
+  HTML_PREVIEW_LANGUAGE,
+  parseReferenceHref,
+  parseCitationHref,
+} from "@stanley2058/lilac-client-protocol";
+import { CitationChip } from "./CitationChip";
 import { ConversationBadge } from "./ConversationReference";
 import { FileLink, MarkdownImage } from "./FileActions";
 import { parseFilePath } from "../file-target";
 import { githubAlerts, MarkdownBlockquote } from "./markdown-alerts";
-import { createContext, useContext, lazy, memo, Suspense, type ComponentProps } from "react";
+import {
+  createContext,
+  useContext,
+  useMemo,
+  lazy,
+  memo,
+  Suspense,
+  type ComponentProps,
+} from "react";
 import ReactMarkdown, { type Components, type ExtraProps } from "react-markdown";
 import remarkCjkFriendly from "remark-cjk-friendly/parseOnly";
 import remarkCjkFriendlyGfmStrikethrough from "remark-cjk-friendly-gfm-strikethrough/parseOnly";
@@ -15,8 +28,17 @@ import { LinkWithFavicon } from "./LinkWithFavicon";
 import { AttachmentReference } from "./AttachmentReference";
 import { MessageResourcesContext } from "./message-resources";
 import { CodeBlock } from "./CodeBlock";
+import { HtmlPreviewBlock } from "./HtmlPreview";
 import { markdownUrl } from "./markdown-policy";
 import { userMessageLineBreaks } from "./composer-line-breaks";
+import { remarkSkillMentions, SkillCatalogContext } from "./skill-mentions";
+import { SkillBadge } from "./SkillBadge";
+import {
+  type MarkdownSource,
+  remarkMarkdownSource,
+  rehypeMarkdownSource,
+  sourceAttributes,
+} from "../markdown-source";
 
 const HighlightedCode = lazy(() => import("./rich-code"));
 const Diagram = lazy(() => import("./rich-diagram"));
@@ -28,18 +50,40 @@ const plugins = [
   remarkMath,
   remarkChatMath,
 ];
-const userPlugins = [...plugins, userMessageLineBreaks];
 const rehypePlugins = [githubAlerts];
+function userPlugins(skillNames: string[]) {
+  return [
+    ...plugins,
+    userMessageLineBreaks,
+    [remarkSkillMentions, skillNames] satisfies [typeof remarkSkillMentions, string[]],
+  ];
+}
 
-function RichBlock({ source, language }: { source: string; language: string }) {
+function RichBlock({
+  source,
+  language,
+  node,
+}: {
+  source: string;
+  language: string;
+  node: ExtraProps["node"];
+}) {
+  if (language === HTML_PREVIEW_LANGUAGE)
+    return (
+      <div {...sourceAttributes(node)}>
+        <HtmlPreviewBlock source={source} />
+      </div>
+    );
   const fallback = <CodeBlock source={source} language={language} />;
   let content = <HighlightedCode source={source} language={language} />;
   if (language === "mermaid") content = <Diagram source={source} />;
   if (language === "math") content = <MathExpression source={source} display />;
   return (
-    <RichRenderBoundary key={`${language}:${source}`} fallback={fallback}>
-      <Suspense fallback={fallback}>{content}</Suspense>
-    </RichRenderBoundary>
+    <div {...sourceAttributes(node)} data-language={language}>
+      <RichRenderBoundary key={`${language}:${source}`} fallback={fallback}>
+        <Suspense fallback={fallback}>{content}</Suspense>
+      </RichRenderBoundary>
+    </div>
   );
 }
 
@@ -56,6 +100,7 @@ function Pre({ node, children }: ComponentProps<"pre"> & ExtraProps) {
     .replace(/\n$/u, "");
   return (
     <RichBlock
+      node={code}
       source={source}
       language={typeof language === "string" ? language.slice(9) : "text"}
     />
@@ -81,8 +126,20 @@ function TaskCheckbox({ checked }: ComponentProps<"input">) {
   return <input type="checkbox" checked={checked} disabled aria-label={label} />;
 }
 
-function MessageLink({ children, href }: ComponentProps<"a">) {
+function MessageLink({ children, href, node }: ComponentProps<"a"> & ExtraProps) {
+  if (node?.properties["data-source"] === undefined)
+    return <RenderedMessageLink href={href}>{children}</RenderedMessageLink>;
+  return (
+    <span {...sourceAttributes(node)}>
+      <RenderedMessageLink href={href}>{children}</RenderedMessageLink>
+    </span>
+  );
+}
+
+function RenderedMessageLink({ children, href }: ComponentProps<"a">) {
   const resources = useContext(MessageResourcesContext);
+  const citation = href ? parseCitationHref(href) : undefined;
+  if (citation) return <CitationChip citation={citation} />;
   const reference = href
     ? parseReferenceHref(href, typeof location === "undefined" ? undefined : location.origin)
     : undefined;
@@ -110,42 +167,93 @@ const components: Components = {
   blockquote: MarkdownBlockquote,
   li: ListItem,
   input: TaskCheckbox,
-  code: ({ className, children }) => {
+  code: ({ className, children, node }) => {
     const file = !className && typeof children === "string" ? parseFilePath(children) : undefined;
-    if (file) return <FileLink target={file} />;
+    if (file)
+      return (
+        <span {...sourceAttributes(node)}>
+          <FileLink target={file} />
+        </span>
+      );
     const display = className?.includes("math-display") ?? false;
     if (!display && !className?.includes("math-inline"))
-      return <code className={className}>{children}</code>;
+      return (
+        <code {...sourceAttributes(node)} className={className}>
+          {children}
+        </code>
+      );
     const source = typeof children === "string" ? children : "";
     const fallback = <code>{source}</code>;
     return (
       <RichRenderBoundary key={source} fallback={fallback}>
         <Suspense fallback={fallback}>
-          <MathExpression source={source} display={display} />
+          <span {...sourceAttributes(node)}>
+            <MathExpression source={source} display={display} />
+          </span>
         </Suspense>
       </RichRenderBoundary>
     );
   },
   a: MessageLink,
-  img: MarkdownImage,
-  table: ({ children }) => (
+  span: ({ node, ...props }) => {
+    const skill = node?.properties.dataSkill;
+    if (typeof skill === "string") return <SkillBadge name={skill} />;
+    return <span {...props} />;
+  },
+  img: ({ node, ...props }) =>
+    node?.properties["data-source"] === undefined ? (
+      <MarkdownImage {...props} />
+    ) : (
+      <span {...sourceAttributes(node)}>
+        <MarkdownImage {...props} />
+      </span>
+    ),
+  table: ({ children, node }) => (
     <div className="markdown-table">
-      <table>{children}</table>
+      <table {...sourceAttributes(node)}>{children}</table>
     </div>
   ),
 };
 
-export default memo(function MarkdownContent({
+function UserMarkdown({ text }: { text: string }) {
+  const skills = useContext(SkillCatalogContext);
+  const remarkPlugins = useMemo(() => userPlugins(skills.map((skill) => skill.name)), [skills]);
+  return <RenderedMarkdown text={text} remarkPlugins={remarkPlugins} />;
+}
+
+function RenderedMarkdown({
   text,
-  preserveLineBreaks = false,
+  remarkPlugins,
+  source,
 }: {
   text: string;
-  preserveLineBreaks?: boolean;
+  remarkPlugins: ComponentProps<typeof ReactMarkdown>["remarkPlugins"];
+  source?: MarkdownSource;
 }) {
+  const mappedRemarkPlugins = useMemo(
+    () =>
+      source
+        ? [
+            ...(remarkPlugins ?? []),
+            [remarkMarkdownSource, source] satisfies [typeof remarkMarkdownSource, typeof source],
+          ]
+        : remarkPlugins,
+    [remarkPlugins, source],
+  );
+  const mappedRehypePlugins = useMemo(
+    () =>
+      source
+        ? [
+            ...rehypePlugins,
+            [rehypeMarkdownSource, source] satisfies [typeof rehypeMarkdownSource, typeof source],
+          ]
+        : rehypePlugins,
+    [source],
+  );
   return (
     <ReactMarkdown
-      remarkPlugins={preserveLineBreaks ? userPlugins : plugins}
-      rehypePlugins={rehypePlugins}
+      remarkPlugins={mappedRemarkPlugins}
+      rehypePlugins={mappedRehypePlugins}
       components={components}
       urlTransform={markdownUrl}
       skipHtml
@@ -153,4 +261,17 @@ export default memo(function MarkdownContent({
       {text}
     </ReactMarkdown>
   );
+}
+
+export default memo(function MarkdownContent({
+  text,
+  preserveLineBreaks = false,
+  source,
+}: {
+  text: string;
+  preserveLineBreaks?: boolean;
+  source?: MarkdownSource;
+}) {
+  if (preserveLineBreaks) return <UserMarkdown text={text} />;
+  return <RenderedMarkdown text={text} remarkPlugins={plugins} source={source} />;
 });

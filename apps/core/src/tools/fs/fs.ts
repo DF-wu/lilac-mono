@@ -1695,8 +1695,8 @@ export function fsTool(
     if (readFileDirectMediaSupported) {
       parts.push(
         opts?.readRemoteMedia
-          ? `Analyze ${mediaDescription} already attached to context directly. Use read to attach ${mediaDescription} from a filesystem path, resource:// URI, or direct HTTP(S) URL, directly or as an independent batch child. Use fetch for web pages and text URLs. If read reports unsupported or oversized media, use shell tools to create a supported file, then read that file.`
-          : `Analyze ${mediaDescription} already attached to context directly. Use read to attach ${mediaDescription} available only through a filesystem path or resource:// URI, directly or as an independent batch child. If read reports unsupported or oversized media, use shell tools to create a supported file, then read that file.`,
+          ? `Analyze ${mediaDescription} already attached to context directly. Use read to attach ${mediaDescription} from a filesystem path, resource:// URI, or direct HTTP(S) URL. Use fetch for web pages and text URLs. If read reports unsupported or oversized media, use shell tools to create a supported file, then read that file.`
+          : `Analyze ${mediaDescription} already attached to context directly. Use read to attach ${mediaDescription} available only through a filesystem path or resource:// URI. If read reports unsupported or oversized media, use shell tools to create a supported file, then read that file.`,
       );
     }
     parts.push("Continue a paged text read by passing a returned nextStart back unchanged.");

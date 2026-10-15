@@ -150,7 +150,6 @@ function testToolset(onEffect: () => void): BuiltLevel1Toolset {
     directToolNames: new Set(["builtin", "find_tools"]),
     catalog: [],
     catalogMetadata: {},
-    updateActiveBatchTools: () => undefined,
     genericOutputNormalizerBypassTools: new Set(["builtin"]),
     aggregateOutputBudgetExemptTools: new Set(),
     release: async () => Result.ok(undefined),

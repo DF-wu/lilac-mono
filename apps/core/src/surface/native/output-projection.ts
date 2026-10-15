@@ -14,6 +14,11 @@ interface ProjectedTurn {
   readonly changes: LiveUpdate["changes"];
 }
 
+type ActivityPart = Extract<DisplayPart, { type: "data-activity" }>;
+type ActivityPayload = Omit<
+  Extract<NativeOutputPayload, { type: "activity" }>,
+  "type" | "position" | "activityId" | "stepId"
+>;
 type PositionedPayload = Extract<NativeOutputPayload, { position: number }>;
 const TEXT_PART_LIMIT = 8_192;
 const DETAIL_LIMIT = 8_192;
@@ -155,26 +160,33 @@ function projectActivity(
   return updatePart(projection, messageId, 0, {
     type: "data-activity",
     id: digest(payload.activityId),
-    data: {
-      kind: payload.kind,
-      label: (
-        payload.label ??
-        previousLabel ??
-        (payload.kind === "thinking" ? "Thinking" : "Tool call")
-      ).slice(0, 256),
-      state: payload.state === "start" ? "running" : payload.state,
-      ...activityDetail(payload),
-      ...(payload.output === undefined ? {} : { output: payload.output.slice(0, OUTPUT_LIMIT) }),
-      ...(payload.exitCode === undefined ? {} : { exitCode: payload.exitCode }),
-      ...(payload.file === undefined || payload.file.path.length > 4096
-        ? {}
-        : { file: payload.file }),
-      ...(payload.durationMs === undefined ? {} : { durationMs: payload.durationMs }),
-    },
+    data: activityPartData(payload, previousLabel),
   });
 }
 
-function activityDetail(payload: Extract<NativeOutputPayload, { type: "activity" }>): {
+export function activityPartData(
+  payload: ActivityPayload,
+  previousLabel?: string,
+): ActivityPart["data"] {
+  return {
+    kind: payload.kind,
+    label: (
+      payload.label ??
+      previousLabel ??
+      (payload.kind === "thinking" ? "Thinking" : "Tool call")
+    ).slice(0, 256),
+    state: payload.state === "start" ? "running" : payload.state,
+    ...activityDetail(payload),
+    ...(payload.output === undefined ? {} : { output: payload.output.slice(0, OUTPUT_LIMIT) }),
+    ...(payload.exitCode === undefined ? {} : { exitCode: payload.exitCode }),
+    ...(payload.file === undefined || payload.file.path.length > 4096
+      ? {}
+      : { file: payload.file }),
+    ...(payload.durationMs === undefined ? {} : { durationMs: payload.durationMs }),
+  };
+}
+
+function activityDetail(payload: ActivityPayload): {
   detail?: string;
 } {
   if (payload.detail) return { detail: payload.detail.slice(0, DETAIL_LIMIT) };

@@ -1,5 +1,167 @@
 # MIGRATIONS.md
 
+## Permanent native DM
+
+Native thread records and summaries gain optional `kind: "dm"`. Absence retains ordinary-thread
+behavior. Bootstrap creates one private DM per human user, enforced by a unique SQLite expression
+index. DMs cannot be shared, renamed, archived, rewound, deleted, or removed by retention.
+New input indexes bound request/delivery lookup, pending work, and age selection. Initialization
+creates these indexes without rewriting existing records.
+
+Deployment settings gain `dmContextMaxAgeMs`, defaulting to 10,800,000 ms when absent. It is
+independent of ordinary-thread context age. `threads.context` reports the selected context boundary,
+summary boundary, generation, and expiry. The built-in `/compact` command uses the existing agent
+compactor and preserves display history. The authenticated native request envelope gains optional
+`compact`, checked against the accepted command before execution.
+DM thread summaries gain optional `preview`: the latest user or assistant text message, with
+whitespace collapsed and at most 160 characters. Ordinary thread summaries omit it.
+
+Deploy Core and web together. Older strict protocol validators may reject the new fields. Do not
+roll back Core over a database containing DM records: older code does not enforce their permanence.
+
+## Optional auto-inject decision gate
+
+Auto-inject now always uses the query planner and search ranking. Optional
+`conversation.thread.autoInject.gate` configures `mode: off | shadow | enforce`, an ordered `model`
+list, and `skipMinProbability` (default 0.8). Omission disables the gate; a configured gate defaults
+to shadow. Shadow records decisions and continues retrieval. Enforce skips only when the negative
+score meets the cutoff and the usefulness score is at most its complement. Invalid responses,
+refusals, image preparation failures, and unavailable providers continue to the planner.
+
+Legacy `autoInjectMode: decision` or `jev` maps to a shadow gate with the existing decision model
+list. Explicit `autoInject.gate`, including `mode: off`, takes precedence. Legacy decision options
+remain accepted for configuration compatibility, but candidate limits, relevance cutoffs, and old
+message thresholds no longer affect runtime behavior. Move model settings to `autoInject.gate.model`
+and remove `autoInjectMode`, `decisionAutoInject`, and `jevAutoInject` when editing configuration.
+Existing explicit length floors still apply before the gate, so lower old 80/110 overrides to admit
+short questions. No schema version or stored-data change is required.
+
+Gate logs use `conversation.thread.auto_inject.gate`, with mode, outcome, model, probabilities, and
+elapsed time. Outcomes include `length-skip` and `failed`; shadow `skip` means the gate would skip,
+while retrieval still proceeds. Correlate with usage and appended events by request ID.
+
+## Auto-inject length floor
+
+Initial and follow-up auto-inject length defaults are now 10 meaningful text units. Explicit
+`minTextUnits` and `followUpMinTextUnits` values retain precedence. The planner now generates
+queries for the current subject, including useful personal history without explicit recall wording.
+No schema version or stored-data change is required.
+
+## Native assistant citations version 1
+
+Native message and draft text can contain `[Assistant quote](lilac-citation://v1/quote?...)`
+links. The query contains `thread`, `message`, `text`, `start`, `end`, `prefix`, `suffix`, and
+an optional `comment`. Selectors use whitespace-normalized rendered assistant text and UTF-16
+offsets. The quote and comment remain usable when the source is changed or removed.
+
+Core expands valid links into quoted model context for prompts, follow-ups, and steering.
+Display history and drafts retain their links. Both encoded and expanded input must fit the
+existing 65,536-character input limit. No database schema or RPC fields change. Older clients
+cannot render the chips, and older Core versions do not expand them. Update Core and web together.
+
+## Sidebar working time
+
+Native thread summaries gain an optional `workingSince` field while a thread is working. Core reads it
+from the latest turn's start time, or from its first message's creation time before output begins.
+Native web shows the elapsed time in place of the last-activity time. No stored data changes.
+Update Core and web together because older strict thread validators reject the new field.
+
+## Shared working indicators
+
+Version-2 configuration adds `surface.workingIndicators`, the status phrases shown while a request
+runs. It defaults to the built-in list. `surface.discord.workingIndicators` no longer has a default
+and now overrides the shared list for Discord only; existing Discord values keep their behavior.
+Version-1 configurations use the built-in list for native web. No schema version or stored-data change is required.
+
+The native bootstrap reply gains an optional `workingIndicators` field. Native web rotates the
+phrases in place of "Working" and shows the past tense of the final phrase in place of "Worked".
+Every client derives the phrase from the turn ID and elapsed time, so reloads show the same word.
+Update Core and web together because older strict bootstrap validators reject the new field.
+
+## Separate thread query embeddings
+
+`conversation.thread.embedding.queryModel` optionally selects the search-query encoder.
+It defaults to `embedding.model`, which remains the document encoder and stored embedding ID.
+Both encoders must share a vector space and dimensions. Changing the document model requires
+re-embedding existing summary facets. No schema-version or database change is required.
+
+## Decision auto-inject F1 defaults
+
+Decision auto-inject defaults now select useful prior facts without requiring a recall/durable
+message gate. Both scoped `recallMinProbability` defaults are zero; setting a positive recall threshold
+still enables the existing gate. The default shortlist has up to 40 candidates, Jev relevance defaults
+to 0.2, and Luna relevance defaults to 0.1. Luna uses a usefulness question and no longer truncates
+the configured shortlist to ten. Existing explicit configuration values retain precedence.
+
+With `semanticFallback: true`, retrieval now reserves half the candidate budget for lexical matches
+and half for semantic matches, merging duplicate threads. Semantic search runs even when lexical
+matches exist. Missing embeddings or embedding failure retain lexical retrieval; false keeps lexical-only
+retrieval. The latest message and up to three recent authored user messages inform retrieval and scoring.
+Generated recall and assistant messages are excluded from that context. Debug decision events can now
+report `source: "hybrid"`. No configuration fields, schema version, or stored data are added.
+
+## Native HTML previews
+
+Native agent replies can show a page from a fenced `html-preview-file` block containing one file path.
+When a completed or failed turn ends, Core reads each named file under the thread's filesystem
+permissions, inlines local and `resource://` assets as data URIs, and stores the page as a published
+native upload. Native store records gain the `html-preview` kind, which maps a turn and path to that
+upload or to the reason it could not be saved. Thread deletion removes these records. No SQLite schema
+change or backfill is needed. Older strict record parsers reject the new kind, so restore a consistent
+backup before downgrading.
+
+The authenticated `GET /api/html-previews?thread=&message=&path=` route serves the saved page with
+`Content-Security-Policy: sandbox allow-scripts allow-forms allow-popups`, so remote scripts load but
+the page has an opaque origin. Update Core and web together. Older clients show these fences as code.
+
+The built-in `visualize` skill teaches agents the fence. Skill frontmatter accepts an optional
+`surfaces` list, and `visualize` sets `surfaces: [native]`, so only native requests see it in the skills
+index, `skills.list`, and `skills.read`. Skills without the field are unchanged. A skill whose `surfaces`
+is not a non-empty list of names is now reported as invalid and skipped.
+
+## Decision auto-inject configuration
+
+Rename version-2 `conversation.thread.autoInjectMode: jev` to `decision` and the `jevAutoInject`
+section to `decisionAutoInject`. Old settings normalize to the new runtime shape, preserving thresholds;
+the new section wins if both are present. No config-version or database migration is required.
+`decisionAutoInject.model` is now an ordered array. Single strings still parse. Move the four
+`*Probability` fields into `decisionAutoInject.jev` or `decisionAutoInject.luna`; old flat fields
+apply to both scopes, with explicit scoped fields taking precedence. Configure
+`[typesafe/jev-1.13.0, openai/gpt-6-luna]` to select Jev for text and Luna for attached images.
+The array controls routing, without retrying another model on failure. Log queries must also change:
+the `conversation.thread.auto_inject.jev` event is now `conversation.thread.auto_inject.decision`,
+and the usage record's `jev` field and timing stage are now `decision`. OpenAI can evaluate
+attached images through existing scoped resource access. See [config migration guidance](docs/core-config-migrations.md#decision-auto-inject-lane).
+
+## Native workflow cards
+
+Native display messages accept a `data-workflow` part that carries a structured workflow progress
+card: status, start and end times, step counts, phases, current steps, waits, the result or failure
+reason, agent counts, and the next scheduled run. Core adds it to native workflow progress messages
+next to the existing markdown text and `data-actions` controls, and replaces it on each edit. The web
+app renders the card as its own block in place of the text. Discord and GitHub cards are unchanged.
+Existing progress messages keep their text-only form until their next edit. Stored data needs no
+backfill. Update Core, web, and TUI together because older strict validators reject the new part.
+
+## Generated context messages
+
+New deferred subagent completions, automatic conversation recall, and custom-command outputs use
+labeled user messages with `providerOptions.lilac.generated` version 1 metadata. Existing message
+codecs preserve this metadata, so no database rewrite or schema bump is required. Existing synthetic
+tool exchanges remain readable and participate in completion and recall deduplication. Generated
+messages do not count as human turns for compaction. Deploy the runtime and adapters together.
+
+## Batch retirement
+
+The `batch` tool and tool-call expansion API are removed. Ordinary model-issued calls run concurrently
+in received-order groups separated by `write`, `edit`, and `patch` calls, including their legacy
+aliases. Each mutation waits for the preceding group and finishes before the following group starts.
+Bash calls may race. The Claude MCP bridge applies barriers in request-receipt order; Claude owns when
+it submits those requests. Existing `tools.batch.maxCalls`, `supportsBatch`, and `editTargets` fields
+remain accepted for configuration/plugin compatibility but no longer control execution. Remove them
+from maintained configurations and plugins. Old transcripts remain replayable; a newly attempted
+`batch` call receives the ordinary unknown-tool error.
+
 ## Native activity details
 
 Native output activity payloads and `data-activity` display parts add optional `output`,
@@ -12,6 +174,31 @@ per line. Stored turns
 need no backfill: older activities render without these details, and thinking rows without reasoning
 text are hidden. Update Core and web together because older strict validators reject the new fields.
 
+## Native agent streams
+
+Native v1 adds `streams.sync`, `streams.watch`, `streams.hydrate`, and `streams.turnPage`. Their target
+selects either a native thread or a subagent owned by that thread. Both targets use the existing
+display-message, turn, replay-checkpoint, and subscription event schemas. Core and web must be updated
+together. The existing thread and paged subagent RPCs remain available.
+
+Native SQLite `user_version` advances from 1 to 2 without rewriting existing records. The native record
+codec adds `agent-stream` metadata; child display turns, replay deltas, projection provenance, and
+deduplication receipts reuse the existing native tables. Older binaries reject version 2. Rollback
+requires a pre-upgrade backup. New child runs publish through the same durable semantic output path
+as primary runs, including recovery-frontier resets, reasoning details, redacted tool arguments and
+results, text phases, and terminal state.
+
+Existing completed children are projected lazily from retained transcripts when opened. Those
+transcripts cannot recover original timing or text-phase events. System prompts, opaque provider
+state, and encrypted reasoning remain excluded. This replaces the original subagent inspection
+policy that omitted all tool arguments and reasoning text.
+
+Child access follows the verified workflow ancestry to a canonical native parent request. Parent
+rewind or deletion invalidates discarded descendants and removes their native display records.
+Minimal deleted stream metadata remains so retained late output events are acknowledged as stale.
+Grant revocation ends child subscriptions and purges their cached display data. Child display streams
+do not create sidebar conversations or grant permission to edit, rewind, or submit input to children.
+
 ## Native computer viewer
 
 Native RPC adds `computer.read`. Deploy Core and web together, and rebuild the optional computer-use
@@ -23,7 +210,6 @@ Viewer credentials are fetched under the native thread edit permission, kept in 
 the viewer frame using origin-checked messages. They are not included in URLs or the conversation
 cache. Existing direct noVNC links and provisioning responses remain unchanged.
 
-
 ## Native web keybindings
 
 Keyboard shortcuts are stored only in the browser under `lilac-keybindings-v1`, scoped to the
@@ -31,13 +217,11 @@ installation and principal. The version 1 payload contains physical key codes an
 each action; null disables an action. Missing, invalid, duplicate, or unsupported payloads use
 default bindings without rewriting storage. No Core configuration or server-data migration is needed.
 
-
 ## Native reaction names
 
 Reaction responses add optional `userNames` (at most five display names) and `overflowCount`.
 Core projects these fields from current users when personalizing messages; stored messages need no
 backfill. Update Core and web together because older strict response validators reject these fields.
-
 
 ## Native deployment settings
 
@@ -140,7 +324,6 @@ old credential/cache directories are not automatically deleted. Stop using those
 those local files if no longer needed. Web authentication and retained conversations are unchanged.
 Operator-only Core startup is enabled by the existing container operator-token hash without enabling
 the public native listener or requiring Discord. The native owner ID is reused if web is enabled later.
-
 
 This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
 documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).

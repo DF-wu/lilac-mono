@@ -1,3 +1,4 @@
+import { isGeneratedMessage } from "@stanley2058/lilac-agent";
 import type { ModelMessage, UserContent } from "ai";
 
 import { stripSurfaceMetadataLines } from "../surface-metadata";
@@ -16,7 +17,7 @@ export type LatestUserInput = {
 export function latestUserInput(messages: readonly ModelMessage[]): LatestUserInput {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i]!;
-    if (message.role !== "user") continue;
+    if (message.role !== "user" || isGeneratedMessage(message)) continue;
     if (typeof message.content === "string") {
       const text = stripSurfaceMetadataLines(message.content).trim();
       return { text, authoredText: text, content: text, hasAttachment: false };
@@ -88,4 +89,24 @@ export function shouldRunAutoInjectedThreadSearch(input: {
   minTextUnits: number;
 }): boolean {
   return measureMeaningfulTextUnits(input.text) >= input.minTextUnits;
+}
+
+export function decisionAutoInjectContext(
+  message: string,
+  previousMessages: readonly ModelMessage[],
+): string {
+  return autoInjectPlannerContext(message.slice(0, 4000), previousMessages);
+}
+
+export function autoInjectPlannerContext(
+  message: string,
+  previousMessages: readonly ModelMessage[],
+): string {
+  const recent = previousMessages
+    .filter((item) => item.role === "user" && !isGeneratedMessage(item))
+    .slice(-3)
+    .map((item) => latestUserInput([item]).authoredText.slice(-800))
+    .filter(Boolean);
+  if (recent.length === 0) return message;
+  return `Recent user messages, oldest first:\n${recent.join("\n")}\nCurrent message:\n${message}`;
 }

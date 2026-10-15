@@ -2687,10 +2687,12 @@ describe("conversation thread store", () => {
 
     expect(serialized).not.toContain("minItems");
     expect(serialized).not.toContain("maxItems");
-    expect(instructions).toContain('Return {"searches":[]} when retrieval would not help');
-    expect(instructions).toContain("Use one search for one substantive user intent");
-    expect(instructions).toContain("Use 2-3 searches only when the user explicitly asks");
-    expect(instructions).toContain("Each search must contain 1-3 non-empty query variants");
+    expect(instructions).toContain(
+      'Return {"searches":[]} when the input has no identifiable subject',
+    );
+    expect(instructions).toContain("Use one search per distinct subject");
+    expect(instructions).toContain("up to three");
+    expect(instructions).toContain("Each search contains 1-3 short query variants");
   });
 
   it("uses the text planner only for text-only auto-inject input", () => {
@@ -3546,7 +3548,7 @@ describe("conversation thread store", () => {
     threadStore.close();
   });
 
-  it("shortlists auto-inject candidates by any term with a semantic fallback", async () => {
+  it("merges lexical and semantic auto-inject candidates even when a word matches", async () => {
     const dbPath = await createDbPath();
     const searchStore = new DiscordSearchStore(dbPath);
     const threadStore = new ConversationThreadStore(dbPath);
@@ -3568,10 +3570,17 @@ describe("conversation thread store", () => {
         ts: 3 + 2 * 60 * 60 * 1000,
       }),
     ]);
+    const embeddedTexts: string[] = [];
     const service = new ConversationThreadService({
       store: threadStore,
       getConfig: async () => testConfig(),
-      getEmbeddingAdapter: async () => fakeEmbeddingAdapter,
+      getEmbeddingAdapter: async () => ({
+        ...fakeEmbeddingAdapter,
+        embed: async (input) => {
+          embeddedTexts.push(input.text);
+          return fakeEmbeddingAdapter.embed(input);
+        },
+      }),
       summarizer: async ({ threadId }) =>
         threadId.endsWith(":m3")
           ? {
@@ -3602,9 +3611,26 @@ describe("conversation thread store", () => {
 
     // One matching word is enough; the planner-style search would require every token.
     const lexical = await shortlist({ text: "what did we decide on sqlite pragmas last week?" });
-    expect(lexical.source).toBe("lexical");
-    expect(lexical.results.map((result) => result.title)).toEqual(["Database storage"]);
+    expect(lexical.source).toBe("hybrid");
+    expect(lexical.results.map((result) => result.title)).toContain("Database storage");
+    expect(new Set(lexical.results.map((result) => result.threadId)).size).toBe(
+      lexical.results.length,
+    );
+    expect(lexical.results.length).toBeLessThanOrEqual(5);
     expect(lexical.results[0]?.timeRange).toBeDefined();
+
+    const combined = await shortlist({ text: "sqlite yellow fruit", limit: 2 });
+    expect(combined.source).toBe("hybrid");
+    expect(combined.results.map((result) => result.title)).toEqual([
+      "Database storage",
+      "Dessert planning",
+    ]);
+    const oneSemantic = await shortlist({ text: "yellow fruit", limit: 1 });
+    expect(oneSemantic.source).toBe("semantic");
+    expect(oneSemantic.results.map((result) => result.title)).toEqual(["Dessert planning"]);
+    expect((await shortlist({ text: "sqlite yellow fruit", limit: 1 })).results).toHaveLength(1);
+    const lexicalOnly = await shortlist({ text: "sqlite yellow fruit", semanticFallback: false });
+    expect(lexicalOnly.results.map((result) => result.title)).toEqual(["Database storage"]);
 
     const excluded = await shortlist({
       text: "sqlite yellow fruit",
@@ -3615,6 +3641,23 @@ describe("conversation thread store", () => {
     expect(excluded.results.map((result) => result.threadId)).not.toContain(
       lexical.results[0]!.threadId,
     );
+
+    for (const url of [
+      "https://example.test/banana",
+      "http://example.test/banana",
+      "www.example.test/banana",
+      "https://example.test/Banana_(fruit)",
+    ]) {
+      const withoutUrl = await shortlist({ text: `sqlite ${url}`, limit: 2 });
+      expect(embeddedTexts.at(-1)).toBe("sqlite");
+      expect(withoutUrl.results.map((result) => result.title)).toEqual(["Database storage"]);
+    }
+    const embeddingCount = embeddedTexts.length;
+    expect(await shortlist({ text: "https://example.test/banana" })).toEqual({
+      source: "none",
+      results: [],
+    });
+    expect(embeddedTexts).toHaveLength(embeddingCount);
 
     const noFallback = await shortlist({ text: "黃色水果", semanticFallback: false });
     expect(noFallback).toEqual({ source: "none", results: [] });

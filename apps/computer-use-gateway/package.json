@@ -13,6 +13,6 @@
     "@modelcontextprotocol/sdk": "^1.29.0"
   },
   "devDependencies": {
-    "@ai-sdk/mcp": "2.0.39"
+    "@ai-sdk/mcp": "2.0.69"
   }
 }

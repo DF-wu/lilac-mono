@@ -130,8 +130,6 @@ export type BuiltLevel1Toolset = {
   catalog: readonly CatalogToolEntry[];
   /** Deferred metadata consumed by the Claude Code MCP bridge. */
   catalogMetadata: ClaudeCodeToolCatalogMetadataMap;
-  /** Refresh the run-scoped batch child mapping before freezing step authority. */
-  updateActiveBatchTools(activeToolNames: ReadonlySet<string>): void;
   contributionInfo: ReadonlyMap<CoreLevel1ToolSpec, Level1ContributionInfo>;
   genericOutputNormalizerBypassTools: ReadonlySet<string>;
   aggregateOutputBudgetExemptTools: ReadonlySet<string>;
@@ -285,7 +283,7 @@ export function createCoreToolPluginManager(params: {
     const resolvedConfig = await resolveConfig();
 
     const tools: ToolSet = {} as ToolSet;
-    const batchTools: ToolSet = {} as ToolSet;
+    const directTools: ToolSet = {} as ToolSet;
     const specs = new Map<string, CoreLevel1ToolSpec>();
     const directSpecs = new Map<string, CoreLevel1ToolSpec>();
     const contributionInfo = generation.level1ContributionInfo;
@@ -481,7 +479,7 @@ export function createCoreToolPluginManager(params: {
 
     const buildContext = {
       ...runContext,
-      getTools: () => batchTools,
+      getTools: () => directTools,
       getLevel1ToolSpecs: () => directSpecs,
       resolveEditTargets: async <TArgs>(
         spec: CoreLevel1ToolSpec,
@@ -518,7 +516,7 @@ export function createCoreToolPluginManager(params: {
       }
       const executableValue = selectResultValue(executable);
       assignOpaqueTool(tools, specName, executableValue);
-      assignOpaqueTool(batchTools, specName, executableValue);
+      assignOpaqueTool(directTools, specName, executableValue);
     }
 
     const candidates: CatalogToolCandidate[] = [];
@@ -604,46 +602,12 @@ export function createCoreToolPluginManager(params: {
       assignOpaqueTool(tools, "find_tools", searchTool);
     }
 
-    let batchAuthorityKey = [...directSpecs.keys()].sort().join("\0");
-    const updateActiveBatchTools = (activeToolNames: ReadonlySet<string>) => {
-      for (const name of Object.keys(batchTools)) delete batchTools[name];
-      directSpecs.clear();
-      for (const name of activeToolNames) {
-        const executable = readOpaqueTool(tools, name);
-        const spec = specs.get(name);
-        if (executable && spec) {
-          assignOpaqueTool(batchTools, name, executable);
-          directSpecs.set(name, spec);
-        }
-      }
-
-      const batchSpec = specs.get("batch");
-      if (!activeToolNames.has("batch") || !batchSpec) return;
-      const nextBatchAuthorityKey = [...directSpecs.keys()].sort().join("\0");
-      if (nextBatchAuthorityKey === batchAuthorityKey) return;
-      batchAuthorityKey = nextBatchAuthorityKey;
-      const contribution = contributionForSpec(batchSpec);
-      const executable = adaptPluginResultToHost(
-        "level1.createTool",
-        invokeLevel1CreateTool({
-          pluginId: contribution.pluginId,
-          source: contribution.source,
-          spec: batchSpec,
-          capability: capabilityForSpec(batchSpec),
-          context: buildContext,
-        }),
-      );
-      assignOpaqueTool(tools, "batch", executable);
-      assignOpaqueTool(batchTools, "batch", executable);
-    };
-
     return Result.ok({
       tools,
       specs,
       directToolNames,
       catalog: catalog.entries,
       catalogMetadata: catalog.catalogMetadata,
-      updateActiveBatchTools,
       contributionInfo,
       genericOutputNormalizerBypassTools: new Set(
         [...specs.entries()]

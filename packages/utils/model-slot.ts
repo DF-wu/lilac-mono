@@ -12,6 +12,7 @@ import type {
   ModelReasoningEffort,
 } from "./core-config";
 import { createLogger } from "./logging";
+import { isRecord } from "./runtime-utils";
 import { parseModelSpecifierResult } from "./model-capability";
 import {
   formatModelProviderOptionWarning,
@@ -110,9 +111,9 @@ export function toDurableResolvedModelRequest(
       ),
     );
   const compactJsonValue = (value: JSONValue): DurableJsonValue => {
-    if (Array.isArray(value)) return value.map(compactJsonValue);
-    if (value !== null && typeof value === "object") return compactJsonObject(value);
-    return value;
+    if (value === null || typeof value !== "object") return value;
+    if (isRecord(value)) return compactJsonObject(value);
+    return value.map(compactJsonValue);
   };
   const providerOptions = resolved.providerOptions
     ? Object.fromEntries(

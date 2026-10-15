@@ -29,6 +29,9 @@ describe("core config seeding", () => {
       const rawThird = await Bun.file(third.configPath).text();
       expect(rawThird).not.toContain("foo: bar");
       expect(rawThird).toContain("surface:");
+      expect(rawThird).toStartWith(
+        "# yaml-language-server: $schema=./.schemas/core-config.schema.json\n",
+      );
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

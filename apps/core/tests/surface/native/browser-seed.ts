@@ -42,6 +42,8 @@ export function isNewer(current: Turn, next: Turn): boolean {
 
 See the [local thread](#) or [reference documentation](https://example.com).
 
+Read: https://claude.dev/blog/how-we-made-claude-ai-faster/
+
 ## Malformed content stays contained
 
 The unfinished **bold marker and [unclosed link( remain readable.
@@ -117,6 +119,21 @@ function completedTurn(
         {
           type: "text",
           text: "I found the transport and cache boundaries. I am checking the rendered result next.",
+        },
+        {
+          type: "data-activity",
+          id: `remote_image_${index}`,
+          data: {
+            kind: "tool",
+            label: "read",
+            detail: 'read {"path":"https://pbs.twimg.com/media/HT6WgFLWoAAelfQ.png"}',
+            state: "complete",
+            durationMs: 120,
+            file: {
+              path: "https://pbs.twimg.com/media/HT6WgFLWoAAelfQ.png",
+              mediaType: "image/png",
+            },
+          },
         },
         {
           type: "data-activity",

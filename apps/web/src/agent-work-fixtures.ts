@@ -3,16 +3,272 @@ import type {
   DisplayPart,
   ReadyTurnSlot,
   SubagentSummary,
+  WorkflowCard,
 } from "@stanley2058/lilac-client-protocol";
+import {
+  subagentActivities,
+  subagentTranscripts,
+  toolActivities,
+  workflowProgress,
+} from "./generated/tool-activities";
 
 type Activity = Extract<DisplayPart, { type: "data-activity" }>;
+/** A turn frame, optionally followed by a workflow card that Core posts as its own slot. */
+export type AgentWorkFrame = ReadyTurnSlot & { following?: ReadyTurnSlot };
 export type AgentWorkStage = {
   id: string;
   label: string;
   description: string;
-  frames: ReadyTurnSlot[];
+  frames: AgentWorkFrame[];
 };
 export const demoTime = Date.parse("2026-09-19T09:00:00Z");
+
+export function workflowFrame(key: keyof typeof workflowProgress): ReadyTurnSlot {
+  return workflowCardFrame(workflowProgress[key]);
+}
+
+function workflowCardFrame(progress: {
+  readonly text: string;
+  readonly actions: readonly Extract<
+    DisplayPart,
+    { type: "data-actions" }
+  >["data"]["actions"][number][];
+  readonly workflow: WorkflowCard;
+}): ReadyTurnSlot {
+  // Matches the slot and parts Core's native adapter creates when it posts a workflow card.
+  return {
+    kind: "ready",
+    slotId: "demo_workflow",
+    turnId: "demo_workflow",
+    position: 1,
+    state: "complete",
+    messages: [
+      {
+        id: "demo_workflow",
+        role: "assistant",
+        metadata: { authorId: "demo_agent", createdAt: demoTime + 3000 },
+        parts: [
+          { type: "text", text: progress.text },
+          { type: "data-workflow", id: "workflow_demo_workflow", data: progress.workflow },
+          ...(progress.actions.length
+            ? [
+                {
+                  type: "data-actions" as const,
+                  id: "demo_workflow_actions",
+                  data: { requestId: "demo_request", revision: 0, actions: [...progress.actions] },
+                },
+              ]
+            : []),
+        ],
+      },
+    ],
+  };
+}
+
+/** Moves workflow card times so the sample's present is `at`, keeping live timers realistic. */
+export function rebaseWorkflowTimes(slot: ReadyTurnSlot, at: number): ReadyTurnSlot {
+  const shift = (value: number) => value + at - demoTime;
+  return {
+    ...slot,
+    messages: slot.messages.map((message) => ({
+      ...message,
+      parts: message.parts.map((part) => {
+        if (part.type !== "data-workflow") return part;
+        const card = part.data;
+        return {
+          ...part,
+          data: {
+            ...card,
+            startedAt: shift(card.startedAt),
+            ...(card.endedAt !== undefined ? { endedAt: shift(card.endedAt) } : {}),
+            ...(card.nextRunAt !== undefined ? { nextRunAt: shift(card.nextRunAt) } : {}),
+            ...(card.wait
+              ? {
+                  wait: {
+                    ...card.wait,
+                    ...(card.wait.dueAt !== undefined ? { dueAt: shift(card.wait.dueAt) } : {}),
+                    ...(card.wait.deadlineAt !== undefined
+                      ? { deadlineAt: shift(card.wait.deadlineAt) }
+                      : {}),
+                  },
+                }
+              : {}),
+          },
+        };
+      }),
+    })),
+  };
+}
+
+export function workflowActionFrame(
+  frame: AgentWorkFrame,
+  actionId: string,
+): AgentWorkFrame | undefined {
+  if (frame.following) {
+    const following = workflowActionFrame(frame.following, actionId);
+    return following && { ...frame, following };
+  }
+  const message = frame.messages.find((item) => item.id === "demo_workflow");
+  const text = message?.parts.find((part) => part.type === "text")?.text;
+  const sample = Object.values(workflowProgress).find(
+    (progress) =>
+      progress.text === text ||
+      Object.values(progress.transitions).some((transition) => transition.text === text),
+  );
+  if (!sample) return;
+  let transition: keyof typeof sample.transitions;
+  switch (actionId) {
+    case "demo_workflow_pause":
+      transition = "paused";
+      break;
+    case "demo_workflow_resume":
+      transition = "resumed";
+      break;
+    case "demo_workflow_cancel":
+      transition = "cancelled";
+      break;
+    default:
+      return;
+  }
+  return workflowCardFrame(sample.transitions[transition]);
+}
+
+const workflowExamples: {
+  key: keyof typeof workflowProgress;
+  label: string;
+  description: string;
+}[] = [
+  {
+    key: "queued",
+    label: "Queued",
+    description: "Accepted before any steps start. Try Pause or Cancel.",
+  },
+  {
+    key: "starting",
+    label: "Starting",
+    description: "One agent is starting; another step is queued.",
+  },
+  {
+    key: "parallel",
+    label: "Parallel steps",
+    description: "Weather and opening hours run together.",
+  },
+  {
+    key: "partial",
+    label: "Partial results",
+    description: "One step completes while another continues and an alternate step stops.",
+  },
+  {
+    key: "running",
+    label: "Phase progress",
+    description: "Research is complete. Route planning runs before the coffee-stop step.",
+  },
+  {
+    key: "blocked",
+    label: "Blocked",
+    description: "An agent operation is blocked. Pause and Cancel remain available.",
+  },
+  {
+    key: "waiting",
+    label: "Waiting",
+    description: "A timed wait shows when the workflow resumes.",
+  },
+  {
+    key: "reply",
+    label: "Waiting for reply · Discord only",
+    description:
+      "A Discord-origin workflow needs a reply in Discord. Native workflows cannot create reply waits.",
+  },
+  {
+    key: "paused",
+    label: "Paused",
+    description: "Try Resume to return to running, or Cancel to stop.",
+  },
+  {
+    key: "resumed",
+    label: "Resumed",
+    description: "After resuming, the card returns to Running with its existing progress.",
+  },
+  {
+    key: "succeeded",
+    label: "Succeeded",
+    description:
+      "All steps complete. The result replaces the recent-operation list and controls disappear.",
+  },
+  {
+    key: "failed",
+    label: "Failed",
+    description: "The failure reason and completed research remain visible.",
+  },
+  {
+    key: "timeout",
+    label: "Step timed out",
+    description: "A timed-out step stays visible while a fallback step runs.",
+  },
+  {
+    key: "stepFailed",
+    label: "Step failed",
+    description: "A failed step stays visible while a fallback step runs.",
+  },
+  {
+    key: "cancelled",
+    label: "Cancelled",
+    description: "Stopped steps and the cancellation reason remain visible.",
+  },
+  {
+    key: "attention",
+    label: "Needs attention",
+    description: "An operation's outcome is uncertain. Only Cancel is available.",
+  },
+  {
+    key: "scheduled",
+    label: "Scheduled next run",
+    description: "A recurring workflow shows its next run time.",
+  },
+  {
+    key: "largeResult",
+    label: "Result stored separately",
+    description: "A large result directs you to ask Lilac for the full output.",
+  },
+  {
+    key: "noResult",
+    label: "Succeeded without output",
+    description: "A successful run can finish without a result block.",
+  },
+  {
+    key: "shortenedResult",
+    label: "Shortened result",
+    description: "A long result is shortened with a prompt to ask for the full output.",
+  },
+  {
+    key: "sensitive",
+    label: "Sensitive result",
+    description: "Sensitive workflow output and phase names stay hidden.",
+  },
+  {
+    key: "manyPhases",
+    label: "Many phases",
+    description: "Every phase shows its own progress.",
+  },
+];
+
+export const workflowStages: AgentWorkStage[] = [
+  {
+    id: "workflow",
+    label: "Workflow · full run",
+    description:
+      "Play from queued to succeeded, or use the frame arrows. Pause, Resume, and Cancel update this demo locally.",
+    frames: (["queued", "starting", "parallel", "running", "succeeded"] as const).map(
+      workflowFrame,
+    ),
+  },
+  ...workflowExamples.map(({ key, label, description }) => ({
+    id: `workflow-${key}`,
+    label: `Workflow · ${label}`,
+    description,
+    frames: [workflowFrame(key)],
+  })),
+];
 const prompt: DisplayMessage = {
   id: "demo_prompt",
   role: "user",
@@ -31,9 +287,11 @@ function activity(
   state: Activity["data"]["state"],
   detail: string,
   durationMs?: number,
-  result: Pick<Activity["data"], "output" | "exitCode" | "file"> = {},
 ): Activity {
-  return { type: "data-activity", id, data: { kind, label, state, detail, durationMs, ...result } };
+  return { type: "data-activity", id, data: { kind, label, state, detail, durationMs } };
+}
+function tool(id: string, data: Activity["data"]): Activity {
+  return { type: "data-activity", id, data };
 }
 function message(
   id: string,
@@ -71,55 +329,23 @@ const thought = activity(
   "**Comparing both plans**\n\nThe forecast decides between them. A dry morning favors the riverside walk; rain points to the museum, so I need its Saturday hours as a fallback.",
   2100,
 );
-const forecast = activity(
-  "demo_forecast",
-  "tool",
-  "bash curl -s https://weather.example/kyoto/saturday | jq '.summary'",
-  "complete",
-  "bash curl -s https://weather.example/kyoto/saturday | jq '.summary'",
-  640,
-  { output: '"18°C, light cloud, 10% chance of rain"', exitCode: 0 },
-);
-const notes = activity(
-  "demo_notes",
-  "tool",
-  "read ~/notes/kyoto-weekend.md",
-  "complete",
-  "read ~/notes/kyoto-weekend.md",
-  90,
-  {
-    output:
-      "# Kyoto weekend\n\n- Prefer walking routes under two hours\n- Museum pass expires in October",
-  },
-);
-const routeMap = activity(
-  "demo_route_map",
-  "tool",
-  "read ~/Pictures/riverside-route.svg",
-  "complete",
-  "read ~/Pictures/riverside-route.svg",
-  120,
-  { file: { path: "~/Pictures/riverside-route.svg", mediaType: "image/svg+xml" } },
-);
-const weather = activity(
-  "demo_weather",
-  "tool",
-  'weather.lookup {"city":"Kyoto","day":"Saturday"}',
-  "complete",
-  'weather.lookup {"city":"Kyoto","day":"Saturday"}',
-  850,
-  { output: '{"tempC":18,"sky":"light cloud","rainChance":0.1}' },
-);
-const hours = activity(
-  "demo_hours",
-  "tool",
-  'web.search {"query":"Kyoto museum Saturday hours"}',
-  "complete",
-  'web.search {"query":"Kyoto museum Saturday hours"}',
-  1200,
-  { output: "Open 10:00–18:00. Last admission 17:30." },
-);
-const work = message("demo_work", [thought, notes, routeMap, forecast, weather, hours]);
+const forecast = tool("demo_forecast", toolActivities.forecast.settled);
+const notes = tool("demo_notes", toolActivities.notes.settled);
+const routeMap = tool("demo_route_map", toolActivities.routeMap.settled);
+const weather = tool("demo_weather", toolActivities.weather.settled);
+const hours = tool("demo_hours", toolActivities.hours.settled);
+const notesSearch = tool("demo_notes_search", toolActivities.notesSearch.settled);
+const hoursAndNotes = tool("demo_hours_notes", toolActivities.hoursAndNotes.settled);
+const planEdit = tool("demo_plan_edit", toolActivities.planEdit.settled);
+const work = message("demo_work", [
+  thought,
+  notes,
+  routeMap,
+  notesSearch,
+  forecast,
+  weather,
+  hours,
+]);
 const commentary = message("demo_commentary", [
   {
     type: "text",
@@ -129,22 +355,14 @@ const commentary = message("demo_commentary", [
 const multiple = [
   message("demo_reasoning", [thought]),
   commentary,
-  message("demo_tools", [forecast, hours]),
+  message("demo_tools", [forecast, hoursAndNotes, planEdit]),
   message("demo_comparison", [
     {
       type: "text",
       text: "Both options fit. Here's the comparison:\n\n| Plan | Best for | Time |\n| --- | --- | --- |\n| Riverside walk | Fresh air, flexible stops | 2 hours |\n| Museum | Rainy weather, a quieter pace | 90 minutes |",
     },
   ]),
-  message("demo_followup_work", [
-    activity(
-      "demo_route",
-      "tool",
-      "bash ./scripts/route.sh --from 'Sanjo Station' --to 'Riverside café' --mode walk",
-      "running",
-      "bash ./scripts/route.sh --from 'Sanjo Station' --to 'Riverside café' --mode walk",
-    ),
-  ]),
+  message("demo_followup_work", [tool("demo_route", toolActivities.firstRoute.running)]),
 ];
 const answer = [
   "I'd choose the **riverside walk** for Saturday and keep the museum as a backup. The forecast is mild at 18°C, with light cloud and only a small chance of rain. That makes the river the more flexible choice, especially if you want time to stop along the way.",
@@ -178,14 +396,7 @@ const introduction = message("demo_introduction", [
   { type: "text", text: "I'll compare both plans and check the conditions for Saturday." },
 ]);
 const firstWork = message("demo_first_work", [
-  activity(
-    "demo_first_tool",
-    "tool",
-    "Checked the first route",
-    "complete",
-    "The riverside route takes about two hours.",
-    20_000,
-  ),
+  tool("demo_first_tool", toolActivities.firstRoute.settled),
 ]);
 const steer = (id: string, authorId: string, text: string, offset: number): DisplayMessage => ({
   id,
@@ -220,24 +431,21 @@ const afterSteer = [
     { type: "text", text: "I'll shorten the walk and look for a coffee stop along the way." },
   ]),
 ];
-const nextTool = (state: Activity["data"]["state"]) =>
-  message("demo_steer_work", [
-    activity(
-      "demo_steer_tool",
-      "tool",
-      state === "running" ? "Checking shorter routes…" : "Checked shorter routes",
-      state,
-      "A 45-minute loop starts and ends near Sanjo Station.",
-      state === "complete" ? 10_000 : undefined,
-    ),
-  ]);
-const firstSteering = [introduction, firstWork, ownSteer, ...afterSteer, nextTool("running")];
+const nextTool = (data: Activity["data"]) =>
+  message("demo_steer_work", [tool("demo_steer_tool", data)]);
+const firstSteering = [
+  introduction,
+  firstWork,
+  ownSteer,
+  ...afterSteer,
+  nextTool(toolActivities.shorterRoute.running),
+];
 const secondSteering = [
   introduction,
   firstWork,
   ownSteer,
   ...afterSteer,
-  nextTool("complete"),
+  nextTool(toolActivities.shorterRoute.settled),
   otherSteer,
   message("demo_cafe_thought", [
     activity(
@@ -277,30 +485,13 @@ const delegation = message("demo_delegation", [
     text: "I'll ask one subagent to check the weather and another to check the museum. Meanwhile, I'll compare travel times.",
   },
 ]);
-// Native projection exposes subagent progress as tool labels, without a child transcript or detail.
-function subagent(id: string, label: string, state: Activity["data"]["state"]) {
-  return message(id, [{ type: "data-activity", id, data: { kind: "tool", label, state } }]);
+function subagent(id: string, data: Activity["data"]) {
+  return message(id, [tool(id, data)]);
 }
-const weatherSubagent = subagent(
-  "demo_subagent_weather",
-  "subagent (explore; 1/2 done)\n|- + Check Saturday's forecast\n`- > Check riverside conditions",
-  "running",
-);
-const museumSubagent = subagent(
-  "demo_subagent_museum",
-  "subagent (general; 0/2 done)\n|- > Check opening hours\n`- > Check ticket availability",
-  "running",
-);
-const weatherSubagentDone = subagent(
-  "demo_subagent_weather",
-  "subagent (explore; 2/2 done)\n|- + Check Saturday's forecast\n`- + Check riverside conditions",
-  "complete",
-);
-const museumSubagentDone = subagent(
-  "demo_subagent_museum",
-  "subagent (general; 2/2 done)\n|- + Check opening hours\n`- + Check ticket availability",
-  "complete",
-);
+const weatherSubagent = subagent("demo_subagent_weather", subagentActivities.weather.working);
+const museumSubagent = subagent("demo_subagent_museum", subagentActivities.museum.working);
+const weatherSubagentDone = subagent("demo_subagent_weather", subagentActivities.weather.done);
+const museumSubagentDone = subagent("demo_subagent_museum", subagentActivities.museum.done);
 const subagentUpdate = message("demo_subagent_update", [
   {
     type: "text",
@@ -308,14 +499,7 @@ const subagentUpdate = message("demo_subagent_update", [
   },
 ]);
 const parentRouteDone = message("demo_parent_work", [
-  activity(
-    "demo_parent_route",
-    "tool",
-    "Checked travel times",
-    "complete",
-    "The riverside path starts at Sanjo Station. The museum is a 15-minute bus ride away.",
-    8000,
-  ),
+  tool("demo_parent_route", toolActivities.travelTimes.settled),
 ]);
 
 const foldedActivityMessages = [
@@ -324,13 +508,7 @@ const foldedActivityMessages = [
   ]),
   message("demo_first_update", [{ type: "text", text: "The route comparison is ready." }]),
   message("demo_background_agent", [
-    activity(
-      "demo_background_agent_part",
-      "tool",
-      "subagent (general)",
-      "running",
-      "Checking museum hours.",
-    ),
+    tool("demo_subagent_museum", subagentActivities.museum.started),
   ]),
   message("demo_second_update", [
     { type: "text", text: "The agent is checking opening hours while I finish the plan." },
@@ -401,18 +579,7 @@ export const agentWorkStages: AgentWorkStage[] = [
     label: "Tool call",
     description: "Completed reasoning followed by a running tool.",
     frames: [
-      turn([
-        message("demo_work", [
-          thought,
-          activity(
-            "demo_weather",
-            "tool",
-            'weather.lookup {"city":"Kyoto","day":"Saturday"}',
-            "running",
-            'weather.lookup({ city: "Kyoto", day: "Saturday" })',
-          ),
-        ]),
-      ]),
+      turn([message("demo_work", [thought, tool("demo_weather", toolActivities.weather.running)])]),
     ],
   },
   {
@@ -423,20 +590,8 @@ export const agentWorkStages: AgentWorkStage[] = [
       turn([
         message("demo_work", [
           thought,
-          activity(
-            "demo_weather",
-            "tool",
-            'weather.lookup {"city":"Kyoto","day":"Saturday"}',
-            "running",
-            "Waiting for the forecast.",
-          ),
-          activity(
-            "demo_hours",
-            "tool",
-            'web.search {"query":"Kyoto museum Saturday hours"}',
-            "running",
-            "Waiting for the museum's schedule.",
-          ),
+          tool("demo_weather", toolActivities.weather.running),
+          tool("demo_hours", toolActivities.hours.running),
         ]),
       ]),
     ],
@@ -463,13 +618,7 @@ export const agentWorkStages: AgentWorkStage[] = [
         weatherSubagent,
         museumSubagent,
         message("demo_parent_work", [
-          activity(
-            "demo_parent_route",
-            "tool",
-            "Checking travel times…",
-            "running",
-            "Compare the walk from Sanjo Station with the trip to the museum.",
-          ),
+          tool("demo_parent_route", toolActivities.travelTimes.running),
         ]),
       ]),
     ],
@@ -503,25 +652,7 @@ export const agentWorkStages: AgentWorkStage[] = [
       },
     ],
   },
-  {
-    id: "workflow",
-    label: "Workflow",
-    description: "A child workflow running after the initial tools finish.",
-    frames: [
-      turn([
-        work,
-        message("demo_workflow", [
-          activity(
-            "demo_plan",
-            "workflow",
-            "Planning the route…",
-            "running",
-            "Route planner\n• Find a starting point\n• Check walking distances\n• Pick a coffee stop",
-          ),
-        ]),
-      ]),
-    ],
-  },
+  ...workflowStages,
   {
     id: "streaming",
     label: "Paragraph streaming",
@@ -545,15 +676,7 @@ export const agentWorkStages: AgentWorkStage[] = [
         introduction,
         message("demo_full_thought", [thought]),
         commentary,
-        message("demo_full_tool", [
-          activity(
-            "demo_full_call",
-            "tool",
-            'web.search {"query":"Kyoto museum Saturday hours"}',
-            "running",
-            "Waiting for the museum schedule.",
-          ),
-        ]),
+        message("demo_full_tool", [tool("demo_full_call", toolActivities.hours.running)]),
       ]),
     ],
   },
@@ -647,15 +770,7 @@ export const agentWorkStages: AgentWorkStage[] = [
       turn([
         message("demo_work", [
           thought,
-          activity(
-            "demo_weather",
-            "tool",
-            "bash curl -sf https://weather.example/kyoto/saturday",
-            "failed",
-            "bash curl -sf https://weather.example/kyoto/saturday",
-            5000,
-            { output: "curl: (28) Operation timed out after 5000 milliseconds", exitCode: 28 },
-          ),
+          tool("demo_weather", toolActivities.forecastTimeout.settled),
         ]),
         message("demo_fallback", [
           { type: "text", text: "The forecast service timed out. I'll use another source." },
@@ -672,14 +787,7 @@ export const agentWorkStages: AgentWorkStage[] = [
         [
           message("demo_work", [
             thought,
-            activity(
-              "demo_weather",
-              "tool",
-              "Weather lookup",
-              "failed",
-              "The forecast service remained unavailable after retrying.",
-              5000,
-            ),
+            tool("demo_weather", toolActivities.forecastUnavailable.settled),
           ]),
         ],
         "failed",
@@ -700,11 +808,18 @@ const flowStages = [
   "tool-call",
   "parallel-tools",
   "tool-results",
+  "workflow",
   "streaming",
   "complete",
 ];
 export const conversationFrames = flowStages
-  .flatMap((id) => agentWorkStages.find((stage) => stage.id === id)!.frames)
+  .flatMap((id) => {
+    const frames = agentWorkStages.find((stage) => stage.id === id)!.frames;
+    if (id === "workflow") return frames.map((card) => ({ ...turn([work]), following: card }));
+    if (id === "streaming" || id === "complete")
+      return frames.map((frame) => ({ ...frame, following: workflowFrame("succeeded") }));
+    return frames;
+  })
   .map((frame) => ({
     ...frame,
     messages: frame.messages.map((message) => ({
@@ -726,29 +841,38 @@ agentWorkStages.unshift({
   frames: conversationFrames,
 });
 
+const demoSubagentSamples = {
+  demo_subagent_weather: { profile: "explore", name: "Weather and riverside", sample: "weather" },
+  demo_subagent_museum: { profile: "general", name: "Museum visit", sample: "museum" },
+} as const;
+
+function demoSubagentSample(id: string) {
+  return id in demoSubagentSamples
+    ? demoSubagentSamples[id as keyof typeof demoSubagentSamples]
+    : undefined;
+}
+
 export function demoSubagents(slot: ReadyTurnSlot): SubagentSummary[] {
   return slot.messages.flatMap((message) =>
     message.parts.flatMap((part) => {
       if (part.type !== "data-activity") return [];
-      const profiles = {
-        demo_subagent_weather: "explore",
-        demo_subagent_museum: "general",
-      } as const;
-      const profile = profiles[part.id as keyof typeof profiles];
-      if (!profile) return [];
-      const titles = {
-        explore: "Checking riverside conditions…",
-        general: 'web.search {"query":"Kyoto museum Saturday hours"}',
-      };
+      const sample = demoSubagentSample(part.id);
+      if (!sample) return [];
+      const running = part.data.state === "running";
+      // Core titles a running subagent with its active tool's name.
+      const activeTool = subagentTranscripts[sample.sample].running
+        .flatMap((child) => child.parts)
+        .findLast((child) => child.type === "data-activity" && child.data.state === "running");
+      const title = activeTool?.type === "data-activity" ? activeTool.data.label : "Thinking…";
       return [
         {
           id: part.id,
           activityId: part.id,
           turnId: slot.turnId,
-          profile,
-          name: profile === "explore" ? "Weather and riverside" : "Museum visit",
+          profile: sample.profile,
+          name: sample.name,
           state: part.data.state,
-          title: part.data.state === "running" ? titles[profile] : "Completed",
+          title: running ? title : "Completed",
           startedAt: demoTime + 3000,
         },
       ];
@@ -757,63 +881,7 @@ export function demoSubagents(slot: ReadyTurnSlot): SubagentSummary[] {
 }
 
 export function demoSubagentTranscript(agent: SubagentSummary): DisplayMessage[] {
-  const weather = agent.profile === "explore";
-  const transcript: DisplayMessage[] = [
-    {
-      id: "child_prompt",
-      role: "user",
-      parts: [
-        {
-          type: "text",
-          text: weather
-            ? "Check Saturday's weather and the riverside walking conditions."
-            : "Check the museum's opening hours and ticket availability.",
-        },
-      ],
-    },
-    message("child_commentary", [
-      {
-        type: "text",
-        text: weather
-          ? "I'll check the forecast, then look for path closures."
-          : "I'll check the museum's own schedule and booking page.",
-      },
-    ]),
-    message("child_thought", [
-      activity(
-        "child_reasoning",
-        "thinking",
-        "Thought",
-        "complete",
-        "Check the original source before summarizing.",
-      ),
-    ]),
-    message("child_work", [
-      activity(
-        "child_tool",
-        "tool",
-        agent.title,
-        agent.state === "running" ? "running" : "complete",
-        weather
-          ? "Forecast: 18°C with light cloud. No path closures reported."
-          : "Saturday hours: 10:00–18:00. Tickets available at the door.",
-      ),
-    ]),
-  ];
-  if (agent.state === "complete")
-    transcript.push(
-      message(
-        "child_final",
-        [
-          {
-            type: "text",
-            text: weather
-              ? "Mild and dry on Saturday. The riverside path is open; bring a light jacket."
-              : "The museum is open 10:00–18:00, with last admission at 17:30. No advance booking is needed.",
-          },
-        ],
-        "final",
-      ),
-    );
-  return transcript;
+  const sample = demoSubagentSample(agent.id);
+  if (!sample) return [];
+  return subagentTranscripts[sample.sample][agent.state === "running" ? "running" : "complete"];
 }

@@ -763,7 +763,7 @@ export class Attachment implements ServerTool {
         source.mimeType ||
         inferMimeTypeFromFilename(filename);
 
-      if (ctx?.requestClient === "native") {
+      if (ctx?.requestClient === "native" || ctx?.requestInitiator?.platform === "native") {
         if (!this.params.nativeOutput)
           return Result.err(
             attachmentFailure("unavailable", "Native attachment output is unavailable"),

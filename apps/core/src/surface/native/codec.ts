@@ -38,6 +38,7 @@ export const nativeUserSchema = z.strictObject({
   toolMode: z.enum(["restricted", "full"]),
 });
 export const nativeThreadRecordSchema = z.strictObject({
+  kind: z.literal("dm").optional(),
   id,
   title: z.string().max(512),
   titleGeneration: z
@@ -102,6 +103,14 @@ export const nativeUploadRecordSchema = z.strictObject({
   revision,
   published: z.boolean(),
 });
+export const nativeHtmlPreviewRecordSchema = z.strictObject({
+  id,
+  threadId: id,
+  turnId: id,
+  path: z.string().min(1).max(4096),
+  uploadId: id.optional(),
+  error: z.string().max(1024).optional(),
+});
 const mutationResultSchema = z.strictObject({
   threadId: id,
   inputId: id.optional(),
@@ -116,10 +125,28 @@ const commandSchema = z.strictObject({
   fingerprint: z.string(),
   result: mutationResultSchema,
 });
+export const nativeAgentStreamRecordSchema = z.strictObject({
+  id,
+  state: z.enum(["running", "complete", "failed", "canceled"]).default("running"),
+  title: z.string().max(256).default("Thinking…"),
+  parentThreadId: id,
+  parentRequestId: z.string().min(1),
+  runId: z.string().min(1),
+  requestId: z.string().min(1),
+  turnId: id,
+  attemptId: id.optional(),
+  previousAttemptId: id.optional(),
+  historyGeneration: revision,
+  revision,
+  updatedAt: revision,
+  deleted: z.boolean(),
+  mutationPending: z.boolean(),
+});
 export const nativeRecordSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("deployment"), value: nativeDeploymentDocumentSchema }),
   z.strictObject({ kind: z.literal("user"), value: nativeUserSchema }),
   z.strictObject({ kind: z.literal("thread"), value: nativeThreadRecordSchema }),
+  z.strictObject({ kind: z.literal("agent-stream"), value: nativeAgentStreamRecordSchema }),
   z.strictObject({
     kind: z.literal("turn"),
     value: readyTurnSlotSchema.extend({
@@ -136,11 +163,14 @@ export const nativeRecordSchema = z.discriminatedUnion("kind", [
     kind: z.literal("path"),
     value: z.strictObject({ id, threadId: id, path: z.string(), cwd: z.string().optional() }),
   }),
+  z.strictObject({ kind: z.literal("html-preview"), value: nativeHtmlPreviewRecordSchema }),
 ]);
 export type NativeUser = z.infer<typeof nativeUserSchema>;
 export type NativeThreadRecord = z.infer<typeof nativeThreadRecordSchema>;
+export type NativeAgentStreamRecord = z.infer<typeof nativeAgentStreamRecordSchema>;
 export type NativeInputRecord = z.infer<typeof nativeInputRecordSchema>;
 export type NativeUploadRecord = z.infer<typeof nativeUploadRecordSchema>;
+export type NativeHtmlPreviewRecord = z.infer<typeof nativeHtmlPreviewRecordSchema>;
 export type NativeRecord = z.infer<typeof nativeRecordSchema>;
 export type NativeMutationResult = z.infer<typeof mutationResultSchema>;
 export type NativePersistedRow = {

@@ -11,22 +11,152 @@ import {
   composerExtensions,
   attachmentNode,
   referenceNode,
+  citationNode,
+  insertEditorCitation,
+  skillNode,
+  markEditorSkills,
+  editorSkillIds,
   captureEditorPaste,
   composerCompletionPrefix,
   completeEditor,
+  insertEditorReference,
+  composerBadgeSelection,
 } from "../src/components/composer-tiptap";
 import { createComposerEditor, composerMarkdown } from "../src/components/composer-document";
+import {
+  serializeCitation,
+  collectCitations,
+  type AssistantCitation,
+} from "@stanley2058/lilac-client-protocol";
+
+const citation: AssistantCitation = {
+  version: 1,
+  threadId: "thread",
+  messageId: "response",
+  text: "A saved quote",
+  start: 0,
+  end: 13,
+  prefix: "",
+  suffix: "",
+};
+
+it("inserts a citation at the caret, round-trips through drafts and submission, and supports undo", () => {
+  const editor = headlessEditor("before after");
+  editor.registerPlugin(history());
+  editor.commands.setTextSelection(7);
+  expect(insertEditorCitation(editor, citation)).toBeDefined();
+  const markdown = writeComposerDocument(editor.state.doc);
+  expect(collectCitations(markdown).map((match) => match.citation)).toEqual([citation]);
+  expect(writeComposerDocument(editor.state.doc, false)).toBe(markdown);
+  expect(writeComposerDocument(readComposerDocument(markdown))).toBe(markdown);
+  expect(composerText(editor.state.doc)).toContain("A saved quote");
+  undo(editor.state, editor.view.dispatch);
+  expect(writeComposerDocument(editor.state.doc)).toBe("before after");
+  editor.destroy();
+});
+
+it("rejects a citation that would exceed the encoded draft limit without changing the document", () => {
+  const editor = headlessEditor("x".repeat(65500));
+  const before = writeComposerDocument(editor.state.doc);
+  expect(insertEditorCitation(editor, citation)).toBeUndefined();
+  expect(writeComposerDocument(editor.state.doc)).toBe(before);
+  editor.destroy();
+});
+
+it("restores copied citation chips and leaves citation examples in code literal", () => {
+  const link = serializeCitation(citation);
+  const doc = readComposerDocument(`Quote ${link}\n\n\`${link}\``);
+  const types: string[] = [];
+  doc.descendants((node) => {
+    types.push(node.type.name);
+  });
+  expect(types.filter((type) => type === "composer_citation")).toHaveLength(1);
+  expect(writeComposerDocument(doc)).toContain(link);
+});
 
 function headlessEditor(text: string) {
   const editor = new Editor({
     element: null,
-    extensions: [...composerExtensions, attachmentNode, referenceNode],
+    extensions: [...composerExtensions, attachmentNode, referenceNode, skillNode, citationNode],
     content: readComposerDocument(text).toJSON(),
   });
   // Tiptap treats an unmounted editor as destroyed even though its transactions work headlessly.
   Object.defineProperty(editor, "isDestroyed", { get: () => false });
   return editor;
 }
+
+it("converts a keyboard-inserted reference at its replacement range and supports undo", () => {
+  const editor = headlessEditor("before replace after");
+  editor.registerPlugin(history());
+  const url = "https://lilac.stw.tw/?ref=discord%3A1556290807915610183&range=first..last";
+  expect(insertEditorReference(editor.view, 8, 15, url, "https://lilac.stw.tw")).toBe(true);
+  expect(editor.state.doc.firstChild?.child(1).type.name).toBe("composer_reference");
+  expect(editor.state.doc.firstChild?.child(1).attrs.url).toBe(
+    "/?ref=discord%3A1556290807915610183&range=first..last",
+  );
+  expect(editor.state.selection.from).toBe(9);
+  expect(composerText(editor.state.doc)).toContain("before ");
+  expect(composerText(editor.state.doc)).toEndWith(" after");
+  undo(editor.state, editor.view.dispatch);
+  expect(composerText(editor.state.doc)).toBe("before replace after");
+  editor.destroy();
+});
+
+it("leaves ordinary keyboard text and foreign-origin references unchanged", () => {
+  const editor = headlessEditor("before after");
+  for (const text of [
+    "hello",
+    "h",
+    "https://example.com/?ref=discord%3Atest",
+    "https://lilac.stw.tw/",
+  ]) {
+    expect(insertEditorReference(editor.view, 8, 8, text, "https://lilac.stw.tw")).toBe(false);
+    expect(composerText(editor.state.doc)).toBe("before after");
+  }
+  editor.destroy();
+});
+
+it("keeps reference insertion selections valid after fitting the document", () => {
+  const editor = headlessEditor("before\n\nafter");
+  editor.view.dispatch(editor.state.tr.setSelection(new AllSelection(editor.state.doc)));
+  insertEditorReference(
+    editor.view,
+    0,
+    editor.state.doc.content.size,
+    "/?ref=discord%3Atest",
+    "https://lilac.stw.tw",
+  );
+  expect(editor.state.selection.from).toBe(2);
+  expect(editor.state.selection.$from.nodeBefore?.type.name).toBe("composer_reference");
+  editor.destroy();
+
+  const code = headlessEditor("```\nabc\n```");
+  insertEditorReference(code.view, 2, 2, "/?ref=discord%3Atest", "https://lilac.stw.tw");
+  expect(code.state.selection.$from.parent.inlineContent).toBe(true);
+  expect(code.state.selection.$from.nodeBefore?.type.name).toBe("composer_reference");
+  expect(code.state.selection.$from.nodeAfter?.text).toBe("bc");
+  code.destroy();
+});
+
+it("preserves active marks when inserting a reference", () => {
+  const editor = headlessEditor("**abc**");
+  insertEditorReference(editor.view, 2, 2, "/?ref=discord%3Atest", "https://lilac.stw.tw");
+  expect(editor.state.selection.$from.nodeBefore?.marks.map((mark) => mark.type.name)).toEqual([
+    "bold",
+  ]);
+  editor.view.dispatch(editor.state.tr.insertText("next"));
+  expect(editor.state.selection.$from.nodeBefore?.marks.map((mark) => mark.type.name)).toEqual([
+    "bold",
+  ]);
+  editor.destroy();
+});
+
+it("leaves native mutation selections to ProseMirror's updated document", () => {
+  const editor = headlessEditor("before");
+  const transaction = editor.state.tr.insertText("x", 1);
+  expect(composerBadgeSelection(editor.view, transaction.doc.resolve(2))).toBeNull();
+  editor.destroy();
+});
 
 it("pastes copied message fragments inline at a tracked position", () => {
   const editor = headlessEditor("before after");
@@ -51,6 +181,50 @@ it("completes a mention after a soft line break without deleting preceding text"
   expect(composerCompletionPrefix(editor)).toBe("hello\n$sk");
   completeEditor(editor, "$skill", 3);
   expect(writeComposerDocument(editor.state.doc)).toBe("hello\n$skill ");
+  editor.destroy();
+});
+
+it("replaces the rest of a command argument token after the cursor", () => {
+  const editor = headlessEditor("/tarot 3 single more");
+  editor.commands.setTextSelection(12);
+  expect(composerCompletionPrefix(editor)).toBe("/tarot 3 si");
+  completeEditor(editor, "spread=single", 2, undefined, { after: 4 });
+  expect(composerText(editor.state.doc)).toBe("/tarot 3 spread=single  more");
+  completeEditor(editor, "mode=", 0, undefined, { space: false });
+  expect(composerText(editor.state.doc)).toContain("spread=single mode= more");
+  editor.destroy();
+});
+
+it("completes a skill as a badge that keeps its mention syntax", () => {
+  const editor = headlessEditor("use $ag");
+  editor.commands.setTextSelection(editor.state.doc.content.size - 1);
+  completeEditor(editor, "$my_skill", 3, { id: "skill-1", name: "my_skill" });
+  const badge = editor.state.doc.firstChild?.child(1);
+  expect(badge?.type.name).toBe("composer_skill");
+  expect(badge?.attrs).toMatchObject({ id: "skill-1", name: "my_skill" });
+  expect(composerText(editor.state.doc)).toBe("use $my_skill ");
+  expect(writeComposerDocument(editor.state.doc)).toBe("use $my\\_skill ");
+  expect(editor.state.selection.from).toBe(editor.state.doc.content.size - 1);
+  editor.destroy();
+});
+
+it("restores badges only for exact selected skill mentions outside code", () => {
+  const text =
+    "$review /skill:review $reviewer $review-next `$review` **x**$review $Better Result, $a+b\n\n```\n$review\n```";
+  const editor = headlessEditor(text);
+  const before = writeComposerDocument(editor.state.doc);
+  markEditorSkills(editor, [
+    { id: "r", name: "review" },
+    { id: "b", name: "Better Result" },
+    { id: "a", name: "a+b" },
+  ]);
+  const badges: string[] = [];
+  editor.state.doc.descendants((node) => {
+    if (node.type.name === "composer_skill") badges.push(node.attrs.text);
+  });
+  expect(badges).toEqual(["$review", "/skill:review", "$Better Result", "$a+b"]);
+  expect(editorSkillIds(editor.state.doc)).toEqual(["r", "b", "a"]);
+  expect(writeComposerDocument(editor.state.doc)).toBe(before);
   editor.destroy();
 });
 

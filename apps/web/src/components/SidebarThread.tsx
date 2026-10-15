@@ -11,7 +11,7 @@ import {
   ArchiveRestore,
   Pencil,
   Trash2,
-  CircleCheck,
+  Check,
   Undo2,
   Pin,
   PinOff,
@@ -25,6 +25,7 @@ import {
   ContextMenuItem,
   ContextMenuTrigger,
 } from "./ui/context-menu";
+import { ThreadSettleButton } from "./ThreadSettleButton";
 import { ThreadCard, ThreadSelect } from "./ThreadSelect";
 
 function hasUnsentDraft(draft: Draft) {
@@ -88,18 +89,16 @@ export const SidebarThread = memo(function SidebarThread({
   const editable = thread?.capabilities.edit ?? draft?.editable ?? false;
   const settleAction =
     thread && !thread.archived && onSettle ? (
-      <IconButton
-        label={`${section === "settled" ? "Unsettle" : "Settle"} ${title || "conversation"}`}
-        tooltip={section === "settled" ? "Unsettle" : "Settle"}
+      <ThreadSettleButton
+        settled={section === "settled"}
+        title={title}
         onClick={settle}
         disabled={settleDisabled}
-      >
-        {section === "settled" ? <Undo2 /> : <CircleCheck />}
-      </IconButton>
+      />
     ) : null;
   const showDiscard = !selected && (thread ? hasReplyDraft : !!draft);
   const actions =
-    showDiscard || settleAction || editable ? (
+    showDiscard || settleAction ? (
       <>
         {showDiscard ? (
           <IconButton
@@ -112,15 +111,6 @@ export const SidebarThread = memo(function SidebarThread({
           </IconButton>
         ) : null}
         {settleAction}
-        {editable ? (
-          <IconButton
-            label={`Rename ${title || "conversation"}`}
-            tooltip="Rename"
-            onClick={() => onRename(id, title)}
-          >
-            <Pencil />
-          </IconButton>
-        ) : null}
       </>
     ) : undefined;
   const [now] = useState(Date.now);
@@ -135,6 +125,7 @@ export const SidebarThread = memo(function SidebarThread({
             modelLabel={modelLabel}
             selected={selected}
             pinned={section === "pinned"}
+            settled={section === "settled"}
             actions={actions}
             onSelect={() => onSelect(id)}
           />
@@ -150,6 +141,7 @@ export const SidebarThread = memo(function SidebarThread({
             now={now}
             selected={selected}
             pinned={section === "pinned"}
+            settled={section === "settled"}
             actions={actions}
             onSelect={() => onSelect(id)}
           />
@@ -162,7 +154,7 @@ export const SidebarThread = memo(function SidebarThread({
           ) : null}
           {settleAction ? (
             <ContextMenuItem disabled={settleDisabled} onClick={settle}>
-              {section === "settled" ? <Undo2 /> : <CircleCheck />}
+              {section === "settled" ? <Undo2 /> : <Check />}
               {section === "settled" ? "Unsettle" : "Settle"}
             </ContextMenuItem>
           ) : null}

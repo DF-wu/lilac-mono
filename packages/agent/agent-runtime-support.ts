@@ -14,7 +14,6 @@ import { isRecord } from "@stanley2058/lilac-utils/runtime-utils";
 import type { ModelReasoningEffort } from "@stanley2058/lilac-utils/core-config/types";
 import type {
   AtomicToolExecutionFailed,
-  NormalizeSettledToolResultOutputsFn,
   NormalizeToolResultOutputFn,
   ToolResultOutput,
 } from "./atomic-tool-execution";
@@ -24,15 +23,10 @@ import {
   type OpaqueAgentValue,
 } from "./failure-adapters";
 import { cloneAgentMessage as cloneQueuedMessageValue } from "./message-clone";
-import type { ExpandedToolCall } from "./tool-call-expansion";
+import type { AgentToolCall } from "./tool-call";
 import type { ToolBatchExecutionFailed } from "./agent-tool-host";
 import type { AgentRecoveryRequired } from "./agent-adapter";
-export type {
-  StepToolSnapshot,
-  ExecutedExpansionChild,
-  ExternalToolExecutionOutcome,
-} from "./agent-tool-host";
-export const SETTLED_NORMALIZATION_FAILED = "[settled tool results could not be normalized]";
+export type { StepToolSnapshot, ExternalToolExecutionOutcome } from "./agent-tool-host";
 export const LENGTH_RECOVERY_CONTINUE_TEXT =
   "Continue from the compacted context. Do not retry any tool call that was truncated unless it is still necessary.";
 export const LENGTH_RECOVERY_PROVIDER_OPTIONS = {
@@ -376,8 +370,8 @@ export interface AgentState<TOOLS extends ToolSet> {
   };
 }
 
-export type JSONArray = JSONValue[];
-export type JSONValue = null | string | number | boolean | JSONObject | JSONArray;
+export type JSONArray = readonly JSONValue[];
+export type JSONValue = null | string | number | boolean | Readonly<JSONObject> | JSONArray;
 export type JSONObject = {
   [key: string]: JSONValue | undefined;
 };
@@ -515,8 +509,6 @@ export type AgentOptions<TOOLS extends ToolSet> = {
   recoveryCheckpointHandler?: RecoveryCheckpointHandler;
   /** Normalize model-facing tool output before it enters the canonical transcript. */
   normalizeToolResultOutput?: NormalizeToolResultOutputFn;
-  /** Normalize one fully settled expansion cohort in declared child order. */
-  normalizeSettledToolResultOutputs?: NormalizeSettledToolResultOutputsFn;
   /** Tool names whose specs guarantee already-bounded model output. */
   genericOutputNormalizerBypassTools?: ReadonlySet<string>;
   /** Trusted tool names excluded from the settled cohort's aggregate output budget. */
@@ -818,7 +810,7 @@ export function getUnresolvedAssistantToolCallIds(message: ModelMessage): string
 }
 
 export function truncatedToolCallResultMessage(
-  toolCalls: readonly ExpandedToolCall[],
+  toolCalls: readonly AgentToolCall[],
 ): ToolModelMessage | null {
   if (toolCalls.length === 0) return null;
   return {

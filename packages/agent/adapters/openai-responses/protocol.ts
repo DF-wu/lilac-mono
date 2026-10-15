@@ -20,8 +20,8 @@ export type OpenAIJson =
   | boolean
   | number
   | string
-  | OpenAIJson[]
-  | { [key: string]: OpenAIJson | undefined };
+  | readonly OpenAIJson[]
+  | { readonly [key: string]: OpenAIJson | undefined };
 export type OpenAIInputItem = ResponseInputItem;
 export type OpenAIResponseRequest = Omit<ResponsesClientEvent.ResponseCreate, "model" | "input"> & {
   model: string;

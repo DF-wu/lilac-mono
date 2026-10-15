@@ -9,6 +9,9 @@ export * from "./failure-adapters";
 export * from "./recovery-checkpoint";
 export * from "./retry-backoff";
 export * from "./session-continuation";
-export * from "./tool-call-expansion";
+export * from "./tool-call";
 export * from "./tool-call-id-normalization";
 export * from "./transient-model-retry";
+
+export { ToolCallScheduler } from "./tool-call-scheduling";
+export * from "./generated-message";

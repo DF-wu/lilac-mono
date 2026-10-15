@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=./.schemas/mcp-config.schema.json
 configVersion: 1
 
 servers: {}

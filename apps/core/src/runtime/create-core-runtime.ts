@@ -1,3 +1,4 @@
+import { ConversationThreadSearchPool } from "../conversation/thread-search-pool";
 import { nativeFailure } from "../surface/native/errors";
 import { openNativeInstallation, type NativeInstallation } from "../surface/native/installation";
 import {
@@ -172,6 +173,7 @@ import {
 } from "../surface/discord/discord-context-report";
 import { CustomCommandManager } from "../custom-commands/manager";
 import { handleCoreConfigWatchEvent } from "./core-config-watch";
+import { publishConfigSchemas } from "./config-schemas";
 import { loadOrCreateCoreDeadLetterKey, type CoreDeadLetterKeyError } from "./core-dead-letter-key";
 import {
   captureRuntimeError,
@@ -1943,11 +1945,14 @@ export async function createCoreRuntime(
 
   const loadedCoreConfig = (
     await Result.tryPromise({
-      try: () => getCoreConfig(),
+      try: async () => {
+        await publishConfigSchemas(env.dataDir);
+        return getCoreConfig();
+      },
       catch: captureRuntimeError,
     })
   ).mapError((captured) =>
-    projectCapturedRuntimeError(captured, "Core config startup read failed"),
+    projectCapturedRuntimeError(captured, "Core config startup preparation failed"),
   );
   const coreConfigSelection = loadedCoreConfig.match<
     | {
@@ -2017,6 +2022,7 @@ export async function createCoreRuntime(
   let resourceService: CoreResourceService | null = null;
   let discordSearchStore: DiscordSearchStore | null = null;
   let discordSurfaceStore: DiscordSurfaceStore | null = null;
+  let conversationThreadSearchPool: ConversationThreadSearchPool | null = null;
   let conversationThreadStore: ConversationThreadStore | null = null;
   let discoveryService: DiscoveryService | null = null;
 
@@ -2073,6 +2079,8 @@ export async function createCoreRuntime(
       nativeInstallation = null;
     });
     await cleanup.run("conversationThreadStore.createFailure.close", async () => {
+      conversationThreadSearchPool?.close();
+      conversationThreadSearchPool = null;
       conversationThreadStore?.close();
       conversationThreadStore = null;
     });
@@ -3425,7 +3433,16 @@ export async function createCoreRuntime(
               telegramConversationMemory.dbPath,
               telegramConversationMemory.botName,
             );
+          conversationThreadSearchPool = new ConversationThreadSearchPool({
+            searchDbPath: discordSearchDbPath,
+            surfaceDbPath: discordSurfaceDbPath,
+            nativeDbPath: nativeConversationDbPath,
+            telegramDbPath: telegramConversationMemory?.dbPath,
+            telegramBotName: telegramConversationMemory?.botName,
+            botName: initialCoreConfig.surface.discord.botName,
+          });
           const threadService = new ConversationThreadService({
+            searchPool: conversationThreadSearchPool,
             store: activeConversationThreadStore,
             getConfig: () => getCoreConfig(),
             getEmbeddingAdapter: getConversationThreadEmbeddingAdapter,
@@ -4619,6 +4636,8 @@ export async function createCoreRuntime(
         discordSurfaceStore = null;
       });
       await safe("conversationThreadStore.close", async () => {
+        conversationThreadSearchPool?.close();
+        conversationThreadSearchPool = null;
         conversationThreadStore?.close();
         conversationThreadStore = null;
         conversationThreadService = null;

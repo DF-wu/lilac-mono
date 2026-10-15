@@ -1,5 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
-import { decodeResourcePreview, loadResourcePreview, previewUrl } from "../src/resource-preview";
+import {
+  decodeResourcePreview,
+  loadResourcePreview,
+  loadHtmlFile,
+  previewUrl,
+} from "../src/resource-preview";
 
 const originalFetch = globalThis.fetch;
 const originalLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
@@ -61,4 +66,29 @@ test("binary and missing files produce bounded local messages", async () => {
         : "This file is unavailable.",
     );
   }
+});
+
+test("HTML rendering fetches complete authorized bytes and forwards cancellation", async () => {
+  const source = "<!doctype html>" + " ".repeat(70_000) + "<h1>End of report</h1>";
+  const signal = new AbortController().signal;
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("/api/files/id?revision=1");
+      expect(init).toMatchObject({ signal, credentials: "same-origin", cache: "no-store" });
+      return new Response(source);
+    },
+    { preconnect: originalFetch.preconnect },
+  );
+  expect((await loadHtmlFile("/api/files/id?revision=1", signal)).unwrap()).toBe(source);
+});
+
+test("HTML rendering does not display failed response bodies", async () => {
+  globalThis.fetch = Object.assign(
+    async () => new Response("private backend details", { status: 404 }),
+    { preconnect: originalFetch.preconnect },
+  );
+  const result = await loadHtmlFile("/api/files/missing", new AbortController().signal);
+  expect(result.match({ ok: () => "unexpected", err: (error) => error.message })).toBe(
+    "This file is unavailable.",
+  );
 });

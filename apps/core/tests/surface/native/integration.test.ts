@@ -13,6 +13,63 @@ import {
   nativeFixtureTextResponse,
 } from "./integration-fixture";
 import type { NativeStore } from "../../../src/surface/native/store";
+import { serializeCitation } from "@stanley2058/lilac-client-protocol";
+
+test.each(["prompt", "followup"] as const)(
+  "%s expands saved citations for the model while retaining the original display input",
+  async (mode) => {
+    const prompts: string[] = [];
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const fixture = await createNativeIntegrationFixture({
+      model: new MockLanguageModelV4({
+        modelId: "citation-fixture",
+        doStream: async ({ prompt }) => {
+          prompts.push(JSON.stringify(prompt));
+          if (mode === "followup" && prompts.length === 1) {
+            started.resolve();
+            await release.promise;
+          }
+          return nativeFixtureTextResponse("Quoted reply.");
+        },
+      }),
+    });
+    try {
+      const { client } = fixture.connect();
+      const thread = await client.threads.create({
+        commandId: crypto.randomUUID(),
+        title: "Citations",
+      });
+      if (mode === "followup") {
+        await client.inputs.submit(nativePrompt(thread.id, "Begin"));
+        await started.promise;
+      }
+      const link = serializeCitation({
+        version: 1,
+        threadId: thread.id,
+        messageId: "removed-response",
+        text: "The original saved claim.",
+        comment: "Explain this claim.",
+        start: 0,
+        end: 25,
+        prefix: "",
+        suffix: "",
+      });
+      const receipt = await client.inputs.submit(nativePrompt(thread.id, link, mode));
+      release.resolve();
+      await completed(fixture.store, receipt.inputId);
+      expect(prompts).toHaveLength(mode === "prompt" ? 1 : 2);
+      expect(prompts.at(-1)).toContain("The original saved claim.");
+      expect(prompts.at(-1)).toContain("Explain this claim.");
+      expect(prompts.at(-1)).toContain("assistant_citations");
+      expect(prompts.at(-1)).not.toContain("lilac-citation:");
+      expect(fixture.store.getInput(receipt.inputId).unwrap().text).toBe(link);
+    } finally {
+      release.resolve();
+      await fixture.close();
+    }
+  },
+);
 
 function waitForStore(store: NativeStore, predicate: () => boolean): Promise<void> {
   if (predicate()) return Promise.resolve();
@@ -714,6 +771,52 @@ export async function execute(_args, context) {
   },
 );
 
+test("custom command submissions with invalid arguments are rejected before admission", async () => {
+  const fixture = await createNativeIntegrationFixture({
+    prepare: async ({ dataDir }) => {
+      const directory = path.join(dataDir, "cmds", "typed-fixture");
+      await mkdir(directory, { recursive: true });
+      await writeFile(
+        path.join(directory, "def.json"),
+        JSON.stringify({
+          name: "typed-fixture",
+          description: "Typed integration command",
+          args: [
+            { key: "count", type: "number", required: true },
+            { key: "mode", type: "string", choices: ["single", "spread"] },
+          ],
+        }),
+      );
+      await writeFile(
+        path.join(directory, "index.ts"),
+        'export function execute() { return { type: "text", value: "unused" }; }\n',
+      );
+    },
+  });
+  try {
+    const client = fixture.connect().client;
+    const thread = await client.threads.create({
+      commandId: crypto.randomUUID(),
+      title: "Typed command",
+    });
+    for (const [args, message] of [
+      ["", "Missing required argument 'count'."],
+      ["three", "Expected a number, got 'three'."],
+      ["3 mode=triple", "Argument 'mode' must be one of: single, spread."],
+    ] as const)
+      await expect(
+        client.inputs.submit({
+          ...nativePrompt(thread.id, ""),
+          command: { id: "custom:typed-fixture", arguments: args },
+        }),
+      ).rejects.toMatchObject({ message });
+    expect((await client.runs.queue({ threadId: thread.id })).items).toEqual([]);
+    expect(fixture.fatalErrors).toEqual([]);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("a custom command submitted as steering queues and executes in its own full turn", async () => {
   const firstStarted = Promise.withResolvers<void>();
   const releaseFirst = Promise.withResolvers<void>();
@@ -788,3 +891,49 @@ test("a custom command submitted as steering queues and executes in its own full
     await fixture.close();
   }
 });
+
+test("permanent DM compacts through the real runner without removing display history", async () => {
+  const fixture = await createNativeIntegrationFixture();
+  try {
+    const { client } = fixture.connect();
+    const bootstrap = await client.bootstrap.get({});
+    const dm = bootstrap.threads.items.find((thread) => thread.kind === "dm")!;
+    expect(dm).toBeDefined();
+    for (const text of ["Remember project A", "Now discuss dinner", "Return to project A"]) {
+      const receipt = await client.inputs.submit(nativePrompt(dm.id, text));
+      await completed(fixture.store, receipt.inputId);
+    }
+    const before = await client.threads.sync({ threadId: dm.id });
+    const command = {
+      ...nativePrompt(dm.id, "/compact"),
+      command: { id: "compact", arguments: "" },
+    };
+    const receipt = await client.inputs.submit(command);
+    await completed(fixture.store, receipt.inputId);
+    expect((await client.inputs.submit(command)).inputId).toEqual(receipt.inputId);
+    const after = await client.threads.sync({ threadId: dm.id });
+    expect(after.kind).toBe("window");
+    if (before.kind !== "window" || after.kind !== "window") throw new Error("Expected windows");
+    expect(after.slots.length).toBe(before.slots.length + 1);
+    const parts = after.slots.flatMap((slot) =>
+      slot.kind === "ready" ? slot.messages.flatMap((message) => message.parts) : [],
+    );
+    expect(
+      parts.some((part) => part.type === "data-compaction" && part.data.state === "complete"),
+    ).toBe(true);
+    expect((await client.threads.context({ threadId: dm.id })).hasSummary).toBe(true);
+    const followup = await client.inputs.submit(nativePrompt(dm.id, "Next subject"));
+    await completed(fixture.store, followup.inputId);
+    expect((await client.threads.context({ threadId: dm.id })).hasSummary).toBe(true);
+    await expect(
+      client.threads.delete({
+        threadId: dm.id,
+        commandId: crypto.randomUUID(),
+        historyGeneration: 0,
+      }),
+    ).rejects.toThrow();
+    expect(fixture.fatalErrors).toEqual([]);
+  } finally {
+    await fixture.close();
+  }
+}, 30_000);

@@ -4,7 +4,7 @@ Language: [`English (primary / canonical)`](./fork-differences.md) · [`Traditio
 
 This document describes the current differences between [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) and [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono).
 
-The comparison baseline is the merge base with upstream `main` as of 2026-10-06 (sync merge [`ca808ccb`](https://github.com/DF-wu/lilac-mono/commit/ca808ccb)): this fork includes upstream commit [`bde35937`](https://github.com/stanley2058/lilac-mono/commit/bde35937) and retains the following feature and operational changes on top of it.
+The comparison baseline is upstream commit [`0c906d23`](https://github.com/stanley2058/lilac-mono/commit/0c906d23), integrated through fork PR [#85](https://github.com/DF-wu/lilac-mono/pull/85) on 2026-10-07. The fork retains the following feature and operational changes on top of it.
 
 > [!IMPORTANT]
 > This is a maintenance document, not a permanent compatibility commitment. After an upstream sync, differences that have been accepted upstream or no longer exist must be removed from this table or reclassified.
@@ -18,9 +18,10 @@ The comparison baseline is the merge base with upstream `main` as of 2026-10-06 
 | OpenAI `web.search` provider | `tools.web.extract.providers` accepts `openai`: `web.search` runs the OpenAI Responses `web_search` tool (forced via `tool_choice: required`) and returns the answer's URL citations followed by uncited retrieved sources; `tools.web.openai.{model,searchContextSize}` tune it, and `model` is a `provider/model` spec on the `openai` or `openai-compatible` provider. Search-only: `web.extract` skips it | [`web-search-openai.md`](./web-search-openai.md), [`core-config-migrations.md`](./core-config-migrations.md), `apps/core/src/tool-server/tools/web-search/openai-web-search-provider.ts` | Staged for an upstream contribution (not yet submitted); needs direct `api.openai.com` or a gateway that implements Responses `web_search`; no publish-date filter beyond model instructions |
 | GitHub final-publication policy | Issue and PR-review prompts tell the agent that Lilac publishes the final response itself: the agent must not repost it through `gh`, the GitHub API, or `surface.messages.send`, and returns `NO_REPLY` after publishing directly or after a successful `gh pr review` submission | `apps/core/src/github/webhook/github-webhook-server.ts`, fork PR [#56](https://github.com/DF-wu/lilac-mono/pull/56) | Prompt guidance only; a model that ignores it can still post a duplicate. |
 | Custom media plugin example | Provides an external Level 2 image/video plugin using an OpenAI-compatible image API and a QuantumNous/new-api-compatible video flow | [`custom-media/README.md`](../examples/plugins/custom-media/README.md), fork PR [#30](https://github.com/DF-wu/lilac-mono/pull/30) | Plugins are trusted in-process code; restricted callers currently cannot use external callables directly |
+| Protected current-input compaction | Core validates the active input boundary before threshold checks, skips soft compaction without older history, and preserves current input verbatim when summarizing older history. Callers without a protected boundary retain upstream active-request compaction | `packages/agent/auto-compaction.ts`, `apps/core/src/surface/bridge/bus-agent-runner.ts`, fork PR [#82](https://github.com/DF-wu/lilac-mono/pull/82) | Real overflow still follows the existing recovery/failure path; skipping the soft trigger does not guarantee the next request fits |
 | Compatible-provider tool calls | When a compatible provider returns a nonstandard finish reason such as `other`, parsed local tool calls are still executed and their results preserved | Commit [`1c58e532`](https://github.com/DF-wu/lilac-mono/commit/1c58e532201ee51782c98c1d8b16086f6bf45c34) | Trusts only local tool calls that passed the parser; arbitrary provider text is not treated as a tool invocation |
 | Container delivery | The build workflow publishes verified `catalina`, `claudia`, and SHA tags, with `latest` pointing to `catalina`; each variant has its own account and home directory, and the image also includes `rsync` | [`build-image.yml`](../.github/workflows/build-image.yml), [`Dockerfile`](../Dockerfile) | Both published variants use UID/GID 3000; host bind mounts must grant that numeric identity access |
-| Upstream maintenance | A scheduled workflow fetches upstream `main` every 6 hours, attempts a merge when new commits exist, and triggers an image build after a successful merge | [`sync-upstream.yml`](../.github/workflows/sync-upstream.yml) | Merge conflicts fail the workflow and require manual integration and validation |
+| Upstream maintenance | Every 6 hours, verify clean candidate merges with full CI before updating `main` and publishing images; Git conflicts open a PR with read-only Claude analysis and request `Catalina-df` review | [`sync-upstream.yml`](../.github/workflows/sync-upstream.yml), [configuration](./upstream-sync.md) | CI failures stop the update; humans resolve conflicts and validate integration |
 
 ## Current Telegram Status
 
@@ -98,7 +99,7 @@ The fork keeps behavior in fork-owned modules and touches upstream files only at
 | Feature | Fork-owned modules | Upstream seams |
 | --- | --- | --- |
 | Telegram surface | `apps/core/src/surface/telegram/` (adapter, ingress, output, store, protocol, and the router split into `telegram-request-router.ts`, `telegram-request-router-composition.ts`, and `telegram-request-router-publish.ts`; the router mirrors the upstream Discord router and imports the shared helpers under `surface/discord/discord-request-router/` unchanged, see [`telegram-feature-parity.md`](./telegram-feature-parity.md)). `telegram-surface-runtime.ts` is the single wiring entry Core calls: startup adapter resolution, the runtime descriptor entry, config hot-reload, and workflow target authorization | `runtime/create-core-runtime.ts` (four call sites: startup adapter resolution, the runtime descriptor input, config hot-reload, and the workflow target authorizer), `runtime/compose-builtin-surface-runtimes.ts` (one descriptor entry), the closed platform unions in `surface/types.ts`, `builtin-surface-protocols.ts`, `bridge/request-ids.ts`, the attachment-resolver capability in `surface/adapter.ts`, platform-aware composition and relay refs under `surface/bridge/`, Telegram platform filters in `transcript/transcript-store.ts` and the legacy snapshot decoders, and, under `workflow/`, the domain types, engine, waits, operation policy, progress projector and view, trigger scheduler, and durable store (Telegram targets, `waitForReply`, progress cards, and target revalidation) |
-| Telegram conversation memory | `apps/core/src/surface/telegram/telegram-conversation-source.ts` (SQL views over `telegram-surface.db`, projection decoders, attachment metadata) and the `telegramConversationMemoryInput` / `hydrateTelegramConversationAttachments` helpers in `telegram-surface-runtime.ts` | `conversation/thread-store.ts` (a third source branch, `telegram_thread` kind, allowlist clause), `thread-service.ts` (surface labels and allowlist checks), the summarization worker, its protocol, and `thread-worker.ts`, `runtime/create-core-runtime.ts` (attaches the source, hydrates Telegram refs, passes the worker paths, and adds `surface.telegram.botName` to the thread store's main-agent user names), `bus-agent-runner.ts` (recall surface label), `tool-server/tools/conversation-thread.ts` (enum), `packages/utils/prompt-templates/TOOLS.md` (Telegram `t.me` links) |
+| Telegram conversation memory | `apps/core/src/surface/telegram/telegram-conversation-source.ts` (SQL views over `telegram-surface.db`, projection decoders, attachment metadata) and the `telegramConversationMemoryInput` / `hydrateTelegramConversationAttachments` helpers in `telegram-surface-runtime.ts` | `conversation/thread-store.ts` (a third source branch, `telegram_thread` kind, allowlist clause), `thread-service.ts` (surface labels and allowlist checks), the summarization worker, its protocol, and `thread-worker.ts`, the search worker and its protocol (Telegram source paths, filters, allowlists, hit kinds, and source revision checks), `runtime/create-core-runtime.ts` (attaches the source, hydrates Telegram refs, passes the worker paths, and adds `surface.telegram.botName` to the thread store's main-agent user names), `bus-agent-runner.ts` (recall surface label), `tool-server/tools/conversation-thread.ts` (enum), `packages/utils/prompt-templates/TOOLS.md` (Telegram `t.me` links) |
 | Telegram configuration | `packages/utils/core-config/telegram-surface.ts` (type, defaults, v2 schema) and `telegram-runtime.ts` (token and database-path helpers) | `core-config/types.ts`, `v1.ts`, `v2.ts` (one field each) and `core-config.ts` re-exports |
 | OpenAI-compatible image provider | `apps/core/src/tool-server/tools/image-script-openai-compatible.ts`, `packages/utils/builtin-skills/image-generation/references/openai-compatible.md`, and `apps/core/tests/tool-server/image-script-openai-compatible.test.ts` | `tool-server/tools/image-script.ts` (adds the provider in `configuredImageProviders`), the `image-generation` `SKILL.md` catalog row, and `tests/tool-server-image-generation.test.ts` (isolates the provider from the environment) |
 | OpenAI `web.search` provider | `apps/core/src/tool-server/tools/web-search/openai-web-search-provider.ts` (Responses request, citation decoding, snippet labeling), `openai-web-search-model.ts` (endpoint resolution for `tools.web.openai.model`), and `apps/core/tests/tools/web-search-openai*.test.ts` | `tools/web-search.ts` (export), `web-search/default-web-search-providers.ts` (registration), `resolve-provider.ts` (missing-key message), `web-search/types.ts` (provider id), `tools/web.ts` and `web/provider-page-extraction.ts` (environment and search-only skip), `core-config/types.ts` and `v2.ts` (`openai` provider id and `tools.web.openai`) |
@@ -113,11 +114,12 @@ The fork keeps behavior in fork-owned modules and touches upstream files only at
 
 ## Branch Policy
 
-`main` is the only long-lived branch: upstream `main` plus the fork's features, always green. Everything else is short-lived and merges into `main` through a pull request so CI (including the upstream-footprint job) runs first.
+`main` is the only long-lived branch: upstream `main` plus the fork's features, always green. Other branches are short-lived and merge through a pull request. Clean automated upstream candidates are the exception: full CI (including the upstream-footprint job) runs before `main` fast-forwards to their existing commit. Only Git conflicts open an upstream synchronization PR.
 
 | Prefix | Use | Lifetime |
 | --- | --- | --- |
-| `chore/sync-upstream-YYYYMMDD` | Merging upstream `main`, conflict resolution, and any follow-up needed to keep fork features working with the new upstream | Deleted after the PR merges |
+| `chore/sync-upstream-<run-id>-<attempt>` | Clean upstream merge candidate verified before updating `main` | Deleted after successful update/publication dispatch; retained on failure |
+| `automation/sync-upstream` | Upstream conflict PR for human resolution and review | Deleted after the PR merges |
 | `feat/`, `fix/`, `refactor/`, `docs/`, `test/` | One change each, named after the change (`feat/telegram-forum-topics`) | Deleted after the PR merges |
 | `archive/<old-branch>` (tag, not branch) | Retired work whose commits are not in `main` but may be worth reading later | Permanent; never checked out for new work |
 
@@ -136,10 +138,15 @@ flowchart TD
     Fetch --> Behind{Fork behind upstream?}
     Behind -->|No| Stop[No change]
     Behind -->|Yes| Merge[Merge upstream main]
-    Merge --> Clean{Merge succeeds?}
-    Clean -->|Yes| Push[Push fork main]
+    Merge --> Clean{Git conflicts?}
+    Clean -->|No| CI[Full CI on candidate SHA]
+    CI --> Passed{All gates pass?}
+    Passed -->|No| Hold[Keep candidate; stop update]
+    Passed -->|Yes| Push[Fast-forward unchanged fork main]
     Push --> Build[Trigger image build]
-    Clean -->|No| Manual[Resolve and validate manually]
+    Clean -->|Yes| PR[Open PR; request Catalina-df review]
+    PR --> AI[Read-only Claude conflict analysis]
+    AI --> Manual[Human resolution and validation]
 ```
 
 Sync principles:

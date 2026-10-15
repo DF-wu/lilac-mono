@@ -194,3 +194,20 @@ test("unavailable retained images render a placeholder without requesting image 
   expect(html).toContain("Image unavailable");
   expect(html).not.toContain("<img");
 });
+
+test("HTML attachments share the Markdown toolbar and start in source mode", () => {
+  for (const name of ["review.html", "REVIEW.HTM"]) {
+    const html = renderToStaticMarkup(
+      <AttachmentPreviewBody
+        name={name}
+        href="/api/files/html"
+        kind="text"
+        text={{ status: "ready", text: "<h1>Report</h1>", truncated: true }}
+      />,
+    );
+    expect(html).toContain('aria-label="Preview HTML"');
+    expect(html).toContain('aria-label="Word wrap"');
+    expect(html).not.toContain("<iframe");
+    expect(html).toContain("Showing the first 64 KB");
+  }
+});

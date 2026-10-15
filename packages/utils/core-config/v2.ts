@@ -367,10 +367,7 @@ const discordSurfaceSchema = z
     outputPreviewModeFinalText: z.enum(["flat", "reply-chain"]).default("flat"),
     outputNotification: z.boolean().default(true),
     attachmentCache: discordAttachmentCacheSchema,
-    workingIndicators: z
-      .array(z.string().trim().min(1))
-      .min(1)
-      .default(cloneDefaultWorkingIndicators()),
+    workingIndicators: z.array(z.string().trim().min(1)).min(1).optional(),
     markdownTableRender: discordMarkdownTableRenderSchema,
     markdownMathRender: discordMarkdownMathRenderSchema,
   })
@@ -384,7 +381,6 @@ const discordSurfaceSchema = z
     outputPreviewModeFinalText: "flat",
     outputNotification: true,
     attachmentCache: { ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
-    workingIndicators: cloneDefaultWorkingIndicators(),
     markdownTableRender: {
       enabled: true,
       style: "unicode",
@@ -540,16 +536,76 @@ const toolsSchema = z
     },
   });
 
-const jevAutoInjectDefaultsV2 = {
-  model: "jev-1.13.0",
-  limit: 3,
-  candidateLimit: 30,
-  semanticFallback: true,
-  recallMinProbability: 0.7,
+const jevDecisionProbabilitiesV2 = {
+  recallMinProbability: 0,
   durableSubjectMinProbability: 0.6,
   casualMaxProbability: 0.6,
-  relevanceMinProbability: 0.6,
+  relevanceMinProbability: 0.2,
 };
+
+const lunaDecisionProbabilitiesV2 = {
+  recallMinProbability: 0,
+  durableSubjectMinProbability: 0.5,
+  casualMaxProbability: 0.3,
+  relevanceMinProbability: 0.1,
+};
+
+const decisionProbabilityOverridesSchemaV2 = z.object({
+  recallMinProbability: z.number().min(0).max(1).optional(),
+  durableSubjectMinProbability: z.number().min(0).max(1).optional(),
+  casualMaxProbability: z.number().min(0).max(1).optional(),
+  relevanceMinProbability: z.number().min(0).max(1).optional(),
+});
+
+const decisionAutoInjectDefaultsV2 = {
+  model: ["typesafe/jev-1.13.0"],
+  limit: 3,
+  candidateLimit: 40,
+  semanticFallback: true,
+  jev: jevDecisionProbabilitiesV2,
+  luna: lunaDecisionProbabilitiesV2,
+};
+
+const decisionAutoInjectSchemaV2 = decisionProbabilityOverridesSchemaV2
+  .extend({
+    model: z
+      .union([z.string().trim().min(1), z.array(z.string().trim().min(1)).min(1)])
+      .transform((model) => (typeof model === "string" ? [model] : model))
+      .default(decisionAutoInjectDefaultsV2.model),
+    limit: z.number().int().positive().max(10).default(decisionAutoInjectDefaultsV2.limit),
+    candidateLimit: z
+      .number()
+      .int()
+      .positive()
+      .max(50)
+      .default(decisionAutoInjectDefaultsV2.candidateLimit),
+    semanticFallback: z.boolean().default(decisionAutoInjectDefaultsV2.semanticFallback),
+    jev: decisionProbabilityOverridesSchemaV2.optional(),
+    luna: decisionProbabilityOverridesSchemaV2.optional(),
+  })
+  .transform(
+    ({
+      jev,
+      luna,
+      recallMinProbability,
+      durableSubjectMinProbability,
+      casualMaxProbability,
+      relevanceMinProbability,
+      ...options
+    }) => {
+      const legacy = {
+        ...(recallMinProbability !== undefined ? { recallMinProbability } : {}),
+        ...(durableSubjectMinProbability !== undefined ? { durableSubjectMinProbability } : {}),
+        ...(casualMaxProbability !== undefined ? { casualMaxProbability } : {}),
+        ...(relevanceMinProbability !== undefined ? { relevanceMinProbability } : {}),
+      };
+      return {
+        ...options,
+        jev: { ...jevDecisionProbabilitiesV2, ...legacy, ...jev },
+        luna: { ...lunaDecisionProbabilitiesV2, ...legacy, ...luna },
+      };
+    },
+  );
 
 const conversationSchemaV2 = z
   .object({
@@ -574,6 +630,7 @@ const conversationSchemaV2 = z
           .object({
             enabled: z.boolean().default(false),
             model: z.string().trim().min(1).default("openai/text-embedding-3-small"),
+            queryModel: z.string().trim().min(1).optional(),
           })
           .default({ enabled: false, model: "openai/text-embedding-3-small" }),
         autoInject: z
@@ -581,8 +638,18 @@ const conversationSchemaV2 = z
             enabled: z.boolean().default(false),
             plannerModel: z.string().trim().min(1).optional(),
             textPlannerModel: z.string().trim().min(1).optional(),
-            minTextUnits: z.number().int().positive().default(80),
-            followUpMinTextUnits: z.number().int().positive().default(110),
+            gate: z
+              .object({
+                mode: z.enum(["off", "shadow", "enforce"]).default("shadow"),
+                model: z
+                  .union([z.string().trim().min(1), z.array(z.string().trim().min(1)).min(1)])
+                  .transform((model) => (typeof model === "string" ? [model] : model))
+                  .default(["typesafe/jev-1.13.0"]),
+                skipMinProbability: z.number().min(0.5).max(1).default(0.8),
+              })
+              .optional(),
+            minTextUnits: z.number().int().positive().default(10),
+            followUpMinTextUnits: z.number().int().positive().default(10),
             limit: z.number().int().positive().max(10).default(3),
             minScore: z.number().nonnegative().default(0.1),
             expansionMinConfidence: z.number().min(0).max(1).default(0.57),
@@ -591,49 +658,39 @@ const conversationSchemaV2 = z
           })
           .default({
             enabled: false,
-            minTextUnits: 80,
-            followUpMinTextUnits: 110,
+            minTextUnits: 10,
+            followUpMinTextUnits: 10,
             limit: 3,
             minScore: 0.1,
             expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           }),
-        autoInjectMode: z.enum(["llm", "jev"]).default("llm"),
-        jevAutoInject: z
-          .object({
-            model: z.string().trim().min(1).default(jevAutoInjectDefaultsV2.model),
-            limit: z.number().int().positive().max(10).default(jevAutoInjectDefaultsV2.limit),
-            candidateLimit: z
-              .number()
-              .int()
-              .positive()
-              .max(50)
-              .default(jevAutoInjectDefaultsV2.candidateLimit),
-            semanticFallback: z.boolean().default(jevAutoInjectDefaultsV2.semanticFallback),
-            recallMinProbability: z
-              .number()
-              .min(0)
-              .max(1)
-              .default(jevAutoInjectDefaultsV2.recallMinProbability),
-            durableSubjectMinProbability: z
-              .number()
-              .min(0)
-              .max(1)
-              .default(jevAutoInjectDefaultsV2.durableSubjectMinProbability),
-            casualMaxProbability: z
-              .number()
-              .min(0)
-              .max(1)
-              .default(jevAutoInjectDefaultsV2.casualMaxProbability),
-            relevanceMinProbability: z
-              .number()
-              .min(0)
-              .max(1)
-              .default(jevAutoInjectDefaultsV2.relevanceMinProbability),
-          })
-          .default(jevAutoInjectDefaultsV2),
+        autoInjectMode: z
+          .enum(["llm", "decision", "jev"])
+          .default("llm")
+          .transform((mode) => (mode === "jev" ? ("decision" as const) : mode)),
+        decisionAutoInject: decisionAutoInjectSchemaV2.optional(),
+        jevAutoInject: decisionAutoInjectSchemaV2.optional(),
       })
+      .transform(({ jevAutoInject, decisionAutoInject, ...thread }) => ({
+        ...thread,
+        autoInject: {
+          ...thread.autoInject,
+          ...(thread.autoInject.gate || thread.autoInjectMode === "llm"
+            ? {}
+            : {
+                gate: {
+                  mode: "shadow" as const,
+                  model: (decisionAutoInject ?? jevAutoInject ?? decisionAutoInjectDefaultsV2)
+                    .model,
+                  skipMinProbability: 0.8,
+                },
+              }),
+        },
+        decisionAutoInject: decisionAutoInject ??
+          jevAutoInject ?? { ...decisionAutoInjectDefaultsV2 },
+      }))
       .default({
         summarization: {
           enabled: false,
@@ -645,8 +702,8 @@ const conversationSchemaV2 = z
         embedding: { enabled: false, model: "openai/text-embedding-3-small" },
         autoInject: {
           enabled: false,
-          minTextUnits: 80,
-          followUpMinTextUnits: 110,
+          minTextUnits: 10,
+          followUpMinTextUnits: 10,
           limit: 3,
           minScore: 0.1,
           expansionMinConfidence: 0.57,
@@ -654,7 +711,7 @@ const conversationSchemaV2 = z
           filterCurrentParticipants: false,
         },
         autoInjectMode: "llm",
-        jevAutoInject: jevAutoInjectDefaultsV2,
+        decisionAutoInject: decisionAutoInjectDefaultsV2,
       }),
   })
   .default({
@@ -669,8 +726,8 @@ const conversationSchemaV2 = z
       embedding: { enabled: false, model: "openai/text-embedding-3-small" },
       autoInject: {
         enabled: false,
-        minTextUnits: 80,
-        followUpMinTextUnits: 110,
+        minTextUnits: 10,
+        followUpMinTextUnits: 10,
         limit: 3,
         minScore: 0.1,
         expansionMinConfidence: 0.57,
@@ -678,7 +735,7 @@ const conversationSchemaV2 = z
         filterCurrentParticipants: false,
       },
       autoInjectMode: "llm",
-      jevAutoInject: jevAutoInjectDefaultsV2,
+      decisionAutoInject: decisionAutoInjectDefaultsV2,
     },
   });
 
@@ -844,6 +901,10 @@ export const coreConfigInputSchemaV2 = z.object({
 
   surface: z
     .object({
+      workingIndicators: z
+        .array(z.string().trim().min(1))
+        .min(1)
+        .default(() => cloneDefaultWorkingIndicators()),
       native: nativeSurfaceSchema,
       router: routerSchema,
       discord: discordSurfaceSchema,
@@ -853,6 +914,7 @@ export const coreConfigInputSchemaV2 = z.object({
     // Lazy: a literal default object is built once at module load and handed
     // out by reference, so every config would share the same nested arrays.
     .default(() => ({
+      workingIndicators: cloneDefaultWorkingIndicators(),
       native: defaultNativeSurfaceConfig(),
       router: {
         defaultMode: "mention" as const,
@@ -870,7 +932,6 @@ export const coreConfigInputSchemaV2 = z.object({
         outputPreviewModeFinalText: "flat" as const,
         outputNotification: true,
         attachmentCache: { ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
-        workingIndicators: cloneDefaultWorkingIndicators(),
         markdownTableRender: {
           enabled: true,
           style: "unicode" as const,
@@ -1014,6 +1075,7 @@ function coreConfigV2ToUniversal(
       ...isolated.surface,
       discord: {
         ...discord,
+        workingIndicators: discord.workingIndicators ?? isolated.surface.workingIndicators,
         attachmentCache: {
           ttlMs: retentionLimit(attachmentCache.ttl),
         },

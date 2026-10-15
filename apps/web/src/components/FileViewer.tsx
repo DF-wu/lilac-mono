@@ -92,6 +92,7 @@ export function FilePanelContent({
   if (kind === "text")
     return (
       <FileSource
+        href={file?.href}
         name={file?.name ?? target.name}
         text={text}
         line={target.line}

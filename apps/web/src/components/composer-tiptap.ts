@@ -1,8 +1,16 @@
 import { Extension, Node, getSchema, type Editor, type JSONContent } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
-import { Slice, type Node as DocumentNode, type Schema } from "@tiptap/pm/model";
-import { EditorState, TextSelection } from "@tiptap/pm/state";
+import { Slice, type Node as DocumentNode, type ResolvedPos, type Schema } from "@tiptap/pm/model";
+import { EditorState, TextSelection, Plugin } from "@tiptap/pm/state";
+import type { EditorView } from "@tiptap/pm/view";
+import {
+  parseReferenceHref,
+  referenceHref,
+  citationHref,
+  citationInputFits,
+  type AssistantCitation,
+} from "@stanley2058/lilac-client-protocol";
 import { KEYS, NodeApi } from "platejs";
 import {
   createComposerEditor,
@@ -11,12 +19,14 @@ import {
   composerPlainText,
 } from "./composer-document";
 import type { Attachment } from "../types";
+import { skillMentionPattern } from "./skill-mentions";
 
 export const attachmentNode = Node.create({
   name: "composer_attachment",
   group: "inline",
   inline: true,
   atom: true,
+  selectable: false,
   addAttributes: () => ({ attachmentKey: { default: "" }, name: { default: "File" } }),
   parseHTML: () => [{ tag: "span[data-composer-attachment]" }],
   renderHTML: ({ HTMLAttributes }) => [
@@ -30,6 +40,7 @@ export const referenceNode = Node.create({
   group: "inline",
   inline: true,
   atom: true,
+  selectable: false,
   addAttributes: () => ({ url: { default: "" } }),
   parseHTML: () => [{ tag: "span[data-composer-reference]" }],
   renderHTML: ({ HTMLAttributes }) => [
@@ -38,6 +49,104 @@ export const referenceNode = Node.create({
     HTMLAttributes.url,
   ],
 });
+export const citationNode = Node.create({
+  name: "composer_citation",
+  group: "inline",
+  inline: true,
+  atom: true,
+  selectable: false,
+  addAttributes: () => ({ url: { default: "" }, citationKey: { default: "" } }),
+  parseHTML: () => [{ tag: "span[data-composer-citation]" }],
+  renderHTML: ({ HTMLAttributes }) => [
+    "span",
+    { ...HTMLAttributes, "data-composer-citation": "", contenteditable: "false" },
+    "Assistant quote",
+  ],
+  addProseMirrorPlugins: () => [
+    new Plugin({
+      filterTransaction: (transaction) => {
+        if (!transaction.docChanged) return true;
+        let containsCitation = false;
+        transaction.doc.descendants((node) => {
+          if (node.type.name === "composer_citation") containsCitation = true;
+        });
+        return !containsCitation || citationInputFits(writeComposerDocument(transaction.doc));
+      },
+    }),
+  ],
+});
+
+export function insertEditorCitation(editor: Editor, citation: AssistantCitation) {
+  const key = crypto.randomUUID();
+  const { from, to } = editor.state.selection;
+  const before = from > 1 && /\S/.test(editor.state.doc.textBetween(from - 1, from));
+  const node = editor.schema.nodes.composer_citation!.create({
+    url: citationHref(citation),
+    citationKey: key,
+  });
+  const transaction = editor.state.tr;
+  const nodes = [...(before ? [editor.schema.text(" ")] : []), node, editor.schema.text(" ")];
+  const inserted = editor.schema.nodes.paragraph!.create(null, nodes).content;
+  transaction.replaceWith(from, to, inserted);
+  if (!citationInputFits(writeComposerDocument(transaction.doc))) return;
+  transaction.setSelection(
+    TextSelection.create(transaction.doc, from + (before ? 1 : 0) + node.nodeSize + 1),
+  );
+  editor.view.dispatch(transaction);
+  return { key, before };
+}
+export const skillNode = Node.create({
+  name: "composer_skill",
+  group: "inline",
+  inline: true,
+  atom: true,
+  selectable: false,
+  addAttributes: () => ({ id: { default: "" }, name: { default: "" }, text: { default: "" } }),
+  parseHTML: () => [{ tag: "span[data-composer-skill]" }],
+  renderHTML: ({ HTMLAttributes }) => [
+    "span",
+    { ...HTMLAttributes, "data-composer-skill": "", contenteditable: "false" },
+    HTMLAttributes.text,
+  ],
+});
+
+export function insertEditorReference(
+  view: EditorView,
+  from: number,
+  to: number,
+  text: string,
+  origin: string,
+): boolean {
+  const target = parseReferenceHref(text.trim(), origin);
+  if (!target) return false;
+  const node = view.state.schema.nodes.composer_reference!.create({ url: referenceHref(target) });
+  const transaction = view.state.tr;
+  if (transaction.selection.from !== from || transaction.selection.to !== to)
+    transaction.setSelection(TextSelection.create(transaction.doc, from, to));
+  view.dispatch(transaction.replaceSelectionWith(node).scrollIntoView());
+  return true;
+}
+
+export function composerBadgeSelection(
+  view: EditorView,
+  anchor: ResolvedPos,
+): TextSelection | null {
+  // Native edits can request a selection in a document the view has not applied yet.
+  if (anchor.doc !== view.state.doc) return null;
+  const selection = view.dom.ownerDocument.getSelection();
+  if (!selection?.isCollapsed || !selection.focusNode) return null;
+  const focus = selection.focusNode;
+  const element = focus.nodeType === 1 ? (focus as Element) : focus.parentElement;
+  const badge = element?.closest("[data-composer-badge]");
+  if (!badge || !view.dom.contains(badge)) return null;
+  const from = view.posAtDOM(badge, 0);
+  const node = view.state.doc.nodeAt(from);
+  if (!node?.isAtom) return null;
+  const to = from + node.nodeSize;
+  // Android drops its IME connection at non-editable spans. Keep the DOM editable,
+  // then move native caret positions inside a badge across the atomic model node.
+  return TextSelection.create(view.state.doc, view.state.selection.head >= to ? from : to);
+}
 
 const indentation = Extension.create({
   name: "composerIndentation",
@@ -103,7 +212,13 @@ export const composerExtensions = [
   indentation,
   horizontalRule,
 ];
-export const composerSchema = getSchema([...composerExtensions, attachmentNode, referenceNode]);
+export const composerSchema = getSchema([
+  ...composerExtensions,
+  attachmentNode,
+  referenceNode,
+  skillNode,
+  citationNode,
+]);
 export { Placeholder };
 
 type ComposerLeaf = {
@@ -142,6 +257,8 @@ function inline(nodes: ComposerNode[]): JSONContent[] {
     if (node.type === "composer_attachment")
       return [{ type: node.type, attrs: { attachmentKey: node.attachmentKey, name: node.name } }];
     if (node.type === "composer_reference") return [{ type: node.type, attrs: { url: node.url } }];
+    if (node.type === "composer_citation")
+      return [{ type: node.type, attrs: { url: node.url, citationKey: crypto.randomUUID() } }];
     return inline(node.children);
   });
 }
@@ -237,6 +354,10 @@ function leaves(node: DocumentNode): ComposerNode[] {
     }
     if (child.type.name === "hardBreak") {
       result.push({ text: "\n" });
+      return;
+    }
+    if (child.type.name === "composer_skill") {
+      result.push({ text: child.attrs.text });
       return;
     }
     result.push({ type: child.type.name, ...child.attrs, children: [{ text: "" }] });
@@ -343,6 +464,14 @@ export function editorAttachmentKeys(doc: DocumentNode): Set<string> {
   });
   return keys;
 }
+export type ComposerSkill = { id: string; name: string };
+export function editorSkillIds(doc: DocumentNode): string[] {
+  const ids = new Set<string>();
+  doc.descendants((node) => {
+    if (node.type.name === "composer_skill") ids.add(node.attrs.id);
+  });
+  return [...ids];
+}
 export function insertEditorAttachment(
   editor: Editor,
   attachment: Pick<Attachment, "key" | "file">,
@@ -390,11 +519,57 @@ export function captureEditorPaste(editor: Editor) {
     },
   };
 }
-export function completeEditor(editor: Editor, text: string, length: number) {
+/** `after` extends the replacement past the cursor; `space` appends a separating space. */
+export type CompletionRange = { space?: boolean; after?: number };
+export function completeEditor(
+  editor: Editor,
+  text: string,
+  length: number,
+  skill?: ComposerSkill,
+  { space = true, after = 0 }: CompletionRange = {},
+) {
   const { from } = editor.state.selection;
+  const start = Math.max(1, from - length);
+  const end = Math.min(from + after, editor.state.selection.$from.end());
+  const { schema, tr } = editor.state;
+  if (!skill) {
+    editor.view.dispatch(tr.insertText(space ? `${text} ` : text, start, end).scrollIntoView());
+    return;
+  }
   editor.view.dispatch(
-    editor.state.tr.insertText(`${text} `, Math.max(1, from - length), from).scrollIntoView(),
+    tr
+      .replaceWith(start, from, [
+        schema.nodes.composer_skill!.create({ ...skill, text }),
+        schema.text(" "),
+      ])
+      .scrollIntoView(),
   );
+}
+// Drafts store skill mentions as text. Restore badges for mentions of skills the draft selected.
+export function markEditorSkills(editor: Editor, skills: readonly ComposerSkill[]) {
+  if (!skills.length) return;
+  const pattern = skillMentionPattern(skills.map((skill) => skill.name));
+  const { schema, tr } = editor.state;
+  editor.state.doc.descendants((node, pos) => {
+    if (node.type.name === "codeBlock") return false;
+    if (!node.isText || node.marks.some((mark) => mark.type.name === "code")) return;
+    const before = editor.state.doc.resolve(pos).nodeBefore;
+    const boundary = !before || before.type.name === "hardBreak";
+    for (const match of node.text!.matchAll(pattern)) {
+      if (match.index === 0 && !match[1] && !boundary) continue;
+      const from = pos + match.index + match[1]!.length;
+      tr.replaceWith(
+        tr.mapping.map(from),
+        tr.mapping.map(from + match[2]!.length),
+        schema.nodes.composer_skill!.create({
+          id: skills.find((skill) => skill.name === match[3])!.id,
+          name: match[3],
+          text: match[2],
+        }),
+      );
+    }
+  });
+  if (tr.docChanged) editor.view.dispatch(tr.setMeta("addToHistory", false));
 }
 export function replaceEditorDocument(editor: Editor, text: string) {
   const doc = readComposerDocument(text, editor.schema);

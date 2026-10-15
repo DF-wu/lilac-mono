@@ -1,5 +1,12 @@
 # Core Config Migrations
 
+## Separate thread query embeddings
+
+`conversation.thread.embedding.queryModel` optionally selects the search-query encoder.
+It defaults to `embedding.model`, which remains the document encoder and stored embedding ID.
+Both encoders must share a vector space and dimensions. Changing the document model requires
+re-embedding existing summary facets. No schema-version or database change is required.
+
 This guide records manual `core-config.yaml` changes between config versions. The current field-level
 reference is
 [`packages/utils/config-templates/core-config.example.yaml`](../packages/utils/config-templates/core-config.example.yaml).
@@ -10,12 +17,154 @@ application consumes only the universal shape.
 ## Versioning Rules
 
 - New generated configs include `configVersion`.
-- Existing configs without `configVersion` are treated as `configVersion: 1`.
+- Existing configs with omitted `configVersion` are treated as `configVersion: 1`.
+  The version dispatcher also selects v1 for `null`, but the v1 literal schema rejects it; omit the
+  key or use numeric `1` / `2`. Strings such as `"2"` fail version validation.
 - Lilac does not auto-upgrade config files at startup.
 - Versioned parsers own defaults for their version.
 - New behavior-changing defaults apply only to configs on the version that introduced them.
 - If a newer field cannot be represented safely in an older version, that field requires the newer
   `configVersion`.
+
+## Validation, units, and reload boundaries
+
+The runtime parser logs and ignores most unknown keys. This is not a guarantee that a typo is safe:
+known fields with invalid types/ranges fail, explicitly removed fields fail with migration guidance,
+and `blobStorage` objects are strict (unknown adapter keys fail). Unknown model option names produce
+separate warnings and are not proof that a provider supports a value. Plugin config payloads are
+opaque to Core and may have their own plugin validation. The editor's generated JSON Schema is a
+separate validation layer; the versioned parser is the runtime authority.
+
+Friendly units are field-specific, not a feature of every `*Ms` field:
+
+| Fields (v2 input) | Accepted values |
+| --- | --- |
+| `tools.output.maxPreviewBytes`, `artifactMaxBytesPerSession`; `tools.media.maxInlineBytesPerPart`, `maxInlineBytesTotal`; `surface.telegram.inboundMedia.maxBytesPerAttachment`, `maxBytesPerRequest` | Positive integer bytes or `B`, `KB`, `MB`, `GB`, `KiB`, `MiB`, `GiB` strings |
+| `tools.output.artifactTtl`, `tools.web.firecrawl.queueTtl` | Positive integer milliseconds or `ms`, `s`, `m`, `h`, `d`, `w`, `mo` strings |
+| `agent.transcriptRetention.maxAge`, `surface.discord.attachmentCache.ttl` | The same positive duration values, or `"unlimited"` |
+| `agent.transcriptRetention.maxRequests` | Positive integer count, or `"unlimited"` |
+| Legacy native initial-import `oldMessageSelectionMaxAgeMs`, `storageRetentionMaxAgeMs` | The same positive duration values, or `null` (no age limit) |
+| Router `activeDebounceMs`, `activeGate.timeoutMs`; heartbeat `quietAfterActivityMs`, `retryBusyMs`; agent `idleTimeoutMs`, retry `baseDelayMs`, `maxDelayMs`; Telegram `streamEditIntervalMs` | Integer milliseconds only; field-specific ranges apply |
+
+Unit suffixes are case-sensitive, with no spaces: `1.5MiB` and `3s` are valid when they normalize to
+integer values. `mo` is exactly 30 days; decimal byte units use powers of 1000, binary units powers of
+1024. `"unlimited"` applies only to the retention fields listed above. Counts, token thresholds,
+concurrency, and widths are integers without unit suffixes. See
+[`friendly-units.ts`](../packages/utils/friendly-units.ts) and the
+[v2 schema](../packages/utils/core-config/v2.ts).
+
+Core watches the file, forces validation/reload, updates the current config and native catalog,
+refreshes connected Discord/Telegram adapters, reloads tool plugins, and marks conversation
+materialization dirty. Consumers observe changes at their next config read; this does not rebuild
+startup resources or guarantee that an in-flight run changes settings. Transcript retention applies
+on the next save. A failed reload is logged as a validation failure, not a successful application.
+
+| Restart boundary | Operational effect |
+| --- | --- |
+| `blobStorage` adapter and storage/credential configuration | The blob store is created once. Restart after a verified data cutover; a YAML edit does not migrate objects. |
+| Native `enabled`, `host`, `port`, `publicUrl`, `installationId`, `allowedOrigins`, `auth`, and authentication environment secrets | Listener, installation and authenticator are startup resources. Restart and update proxy/container mappings as needed. |
+| Discord `tokenEnv`, `dbPath`, `memberPresence` | Connection token, store and gateway intents are established at startup. Restart. |
+| Telegram `enabled`, `token`, `apiRoot`, `dbPath`, `commandMenu` | Connected adapters pin old values during reload and log restart requirements. A disabled/skipped adapter is not created on reload. Restart. |
+
+Telegram authorization/rendering settings reload on the connected adapter. Its bot identity/username
+is established on connection; reconnect/restart when changing that identity. Native deployment
+settings instead belong to the database after their first import; see the final section.
+Evidence: [`create-core-runtime.ts`](../apps/core/src/runtime/create-core-runtime.ts),
+[`telegram-adapter.ts`](../apps/core/src/surface/telegram/telegram-adapter.ts), and
+[`native/runtime.ts`](../apps/core/src/surface/native/runtime.ts).
+
+## Retired batch configuration
+
+The `batch` tool and expansion API are removed. Remove `batch` from explicit profile tool lists and
+remove maintained `tools.batch.maxCalls` settings. That setting is still accepted and defaulted in
+the universal shape solely for compatibility; it has no execution effect. Plugin `supportsBatch` and
+`editTargets` are also inert compatibility fields. Ordinary tool calls run concurrently in groups
+separated by mutation barriers; Bash calls may race. See
+[`MIGRATIONS.md#batch-retirement`](../MIGRATIONS.md#batch-retirement).
+
+## Web, tool output, and plugin policies
+
+`tools.fsBackend` selects `fff` (v2 default, including `fuzzy_search`) or `node-rg` (without
+`fuzzy_search`). New Level-1 toolsets use the current config; startup-only fff prewarming is not rerun
+on reload. See [`builtin/local-tools.ts`](../apps/core/src/plugins/builtin/local-tools.ts) and
+[`plugins/manager.ts`](../apps/core/src/plugins/manager.ts). `tools.web.extract.providers` is one ordered,
+nonempty, deduplicated chain for both search and page extraction. Unconfigured providers are skipped.
+Search retries the next configured provider on retryable failures; extraction also advances on
+fallback-eligible content failures. Abort and terminal failures can end the chain. `openai` is
+search-only and is skipped for page extraction.
+
+`tools.web.fetch.mode` defaults to `auto` and can be overridden per call:
+
+- `auto`: direct HTTP, then browser on failed/weak content, then providers for non-HTML content;
+  retained browser content can be a final fallback.
+- `fetch`: direct HTTP only.
+- `browser`: browser only.
+- `extract`: provider extraction with browser fallback on failure, except cancellation.
+- `provider-only`: provider extraction without HTTP/browser fallback.
+
+`web.extract` uses the provider chain without browser fallback. These modes do not select the search
+provider. See [`tools/web.ts`](../apps/core/src/tool-server/tools/web.ts).
+
+`tools.output` limits tool text in the model view and stores overflow as a scoped `resource://`
+artifact. Its TTL/quota apply to transient tool-result artifacts, not all managed blobs. If artifact
+storage fails, an overflow marker does not recover the full result. `tools.media` limits decoded
+binary parts in the model view; oversized or unsupported parts degrade to markers. Telegram ingress
+media has separate budgets. `tools.historicalResultPruning` rewrites old tool results in the model
+view rather than deleting transcripts: it skips the latest human turn and protected tools, protects
+a recent estimated-token budget, and only prunes when eligible output exceeds `minimumTokens`.
+Evidence: [`tool-result-output-normalizer.ts`](../packages/tool-results/src/tool-result-output-normalizer.ts)
+and [`bus-agent-runner.ts`](../apps/core/src/surface/bridge/bus-agent-runner.ts).
+
+`plugins.disabled` contains built-in/external plugin IDs to suppress. `plugins.config` maps plugin IDs
+to opaque plugin-owned payloads. External plugins are discovered in `<DATA_DIR>/plugins`; config
+changes reload the tool/plugin manager and are subject to plugin lifecycle and validation. These
+fields do not install packages. See [plugin authoring](../PLUGIN_AUTHORING.md) and
+[`plugins/manager.ts`](../apps/core/src/plugins/manager.ts).
+
+## Model examples and capabilities
+
+Use one `models.def` mapping with slash-free alias keys and `provider/model` values. `comment` supplies
+dynamic subagent selection guidance; `agentCanSelect: true` opts in an alias, without restricting static
+profiles, slots, or human overrides. Alias guidance does not become a system-prompt instruction.
+Entity comments are different: they do enter the configured-alias prompt overlay alongside alias/ID.
+Keep them suitable for agent-visible context. See
+[`prompt-overlays.ts`](../apps/core/src/surface/bridge/bus-agent-runner/prompt-overlays.ts).
+
+Runtime provider families are `ai-sdk` and `claude-code`, not upstream vendors. An AI SDK head can
+automatically switch between OpenAI, Anthropic, OpenRouter, and other AI SDK providers; it skips
+`claude-code` candidates. A `claude-code` head never runs automatic fallback. Explicit selections
+between these history families remain possible with lossy text replay. See
+[`agent-composition.ts`](../apps/core/src/agent/agent-composition.ts) (`selectNextNativeModelFallback`). Use model options for
+the selected provider: Anthropic adaptive thinking has no `budgetTokens`; that option belongs to
+enabled thinking (the installed SDK permits omission). Vercel routing preferences belong to `gateway`, while OpenRouter reasoning belongs to
+`openrouter.reasoning`. Keep options either flat or a namespace map; do not mix them. Generic
+OpenRouter forwards `temperature`, while direct `openai` / `openaiCompatible` option schemas do not
+accept it here. Model acceptance, credentials and upstream option support still need to be verified
+for your endpoint. Keep the active `basePrompt` once; Codex uses it as Responses instructions
+when `codex_instructions` is absent, and other providers prepend it to prompt files.
+
+`models.capability.forceUnknownProviders` suppresses registry lookup, not explicit overrides or
+provider calls. Explicit overrides can inherit from a resolvable model even for a forced-unknown
+provider. Without `inherit`, Core does not implicitly merge a models.dev base: resolution needs
+`limit.context`; a cost patch needs both `input` and `output`; a modalities patch needs `input`.
+The v2 parser already enforces these requirements for manual overrides. Missing output limit becomes
+`0`, and omitted costs/attachment/modalities remain unknown. Self-inheritance creates an override
+cycle. Inherited partial patches can parse and still fail resolution when their base is unavailable.
+Use `inherit` for partial patches and verify the inheritance target. Costs
+are USD per million tokens. See [`model-capability.ts`](../packages/utils/model-capability.ts).
+
+Heartbeat's default output accepts only `discord/<channel ID or alias>` or
+`github/OWNER/REPO#NUMBER`, for example `github/DF-wu/lilac-mono#123`. Native/Telegram destinations are
+not accepted by this field. The GitHub thread and adapter access must exist; parsing the prefix alone
+is not an access check. See [heartbeat schema](../packages/utils/core-config/v1.ts) and
+[`github-ids.ts`](../apps/core/src/github/github-ids.ts).
+
+## Shared working indicators
+
+Version 2 adds `surface.workingIndicators`. Native web and Discord use this shared list by default.
+`surface.discord.workingIndicators` remains valid and overrides it for Discord only. To use one
+custom list everywhere, move it from `surface.discord` to `surface`. Configs that set neither field
+use the built-in list on both surfaces.
 
 ## Native web port
 
@@ -28,22 +177,40 @@ Explicit port, URL and origin values are preserved. To move an existing deployme
 public URL changes, also update `publicUrl`, `allowedOrigins` and any reverse-proxy destination.
 The installer preserves existing deployment port mappings. No config-version bump is required.
 
-## Jev auto-inject lane
+## Decision auto-inject lane
 
-Version 2 accepts `conversation.thread.autoInjectMode`, defaulting to `llm`, which keeps the existing
-length gate, planner and ranking. Set it to `jev` to replace them with one TypeSafe Jev call. The call
-decides whether the latest message needs past context and which shortlisted threads help. The shortlist
-matches any message word against thread summaries. When nothing matches and embeddings are configured, it
-falls back to a single embedding search. `conversation.thread.autoInject.enabled` still turns the feature
-on, and `filterCurrentParticipants` applies to both lanes.
+Version 2 uses `conversation.thread.autoInjectMode: decision` and
+`conversation.thread.decisionAutoInject`. Rename the old `jev` mode and `jevAutoInject` section.
+Existing version-2 Jev settings still parse into the new runtime fields without changing thresholds.
+If both sections exist, `decisionAutoInject` takes precedence. No config-version bump is required.
 
-`conversation.thread.jevAutoInject` holds the Jev options: `model`, `limit`, `candidateLimit`,
-`semanticFallback`, and the probability thresholds `recallMinProbability`,
-`durableSubjectMinProbability`, `casualMaxProbability` and `relevanceMinProbability`. The `jev` mode
-requires `TYPESAFE_AI_API_KEY`; `TYPESAFE_AI_BASE_URL` optionally overrides the API endpoint. Without a
-key, Lilac logs an error and answers without injected metadata.
+The decision lane uses a local shortlist and one call to judge whether past context helps and which
+threads to inject. The `llm` lane remains the default. `autoInject.enabled` and
+`filterCurrentParticipants` still apply to both lanes.
 
-Both fields are optional; no config rewrite is required. Remove them before using an older parser.
+`decisionAutoInject.model` is an ordered, nonempty array. Configure
+`[typesafe/jev-1.13.0, openai/gpt-6-luna]` to use Jev for text and Luna for image attachments.
+Text selects the first entry. A supported image in the latest user message selects the first
+image-capable entry; if none is configured, the first entry evaluates text only. PDFs alone do not
+select Luna. This is routing, not a retry or failure fallback chain. Only the selected model needs
+credentials. A single string and bare Jev model IDs remain supported as legacy input. TypeSafe uses `TYPESAFE_AI_API_KEY` and optional `TYPESAFE_AI_BASE_URL`; OpenAI uses
+`OPENAI_API_KEY` and optional `OPENAI_BASE_URL`. The endpoint must support `/v1/decisions`.
+Missing credentials and evaluation failures continue without injected metadata. A refused question
+counts as "no" for that question. A zero recall threshold disables message gating.
+
+OpenAI receives attached images as native inline image parts, independently of the primary agent's
+image support. Jev evaluates text only. Shortlisting uses the latest authored text and up to three recent authored user messages; image-only
+messages do not run automatic recall. Image preparation uses existing scoped resource access and inline
+media limits. Images are kept in memory. No transcript or database migration is needed.
+
+`decisionAutoInject` retains shared `limit`, `candidateLimit`, and `semanticFallback`. The four
+probability thresholds now live under `decisionAutoInject.jev` and `decisionAutoInject.luna`.
+TypeSafe Jev IDs use the `jev` scope; OpenAI Luna IDs use `luna`. Each scope has independent defaults.
+Legacy flat thresholds apply to both scopes, and explicit scoped fields override them individually.
+The default model list contains Jev only. Both recall thresholds default to zero, and relevance
+thresholds default to 0.2 for Jev and 0.1 for Luna. The default candidate budget is 40. With
+`semanticFallback: true`, lexical and semantic retrieval share that budget even when lexical matches
+exist. Set it to false for lexical-only retrieval. Explicit configured values retain precedence.
 
 ## Native title model
 
@@ -53,7 +220,9 @@ first-line fallback while this model generates a title without tools. An ambiguo
 be refined once using the first user input and final assistant reply. Manual titles always win, and
 model failures retain the current title. Existing conversations are not renamed.
 
-The field is optional; no config rewrite is required. Remove it before using an older parser.
+The YAML field is now a legacy initial-import value only. Existing native deployment records use
+Settings > Deployment, so editing YAML will not change their title model. No config rewrite is required.
+Remove the field before using a parser that predates it.
 
 ## Image routes removed
 
@@ -184,16 +353,15 @@ New v2 fields:
   `0.57`. Frozen v1 configs receive the same universal default but cannot override it.
 - `conversation.thread.autoInject.mode`: search mode (`hybrid`, `semantic`, or `lexical`); defaults to
   `hybrid`.
-- `conversation.thread.autoInject.filterCurrentParticipants`: optionally restricts search to threads
-  involving any current participant; defaults to `false`. If enabled when no current participant identity
-  can be recovered, auto-injection is skipped.
+- `conversation.thread.autoInject.filterCurrentParticipants`: defaults to `false`; applies to both
+  `llm` and `decision` lanes. With recovered participant IDs, Discord/Telegram origins recall
+  same-platform threads involving any recovered participant plus Native threads, excluding the other
+  messaging platform. Native origins and requests without recovered IDs continue without a participant
+  filter, subject to normal candidate eligibility.
 - `tools.output`: direct-result preview and transient artifact policy. Defaults to `40KiB`, `7d`, and
   `50MiB` per session.
 - `tools.historicalResultPruning`: compatibility policy for rewriting old tool results. It defaults to
   disabled with the prior `40000`/`20000` token thresholds retained when enabled.
-- `tools.batch.maxCalls`: maximum calls accepted by one batch; defaults to `8`.
-- Batch now expands children into ordinary Level 1 tool calls. Enabled tools are batchable by default;
-  plugin authors can set `supportsBatch: false` to opt out.
 - `tools.media`: model-view inline binary limits. Defaults to `10MiB` per part and `20MiB` in total.
 - `agent.retry`: transient upstream and replay-safe primary idle-timeout retry policy. Frozen v1 configs
   cannot configure it; the version-specific defaults are listed below.
@@ -260,7 +428,8 @@ blobStorage:
 The bucket must already exist. Core does not create it or manage its lifecycle policy. Credentials are
 read only from the named environment variables. To move an existing Core data set between local and S3,
 stop Core, copy the whole blob store while preserving object IDs, verify all durable references, and
-switch config only after verification. The persisted-data cutover is documented in
+switch config only after verification, then restart Core. Reload does not replace the active adapter.
+The persisted-data cutover is documented in
 [`MIGRATIONS.md`](../MIGRATIONS.md#core-unified-blob-storage-clean-break).
 
 Changed v2 fields:
@@ -273,14 +442,14 @@ Changed v2 fields:
   by that slot; an explicitly present empty chain suppresses lower-precedence inheritance. An explicit
   alias request override uses that alias's chain, while an explicit `provider/model` override has no
   fallback chain.
-- Automatic model fallback exhausts each candidate's retry budget before moving on, stays within the head
-  model's provider family, and is disabled for a `claude-code` head. There is no global fallback enable
+- Automatic model fallback exhausts each candidate's retry budget before moving on, can switch upstream
+  vendors within `ai-sdk`, skips `claude-code` candidates, and is disabled for a `claude-code` head. There is no global fallback enable
   flag or switch cap. v2 model aliases must not contain `/`, and each `models.def.<alias>.model` must use
   `provider/model` format.
 
-Tool byte-size fields accept `B`, `KB`, `MB`, `GB`, `KiB`, `MiB`, and `GiB`. Duration fields accept `ms`,
-`s`, `m`, `h`, `d`, `w`, and `mo`; `mo` is a fixed 30 days. These fields cannot be configured in the
-frozen v1 input shape, but v1 receives the same universal runtime defaults.
+The field-specific unit table above lists accepted suffixes and exceptions. New v2 tool-output/media
+and retention fields cannot be configured in frozen v1 input, which receives universal fallbacks;
+existing v1 web/router/heartbeat configuration is still supported by its own schema.
 
 Default changes from v1:
 
@@ -308,4 +477,8 @@ Native startup imports `surface.native.titleModel`, `outputStreaming`,
 `oldMessageSelectionMaxAgeMs`, `storageRetentionMaxAgeMs`, and `crossThreadSend` once into
 the native database. After that, use Settings > Deployment. The old YAML keys are accepted
 only as initial import values and may be removed after startup; they do not override database
-settings. The import preserves the YAML file, including comments. See MIGRATIONS.md.
+settings, even after a restart. The import preserves the YAML file, including comments. The age fields
+accept positive friendly durations or `null` (no limit); `outputStreaming` is `paragraph` or `complete`,
+and `crossThreadSend.triggerRun` defaults to `true`. Listener/authentication settings remain in YAML
+and require restart, as described above. See
+[`MIGRATIONS.md`](../MIGRATIONS.md#native-deployment-settings).

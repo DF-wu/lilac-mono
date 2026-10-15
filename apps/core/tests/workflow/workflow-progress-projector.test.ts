@@ -36,6 +36,7 @@ import type {
   RegisteredSurfaceWorkflowProgressRegistration,
   SurfaceProtocolResolver,
   SurfaceWorkflowProgressPort,
+  WorkflowProgressContent,
 } from "../../src/surface/runtime-descriptor";
 import type {
   ContentOpts,
@@ -1689,7 +1690,7 @@ describe("WorkflowProgressProjector", () => {
     let sends = 0;
     let edits = 0;
     const sentContents: ContentOpts[] = [];
-    const editedContents: ContentOpts[] = [];
+    const editedContents: WorkflowProgressContent[] = [];
     const createdRef = {
       platform: "github" as const,
       channelId: "channel-1",
@@ -1771,6 +1772,7 @@ describe("WorkflowProgressProjector", () => {
         JSON.stringify({
           text: restartedContent?.text,
           actions: restartedContent?.actions,
+          workflow: restartedContent?.workflow,
           revision: HASH_A,
         }),
       );

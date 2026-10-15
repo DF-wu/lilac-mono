@@ -10,6 +10,7 @@ import { Result, TaggedError } from "better-result";
 import { z } from "zod";
 import { createNativeMetrics, type NativeMetrics } from "./metrics";
 import { captureError } from "../../shared/error-capture";
+import { handleRemoteImage } from "./remote-image";
 import type { NativeAuthenticator, NativeAuthError, NativeLogin, NativePrincipal } from "./auth";
 import {
   createNativeRouter,
@@ -330,6 +331,7 @@ export function createNativeGateway(options: NativeGatewayOptions) {
       if (response.ok) closeSession(user.sessionId);
       return response;
     }
+    if (url.pathname === "/api/remote-image") return handleRemoteImage(request);
     if (options.resources) {
       const resource = await options.resources.handle(request, user.userId);
       if (resource) return resource;

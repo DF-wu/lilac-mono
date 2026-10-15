@@ -4,6 +4,7 @@ import { LoadingSpinner } from "./ui/loading-spinner";
 import { useWorkspace } from "../workspace-context";
 import { useQuery } from "@tanstack/react-query";
 import { participantOptions, useNativeOnline } from "../queries";
+import { sidebarPreferencesOptions } from "../sidebar-queries";
 import { useEffect, useState, type ComponentType, type ReactNode } from "react";
 import {
   SquarePen,
@@ -18,9 +19,15 @@ import {
   MessageCircleQuestion,
 } from "lucide-react";
 import type { NativeThread, NativeUser } from "@stanley2058/lilac-client-protocol";
-import { relativeThreadTime } from "../thread-metadata";
+import {
+  defaultAutoSettleDays,
+  relativeThreadTime,
+  threadAge,
+  workingDuration,
+} from "../thread-metadata";
 import { Button } from "./ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+import { AvatarGroup } from "./ui/avatar";
 import { ActorAvatar } from "./ActorAvatar";
 import "./thread-card.css";
 
@@ -40,10 +47,13 @@ export function ThreadCard({
   starterAvatarUrl,
   starterIcon,
   updatedAt,
+  workingSince,
   now,
+  settleDays,
   state,
   selected,
   pinned,
+  settled,
   draft,
   actions,
   onSelect,
@@ -54,19 +64,24 @@ export function ThreadCard({
   starterAvatarUrl?: string;
   starterIcon?: ReactNode;
   updatedAt?: number;
+  workingSince?: number;
   now?: number;
+  settleDays?: number;
   state: ThreadDisplayState;
   selected?: boolean;
   pinned?: boolean;
+  settled?: boolean;
   draft?: "new" | "reply";
   actions?: ReactNode;
   onSelect: () => void;
 }) {
   const shortcut = useThreadShortcut(shortcutId);
   const StatusIcon = states[state].icon;
+  const runningSince = state === "working" ? workingSince : undefined;
   return (
     <div
       className={`thread-card relative min-w-0 rounded-md ${selected ? "selected" : ""}`}
+      data-settled={settled || undefined}
       data-state={state}
       data-draft={selected ? undefined : draft}
     >
@@ -77,59 +92,103 @@ export function ThreadCard({
         aria-keyshortcuts={shortcut.aria}
         aria-label={`${title || "Untitled"}, ${states[state].label}${draft && !selected ? ", Draft" : ""}`}
       />
-      <span className="thread-card-copy relative pointer-events-none flex min-w-0 flex-col gap-0 pt-[calc(var(--ui-space-unit)*1.5)] px-3 pb-3">
-        <span className="thread-card-top flex items-center gap-2 h-[var(--ui-control-compact)] text-xs text-muted-foreground">
-          <span className="thread-starter flex min-w-0 items-center gap-1">
-            {draft && !selected ? (
-              <span
-                className="thread-draft-icon text-draft flex-none grid place-items-center"
-                aria-label="Draft"
-              >
-                <SquarePen />
-              </span>
-            ) : null}
-            {starterIcon ? (
-              <span className="thread-starter-icon flex-none grid place-items-center size-[var(--ui-text-lg)]">
-                {starterIcon}
-              </span>
-            ) : (
-              <ActorAvatar displayName={starterName} avatarUrl={starterAvatarUrl} />
-            )}
-            <span>{starterName}</span>
+      {settled ? (
+        <div className="thread-card-copy relative pointer-events-none flex min-w-0 items-center gap-2 px-3 py-1">
+          <AvatarGroup className="thread-settled-avatars shrink-0 -space-x-2 [&>[data-slot=avatar]]:size-[var(--ui-text-lg)] [&>[data-slot=avatar]]:ring-0">
+            <ActorAvatar displayName="Lilac" agentProfile="self" size="sm" />
+            <ActorAvatar displayName={starterName} avatarUrl={starterAvatarUrl} size="sm" />
+          </AvatarGroup>
+          {draft && !selected ? (
+            <span className="thread-draft-icon text-draft flex-none" aria-label="Draft">
+              <SquarePen />
+            </span>
+          ) : null}
+          <span className="thread-card-title min-w-0 flex-1 truncate text-sm">
+            {title || "Untitled"}
           </span>
-          <span className="thread-card-meta ml-auto flex-none flex items-center gap-1">
-            <span className="thread-card-status flex items-center gap-1">
-              {pinned ? (
-                <span className="thread-pin grid place-items-center flex-none" aria-label="Pinned">
-                  <Pin />
+          {actions ? (
+            <span
+              data-ui="thread-card-actions"
+              className="thread-card-actions flex shrink-0 items-center opacity-0 pointer-events-none"
+            >
+              {actions}
+            </span>
+          ) : null}
+        </div>
+      ) : (
+        <span className="thread-card-copy relative pointer-events-none flex min-w-0 flex-col gap-0 pt-[calc(var(--ui-space-unit)*1.5)] px-3 pb-3">
+          <span className="thread-card-top flex items-center gap-2 h-[var(--ui-control-compact)] text-xs text-muted-foreground">
+            <span className="thread-starter flex min-w-0 items-center gap-1">
+              {draft && !selected ? (
+                <span
+                  className="thread-draft-icon text-draft flex-none grid place-items-center"
+                  aria-label="Draft"
+                >
+                  <SquarePen />
                 </span>
               ) : null}
-              {state !== "idle" ? (
-                <span
-                  className="thread-state-icon w-[var(--ui-text-lg)] h-[var(--ui-text-lg)] flex-none grid place-items-center text-muted-foreground"
-                  aria-label={states[state].label}
-                >
-                  <StatusIcon />
+              {starterIcon ? (
+                <span className="thread-starter-icon flex-none grid place-items-center size-[var(--ui-text-lg)]">
+                  {starterIcon}
                 </span>
+              ) : (
+                <ActorAvatar displayName={starterName} avatarUrl={starterAvatarUrl} />
+              )}
+              <span>{starterName}</span>
+            </span>
+            <span className="thread-card-meta ml-auto flex-none flex items-center gap-1">
+              <span className="thread-card-status flex items-center gap-1">
+                {pinned ? (
+                  <span
+                    className="thread-pin grid place-items-center flex-none"
+                    aria-label="Pinned"
+                  >
+                    <Pin />
+                  </span>
+                ) : null}
+                {state !== "idle" ? (
+                  <span
+                    className="thread-state-icon w-[var(--ui-text-lg)] h-[var(--ui-text-lg)] flex-none grid place-items-center text-muted-foreground"
+                    aria-label={states[state].label}
+                  >
+                    <StatusIcon />
+                  </span>
+                ) : null}
+              </span>
+              {actions ? (
+                <span
+                  data-ui="thread-card-actions"
+                  className="thread-card-actions absolute top-[calc(var(--ui-space-unit)*1.5)] right-2 flex items-center opacity-0 pointer-events-none bg-surface-hover rounded-sm"
+                >
+                  {actions}
+                </span>
+              ) : null}
+              {state === "working" ? (
+                <span
+                  data-ui="thread-working-label"
+                  className="hidden text-primary [@media(hover:none)]:inline"
+                >
+                  Working
+                </span>
+              ) : null}
+              {draft !== "new" && runningSince !== undefined ? (
+                <WorkingTime since={runningSince} now={now} />
+              ) : null}
+              {draft !== "new" && runningSince === undefined && updatedAt !== undefined ? (
+                <ThreadTime
+                  updatedAt={updatedAt}
+                  now={now}
+                  settleDays={settleDays}
+                  counting={!settled && !pinned}
+                />
               ) : null}
             </span>
-            {actions ? (
-              <span
-                data-ui="thread-card-actions"
-                className="thread-card-actions absolute top-[calc(var(--ui-space-unit)*1.5)] right-2 flex items-center opacity-0 pointer-events-none bg-surface-hover rounded-sm"
-              >
-                {actions}
-              </span>
-            ) : null}
-            {draft !== "new" && updatedAt !== undefined ? (
-              <ThreadTime updatedAt={updatedAt} now={now} />
-            ) : null}
+          </span>
+          <span className="thread-card-title overflow-hidden text-ellipsis whitespace-nowrap text-sm">
+            {title || "Untitled"}
           </span>
         </span>
-        <span className="thread-card-title overflow-hidden text-ellipsis whitespace-nowrap text-sm">
-          {title || "Untitled"}
-        </span>
-      </span>
+      )}
       {shortcut.held && shortcut.label ? (
         <Kbd
           data-ui="thread-shortcut"
@@ -142,16 +201,52 @@ export function ThreadCard({
   );
 }
 
-function ThreadTime({ updatedAt, now }: { updatedAt: number; now?: number }) {
+export function ThreadTime({
+  updatedAt,
+  now,
+  settleDays = defaultAutoSettleDays,
+  counting,
+}: {
+  updatedAt: number;
+  now?: number;
+  settleDays?: number;
+  counting: boolean;
+}) {
   const [clock, setClock] = useState(Date.now);
   useEffect(() => {
     if (now !== undefined) return;
     const timer = window.setInterval(() => setClock(Date.now()), 60_000);
     return () => window.clearInterval(timer);
   }, [now]);
+  const current = now ?? clock;
   return (
-    <time dateTime={new Date(updatedAt).toISOString()}>
-      {relativeThreadTime(updatedAt, now ?? clock)}
+    <time
+      dateTime={new Date(updatedAt).toISOString()}
+      data-age={counting ? threadAge(updatedAt, current, settleDays) : undefined}
+      className="tabular-nums data-[age=fresh]:font-semibold data-[age=fresh]:text-primary data-[age=recent]:text-primary data-[age=aging]:text-[color-mix(in_srgb,var(--color-primary)_45%,var(--color-muted-foreground))]"
+    >
+      {relativeThreadTime(updatedAt, current)}
+    </time>
+  );
+}
+
+export function WorkingTime({ since, now }: { since: number; now?: number }) {
+  const [clock, setClock] = useState(Date.now);
+  useEffect(() => {
+    if (now !== undefined) return;
+    // The label drops seconds after the first minute, so wake only when its text changes.
+    const elapsed = Math.max(0, clock - since);
+    const step = elapsed < 60_000 ? 1000 : 60_000;
+    const timer = window.setTimeout(() => setClock(Date.now()), step - (elapsed % step));
+    return () => window.clearTimeout(timer);
+  }, [now, clock, since]);
+  return (
+    <time
+      dateTime={new Date(since).toISOString()}
+      data-ui="thread-working-time"
+      className="tabular-nums font-semibold text-primary"
+    >
+      {workingDuration(since, now ?? clock)}
     </time>
   );
 }
@@ -165,6 +260,7 @@ export function ThreadSelect({
   actions,
   selected,
   pinned,
+  settled,
   draft,
   participantNames,
 }: {
@@ -177,6 +273,7 @@ export function ThreadSelect({
   actions?: ReactNode;
   selected?: boolean;
   pinned?: boolean;
+  settled?: boolean;
   draft?: "new" | "reply";
 }) {
   const { client } = useWorkspace();
@@ -185,6 +282,10 @@ export function ThreadSelect({
   const { data, error } = useQuery({
     ...participantOptions(client, thread.id),
     enabled: online && open && !participantNames,
+  });
+  const { data: settleDays } = useQuery({
+    ...sidebarPreferencesOptions(client, online),
+    select: (preferences) => preferences.autoSettleDays,
   });
   const names = participantNames ?? data?.items.map(({ user }) => user.displayName);
   const starter =
@@ -203,10 +304,13 @@ export function ThreadSelect({
             thread.starterId === viewer.id ? viewer.avatarUrl : thread.starterAvatarUrl
           }
           updatedAt={thread.updatedAt}
+          workingSince={thread.workingSince}
           now={now}
+          settleDays={settleDays}
           state={state}
           selected={selected}
           pinned={pinned}
+          settled={settled}
           draft={draft}
           actions={actions}
           onSelect={onSelect}

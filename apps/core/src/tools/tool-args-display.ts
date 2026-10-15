@@ -74,10 +74,6 @@ const subagentDelegateArgsSchema = z.object({
   timeoutMs: z.number().optional(),
 });
 
-const batchArgsSchema = z.object({
-  tool_calls: z.array(z.unknown()),
-});
-
 function parseApplyPatchPathsFromPatchText(patchText: string): string[] {
   // Matches tool patch headers like:
   // *** Add File: path
@@ -287,15 +283,6 @@ export const formatEditFileToolArgs: ToolArgsFormatter = (args) => {
   const p = normalizeRemoteDisplay(parsedPath);
   if (!p) return "";
   return " " + truncateMiddle(p, PATH_HEAD_LEN, PATH_TAIL_LEN, DISPLAY_MAX_LEN);
-};
-
-export const formatBatchToolArgs: ToolArgsFormatter = (args) => {
-  const parsed = safeValidateSync(batchArgsSchema, args);
-  if (!isRecord(parsed) || !Array.isArray(parsed["tool_calls"])) return "";
-
-  const n = parsed["tool_calls"].length;
-  if (!Number.isFinite(n) || n <= 0) return "";
-  return ` (${n} tools)`;
 };
 
 export function formatToolArgsForDisplay(toolName: string, args: unknown): string {

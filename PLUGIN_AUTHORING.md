@@ -194,12 +194,11 @@ plugins:
 
 - Text and JSON returned to the model are bounded by `tools.output.maxPreviewBytes` after `toModelOutput` conversion.
 - Oversized text and JSON are preserved as transient, session-owned `resource://t1_` artifacts when storage succeeds. The preview tells the model how to inspect the artifact with `read`; built-in `grep` can search the URI directly and always returns a bounded inline result. Core accepts legacy `tool-result://` references as read-only compatibility input.
-- Core's trusted built-in `read` is the exception: it bounds only its textual payload by actual UTF-8 bytes, returns an exact continuation, and is excluded from settled batch aggregate budgeting. External tools named `read` do not receive this trust.
+- Core's trusted built-in `read` is the exception: it bounds only its textual payload by actual UTF-8 bytes, returns an exact continuation, and uses its own output budget. External tools named `read` do not receive this trust.
 - Media and provider-reference content parts are not converted into text artifacts.
 - Truncation does not change whether the tool execution succeeded or failed.
-- Level 1 tools are batch-callable by default. Set `supportsBatch: false` when a tool must not be expanded into a batch child.
-- Batch children execute as ordinary Level 1 calls, so approval checks, streaming, `toModelOutput`, output normalization, media parts, and tool lifecycle events behave the same as direct calls.
-- Writer tools should implement `editTargets` so batch can reject children that would concurrently edit the same resource. Set `supportsBatch: false` when targets cannot be determined safely.
+- `batch` is retired. `supportsBatch` and `editTargets` remain accepted for compatibility but do not affect scheduling.
+- Native calls execute in received order as parallel groups separated by `write`, `edit`, and `patch` barriers. Bash calls may run concurrently.
 - A Level 1 spec may implement `summarizeFailure({ isError, result })` to classify a model-visible
   result. It returns `{ ok: true }` for success or `{ ok: false, ... }` for failure. `failureKind`
   (`hard` or `soft`) and `error` remain optional compatibility fields. Structured failures may also

@@ -14,7 +14,11 @@ import {
   readTelegramConversationMessages,
   readTelegramConversationThreads,
 } from "../../src/surface/telegram/telegram-conversation-source";
-import { ConversationThreadStore } from "../../src/conversation/thread-store";
+import { ConversationThreadSearchPool } from "../../src/conversation/thread-search-pool";
+import {
+  ConversationThreadStore,
+  type ConversationThreadSearchHit,
+} from "../../src/conversation/thread-store";
 import {
   ConversationThreadService,
   createConversationThreadToolService,
@@ -24,18 +28,24 @@ import {
   threadSummarizationWorkerRequestSchema,
 } from "../../src/conversation/thread-summarization-worker-protocol";
 import { ConversationThread } from "../../src/tool-server/tools/conversation-thread";
-import { conversationSurfaceOfRequestClient } from "../../src/surface/bridge/bus-agent-runner";
+import {
+  maybeBuildAutoInjectedThreadSearchMessages,
+  conversationSurfaceOfRequestClient,
+} from "../../src/surface/bridge/bus-agent-runner";
 
 const CHAT = "-100123";
 const TOPIC = `${CHAT}:7`;
 const OTHER_CHAT = "-100999";
+const TELEGRAM_BOT_NAME = "telegram-memory";
 
 let dir: string;
 let telegram: TelegramSurfaceStore;
 let discord: DiscordSearchStore;
 let index: ConversationThreadStore;
 let service: ConversationThreadService;
+let pool: ConversationThreadSearchPool;
 let now: number;
+let afterRecall: (() => void) | undefined;
 let cfg: ReturnType<typeof parseCoreConfigV2ToUniversal>;
 const aboutness = {
   domains: [],
@@ -80,6 +90,7 @@ function upsert(input: {
   userId?: string;
   userName?: string;
   rawJson?: string;
+  editedTs?: number;
 }) {
   const chatId = input.sessionId.split(":")[0]!;
   const threadId = input.sessionId.split(":")[1];
@@ -100,6 +111,7 @@ function upsert(input: {
     text: input.text,
     ts: now + (input.offsetMs ?? 0),
     fromBot: input.fromBot ?? false,
+    editedTs: input.editedTs,
     ...(input.rawJson ? { rawJson: input.rawJson } : {}),
   });
 }
@@ -113,21 +125,34 @@ function seedChat(sessionId = CHAT) {
 beforeEach(async () => {
   dir = await mkdtemp(path.join(tmpdir(), "lilac-telegram-cross-surface-"));
   now = Date.now() - 7_200_000;
+  afterRecall = undefined;
   telegram = new TelegramSurfaceStore(path.join(dir, "telegram.db"));
   discord = new DiscordSearchStore(path.join(dir, "search.db"));
   index = new ConversationThreadStore(path.join(dir, "search.db"), {
     telegramDbPath: path.join(dir, "telegram.db"),
-    telegramBotName: "lilac",
-    mainAgentUserNames: ["lilac"],
+    telegramBotName: TELEGRAM_BOT_NAME,
+    mainAgentUserNames: ["lilac", TELEGRAM_BOT_NAME],
   });
   cfg = parseCoreConfigV2ToUniversal({
     configVersion: 2,
     surface: {
       discord: { botName: "lilac", allowedChannelIds: ["c1"] },
-      telegram: { enabled: true, token: "test-token", botName: "lilac", allowedChatIds: [CHAT] },
+      telegram: {
+        enabled: true,
+        token: "test-token",
+        botName: TELEGRAM_BOT_NAME,
+        allowedChatIds: [CHAT],
+      },
     },
   });
+  pool = new ConversationThreadSearchPool({
+    searchDbPath: path.join(dir, "search.db"),
+    telegramDbPath: path.join(dir, "telegram.db"),
+    telegramBotName: TELEGRAM_BOT_NAME,
+    botName: "lilac",
+  });
   service = new ConversationThreadService({
+    searchPool: pool,
     store: index,
     getConfig: async () => cfg,
     summarizer: async (input) => ({
@@ -141,11 +166,16 @@ beforeEach(async () => {
       dimensions: 2,
       embed: async () => new Float32Array([1, 0]),
     }),
-    queryAboutnessSummarizer: async () => aboutness,
+    queryAboutnessSummarizer: async () => {
+      afterRecall?.();
+      afterRecall = undefined;
+      return aboutness;
+    },
     autoInjectQueryPlanner: async () => ({ searches: [{ queries: ["deployment"], aboutness }] }),
   });
 });
 afterEach(async () => {
+  pool.close();
   index.close();
   discord.close();
   telegram.close();
@@ -365,5 +395,233 @@ describe("telegram conversation memory plumbing", () => {
     expect(conversationSurfaceOfRequestClient("native")).toBe("native");
     expect(conversationSurfaceOfRequestClient("discord")).toBe("discord");
     expect(conversationSurfaceOfRequestClient("github")).toBe("discord");
+  });
+});
+
+describe("Telegram search through the actual worker pool", () => {
+  test("concurrent refreshes across three SQLite workers preserve pool usability", async () => {
+    // Initialize all three connections before changing the source, so each worker must
+    // rebuild the same index rather than seeing it already materialized at startup.
+    const initial = await Promise.all(
+      Array.from({ length: 3 }, () => pool.strings({ type: "prepare" })),
+    );
+    expect(initial).toEqual([[], [], []]);
+
+    const sessions = Array.from({ length: 150 }, (_, i) => `${CHAT}:${i + 1}`);
+    const threadIds = sessions.map((sessionId) => seedChat(sessionId)).sort();
+    const allowlist = { channelIds: [], guildIds: [], telegramChatIds: [CHAT] };
+    const prepared = Array.from({ length: 3 }, () => pool.strings({ type: "prepare", allowlist }));
+    const searched = Array.from({ length: 3 }, () =>
+      pool.hits({ type: "lexical", query: "deployment", allowlist }),
+    );
+    const [preparedResults, searchResults] = await Promise.all([
+      Promise.all(prepared),
+      Promise.all(searched),
+    ]);
+    for (const ids of preparedResults) expect(ids.sort()).toEqual(threadIds);
+    // Unsummarized threads are eligible for preparation but have no lexical facets yet.
+    for (const result of searchResults) expect(result.unwrap()).toEqual([]);
+
+    const target = `telegram:${sessions[0]}`;
+    const summarized = await service.runSummarization({ threadId: target, now: Date.now() });
+    expect(summarized.failed).toBe(0);
+    expect(summarized.summarized).toBe(1);
+    expect(index.listMessages(target)[1]?.userName).toBe(TELEGRAM_BOT_NAME);
+    const subsequent = await Promise.all(
+      Array.from({ length: 3 }, () =>
+        pool.hits({ type: "lexical", query: "deployment", allowlist }),
+      ),
+    );
+    for (const result of subsequent) {
+      const hits = result.unwrap();
+      expect(hits.map((hit) => hit.threadId)).toEqual([target]);
+      expect(hits[0]?.messageCount).toBe(2);
+    }
+    expect((await pool.strings({ type: "prepare", allowlist })).sort()).toEqual(threadIds);
+  });
+
+  test("semantic, hybrid and automatic recall include only allowlisted chats and honor revocation", async () => {
+    const chat = seedChat();
+    seedChat(OTHER_CHAT);
+    expect((await service.runSummarization({ now: Date.now() })).summarized).toBe(2);
+    expect(index.isVectorSearchAvailable()).toBe(true);
+    for (const mode of ["lexical", "semantic", "hybrid"] as const) {
+      const result = (
+        await service.search({
+          query: "deployment",
+          mode,
+          surface: "telegram",
+          queryAboutness: aboutness,
+        })
+      ).unwrap();
+      expect(result.results.map((hit) => hit.threadId)).toEqual([chat]);
+    }
+    const shortlist = (
+      await service.shortlistAutoInjectCandidates({
+        text: "deployment",
+        semanticFallback: true,
+        limit: 5,
+        participantSurface: "telegram",
+        participantIdsAny: ["alice"],
+      })
+    ).unwrap();
+    expect(shortlist.source).toBe("hybrid");
+    expect(shortlist.results.map((hit) => hit.threadId)).toEqual([chat]);
+    cfg.conversation.thread.autoInject.enabled = true;
+    cfg.conversation.thread.autoInject.minTextUnits = 1;
+    cfg.conversation.thread.autoInject.expansionMinConfidence = 0;
+    const recall = () =>
+      maybeBuildAutoInjectedThreadSearchMessages({
+        cfg,
+        surface: "telegram",
+        conversationThreads: createConversationThreadToolService(service),
+        requestId: crypto.randomUUID(),
+        userMessages: [{ role: "user", content: "Please recall our deployment discussion" }],
+        publishToolStatus: async () => {},
+        onError: (_message, error) => {
+          throw new Error(JSON.stringify(error));
+        },
+      });
+    expect(JSON.stringify(await recall())).toContain(chat);
+    cfg.surface.telegram.allowedChatIds = [];
+    for (const mode of ["lexical", "semantic", "hybrid"] as const)
+      expect(
+        (await service.search({ query: "deployment", mode, queryAboutness: aboutness })).unwrap()
+          .results,
+      ).toEqual([]);
+    expect(
+      (
+        await service.shortlistAutoInjectCandidates({
+          text: "deployment",
+          semanticFallback: true,
+          limit: 5,
+        })
+      ).unwrap().results,
+    ).toEqual([]);
+    expect(await service.getAutoInjectRankingCorpusDocuments()).toEqual([]);
+    expect(await recall()).toEqual([]);
+  });
+
+  test("service rechecks permissions and source revisions after recall before publishing worker hits", async () => {
+    seedChat();
+    seedChat(TOPIC);
+    await service.runSummarization({ now: Date.now() });
+    afterRecall = () => {
+      cfg.surface.telegram.allowedChatIds = [];
+    };
+    expect(
+      (await service.search({ query: "deployment", mode: "hybrid" })).unwrap().results,
+    ).toEqual([]);
+    cfg.surface.telegram.allowedChatIds = [CHAT];
+    afterRecall = () => {
+      for (const sessionId of [CHAT, TOPIC])
+        upsert({ sessionId, messageId: "1", text: "replacement", editedTs: now + 5_000 });
+    };
+    expect(
+      (await service.search({ query: "deployment", mode: "hybrid" })).unwrap().results,
+    ).toEqual([]);
+    await service.runSummarization({ now: Date.now() });
+    expect(
+      (await service.search({ query: "replacement", mode: "hybrid" })).unwrap().results,
+    ).toHaveLength(2);
+    afterRecall = () => {
+      for (const sessionId of [CHAT, TOPIC]) {
+        telegram.markDeleted({ sessionId, messageId: "1" });
+        telegram.markDeleted({ sessionId, messageId: "2" });
+      }
+    };
+    expect(
+      (await service.search({ query: "replacement", mode: "hybrid" })).unwrap().results,
+    ).toEqual([]);
+  });
+
+  test("current-hit checks reject Telegram revisions after edits, partial deletions and complete deletions", async () => {
+    const chat = seedChat();
+    upsert({ sessionId: CHAT, messageId: "3", text: "deployment retained", offsetMs: 2_000 });
+    await service.runSummarization({ now: Date.now() });
+    const allowlist = { channelIds: [], guildIds: [], telegramChatIds: [CHAT] };
+    const current = async (hits: readonly ConversationThreadSearchHit[]) =>
+      (await pool.hits({ type: "current", hits, allowlist })).unwrap();
+    const original = (
+      await pool.hits({ type: "lexical", query: "deployment", allowlist })
+    ).unwrap();
+    expect(original.map((hit) => hit.threadId)).toEqual([chat]);
+    expect((await current(original)).map((hit) => hit.threadId)).toEqual([chat]);
+    upsert({ sessionId: CHAT, messageId: "1", text: "replacement", editedTs: now + 5_000 });
+    expect(await current(original)).toEqual([]);
+    await service.runSummarization({ now: Date.now() });
+    const edited = (await pool.hits({ type: "lexical", query: "replacement", allowlist })).unwrap();
+    expect(edited).toHaveLength(1);
+    expect(edited[0]?.sourceRevision).not.toBe(original[0]?.sourceRevision);
+    telegram.markDeleted({ sessionId: CHAT, messageId: "1" });
+    expect(await current(edited)).toEqual([]);
+    expect(
+      (await service.search({ query: "replacement", mode: "lexical" })).unwrap().results,
+    ).toEqual([]);
+    await service.runSummarization({ now: Date.now() });
+    const remaining = (
+      await pool.hits({ type: "lexical", query: "deployment", allowlist })
+    ).unwrap();
+    expect(remaining).toHaveLength(1);
+    telegram.markDeleted({ sessionId: CHAT, messageId: "2" });
+    telegram.markDeleted({ sessionId: CHAT, messageId: "3" });
+    expect(await current(remaining)).toEqual([]);
+    expect(await pool.strings({ type: "prepare", allowlist })).toEqual([]);
+  });
+
+  test("candidate SQL binds both participant filters and isolates equal user, channel and message IDs by platform", async () => {
+    const chat = seedChat();
+    cfg.surface.discord.allowedChannelIds = [CHAT];
+    for (const [messageId, userId] of [
+      ["1", "alice"],
+      ["2", "bot"],
+    ])
+      discord.upsertMessages([
+        {
+          ref: { platform: "discord", channelId: CHAT, messageId: messageId! },
+          session: { platform: "discord", channelId: CHAT },
+          userId: userId!,
+          userName: userId === "bot" ? "lilac" : "alice",
+          text: "deployment discord",
+          ts: now,
+          attachments: [],
+        },
+      ]);
+    index.refreshInferredChannel({ channelId: CHAT });
+    await service.runSummarization({ now: Date.now() });
+    for (const participantSurface of ["discord", "telegram"] as const) {
+      for (const mode of ["lexical", "semantic"] as const) {
+        const result = (
+          await service.search({
+            query: "deployment",
+            mode,
+            participantId: "alice",
+            participantIdsAny: ["alice"],
+            participantSurface,
+            beforeTs: now + 2_000,
+            afterTs: now - 1,
+            queryAboutness: aboutness,
+          })
+        ).unwrap();
+        expect(result.results).toHaveLength(1);
+        expect(result.results[0]?.surface).toBe(participantSurface);
+        if (participantSurface === "telegram") expect(result.results[0]?.threadId).toBe(chat);
+      }
+    }
+    // An identically addressed Discord row must not satisfy a Telegram participant lookup.
+    const db = new Database(path.join(dir, "telegram.db"));
+    db.run("UPDATE telegram_messages SET user_id='telegram-only' WHERE message_id='1'");
+    db.close();
+    expect(
+      (
+        await service.search({
+          query: "deployment",
+          mode: "lexical",
+          surface: "telegram",
+          participantId: "alice",
+          queryAboutness: aboutness,
+        })
+      ).unwrap().results,
+    ).toEqual([]);
   });
 });

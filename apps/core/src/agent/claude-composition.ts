@@ -57,7 +57,6 @@ export function applyCompleteLevel1Tools(
   target: Level1ToolAuthorityTarget,
   toolset: BuiltLevel1Toolset,
 ): void {
-  toolset.updateActiveBatchTools(new Set(Object.keys(toolset.tools)));
   target.setTools(toolset.tools);
   target.setActiveTools(new Set(Object.keys(toolset.tools)));
 }
@@ -66,7 +65,6 @@ export function completeLevel1ToolMapping(toolset: BuiltLevel1Toolset): {
   tools: ToolSet;
   catalogMetadata: BuiltLevel1Toolset["catalogMetadata"];
 } {
-  toolset.updateActiveBatchTools(new Set(Object.keys(toolset.tools)));
   return {
     tools: toolset.tools,
     catalogMetadata: toolset.catalogMetadata,

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { MAX_WORKFLOW_RESULT_LENGTH, workflowCardSchema } from "@stanley2058/lilac-client-protocol";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ import {
   type WorkflowRun,
 } from "../../src/workflow/workflow-domain";
 import {
+  buildWorkflowProgressCard,
   buildWorkflowProgressViewResult,
   renderWorkflowProgressView,
   type WorkflowProgressView,
@@ -329,6 +331,91 @@ describe("workflow progress view", () => {
     expect(rendered.text).not.toContain("<details>");
     expect(rendered.text).not.toContain("@reviewers");
     expect(rendered.text.length).toBeLessThanOrEqual(4_000);
+  });
+
+  it("builds structured cards with timestamps, current steps, and actionable waits", () => {
+    const replyWait = {
+      kind: "reply" as const,
+      prompt: "Choose deploy or stop",
+      dueAt: null,
+      deadlineAt: 1_800_000,
+      requiresReplyToMessage: true,
+      isCurrentChannel: false,
+    };
+    const card = buildWorkflowProgressCard(view({ waits: [replyWait] }));
+    expect(card).toMatchObject({
+      name: "audit-routes",
+      description: "Audit routes for missing authentication coverage.",
+      status: "waiting-reply",
+      startedAt: 2_000,
+      progress: { completed: 3, active: 1, total: 7 },
+      phases: [{ name: "Discovery" }, { name: "Review" }],
+      steps: [
+        { label: "Inspect authentication routes", kind: "agent", state: "running" },
+        { label: "Collect route inventory", kind: "agent", state: "succeeded" },
+      ],
+      wait: {
+        kind: "reply",
+        prompt: "Choose deploy or stop",
+        deadlineAt: 1_800_000,
+        replyToMessage: true,
+        elsewhere: true,
+      },
+      agents: { used: 4, active: 1, queued: 0 },
+      sensitive: false,
+    });
+    expect(card.endedAt).toBeUndefined();
+    expect(workflowCardSchema.safeParse(card).success).toBe(true);
+
+    const paused = buildWorkflowProgressCard(
+      view({ run: { ...run(), state: "paused" }, waits: [replyWait] }),
+    );
+    expect(paused.status).toBe("paused");
+    expect(paused.wait).toBeUndefined();
+    expect(buildWorkflowProgressCard(view({ manualReconciliationRequired: true })).status).toBe(
+      "needs-attention",
+    );
+  });
+
+  it("carries bounded terminal results and hides them for sensitive input", () => {
+    const terminalRun = {
+      ...run(),
+      state: "succeeded" as const,
+      result: "x".repeat(MAX_WORKFLOW_RESULT_LENGTH + 10),
+      claimedBy: null,
+      claimedAt: null,
+      terminalAt: 86_000,
+    };
+    const card = buildWorkflowProgressCard(view({ run: terminalRun, availableActions: [] }));
+    expect(card.status).toBe("succeeded");
+    expect(card.endedAt).toBe(86_000);
+    expect(card.steps).toEqual([]);
+    expect(card.result).toMatchObject({ kind: "text", truncated: true });
+    expect(workflowCardSchema.safeParse(card).success).toBe(true);
+
+    const json = buildWorkflowProgressCard(
+      view({ run: { ...terminalRun, result: { routes: 3 } }, availableActions: [] }),
+    );
+    expect(json.result).toEqual({ kind: "json", text: '{\n  "routes": 3\n}', truncated: false });
+
+    const sensitive = buildWorkflowProgressCard(
+      view({ run: terminalRun, availableActions: [], sensitive: true }),
+    );
+    expect(sensitive.result).toBeUndefined();
+    expect(sensitive.sensitive).toBe(true);
+
+    const failed = buildWorkflowProgressCard(
+      view({
+        run: {
+          ...terminalRun,
+          state: "failed",
+          result: null,
+          terminalDetail: "Route check failed",
+        },
+        availableActions: [],
+      }),
+    );
+    expect(failed.reason).toBe("Route check failed");
   });
 
   it("counts only agent and wait steps and keeps cancellation separate from failure", async () => {

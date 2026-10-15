@@ -1,8 +1,9 @@
 import { useState } from "react";
-import { CircleCheck, Pencil, Undo2, X } from "lucide-react";
+import { X } from "lucide-react";
 import type { NativeThread } from "@stanley2058/lilac-client-protocol";
 import { moveInQueues, type ThreadQueues } from "../sidebar-order";
 import { ThreadQueue } from "./ThreadQueue";
+import { ThreadSettleButton } from "./ThreadSettleButton";
 import { ThreadCard } from "./ThreadSelect";
 import { IconButton } from "./ui";
 const draftTitles: Record<string, string> = {
@@ -40,7 +41,7 @@ function initialQueues(): ThreadQueues {
 }
 export function ThreadQueueDemo() {
   const [queues, setQueues] = useState(initialQueues);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
   const [selected, setSelected] = useState("");
   const [replyDraftId, setReplyDraftId] = useState<string>("queue-demo-0");
   function replyDraft(id: string) {
@@ -77,6 +78,7 @@ export function ThreadQueueDemo() {
             state={entry.source?.displayStatus ?? "idle"}
             selected={selected === entry.id}
             pinned={section === "pinned"}
+            settled={section === "settled"}
             onSelect={() => setSelected(entry.id)}
             actions={
               <>
@@ -90,8 +92,9 @@ export function ThreadQueueDemo() {
                   </IconButton>
                 ) : null}
                 {entry.source ? (
-                  <IconButton
-                    label={section === "settled" ? "Unsettle" : "Settle"}
+                  <ThreadSettleButton
+                    settled={section === "settled"}
+                    title={entry.source.title}
                     onClick={() =>
                       setQueues((current) =>
                         moveInQueues(current, {
@@ -101,13 +104,8 @@ export function ThreadQueueDemo() {
                         }),
                       )
                     }
-                  >
-                    {section === "settled" ? <Undo2 /> : <CircleCheck />}
-                  </IconButton>
+                  />
                 ) : null}
-                <IconButton label="Rename" onClick={() => setSelected(entry.id)}>
-                  <Pencil />
-                </IconButton>
               </>
             }
           />

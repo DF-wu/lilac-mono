@@ -9,7 +9,6 @@ export const LEVEL1_TOOL_NAMES = [
   "edit",
   "patch",
   "subagent_delegate",
-  "batch",
 ] as const;
 
 export type Level1ToolName = (typeof LEVEL1_TOOL_NAMES)[number];

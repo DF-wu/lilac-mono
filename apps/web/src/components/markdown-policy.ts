@@ -1,5 +1,8 @@
+import { parseCitationHref } from "@stanley2058/lilac-client-protocol";
+
 export function markdownUrl(url: string): string {
   const clean = url.trim();
+  if (parseCitationHref(clean)) return clean;
   if (
     [...clean].some((character) => character.charCodeAt(0) <= 32 || character.charCodeAt(0) === 127)
   )

@@ -5,10 +5,13 @@ import {
   findWorkspaceRootResult,
   formatAvailableSkillsSection,
   isPanic,
+  skillAvailableOn,
 } from "@stanley2058/lilac-utils";
 import { Result } from "better-result";
 
-export async function maybeBuildSkillsSectionForPrimary(): Promise<string | null> {
+export async function maybeBuildSkillsSectionForPrimary(
+  requestClient: string,
+): Promise<string | null> {
   const workspaceRoot = findWorkspaceRootResult();
   const root = workspaceRoot.match({ ok: (value) => value, err: () => null });
   if (root === null) return null;
@@ -19,7 +22,9 @@ export async function maybeBuildSkillsSectionForPrimary(): Promise<string | null
         workspaceRoot: root,
         dataDir: env.dataDir,
       });
-      return formatAvailableSkillsSection(skills);
+      return formatAvailableSkillsSection(
+        skills.filter((skill) => skillAvailableOn(skill, requestClient)),
+      );
     },
     catch: captureError,
   });

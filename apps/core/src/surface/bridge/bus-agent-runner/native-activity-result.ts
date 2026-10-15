@@ -3,7 +3,10 @@ import type { z } from "zod";
 
 import { redactSecrets } from "../../../tools/bash-safety/format";
 import { bashInputSchema, bashOutputSchema } from "../../../tools/bash";
-import { editedPathsForDisplay } from "../../../tools/tool-args-display";
+import {
+  editedPathsForDisplay,
+  formatToolArgsForDisplayWithSpecs,
+} from "../../../tools/tool-args-display";
 import { formatToolLogPreview } from "./tool-failure-logging";
 
 export type NativeToolActivityResult = {
@@ -12,6 +15,8 @@ export type NativeToolActivityResult = {
   exitCode?: number;
   file?: { path: string; mediaType: string };
 };
+
+const LABEL_ARGS_CHARS = 8192;
 
 const READ_TOOLS = new Set(["read", "read_file", "readFile"]);
 
@@ -85,6 +90,21 @@ export function nativeToolActivityResult(params: {
   const text = textContent(result);
   if (text !== undefined) return preview(text);
   return preview(formatToolLogPreview({ toolName, value: result }));
+}
+
+export function nativeToolActivityLabel(params: {
+  toolName: string;
+  event: { readonly args: unknown };
+}): string {
+  const args = formatToolArgsForDisplayWithSpecs(
+    params.toolName,
+    undefined,
+    undefined,
+    undefined,
+    params.event,
+    LABEL_ARGS_CHARS,
+  );
+  return `${params.toolName}${args}`;
 }
 
 /**

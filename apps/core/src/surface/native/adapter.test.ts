@@ -4,6 +4,7 @@ import { projectNativeOutput } from "./output-projection";
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Result } from "better-result";
+import type { WorkflowCard } from "@stanley2058/lilac-client-protocol";
 import { Surface } from "../../tool-server/tools/surface";
 import { SurfaceRuntimeRegistry } from "../runtime-descriptor";
 import { NativeSurfaceAdapter } from "./adapter";
@@ -291,11 +292,44 @@ describe("native surface adapter", () => {
         throw new Error("unexpected missing fixture");
       }),
     );
+    const card: WorkflowCard = {
+      name: "audit-routes",
+      description: "Audit routes.",
+      status: "running",
+      startedAt: 1_000,
+      progress: {
+        completed: 0,
+        queued: 0,
+        active: 1,
+        waiting: 0,
+        failed: 0,
+        cancelled: 0,
+        total: 1,
+      },
+      phases: [],
+      steps: [{ label: "Inspect routes", kind: "agent", state: "running" }],
+      agents: { used: 1, active: 1, queued: 0 },
+      sensitive: false,
+    };
     const message = (
-      await port.send({ channelId: f.destination.id, content: { text: "progress" } })
+      await port.send({
+        channelId: f.destination.id,
+        content: { text: "progress", workflow: card },
+      })
     ).unwrap();
     expect((await port.checkMessage(message)).unwrap()).toBe("found");
-    (await port.edit(message, { text: "done" })).unwrap();
+    const stored = () =>
+      f.surface.readMessage("owner", f.destination.id, message.messageId).unwrap()!.message.parts;
+    expect(stored()).toEqual([
+      { type: "text", text: "progress" },
+      { type: "data-workflow", id: `workflow_${message.messageId}`, data: card },
+    ]);
+    const done = { ...card, status: "succeeded" as const, endedAt: 2_000, steps: [] };
+    (await port.edit(message, { text: "done", workflow: done })).unwrap();
+    expect(stored()).toEqual([
+      { type: "text", text: "done" },
+      { type: "data-workflow", id: `workflow_${message.messageId}`, data: done },
+    ]);
     expect(f.kicks).toEqual([]);
     const descriptor = createNativeSurfaceRuntimeDescriptor({
       adapter: f.adapter,

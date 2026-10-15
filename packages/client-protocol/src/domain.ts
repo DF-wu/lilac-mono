@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { identitySchema, revisionSchema, runIdentitySchema } from "./replay.ts";
+import { citationInputFits } from "./assistant-citations.ts";
 
 export const catalogIdentifierSchema = z.string().min(1).max(512);
 
@@ -18,6 +19,7 @@ export const threadCapabilitiesSchema = z.strictObject({
   share: z.boolean(),
 });
 export const nativeThreadSchema = z.strictObject({
+  kind: z.literal("dm").optional(),
   id: identitySchema,
   title: z.string().max(512),
   starterId: identitySchema,
@@ -25,11 +27,15 @@ export const nativeThreadSchema = z.strictObject({
   starterDisplayName: z.string().max(256).optional(),
   displayStatus: z.enum(["idle", "completed", "working", "error"]).optional(),
   activeRunId: runIdentitySchema.optional(),
+  workingSince: revisionSchema.optional(),
   archived: z.boolean(),
   updatedAt: revisionSchema,
   revision: revisionSchema,
   capabilities: threadCapabilitiesSchema,
   modelId: catalogIdentifierSchema.optional(),
+  preview: z
+    .strictObject({ role: z.enum(["user", "assistant"]), text: z.string().min(1).max(512) })
+    .optional(),
 });
 export const participantSchema = z.strictObject({
   user: nativeUserSchema,
@@ -61,12 +67,21 @@ export const skillChoiceSchema = z.strictObject({
   description: z.string().max(1024),
   source: z.string().min(1).max(128),
 });
+export const commandArgumentSchema = z.strictObject({
+  key: z.string().min(1).max(32),
+  type: z.enum(["string", "number", "boolean"]),
+  description: z.string().max(100).optional(),
+  required: z.boolean(),
+  choices: z.array(z.string().min(1).max(100)).max(256).optional(),
+});
+export type CommandArgument = z.infer<typeof commandArgumentSchema>;
 export const commandChoiceSchema = z.strictObject({
   id: catalogIdentifierSchema,
   name: z.string().min(1).max(256),
   description: z.string().max(1024),
   kind: z.enum(["builtin", "custom"]),
   argumentHint: z.string().max(256).optional(),
+  arguments: z.array(commandArgumentSchema).max(24).optional(),
 });
 export const agentIdentitySchema = z.strictObject({
   discordUserId: z
@@ -103,6 +118,9 @@ export const nativeInputSchema = z
     command: z
       .strictObject({ id: catalogIdentifierSchema, arguments: z.string().max(65_536) })
       .optional(),
+  })
+  .refine((input) => citationInputFits(input.text), {
+    message: "Quoted input is too long. Shorten the quote or comment.",
   })
   .refine(
     (input) =>
@@ -236,9 +254,12 @@ export const subagentSummarySchema = z.strictObject({
 });
 export type SubagentSummary = z.infer<typeof subagentSummarySchema>;
 
+export const workingIndicatorsSchema = z.array(z.string().trim().min(1)).min(1);
+
 export const nativeDeploymentSettingsSchema = z.strictObject({
   titleModel: z.string().trim().min(1),
   outputStreaming: z.enum(["paragraph", "complete"]),
+  dmContextMaxAgeMs: z.number().int().positive().default(10_800_000),
   oldMessageSelectionMaxAgeMs: z.number().int().positive().nullable(),
   storageRetentionMaxAgeMs: z.number().int().positive().nullable(),
   crossThreadSend: z.strictObject({ triggerRun: z.boolean() }),

@@ -1,3 +1,4 @@
+import { ContextMessage, useRecentContext } from "./RecentContext";
 import { LoadingSpinner } from "./ui/loading-spinner";
 import { AddReaction, MessageReactions } from "./MessageReactions";
 import { OptimisticTurns, type OptimisticTurn } from "../optimistic-turns";
@@ -15,6 +16,7 @@ import { copyMessage, messageClipboard } from "../message-clipboard";
 import { MessageArrivals } from "../message-arrivals";
 import { MessageArrivalsContext, LiveMessageContext, useMessageArrival } from "./message-arrivals";
 import {
+  DisplayStreamContext,
   MessageServicesContext,
   useMessageServices,
   type MessageServices,
@@ -32,6 +34,7 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  type ComponentProps,
 } from "react";
 import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronDown, ChevronRight, RotateCcw, Copy, CopyCheck } from "lucide-react";
@@ -43,13 +46,21 @@ import type {
 } from "@stanley2058/lilac-client-protocol";
 import { IconButton, attempt } from "./ui";
 import { WorkingText } from "./ui/working-text";
+import { WorkVerb, useSettledWorkVerb } from "./WorkVerb";
 import { ResourceAttachment } from "./ResourceAttachment";
 import { ActorAvatar, type ActorIdentity } from "./ActorAvatar";
 import { MessageIdentityContext } from "./message-identity";
 import { MessageResourcesContext } from "./message-resources";
+import { HtmlPreviewMessageContext } from "./HtmlPreview";
 import { Bubble, BubbleContent } from "./ui/bubble";
 import "./message-presentation.css";
 import { Markdown } from "./Markdown";
+import { AssistantSelectionToolbar } from "./AssistantSelectionToolbar";
+import { useCitationNavigation } from "./use-citation-navigation";
+import { citationStore } from "../citation-store";
+import { useStore } from "zustand";
+import { copyAssistantSelection } from "../markdown-copy";
+import { WorkflowCard } from "./WorkflowCard";
 import { readMotionDuration } from "../theme/motion";
 import { Button } from "./ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
@@ -139,6 +150,12 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   const tailSnapshot = useCallback(() => store.at(store.size - 1)?.kind !== "deferred", [store]);
   const tailHydrated = useSyncExternalStore(subscribeTail, tailSnapshot, tailSnapshot);
   const parent = useRef<HTMLDivElement>(null);
+  const [citationViewport, setCitationViewport] = useState<HTMLDivElement | null>(null);
+  const bindViewport = useCallback((element: HTMLDivElement | null) => {
+    parent.current = element;
+    setCitationViewport(element);
+  }, []);
+  const citationIndexRef = useRef<number | undefined>(undefined);
   const headerRef = useRef<HTMLDivElement>(null);
   const footerRef = useRef<HTMLDivElement>(null);
   const [insets, setInsets] = useState({ top: 0, bottom: 0 });
@@ -191,12 +208,36 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       Math.round(entry?.borderBoxSize?.[0]?.blockSize ?? element.offsetHeight),
     overscan: 3,
     rangeExtractor: (range) => {
+      if (citationIndexRef.current !== undefined && citationIndexRef.current > 0)
+        return [...new Set([...defaultRangeExtractor(range), citationIndexRef.current])].sort(
+          (a, b) => a - b,
+        );
       if (tailRenderedThread === props.threadId) return defaultRangeExtractor(range);
       const tail: number[] = [];
       for (let index = Math.max(0, range.count - 5); index < range.count; index++) tail.push(index);
       return tail;
     },
   });
+  const positionCitation = useCallback(
+    () => setReadingDisclosure(props.threadId),
+    [props.threadId],
+  );
+  citationIndexRef.current = useCitationNavigation({
+    threadId: props.threadId,
+    store,
+    client: props.client,
+    viewport: parent,
+    virtual,
+    ready: !switching && !!store.checkpoint,
+    onPosition: positionCitation,
+  });
+  useEffect(() => {
+    const viewport = parent.current;
+    if (!viewport) return;
+    const copy = (event: ClipboardEvent) => copyAssistantSelection(event, viewport);
+    viewport.addEventListener("copy", copy);
+    return () => viewport.removeEventListener("copy", copy);
+  }, []);
   const measureTurn = useCallback(
     (content: HTMLElement) => {
       const row = content.closest<HTMLDivElement>(".virtual-row");
@@ -279,7 +320,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
         <MessageServicesContext value={services}>
           <div
             className="timeline overflow-auto min-h-0 flex-1 [overflow-anchor:none] chat-scroll relative overflow-y-auto overflow-x-hidden"
-            ref={parent}
+            ref={bindViewport}
             onScroll={(event) => {
               setReadingDisclosure(undefined);
               const viewport = event.currentTarget;
@@ -306,6 +347,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
             aria-label="Conversation"
             tabIndex={0}
           >
+            <AssistantSelectionToolbar viewport={citationViewport} threadId={props.threadId} />
             <div
               ref={measureHeader}
               data-index={0}
@@ -390,6 +432,7 @@ const SlotRow = memo(function SlotRow(props: {
   fallback?: ReadyTurnSlot;
 }) {
   const { client, threadId, onRewind } = useContext(TimelineContext)!;
+  const recentContext = useRecentContext();
   const stored = useSlot(props.store, props.slotId);
   const slot = stored?.kind === "ready" ? stored : (props.fallback ?? stored);
   useEffect(() => {
@@ -411,32 +454,89 @@ const SlotRow = memo(function SlotRow(props: {
         )}
       </div>
     );
+  const outside =
+    recentContext &&
+    recentContext.historyGeneration === props.store.checkpoint?.historyGeneration &&
+    slot.state !== "pending" &&
+    slot.state !== "running" &&
+    (recentContext.firstTurnPosition === null || slot.position < recentContext.firstTurnPosition);
+  const summarized =
+    !outside &&
+    recentContext?.summarizedBeforePosition !== undefined &&
+    slot.position < recentContext.summarizedBeforePosition;
   return (
-    <Turn
-      slot={slot}
-      optimistic={!!props.fallback && stored?.kind !== "ready"}
-      userRenderKey={
-        props.renderKey !== props.slotId || props.fallback ? props.renderKey : undefined
-      }
-      animateArrivals={!!props.fallback || props.slotId === props.store.slotIds.at(-1)}
-      onRewind={onRewind}
-      onLoadMore={() => void client.loadTurnPage(threadId, slot.slotId)}
-    />
+    <ContextMessage outside={!!outside} summarized={summarized}>
+      {recentContext?.firstTurnPosition === slot.position && slot.position > 0 ? (
+        <p className="px-6 pt-3 text-xs text-muted-foreground">
+          Earlier messages outside recent context
+        </p>
+      ) : null}
+      <Turn
+        slot={slot}
+        optimistic={!!props.fallback && stored?.kind !== "ready"}
+        userRenderKey={
+          props.renderKey !== props.slotId || props.fallback ? props.renderKey : undefined
+        }
+        animateArrivals={!!props.fallback || props.slotId === props.store.slotIds.at(-1)}
+        onRewind={onRewind}
+        onLoadMore={() => void client.loadTurnPage(threadId, slot.slotId)}
+      />
+    </ContextMessage>
   );
 });
 
-export const Turn = memo(function Turn(props: {
+type TurnProps = {
   slot: ReadyTurnSlot;
   animateArrivals?: boolean;
   optimistic?: boolean;
   userRenderKey?: string;
   onRewind: (turnId: string) => void;
   onLoadMore: () => void;
-}) {
+};
+
+export const Turn = memo(function Turn(props: TurnProps) {
+  const workflow = workflowCardMessage(props.slot);
+  if (workflow) return <WorkflowTurn turnId={props.slot.turnId} {...workflow} />;
+  return <AgentTurn {...props} />;
+});
+
+/** Core posts each workflow progress card as its own slot, outside any agent turn. */
+function workflowCardMessage(slot: ReadyTurnSlot) {
+  const [message] = slot.messages;
+  if (slot.messages.length !== 1 || !message) return undefined;
+  const card = message.parts.find((part) => part.type === "data-workflow");
+  if (!card) return undefined;
+  const actions = message.parts.find((part) => part.type === "data-actions");
+  return { messageId: message.id, card: card.data, actions };
+}
+
+function WorkflowTurn({
+  turnId,
+  ...card
+}: { turnId: string } & ComponentProps<typeof WorkflowCard>) {
+  return (
+    <article
+      className="turn pt-4 px-6 pb-8 max-workspace:pt-3 max-workspace:px-4 max-workspace:pb-6"
+      data-turn-id={turnId}
+      data-ui="workflow-turn"
+    >
+      <WorkflowCard {...card} />
+    </article>
+  );
+}
+
+function AgentTurn(props: TurnProps) {
   const { onRewind, onLoadMore } = props;
   const { canEdit, rewindDisabled } = useMessageServices();
   const { slot } = props;
   const [expanded, setExpanded] = useState(false);
+  const citedMessage = useStore(citationStore, (state) => {
+    const id = state.navigation?.citation.messageId;
+    return props.slot.messages.some((message) => message.id === id) ? id : undefined;
+  });
+  useEffect(() => {
+    if (citedMessage) setExpanded(true);
+  }, [citedMessage]);
   const firstUser = slot.messages.find(
     (message) => message.role === "user" && message.metadata?.inputMode !== "steer",
   );
@@ -459,6 +559,7 @@ export const Turn = memo(function Turn(props: {
     startedAt !== undefined && slot.settledAt !== undefined
       ? Math.max(0, slot.settledAt - startedAt)
       : undefined;
+  const settledVerb = useSettledWorkVerb(slot.turnId, duration);
   const active = slot.state === "pending" || slot.state === "running";
   const waiting = active && !remaining.some((message) => message.role === "assistant");
   // A running turn always ends in a live row: the trailing activity run, or Thinking after text.
@@ -513,7 +614,8 @@ export const Turn = memo(function Turn(props: {
                     "Working…"
                   ) : (
                     <span>
-                      Working for <ElapsedTime since={startedAt} />
+                      <WorkVerb seed={slot.turnId} startedAt={startedAt} /> for{" "}
+                      <ElapsedTime since={startedAt} />
                     </span>
                   )}
                   <TurnParticipants messages={slot.messages} />
@@ -533,8 +635,8 @@ export const Turn = memo(function Turn(props: {
                     <span className="work-summary-label flex min-w-0 flex-wrap items-center gap-2">
                       <span>
                         {duration === undefined
-                          ? "Worked"
-                          : `Worked for ${formatDuration(duration)}`}
+                          ? settledVerb
+                          : `${settledVerb} for ${formatDuration(duration)}`}
                       </span>
                       <TurnParticipants messages={slot.messages} />
                     </span>
@@ -582,7 +684,7 @@ export const Turn = memo(function Turn(props: {
       ) : null}
     </article>
   );
-});
+}
 
 function recordActivityTimes(times: Map<string, number>, messages: readonly DisplayMessage[]) {
   for (const message of messages) {
@@ -772,6 +874,12 @@ type Group =
   | { kind: "text"; text: string }
   | { kind: "activity"; parts: Extract<DisplayPart, { type: "data-activity" }>[] }
   | { kind: "part"; part: Exclude<DisplayPart, { type: "text" | "data-activity" }> };
+/** A workflow card shows its own controls, and its text is a summary for other surfaces. */
+function visibleParts(parts: readonly DisplayPart[]): readonly DisplayPart[] {
+  if (!parts.some((part) => part.type === "data-workflow")) return parts;
+  return parts.filter((part) => part.type !== "text" && part.type !== "data-actions");
+}
+
 export function groupParts(parts: readonly DisplayPart[]): Group[] {
   const groups: Group[] = [];
   for (const part of parts) {
@@ -955,7 +1063,13 @@ function MessageCard({
               </div>
             ) : null}
             {content.texts.map((text, index) => (
-              <Markdown key={index} text={text} preserveLineBreaks={collapsible} />
+              <div key={index} data-citation-text={collapsible ? undefined : ""}>
+                <Markdown
+                  text={text}
+                  preserveLineBreaks={collapsible}
+                  sourcePositions={!collapsible}
+                />
+              </div>
             ))}
             {files.length > 0 ? (
               <div
@@ -1011,6 +1125,7 @@ const MessageBody = memo(function MessageBody(
   const { message } = props;
   const conversation = useConversation();
   const timeline = useContext(TimelineContext);
+  const displayStream = useContext(DisplayStreamContext);
   const reference =
     message.metadata?.reference ??
     (timeline
@@ -1028,7 +1143,7 @@ const MessageBody = memo(function MessageBody(
     return () => clearTimeout(timer);
   }, [copiedAt]);
   const copyText = props.copyText ?? messageText(message);
-  const groups = useMemo(() => groupParts(message.parts), [message.parts]);
+  const groups = useMemo(() => groupParts(visibleParts(message.parts)), [message.parts]);
   const cards = useMemo(() => groupMessageCards(groups), [groups]);
   const reactions = useMemo(
     () => message.parts.flatMap((part) => (part.type === "data-reactions" ? part.data.items : [])),
@@ -1079,6 +1194,14 @@ const MessageBody = memo(function MessageBody(
       ),
     [attachments, resourceUrl],
   );
+  const previewThreadId = timeline?.threadId ?? displayStream?.threadId;
+  const previewMessage = useMemo(
+    () =>
+      previewThreadId && message.role === "assistant"
+        ? { threadId: previewThreadId, messageId: message.id }
+        : null,
+    [previewThreadId, message.role, message.id],
+  );
   const time =
     message.metadata?.createdAt !== undefined ? (
       <time dateTime={new Date(message.metadata.createdAt).toISOString()}>
@@ -1120,80 +1243,99 @@ const MessageBody = memo(function MessageBody(
         align={self ? "end" : "start"}
         className={`message leading-normal ${conversational ? "py-1" : "py-0"} px-0 wrap-anywhere message-${message.role} native-message text-base`}
         data-message-id={message.id}
+        data-citation-source={
+          message.role === "assistant" &&
+          reference?.surface === "native" &&
+          displayStream?.kind !== "subagent"
+            ? message.id
+            : undefined
+        }
+        data-citation-thread={reference?.surface === "native" ? reference.sessionId : undefined}
       >
         {(props.showAvatar ?? conversational) ? (
           <AuthorAvatar author={author} role={authorRole} self={self} message={message} />
         ) : null}
         <MessageResourcesContext value={resources}>
-          <MessageContent>
-            {cards.map((group, index) => {
-              if (group.kind === "content")
-                return (
-                  <MessageCard
-                    key={index}
-                    arrivalId={`${props.renderKey ?? message.id}:content:${index}`}
-                    content={group}
-                    self={self}
-                    collapsible={message.role === "user"}
-                    streaming={message.role === "assistant" && !!props.live}
-                    reactions={
-                      index === lastContent ? (
-                        <MessageReactions messageId={message.id} items={reactions} />
-                      ) : null
-                    }
-                  />
-                );
-              if (group.kind === "activity") return <Activity key={index} parts={group.parts} />;
-              const part = group.part;
-              switch (part.type) {
-                case "data-compaction":
+          <HtmlPreviewMessageContext value={previewMessage}>
+            <MessageContent>
+              {cards.map((group, index) => {
+                if (group.kind === "content")
                   return (
-                    <Marker variant="separator" className="compaction" key={part.id}>
-                      <MarkerContent>
-                        Context compaction {part.data.state}
-                        {part.data.beforeCount !== undefined && part.data.afterCount !== undefined
-                          ? ` · ${part.data.beforeCount} → ${part.data.afterCount}`
-                          : ""}
-                      </MarkerContent>
-                    </Marker>
+                    <MessageCard
+                      key={index}
+                      arrivalId={`${props.renderKey ?? message.id}:content:${index}`}
+                      content={group}
+                      self={self}
+                      collapsible={message.role === "user"}
+                      streaming={message.role === "assistant" && !!props.live}
+                      reactions={
+                        index === lastContent ? (
+                          <MessageReactions messageId={message.id} items={reactions} />
+                        ) : null
+                      }
+                    />
                   );
-                case "data-input-state":
-                  return part.data.state === "admitted" || part.data.state === "queued" ? null : (
-                    <Marker className="input-state" key={part.id}>
-                      <MarkerContent>{part.data.reason ?? part.data.state}</MarkerContent>
-                    </Marker>
-                  );
-                case "data-actions":
-                  return (
-                    <div className="action-list" key={part.id}>
-                      {part.data.actions.map((action) => (
-                        <Button
-                          key={action.actionId}
-                          type="button"
-                          disabled={!canEdit || action.disabled}
-                          variant={action.style === "danger" ? "destructive" : "secondary"}
-                          onClick={() => onAction(message.id, part, action.actionId)}
-                        >
-                          {action.label}
-                        </Button>
-                      ))}
-                    </div>
-                  );
-                case "data-reactions":
-                  return lastContent < 0 ? (
-                    <Bubble
-                      key={part.id}
-                      variant={self ? "tinted" : "muted"}
-                      className="message-bubble"
-                    >
-                      <BubbleContent>
-                        <MessageReactions messageId={message.id} items={part.data.items} />
-                      </BubbleContent>
-                    </Bubble>
-                  ) : null;
-              }
-            })}
-          </MessageContent>
+                if (group.kind === "activity") return <Activity key={index} parts={group.parts} />;
+                const part = group.part;
+                switch (part.type) {
+                  case "data-compaction":
+                    return (
+                      <Marker variant="separator" className="compaction" key={part.id}>
+                        <MarkerContent>
+                          Context compaction {part.data.state}
+                          {part.data.beforeCount !== undefined && part.data.afterCount !== undefined
+                            ? ` · ${part.data.beforeCount} → ${part.data.afterCount}`
+                            : ""}
+                        </MarkerContent>
+                      </Marker>
+                    );
+                  case "data-input-state":
+                    return part.data.state === "admitted" || part.data.state === "queued" ? null : (
+                      <Marker className="input-state" key={part.id}>
+                        <MarkerContent>{part.data.reason ?? part.data.state}</MarkerContent>
+                      </Marker>
+                    );
+                  case "data-actions":
+                    return (
+                      <div className="action-list" key={part.id}>
+                        {part.data.actions.map((action) => (
+                          <Button
+                            key={action.actionId}
+                            type="button"
+                            disabled={!canEdit || action.disabled}
+                            variant={action.style === "danger" ? "destructive" : "secondary"}
+                            onClick={() => onAction(message.id, part, action.actionId)}
+                          >
+                            {action.label}
+                          </Button>
+                        ))}
+                      </div>
+                    );
+                  case "data-workflow":
+                    return (
+                      <WorkflowCard
+                        key={part.id}
+                        messageId={message.id}
+                        card={part.data}
+                        actions={message.parts.find((item) => item.type === "data-actions")}
+                      />
+                    );
+                  case "data-reactions":
+                    return lastContent < 0 ? (
+                      <Bubble
+                        key={part.id}
+                        variant={self ? "tinted" : "muted"}
+                        className="message-bubble"
+                      >
+                        <BubbleContent>
+                          <MessageReactions messageId={message.id} items={part.data.items} />
+                        </BubbleContent>
+                      </Bubble>
+                    ) : null;
+                }
+              })}
+            </MessageContent>
+          </HtmlPreviewMessageContext>
         </MessageResourcesContext>
         {conversational &&
         (props.showControls ??

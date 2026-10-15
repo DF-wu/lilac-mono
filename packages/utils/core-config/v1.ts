@@ -744,8 +744,8 @@ function coreConfigV1ToUniversal(
         },
         autoInject: {
           enabled: false,
-          minTextUnits: 80,
-          followUpMinTextUnits: 110,
+          minTextUnits: 10,
+          followUpMinTextUnits: 10,
           limit: 3,
           minScore: 0.1,
           expansionMinConfidence: 0.57,
@@ -753,15 +753,23 @@ function coreConfigV1ToUniversal(
           filterCurrentParticipants: false,
         },
         autoInjectMode: "llm",
-        jevAutoInject: {
-          model: "jev-1.13.0",
+        decisionAutoInject: {
+          model: ["typesafe/jev-1.13.0"],
           limit: 3,
-          candidateLimit: 30,
+          candidateLimit: 40,
           semanticFallback: true,
-          recallMinProbability: 0.7,
-          durableSubjectMinProbability: 0.6,
-          casualMaxProbability: 0.6,
-          relevanceMinProbability: 0.6,
+          jev: {
+            recallMinProbability: 0,
+            durableSubjectMinProbability: 0.6,
+            casualMaxProbability: 0.6,
+            relevanceMinProbability: 0.2,
+          },
+          luna: {
+            recallMinProbability: 0,
+            durableSubjectMinProbability: 0.5,
+            casualMaxProbability: 0.3,
+            relevanceMinProbability: 0.1,
+          },
         },
       },
     },
@@ -770,6 +778,7 @@ function coreConfigV1ToUniversal(
     },
     surface: {
       ...parsed.surface,
+      workingIndicators: cloneDefaultWorkingIndicators(),
       native: defaultNativeSurfaceConfig(),
       discord: {
         ...discordRest,

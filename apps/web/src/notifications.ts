@@ -106,7 +106,27 @@ export function watchNotifications(options: {
 }) {
   const { client, preferences } = options;
   const scope = notificationScope(options.scope);
-  let threads = new Map(options.initial.map((thread) => [thread.id, thread]));
+  const threads = new Map<string, NativeThread>();
+  const workingThreads = new Map<string, NativeThread>();
+  function trackWorkingThread(thread: NativeThread) {
+    const working = workingThreads.get(thread.id);
+    // Run cleanup can publish idle before the terminal output projection arrives.
+    if (thread.displayStatus === "idle" && thread.capabilities.read && !thread.archived)
+      return working;
+    workingThreads.delete(thread.id);
+    if (thread.displayStatus === "working" && thread.capabilities.read && !thread.archived)
+      workingThreads.set(thread.id, thread);
+    return working;
+  }
+  function resetThreads(items: NativeThread[]) {
+    threads.clear();
+    workingThreads.clear();
+    for (const thread of items) {
+      threads.set(thread.id, thread);
+      trackWorkingThread(thread);
+    }
+  }
+  resetThreads(options.initial);
   let epoch = 0;
   let leader = false;
   let disposed = false;
@@ -205,23 +225,25 @@ export function watchNotifications(options: {
       }
       epoch += 1;
       threads.clear();
+      workingThreads.clear();
       releaseLeadership();
       return;
     }
     if (event.kind === "bootstrap") {
       epoch += 1;
-      threads = new Map(event.bootstrap.threads.items.map((thread) => [thread.id, thread]));
+      resetThreads(event.bootstrap.threads.items);
       return;
     }
     if (event.kind === "removed") {
       threads.delete(event.threadId);
+      workingThreads.delete(event.threadId);
       return;
     }
     if (event.kind !== "thread") return;
     const previous = threads.get(event.thread.id);
     if (previous && event.thread.revision <= previous.revision) return;
     threads.set(event.thread.id, event.thread);
-    const kind = notificationTransition(previous, event.thread);
+    const kind = notificationTransition(trackWorkingThread(event.thread), event.thread);
     if (!kind || !leader || client.connectionState !== "online") return;
     const prefs = preferences.store.getState();
     if (prefs.enabled && prefs[kind] && notificationPermission() === "granted")

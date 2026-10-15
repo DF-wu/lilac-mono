@@ -7,6 +7,7 @@ import {
   type ToolResultOutputNormalizerOwner,
 } from "@stanley2058/lilac-tool-results/tool-result-output-normalizer";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
+import { isRecord } from "@stanley2058/lilac-utils/runtime-utils";
 
 import type { ToolResultArtifactStore } from "./tool-result-artifact-store";
 import { redactSecrets } from "../tools/bash-safety/format";
@@ -26,9 +27,7 @@ export function createToolResultOutputNormalizer(params: {
       context.bypassGenericOutputNormalizer === true &&
       context.toolName === "subagent_delegate" &&
       (output.type === "json" || output.type === "error-json") &&
-      output.value !== null &&
-      typeof output.value === "object" &&
-      !Array.isArray(output.value) &&
+      isRecord(output.value) &&
       typeof output.value.finalText === "string"
     ) {
       const normalized = await normalizeOverflow(

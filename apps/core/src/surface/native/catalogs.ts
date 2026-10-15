@@ -17,6 +17,12 @@ export type NativeCatalogScope = {
 };
 
 const builtins: DisplayCatalog["commands"] = [
+  {
+    id: "compact",
+    name: "compact",
+    description: "Summarize active context without clearing messages",
+    kind: "builtin",
+  },
   { id: "model", name: "model", description: "Select the model for this thread", kind: "builtin" },
   { id: "cancel", name: "cancel", description: "Cancel the active run", kind: "builtin" },
 ];
@@ -129,6 +135,14 @@ function projectCatalog(source: NativeCatalogSource): Omit<DisplayCatalog, "revi
                 .map((arg) => (arg.required ? `<${arg.key}>` : `[${arg.key}]`))
                 .join(" ")
                 .slice(0, 256),
+              arguments: command.args.map((arg) => ({
+                key: arg.key,
+                type: arg.type,
+                ...(arg.description ? { description: arg.description } : {}),
+                required: arg.required,
+                // Oversized choice lists stay server-validated only.
+                ...(arg.choices && arg.choices.length <= 256 ? { choices: arg.choices } : {}),
+              })),
             }
           : {}),
       })),

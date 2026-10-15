@@ -1,3 +1,5 @@
+import { ContextMessage } from "./components/RecentContext";
+import { DirectThreadCard } from "./components/DirectThreadCard";
 import { ComputerViewer } from "./components/ComputerViewer";
 import computerDemoUrl from "./assets/computer-demo.html?url";
 import { AgentAvatar } from "./components/AgentAvatar";
@@ -16,6 +18,12 @@ import { ConnectionLoading } from "./components/ui/connection-loading";
 import { ReconnectionDemo } from "./components/ReconnectionDemo";
 import { ConversationBadge, ConversationIcon } from "./components/ConversationReference";
 import lilacLogo from "./assets/logo.svg";
+import { ActivityItem, RequestActiveContext } from "./components/ActivityLog";
+import {
+  HtmlPreviewBlock,
+  HtmlPreviewFrame,
+  HtmlPreviewMessageContext,
+} from "./components/HtmlPreview";
 import { LinkPreviewAnchor } from "./components/LinkWithFavicon";
 import { SidebarEmptyState } from "./components/SidebarEmptyState";
 import { ConversationStatus } from "./components/ConversationStatus";
@@ -43,12 +51,15 @@ import {
   RefreshCw,
   Trash2,
 } from "lucide-react";
-import type { DisplayMessage } from "@stanley2058/lilac-client-protocol";
+import type { DisplayMessage, NativeThread } from "@stanley2058/lilac-client-protocol";
 import logo from "./assets/logo.svg";
 import motion from "./assets/design-system/motion.mp4";
 import tone from "./assets/design-system/tone.wav";
 import weekendPdf from "./assets/design-system/weekend.pdf";
 import type { Attachment } from "./types";
+import type { DisplayCatalog } from "@stanley2058/lilac-client-protocol";
+import { HTML_PREVIEW_BOOTSTRAP_MARKUP } from "@stanley2058/lilac-client-protocol";
+import { SkillCatalogContext } from "./components/skill-mentions";
 import { AttachmentPreviewBody, ReadyAttachment } from "./components/ResourcePreview";
 import { MessageIdentityContext } from "./components/message-identity";
 import { toast } from "./components/ui/toast";
@@ -96,14 +107,18 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { Markdown } from "./components/Markdown";
 import { Composer } from "./components/Composer";
 import { Message, ThinkingIndicator } from "./components/Timeline";
+import { ThreadSettleButton } from "./components/ThreadSettleButton";
 import { ThreadQueueDemo } from "./components/ThreadQueueDemo";
 import { DeploymentSettingsForm } from "./components/DeploymentSettings";
 import { AgentWorkDemo } from "./components/AgentWorkDemo";
+import { CitationDemo } from "./components/CitationDemo";
+import { WorkingIndicatorsContext } from "./components/WorkVerb";
 import { SidebarSearch } from "./components/SidebarSearch";
 import { AgentDiscordLink } from "./components/AgentIdentity";
 import { ExternalMessages } from "./components/ExternalMessages";
 import { ExternalSkeleton } from "./components/ExternalSidebar";
 import { ThreadCard } from "./components/ThreadSelect";
+import { toolActivities } from "./generated/tool-activities";
 import "./design-system.css";
 
 const sections = [
@@ -116,6 +131,7 @@ const sections = [
   ["keybindings", "Keybindings"],
   ["deployment", "Deployment settings"],
   ["composer", "Composer"],
+  ["citations", "Citations"],
   ["reconnection", "Reconnection"],
   ["attachments", "Attachments"],
   ["content", "Rich content"],
@@ -124,6 +140,38 @@ const sections = [
   ["layout", "Layout"],
 ] as const;
 const now = new Date("2026-09-19T09:00:00Z").getTime();
+const directThreadBase = {
+  id: "demo-dm",
+  kind: "dm",
+  title: "Chat with Lilac",
+  starterId: "demo",
+  archived: false,
+  revision: 0,
+  capabilities: { read: true, edit: true, share: false },
+} satisfies Omit<NativeThread, "updatedAt">;
+const directThreadDemos: NativeThread[] = [
+  {
+    ...directThreadBase,
+    updatedAt: now - 3 * 60_000,
+    preview: { role: "user", text: "Let us plan the project launch for next week." },
+  },
+  {
+    ...directThreadBase,
+    displayStatus: "working",
+    workingSince: now - 42_000,
+    updatedAt: now,
+  },
+  {
+    ...directThreadBase,
+    displayStatus: "completed",
+    updatedAt: now - 2 * 3_600_000,
+    preview: {
+      role: "assistant",
+      text: "Here is a launch checklist with owners, dates, and the open risks we still need to close.",
+    },
+  },
+  { ...directThreadBase, displayStatus: "error", updatedAt: now - 3 * 86_400_000 },
+];
 const threadStates = [
   { state: "idle", label: "Idle", title: "Weekend reading list" },
   { state: "completed", label: "Completed · unread", title: "A few places to visit in Kyoto" },
@@ -282,17 +330,7 @@ const messageFixtures: DisplayMessage[] = [
           durationMs: 2100,
         },
       },
-      {
-        type: "data-activity",
-        id: "gallery-search",
-        data: {
-          kind: "tool",
-          label: "Searched nearby places",
-          state: "complete",
-          detail: "Found three cafés and two independent bookstores.",
-          durationMs: 900,
-        },
-      },
+      { type: "data-activity", id: "gallery-search", data: toolActivities.nearby.settled },
       {
         type: "text",
         text: "The café opens earlier than the bookstore, so that order works well.",
@@ -342,7 +380,7 @@ const messageFixtures: DisplayMessage[] = [
   },
 ];
 const richText =
-  '### A small plan\n\nUse **bold**, *italic*, ~~strikethrough~~, and `inline code`. Links include a favicon: [GitHub](https://github.com).\n\n> Leave enough room to change your mind.\n\n- [x] Pick a place\n- [ ] Check the weather\n\n| Time | Plan |\n| --- | --- |\n| Morning | Coffee and a walk |\n| Afternoon | Bookstore |\n\n```typescript\nconst weekend = { pace: "slow", reservations: false };\nconsole.log("There is time to stop and explore", weekend);\n```\n\n```bash\nbun run dev:web\n```\n\nCurrency stays prose: your $10 suggestion makes sense over $7.\n\n**注意：**粗體與~~刪除線：~~在全形標點後也能正確結束。\n\nInline math: $a^2 + b^2 = c^2$.\n\n$$\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n$$\n\nLaTeX delimiters: \\(e^{i\\pi} + 1 = 0\\)\n\n\\[\n\\sum_{n=1}^{\\infty} \\frac{1}{n^2} = \\frac{\\pi^2}{6}\n\\]\n\nEscaped brackets stay literal: array\\[0\\] and see \\[1\\].\n\n```mermaid\nflowchart LR\n  Coffee --> Walk --> Bookstore\n```';
+  '### A small plan\n\nUse **bold**, *italic*, ~~strikethrough~~, and `inline code`. Links include a favicon: [GitHub](https://github.com).\n\n> Leave enough room to change your mind.\n\n- [x] Pick a place\n- [ ] Check the weather\n\n| Time | Plan |\n| --- | --- |\n| Morning | Coffee and a walk |\n| Afternoon | Bookstore |\n\n```typescript\nconst weekend = { pace: "slow", reservations: false };\nconsole.log("There is time to stop and explore", weekend);\n```\n\n```bash\nbun run dev:web\n```\n\nCurrency stays prose: your $10 suggestion makes sense over $7.\n\n**注意：**粗體與~~刪除線：~~在全形標點後也能正確結束。\n\nInline math: $a^2 + b^2 = c^2$.\n\n$$\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n$$\n\nLaTeX delimiters: \\(e^{i\\pi} + 1 = 0\\)\n\n\\[\n\\sum_{n=1}^{\\infty} \\frac{1}{n^2} = \\frac{\\pi^2}{6}\n\\]\n\nEscaped brackets stay literal: array\\[0\\] and see \\[1\\].\n\n```mermaid\nflowchart TD\n  Coffee["Coffee and a slow start"] --> Weather{"What does the weather look like?"}\n  Weather -->|Clear| Walk["A long walk through the neighborhood"]\n  Weather -->|Rain| Bookstore["Find a book and somewhere warm to read"]\n```';
 
 const tableExample = [
   "| Restaurant | Location | Budget per person | Why consider it |",
@@ -397,24 +435,7 @@ function Specimen({
   );
 }
 function DemoThreadActions({ onAction }: { onAction: (label: string) => void }) {
-  return (
-    <>
-      <IconButton
-        label="Settle conversation"
-        tooltip="Settle"
-        onClick={() => onAction("Settle selected")}
-      >
-        <Check />
-      </IconButton>
-      <IconButton
-        label="Rename conversation"
-        tooltip="Rename"
-        onClick={() => onAction("Rename selected")}
-      >
-        <Pencil />
-      </IconButton>
-    </>
-  );
+  return <ThreadSettleButton onClick={() => onAction("Settle selected")} />;
 }
 function Foundations() {
   return (
@@ -505,6 +526,7 @@ function Threads() {
                 title={title}
                 starterName={index % 2 ? "Morgan Lee" : "Alex Chen"}
                 updatedAt={now - index * 3_600_000}
+                workingSince={state === "working" ? now - 72_000 : undefined}
                 now={now}
                 state={state}
                 selected={selected === state}
@@ -529,7 +551,16 @@ function Threads() {
             title="Fix search pagination"
             starterName="GitHub"
             starterIcon={<ConversationIcon surface="github" />}
-            updatedAt={now - 3 * 86_400_000}
+            updatedAt={now - 30 * 3_600_000}
+            now={now}
+            state="idle"
+            onSelect={() => {}}
+          />
+          <ThreadCard
+            title="Archive release notes"
+            starterName="GitHub"
+            starterIcon={<ConversationIcon surface="github" />}
+            updatedAt={now - 40 * 86_400_000}
             now={now}
             state="idle"
             onSelect={() => {}}
@@ -673,6 +704,7 @@ function Threads() {
     </Section>
   );
 }
+const demoWorkingIndicators = ["Brewing", "Photosynthesizing", "Tiptoeing", "Tuning", "Waltzing"];
 const reactionDemoNames = ["Morgan Lee", "Sam Rivera", "Jo Park", "Taylor Kim", "Casey Jones"];
 
 function Messages() {
@@ -874,6 +906,29 @@ function Messages() {
         </Specimen>
       </div>
       <ThinkingSpinnerDemo />
+      <Specimen title="HTML preview">
+        <HtmlPreviewFrame src={galleryPreviewSrc} title="weekly-runs.html" />
+      </Specimen>
+      <Specimen title="HTML file preview">
+        <div className="h-96">
+          <FileSource
+            name="weekly-runs.html"
+            href={galleryPreviewSrc}
+            text={{
+              status: "ready",
+              text: decodeURIComponent(galleryPreviewSrc.split(",")[1] ?? ""),
+              truncated: false,
+            }}
+          />
+        </div>
+      </Specimen>
+      <Specimen title="HTML preview loading">
+        <HtmlPreviewMessageContext value={{ threadId: "gallery", messageId: "gallery" }}>
+          <RequestActiveContext value>
+            <HtmlPreviewBlock source="/work/weekly-runs.html" />
+          </RequestActiveContext>
+        </HtmlPreviewMessageContext>
+      </Specimen>
       <Specimen title="Markers">
         <div className="ds-stack">
           <ThinkingIndicator />
@@ -891,12 +946,62 @@ function Messages() {
     </Section>
   );
 }
+const galleryPreviewBars = [
+  ["Mon", 42],
+  ["Tue", 68],
+  ["Wed", 55],
+  ["Thu", 81],
+  ["Fri", 34],
+] as const;
+// The same bootstrap the preview route adds, so the sample follows the theme and reports its height.
+const galleryPreviewSrc = `data:text/html;charset=utf-8,${encodeURIComponent(
+  `<!doctype html><html><head>${HTML_PREVIEW_BOOTSTRAP_MARKUP}<style>.bars{display:flex;align-items:end;gap:12px;height:160px}.bar{flex:1;border-radius:var(--radius) var(--radius) 0 0}.labels{display:flex;gap:12px;margin-top:6px;color:var(--muted-foreground);font-size:12px}.labels span{flex:1;text-align:center}h4{margin:0 0 12px;font-weight:600}</style></head><body><h4>Runs this week</h4><div class="bars">${galleryPreviewBars
+    .map(
+      ([, value], index) =>
+        `<div class="bar" style="height:${value * 1.8}px;background:var(--chart-${index + 1})"></div>`,
+    )
+    .join("")}</div><div class="labels">${galleryPreviewBars
+    .map(([day]) => `<span>${day}</span>`)
+    .join("")}</div></body></html>`,
+)}`;
+const composerCatalog: DisplayCatalog = {
+  revision: "design-system",
+  models: [],
+  skills: [
+    {
+      id: "agent-browser",
+      name: "agent-browser",
+      description: "Browser automation",
+      source: "user",
+    },
+  ],
+  commands: [
+    {
+      id: "custom:tarot",
+      name: "tarot",
+      description: "Draw tarot cards",
+      kind: "custom",
+      argumentHint: "<count> [spread] [reversed]",
+      arguments: [
+        { key: "count", type: "number", required: true, description: "Cards to draw" },
+        {
+          key: "spread",
+          type: "string",
+          required: false,
+          choices: ["single", "past-present-future", "celtic cross"],
+        },
+        { key: "reversed", type: "boolean", required: false, description: "Allow reversed cards" },
+      ],
+    },
+  ],
+};
 function ComposerSpecimen() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(false);
   const [text, setText] = useState(
-    "Help me turn these **notes** into a weekend plan.\n\nKeep Sunday free.\nhttps://example.com/weekend",
+    "Help me turn these **notes** into a weekend plan with $agent-browser.\n\nCompare [the discussion](/?ref=discord%3Aweekend). Keep Sunday free.\nhttps://example.com/weekend",
   );
+  const [skillIds, setSkillIds] = useState(["agent-browser"]);
   const [disabled, setDisabled] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>(() => [
     {
@@ -911,7 +1016,7 @@ function ComposerSpecimen() {
     <Section
       id="composer"
       title="Composer"
-      description="Try the formatting toolbar, Markdown shortcuts, and multiline input."
+      description="Try the formatting toolbar, Markdown shortcuts, multiline input, and /tarot arguments."
     >
       <div className="ds-row flex items-center flex-wrap gap-2">
         <Button variant="secondary" onClick={() => setDisabled((value) => !value)}>
@@ -944,8 +1049,9 @@ function ComposerSpecimen() {
             setAttachments((items) => items.filter((item) => item.key !== key))
           }
           disabled={disabled}
-          skillIds={[]}
-          onSkills={noop}
+          catalog={composerCatalog}
+          skillIds={skillIds}
+          onSkills={setSkillIds}
           onCommand={noop}
           onAttach={noop}
           onRetryAttachment={noop}
@@ -957,7 +1063,9 @@ function ComposerSpecimen() {
         />
       </div>
       <Specimen title="Message preview">
-        <Markdown text={text} preserveLineBreaks />
+        <SkillCatalogContext value={composerCatalog.skills}>
+          <Markdown text={text} preserveLineBreaks />
+        </SkillCatalogContext>
       </Specimen>
       <Collapsible>
         <CollapsibleTrigger render={<Button variant="ghost" />}>
@@ -1276,6 +1384,21 @@ function Controls() {
           <div className="ds-field flex flex-col gap-2 text-sm">
             <span>Search</span>
             <SidebarSearch onSearch={setSearch} />
+            {directThreadDemos.map((thread, index) => (
+              <DirectThreadCard
+                key={thread.displayStatus ?? "idle"}
+                thread={thread}
+                selected={index === 0}
+                now={now}
+                onSelect={() => {}}
+              />
+            ))}
+            <ContextMessage outside>
+              <p className="px-6 text-sm">Earlier conversation, outside context.</p>
+            </ContextMessage>
+            <ContextMessage summarized>
+              <p className="px-6 text-sm">Earlier conversation, represented in the summary.</p>
+            </ContextMessage>
             <span className="ds-muted" role="status">
               {search ? `Search: ${search}` : ""}
             </span>
@@ -1684,7 +1807,9 @@ export default function DesignSystem() {
                 title="Agent work"
                 description="Choose a stage to inspect, or play through the examples. Expand work summaries and tool details. These use the conversation renderer with local sample data."
               >
-                <AgentWorkDemo />
+                <WorkingIndicatorsContext value={demoWorkingIndicators}>
+                  <AgentWorkDemo />
+                </WorkingIndicatorsContext>
               </Section>
               <Section id="appearance" title="Appearance">
                 <div className="max-w-2xl">
@@ -1702,6 +1827,7 @@ export default function DesignSystem() {
                   value={{
                     titleModel: "fast",
                     outputStreaming: "complete",
+                    dmContextMaxAgeMs: 10_800_000,
                     oldMessageSelectionMaxAgeMs: null,
                     storageRetentionMaxAgeMs: null,
                     crossThreadSend: { triggerRun: true },
@@ -1710,6 +1836,13 @@ export default function DesignSystem() {
                 />
               </Section>
               <ComposerSpecimen />
+              <Section
+                id="citations"
+                title="Citations"
+                description="Select assistant text to cite it or copy Markdown. Add a comment, save it, and follow the chip back to its source."
+              >
+                <CitationDemo />
+              </Section>
               <Section
                 id="reconnection"
                 title="Reconnection"
@@ -1747,6 +1880,34 @@ export default function DesignSystem() {
                       Loading preview
                     </LinkPreviewAnchor>
                   </div>
+                  <Specimen title="Remote images">
+                    <LinkPreviewAnchor
+                      href="https://claude.dev/blog/how-we-made-claude-ai-faster/"
+                      preview={{
+                        title: "How we made claude.ai 3x faster in two weeks",
+                        icon: "https://claude.dev/shared/img/favicon.svg",
+                        image: "https://claude.dev/blog/how-we-made-claude-ai-faster/og.png",
+                      }}
+                    >
+                      claude.dev
+                    </LinkPreviewAnchor>
+                    <ActivityItem
+                      part={{
+                        type: "data-activity",
+                        id: "remote-image-preview",
+                        data: {
+                          kind: "tool",
+                          label: "read",
+                          state: "complete",
+                          detail: 'read {"path":"https://claude.dev/shared/img/favicon.svg"}',
+                          file: {
+                            path: "https://claude.dev/shared/img/favicon.svg",
+                            mediaType: "image/svg+xml",
+                          },
+                        },
+                      }}
+                    />
+                  </Specimen>
                   <Markdown text={richText} />
                   <Specimen title="Table with long descriptions">
                     <Markdown text={tableExample} />

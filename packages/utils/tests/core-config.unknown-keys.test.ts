@@ -23,6 +23,40 @@ function collectWarnings(): {
 }
 
 describe("core config unknown keys", () => {
+  it("recognizes migrated flat thresholds and reports unknown model-scoped keys", async () => {
+    const input = {
+      configVersion: 2,
+      conversation: {
+        thread: {
+          decisionAutoInject: {
+            model: ["typesafe/jev-1.13.0", "openai/gpt-6-luna"],
+            recallMinProbability: 0.8,
+            jev: { relevanceMinProbability: 0.7 },
+            luna: { relevanceMinProbability: 0.9, typo: true },
+          },
+        },
+      },
+    };
+    const warnings = collectWarnings();
+    await parseCoreConfig(input, warnings);
+    expect(warnings.paths).toEqual([
+      ["conversation", "thread", "decisionAutoInject", "luna", "typo"],
+    ]);
+  });
+  it("recognizes legacy decision aliases while reporting unknown children", async () => {
+    const warnings = collectWarnings();
+    const parsed = await parseCoreConfig(
+      {
+        configVersion: 2,
+        conversation: {
+          thread: { autoInjectMode: "jev", jevAutoInject: { candidateLimit: 12, typo: true } },
+        },
+      },
+      warnings,
+    );
+    expect(parsed.conversation.thread.decisionAutoInject.candidateLimit).toBe(12);
+    expect(warnings.paths).toEqual([["conversation", "thread", "jevAutoInject", "typo"]]);
+  });
   for (const [version, decode] of [
     [1, decodeCoreConfigV1ToUniversal],
     [2, decodeCoreConfigV2ToUniversal],

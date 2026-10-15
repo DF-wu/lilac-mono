@@ -1,4 +1,10 @@
+import type { ModelMessage } from "ai";
 import { isDeepStrictEqual } from "node:util";
+import {
+  expandAssistantCitations,
+  collectCitations,
+  CITATION_INPUT_LIMIT,
+} from "@stanley2058/lilac-client-protocol";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import {
   EventPublishContractInvalid,
@@ -13,7 +19,11 @@ import type { TranscriptStore } from "../../transcript/transcript-store";
 import { parseNativeRequestEnvelope } from "../authenticated-request";
 import { deleteDiscordRequestBlobHandles } from "../bridge/request-composition/attachments";
 import { prepareStoredMessagesForBus } from "../bridge/request-composition/prepare-bus-messages";
-import { escapeSurfaceMetadataTags, formatSurfaceMetadataLine } from "../bridge/surface-metadata";
+import {
+  escapeSurfaceMetadataTags,
+  formatSurfaceMetadataLine,
+  parseSurfaceMetadataLine,
+} from "../bridge/surface-metadata";
 import type { NativeRunnerLifecycle, NativeRunnerRequest } from "../bridge/bus-agent-runner";
 import type { NativeInputRecord } from "./codec";
 import { nativeFailure, NativeStoreFailure } from "./errors";
@@ -39,6 +49,7 @@ export function createNativeExecution(options: {
   ) => Promise<ResultType<string, Error>> | ResultType<string, Error>;
   validateSkill?: (skillId: string, starterId: string) => boolean;
   getOldMessageSelectionMaxAgeMs?: () => number | undefined;
+  getDmContextMaxAgeMs?: () => number;
   now?: () => number;
   deliveryState?: (
     deliveryId: string,
@@ -46,6 +57,7 @@ export function createNativeExecution(options: {
 }) {
   const { store } = options;
   const publications = new Map<string, Promise<ResultType<void, Error>>>();
+  const activeCompactions = new Map<string, readonly ModelMessage[]>();
   const cancelingThreads = new Set<string>();
   let accepting = true;
 
@@ -68,6 +80,7 @@ export function createNativeExecution(options: {
         native.historyGeneration !== input.historyGeneration ||
         native.threadId !== input.threadId ||
         native.turnId !== input.turnId ||
+        !!native.compact !== (input.command?.id === "compact") ||
         native.authorUserId !== input.authorId ||
         native.starterUserId !== starter.id ||
         native.requestDeliveryId !== input.deliveryId ||
@@ -91,6 +104,32 @@ export function createNativeExecution(options: {
     });
   }
 
+  function directHistorySuffix(
+    threadId: string,
+    firstPosition: number,
+    canonical: readonly StoredMessageV1[],
+  ) {
+    return Result.gen(function* () {
+      for (const [index, message] of canonical.entries()) {
+        if (message.role !== "user") continue;
+        let content = "";
+        if (typeof message.content === "string") content = message.content;
+        else if (message.content[0]?.type === "text") content = message.content[0].text;
+        const header = parseSurfaceMetadataLine(content.split("\n")[0] ?? "");
+        if (header?.meta.platform !== "native" || header.meta.thread_id !== threadId) continue;
+        const direct = yield* store.getInputByRequestId(
+          `native:${threadId}:${header.meta.message_id}`,
+        );
+        if (!direct || direct.mode === "steer" || direct.position < firstPosition) continue;
+        return Result.ok({
+          messages: canonical.slice(index),
+          firstRequestId: direct.requestId,
+        });
+      }
+      return Result.ok({ messages: [] as readonly StoredMessageV1[] });
+    });
+  }
+
   function selectedHistory(
     input: NativeInputRecord,
     latestRequestId: string,
@@ -99,33 +138,26 @@ export function createNativeExecution(options: {
     return Result.gen(function* () {
       const empty = { messages: [] as readonly StoredMessageV1[] };
       if (input.canonicalHistoryStartRequestId === input.requestId) return Result.ok(empty);
-      const requestIds = yield* store.listCanonicalRequestIds(input.threadId);
-      const retained = yield* Result.all(
-        requestIds.map((requestId) => store.getInputByRequestId(requestId)),
-      );
-      const fullTurns = retained.filter(
-        (turn): turn is NativeInputRecord =>
-          turn !== null && turn.mode !== "steer" && turn.completedAt !== undefined,
-      );
-      const indices = new Map(fullTurns.map((turn, index) => [turn.requestId, index]));
-      const latestIndex = indices.get(latestRequestId);
-      if (latestIndex === undefined)
-        return Result.err(nativeFailure("invalid", "Canonical history has no retained turn"));
-      const maxAgeMs = options.getOldMessageSelectionMaxAgeMs?.();
+      const thread = yield* store.getThreadRecord(input.threadId);
+      const maxAgeMs =
+        thread.kind === "dm"
+          ? (options.getDmContextMaxAgeMs?.() ?? 10_800_000)
+          : options.getOldMessageSelectionMaxAgeMs?.();
       const cutoff =
-        maxAgeMs === undefined ? -Infinity : (options.now?.() ?? Date.now()) - maxAgeMs;
-      const firstEligible = input.canonicalHistoryStartRequestId
-        ? (indices.get(input.canonicalHistoryStartRequestId) ?? -1)
-        : fullTurns.findIndex((turn) => turn.createdAt >= cutoff);
-      if (firstEligible < 0) return Result.ok(empty);
+        maxAgeMs === undefined ? 0 : Math.max(0, (options.now?.() ?? Date.now()) - maxAgeMs);
+      const first = input.canonicalHistoryStartRequestId
+        ? yield* store.getInputByRequestId(input.canonicalHistoryStartRequestId)
+        : yield* store.selectCanonicalInput(input.threadId, { since: cutoff });
+      if (!first) return Result.ok(empty);
+      const latest = yield* store.getInputByRequestId(latestRequestId);
+      if (!latest)
+        return Result.err(nativeFailure("invalid", "Canonical history has no retained turn"));
       const snapshots = new Map<string, readonly StoredMessageV1[]>([[latestRequestId, canonical]]);
-      const pending: { messages: readonly StoredMessageV1[]; startIndex: number }[] = [];
-      let snapshotIndex = latestIndex;
-      let selectedIndex = firstEligible;
+      const pending: { messages: readonly StoredMessageV1[]; firstRequestId: string }[] = [];
+      let turn = latest;
+      let selectedTurn = first;
       let selected: { messages: readonly StoredMessageV1[]; firstRequestId?: string } = empty;
       while (true) {
-        const turn = fullTurns[snapshotIndex];
-        if (!turn) return Result.ok(empty);
         let messages = snapshots.get(turn.requestId);
         if (!messages) {
           const snapshot = yield* (
@@ -136,17 +168,21 @@ export function createNativeExecution(options: {
           messages = snapshot.messages;
           snapshots.set(turn.requestId, messages);
         }
-        const sourceIndex = turn.canonicalHistoryStartRequestId
-          ? indices.get(turn.canonicalHistoryStartRequestId)
-          : 0;
-        if (sourceIndex === undefined || sourceIndex > snapshotIndex) return Result.ok(empty);
-        if (selectedIndex <= sourceIndex) {
-          selected = { messages, firstRequestId: fullTurns[sourceIndex]!.requestId };
+        const source = turn.canonicalHistoryStartRequestId
+          ? yield* store.getInputByRequestId(turn.canonicalHistoryStartRequestId)
+          : yield* store.selectCanonicalInput(input.threadId);
+        if (!source || source.position > turn.position) return Result.ok(empty);
+        if (selectedTurn.position <= source.position) {
+          selected = { messages, firstRequestId: source.requestId };
           break;
         }
-        pending.push({ messages, startIndex: selectedIndex });
-        snapshotIndex = selectedIndex - 1;
-        selectedIndex = sourceIndex;
+        pending.push({ messages, firstRequestId: selectedTurn.requestId });
+        const previous = yield* store.selectCanonicalInput(input.threadId, {
+          before: selectedTurn.position,
+        });
+        if (!previous) return Result.ok(empty);
+        turn = previous;
+        selectedTurn = source;
       }
       for (const boundary of pending.toReversed()) {
         if (
@@ -154,11 +190,13 @@ export function createNativeExecution(options: {
             boundary.messages.slice(0, selected.messages.length),
             selected.messages,
           )
-        )
-          return Result.ok(empty);
+        ) {
+          if (thread.kind !== "dm") return Result.ok(empty);
+          return directHistorySuffix(input.threadId, first.position, canonical);
+        }
         selected = {
           messages: boundary.messages.slice(selected.messages.length),
-          firstRequestId: fullTurns[boundary.startIndex]!.requestId,
+          firstRequestId: boundary.firstRequestId,
         };
       }
       return Result.ok(selected);
@@ -189,7 +227,20 @@ export function createNativeExecution(options: {
             Promise.resolve(options.expandReferences(thread.starterId, input.text)),
           )
         : input.text;
-      const body = skillText ? `${skillText}\n\n${expanded}` : expanded;
+      const cited = expandAssistantCitations(expanded);
+      if (collectCitations(input.text).length && cited.length > CITATION_INPUT_LIMIT)
+        return Result.err(
+          nativeFailure("invalid", "Quoted input is too long. Shorten the quote or comment."),
+        );
+      const commandText =
+        input.command?.id === "compact"
+          ? "The user requested context compaction. Briefly acknowledge completion; do not resume earlier tasks."
+          : cited;
+      const dmInstruction =
+        thread.kind === "dm"
+          ? "This is an ongoing personal conversation that may span unrelated topics. Follow the latest message, use earlier messages when relevant, and treat completed requests as history. Ask briefly when a reference is ambiguous. Older conversation can be searched.\n\n"
+          : "";
+      const body = dmInstruction + (skillText ? `${skillText}\n\n${commandText}` : commandText);
       const text = `${header}\n${escapeSurfaceMetadataTags(body)}`;
       const parts: Extract<StoredMessageV1, { role: "user" }>["content"] = [{ type: "text", text }];
       for (const attachmentId of input.attachmentIds) {
@@ -229,14 +280,15 @@ export function createNativeExecution(options: {
     });
   }
 
-  function commandMetadata(input: NativeInputRecord): ResultType<object, Error> {
-    if (!input.command) return Result.ok({});
+  function commandMetadata(input: Pick<NativeInputRecord, "command">): ResultType<object, Error> {
+    if (!input.command || input.command.id === "compact") return Result.ok({});
     const name = input.command.id.replace(/^custom:/u, "");
     const manager = options.customCommands;
     if (!manager?.get(name))
       return Result.err(nativeFailure("invalid", "Custom command is unavailable"));
     return manager
       .parseText(`/${CUSTOM_COMMAND_TEXT_PREFIX}${name} ${input.command.arguments}`)
+      .mapError((error) => nativeFailure("invalid", error.message))
       .andThen((invocation) => {
         if (!invocation)
           return Result.err(nativeFailure("invalid", "Custom command could not be parsed"));
@@ -279,6 +331,7 @@ export function createNativeExecution(options: {
               starterUserId: thread.starterId,
               turnId: input.turnId,
               historyGeneration: input.historyGeneration,
+              compact: input.command?.id === "compact" || undefined,
               inputId: input.id,
               requestId,
               requestDeliveryId: input.deliveryId,
@@ -427,6 +480,7 @@ export function createNativeExecution(options: {
         return Result.err(nativeFailure("invalid", "Settled native request metadata is invalid"));
       const input = yield* store.getInput(native.inputId);
       yield* completeInput(input, outcome);
+      activeCompactions.delete(input.requestId);
       yield* Result.await(kick(native.threadId));
       return Result.ok(undefined);
     });
@@ -437,6 +491,7 @@ export function createNativeExecution(options: {
       const input = yield* store.getInputByDeliveryId(deliveryId);
       if (!input || input.state === "target-ended") return Result.ok(undefined);
       yield* completeInput(input, "cancelled");
+      activeCompactions.delete(input.requestId);
       yield* Result.await(kick(input.threadId));
       return Result.ok(undefined);
     });
@@ -533,14 +588,96 @@ export function createNativeExecution(options: {
     return Result.all(await Promise.all(publications.values())).map(() => undefined);
   }
 
+  function context(actorId: string, threadId: string) {
+    return Result.gen(function* () {
+      const thread = yield* store.authorizeThread(actorId, threadId);
+      const evaluatedAt = options.now?.() ?? Date.now();
+      const latestId = yield* store.getLatestCanonicalRequestId(threadId);
+      const maxAgeMs =
+        thread.kind === "dm"
+          ? (options.getDmContextMaxAgeMs?.() ?? 10_800_000)
+          : options.getOldMessageSelectionMaxAgeMs?.();
+      const empty = {
+        historyGeneration: thread.historyGeneration,
+        evaluatedAt,
+        firstTurnPosition: null,
+        hasSummary: false,
+        active: !!thread.activeRunId,
+      };
+      if (!latestId) return Result.ok(empty);
+      const latest = yield* store.getInputByRequestId(latestId);
+      if (!latest) return Result.ok(empty);
+      const active = thread.activeRunId
+        ? yield* store.getInputByRequestId(thread.activeRunId)
+        : null;
+      const snapshot = yield* (
+        options.transcriptStore.getRequestTranscript?.({ requestId: latestId }) ?? Result.ok(null)
+      );
+      if (!snapshot) return Result.ok(empty);
+      const selector = active ?? {
+        ...latest,
+        requestId: "preview",
+        canonicalHistoryStartRequestId: undefined,
+      };
+      const history = yield* selectedHistory(selector, latestId, snapshot.messages);
+      if (!history.firstRequestId) return Result.ok(empty);
+      const first = yield* store.getInputByRequestId(history.firstRequestId);
+      if (!first?.turnId) return Result.ok(empty);
+      const firstTurnPosition = yield* store.getTurnPosition(first.turnId);
+      const currentMessages = active ? activeCompactions.get(active.requestId) : undefined;
+      const texts = (currentMessages ?? history.messages).flatMap((message) => {
+        if (message.role !== "user") return [];
+        if (typeof message.content === "string") return [message.content];
+        return message.content.flatMap((part) => (part.type === "text" ? [part.text] : []));
+      });
+      const hasSummary = texts.some((text) => text.startsWith("<context-compaction>"));
+      const directHeader = hasSummary
+        ? texts
+            .map((text) => parseSurfaceMetadataLine(text.split("\n")[0] ?? ""))
+            .find(
+              (header) => header?.meta.platform === "native" && header.meta.thread_id === threadId,
+            )
+        : undefined;
+      const directInput = directHeader?.meta.message_id
+        ? yield* store.getInputByRequestId(`native:${threadId}:${directHeader.meta.message_id}`)
+        : null;
+      const summarizedBeforePosition = directInput?.turnId
+        ? yield* store.getTurnPosition(directInput.turnId)
+        : undefined;
+      return Result.ok({
+        ...empty,
+        firstTurnPosition,
+        hasSummary,
+        summarizedBeforePosition,
+        expiresAt:
+          !active && maxAgeMs !== undefined
+            ? Math.max(evaluatedAt + 1, first.createdAt + maxAgeMs + 1)
+            : undefined,
+      });
+    });
+  }
+
+  function validateCommand(input: Pick<NativeInputRecord, "command">): ResultType<void, Error> {
+    return commandMetadata(input).map(() => undefined);
+  }
+
   return {
+    context,
+    validateCommand,
     drainPublications,
     kick,
     cancel,
     rewind,
     deleteThread,
     recoverMutations,
-    runnerLifecycle: { validate, settled, rejected } satisfies NativeRunnerLifecycle,
+    runnerLifecycle: {
+      validate,
+      settled,
+      rejected,
+      compacted(requestId: string, messages: readonly ModelMessage[]) {
+        activeCompactions.set(requestId, messages);
+      },
+    } satisfies NativeRunnerLifecycle,
   };
 }
 

@@ -1,6 +1,7 @@
 import type { ComponentProps } from "react";
 import type { AllowElement, ExtraProps } from "react-markdown";
 import { Info, Lightbulb, MessageSquareWarning, TriangleAlert, OctagonAlert } from "lucide-react";
+import { sourceAttributes } from "../markdown-source";
 
 type MarkdownParent = NonNullable<Parameters<AllowElement>[2]>;
 
@@ -49,9 +50,9 @@ function alertPresentation(kind: string) {
 export function MarkdownBlockquote({ node, children }: ComponentProps<"blockquote"> & ExtraProps) {
   const kind = node?.properties["data-github-alert"];
   const alert = typeof kind === "string" ? alertPresentation(kind) : undefined;
-  if (!alert) return <blockquote>{children}</blockquote>;
+  if (!alert) return <blockquote {...sourceAttributes(node)}>{children}</blockquote>;
   return (
-    <div className="markdown-alert" data-alert={kind}>
+    <div {...sourceAttributes(node)} className="markdown-alert" data-alert={kind}>
       <p className="markdown-alert-title">
         <alert.Icon aria-hidden="true" />
         {alert.title}

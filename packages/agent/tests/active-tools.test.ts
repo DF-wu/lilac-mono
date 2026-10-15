@@ -3,7 +3,6 @@ import { jsonSchema, tool } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 
 import { AiSdkPiAgent } from "../ai-sdk-pi-agent";
-import { ToolExpansion } from "../tool-call-expansion";
 
 function zeroUsage() {
   return {
@@ -178,42 +177,6 @@ describe("AiSdkPiAgent step tool authority", () => {
     expect(originalExecutions).toBe(1);
     expect(replacementExecutions).toBe(0);
     expect(Object.isFrozen(agent.getLastStepToolSnapshot()?.tools.exact_tool)).toBe(true);
-  });
-
-  it("applies the producing step mapping to expansion children", async () => {
-    const offered: string[][] = [];
-    let childExecutions = 0;
-    const model = new MockLanguageModelV4({
-      doStream: async (options) => {
-        offered.push(offeredToolNames(options));
-        return offered.length === 1
-          ? toolCallStep([{ toolCallId: "expand", toolName: "expander" }])
-          : textStep("done");
-      },
-    });
-    let agent: AiSdkPiAgent;
-    agent = new AiSdkPiAgent({
-      system: "test",
-      model,
-      tools: {
-        expander: emptyTool(() => {
-          agent.activateTools(["child"]);
-          return new ToolExpansion("expanded", [
-            { toolCallId: "child-call", toolName: "child", input: {} },
-          ]);
-        }),
-        child: emptyTool(() => {
-          childExecutions += 1;
-          return "child";
-        }),
-      },
-    });
-    agent.setActiveTools(new Set(["expander"]));
-
-    await agent.prompt("expand");
-
-    expect(childExecutions).toBe(0);
-    expect(offered).toEqual([["expander"], ["expander", "child"]]);
   });
 
   it("uses the current step mapping for external calls", async () => {

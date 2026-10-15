@@ -1,8 +1,8 @@
-import { Component, lazy, memo, Suspense, type ReactNode } from "react";
+import { Component, memo, useCallback, useMemo, type ReactNode } from "react";
+import { createMarkdownSource, registerMarkdownSource } from "../markdown-source";
 
 import { MarkdownWrapContext } from "./markdown-layout";
-
-const MarkdownContent = lazy(() => import("./MarkdownContent"));
+import MarkdownContent from "./MarkdownContent";
 
 export class RichRenderBoundary extends Component<
   { children: ReactNode; fallback: ReactNode; resetKey?: string },
@@ -25,19 +25,34 @@ export const Markdown = memo(function Markdown({
   text,
   wrap = false,
   preserveLineBreaks = false,
+  sourcePositions = false,
 }: {
   text: string;
   wrap?: boolean;
   preserveLineBreaks?: boolean;
+  sourcePositions?: boolean;
 }) {
+  const source = useMemo(
+    () => (sourcePositions ? createMarkdownSource(text) : undefined),
+    [sourcePositions, text],
+  );
+  const register = useCallback(
+    (element: HTMLDivElement | null) => {
+      if (element && source) registerMarkdownSource(element, source);
+    },
+    [source],
+  );
   const fallback = <div className="markdown-source">{text}</div>;
   return (
-    <div className="markdown" data-wrap={wrap}>
+    <div
+      ref={register}
+      className="markdown"
+      data-wrap={wrap}
+      data-markdown-source={source ? "" : undefined}
+    >
       <MarkdownWrapContext value={wrap}>
         <RichRenderBoundary resetKey={text} fallback={fallback}>
-          <Suspense fallback={fallback}>
-            <MarkdownContent text={text} preserveLineBreaks={preserveLineBreaks} />
-          </Suspense>
+          <MarkdownContent text={text} preserveLineBreaks={preserveLineBreaks} source={source} />
         </RichRenderBoundary>
       </MarkdownWrapContext>
     </div>

@@ -1,3 +1,5 @@
+import { remoteImageUrl } from "./remote-image";
+
 export type FileTarget =
   | { type: "path"; path: string; name: string; line?: number; endLine?: number }
   | {
@@ -10,6 +12,20 @@ export type FileTarget =
       endLine?: number;
       resourceId?: string;
     };
+
+export function activityFileTarget(path: string, mediaType: string): FileTarget {
+  if (mediaType.startsWith("image/") && URL.canParse(path)) {
+    const url = new URL(path);
+    if (url.protocol === "http:" || url.protocol === "https:")
+      return {
+        type: "resource",
+        href: remoteImageUrl(path),
+        name: url.pathname.split("/").at(-1) || url.hostname,
+        mediaType,
+      };
+  }
+  return { type: "path", path, name: path.slice(path.lastIndexOf("/") + 1) || path };
+}
 
 export function parseFilePath(value: string): Extract<FileTarget, { type: "path" }> | undefined {
   if (value.includes("\n") || value.includes("\0")) return;

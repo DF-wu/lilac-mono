@@ -6,11 +6,7 @@ import type { AiSdkPiAgentOptions, AiSdkPiAgentState } from "./adapters/ai-sdk/s
 import type { JSONObject } from "./agent-runtime-support";
 export * from "./agent-runtime-support";
 export * from "./adapters/ai-sdk/support";
-export type {
-  ExternalToolExecutionOutcome,
-  ExecutedExpansionChild,
-  StepToolSnapshot,
-} from "./agent-tool-host";
+export type { ExternalToolExecutionOutcome, StepToolSnapshot } from "./agent-tool-host";
 export type {
   NormalizeSettledToolResultOutputsFn,
   NormalizeToolResultOutputFn,

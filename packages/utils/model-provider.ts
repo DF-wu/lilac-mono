@@ -1,3 +1,5 @@
+// Normalize process.env before SDK imports initialize their default providers.
+import { env, type ResponsesTransportMode } from "./env";
 import { createHash } from "node:crypto";
 
 import { createCerebras } from "@ai-sdk/cerebras";
@@ -15,7 +17,6 @@ import { z } from "zod";
 
 import { claudeCodeExecutableSettings } from "./claude-code-executable";
 import { CODEX_BASE_INSTRUCTIONS } from "./codex-instructions";
-import { env, type ResponsesTransportMode } from "./env";
 import { OAUTH_DUMMY_KEY } from "./codex-oauth";
 import {
   createCodexOAuthAuthorization,
@@ -25,6 +26,7 @@ export { refreshCodexOAuthTokens, shouldRefreshCodexOAuthTokens } from "./codex-
 export type { RefreshCodexOAuthTokensOptions } from "./codex-provider-auth";
 import { createLogger } from "./logging";
 import { withOpenAIImageEditFilenamesFetch } from "./openai-image-edit-fetch";
+import { withOpenAICompatibleToolImages } from "./openai-compatible-tool-images";
 import { createOpenAIResponsesWebSocketFetch } from "./openai-responses-websocket-fetch";
 import { withLlmWireDebugFetch } from "./llm-wire-debug";
 import { captureResultOutcome, isPanic, isRecord } from "./runtime-utils";
@@ -383,12 +385,14 @@ export function getModelProviders() {
       : null,
 
     "openai-compatible": env.providers.openaiCompatible.baseUrl
-      ? createOpenAICompatible({
-          name: "openaiCompatible",
-          baseURL: env.providers.openaiCompatible.baseUrl,
-          apiKey: env.providers.openaiCompatible.apiKey,
-          includeUsage: true,
-        })
+      ? withOpenAICompatibleToolImages(
+          createOpenAICompatible({
+            name: "openaiCompatible",
+            baseURL: env.providers.openaiCompatible.baseUrl,
+            apiKey: env.providers.openaiCompatible.apiKey,
+            includeUsage: true,
+          }),
+        )
       : null,
 
     cerebras: createCerebras({

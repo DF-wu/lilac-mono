@@ -17,10 +17,6 @@
       "import": "./src/apply-patch.ts",
       "types": "./src/apply-patch.ts"
     },
-    "./batch": {
-      "import": "./src/batch.ts",
-      "types": "./src/batch.ts"
-    },
     "./instructions": {
       "import": "./src/instructions.ts",
       "types": "./src/instructions.ts"
@@ -42,7 +38,7 @@
   "dependencies": {
     "@stanley2058/lilac-agent": "workspace:*",
     "@stanley2058/lilac-fs": "workspace:*",
-    "ai": "^7.0.22",
+    "ai": "^7.0.130",
     "better-result": "catalog:",
     "zod": "^4.3.6"
   },

@@ -88,6 +88,20 @@ export function createNativeRouter(
     return next();
   });
   return api.router({
+    streams: {
+      sync: secured.streams.sync.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.streams.sync(context.principal, input, signal)),
+      ),
+      watch: secured.streams.watch.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.streams.watch(context.principal, input, signal)),
+      ),
+      hydrate: secured.streams.hydrate.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.streams.hydrate(context.principal, input, signal)),
+      ),
+      turnPage: secured.streams.turnPage.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.streams.turnPage(context.principal, input, signal)),
+      ),
+    },
     computer: {
       read: secured.computer.read.handler(async ({ input, context, signal }) =>
         nativeRpcValue(await services.computer.read(context.principal, input, signal)),
@@ -151,6 +165,9 @@ export function createNativeRouter(
       ),
     },
     threads: {
+      context: secured.threads.context.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.threads.context(context.principal, input, signal)),
+      ),
       get: secured.threads.get.handler(async ({ input, context, signal }) =>
         nativeRpcValue(await services.threads.get(context.principal, input, signal)),
       ),

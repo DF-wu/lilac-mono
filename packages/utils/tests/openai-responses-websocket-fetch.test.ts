@@ -65,10 +65,10 @@ class FakeWebSocket {
     FakeWebSocket.onSend?.();
   }
 
-  close(): void {
+  close(code = 1000): void {
     if (this.readyState === FakeWebSocket.CLOSED) return;
     this.readyState = FakeWebSocket.CLOSED;
-    this.emit("close", new CloseEvent("close", { code: 1000, reason: "closed" }));
+    this.emit("close", new CloseEvent("close", { code, reason: "closed" }));
   }
 
   emitMessage(data: string): void {
@@ -240,7 +240,7 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
     const fallbackCalls: unknown[] = [];
     let fallbackDetails:
       | {
-          reason: "websocket_connect_failed";
+          reason: "websocket_connect_failed" | "websocket_message_too_big";
           requestUrl: string;
           errorMessage?: string;
         }
@@ -542,6 +542,171 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
 
     expect(JSON.stringify(errors)).toContain("Context length exceeded");
     expect(JSON.stringify(errors)).toContain("CONTEXT_LENGTH_EXCEEDED");
+  });
+
+  it("replays the original request over SSE after a 1009 close before any messages", async () => {
+    const sent = Promise.withResolvers<void>();
+    FakeWebSocket.onSend = () => sent.resolve();
+    const fallbacks: string[] = [];
+    const body = JSON.stringify({ stream: true, input: "images", store: false });
+    const signal = new AbortController().signal;
+    const request = new Request("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { authorization: "Bearer test-token" },
+      body,
+      signal,
+    });
+    let calls = 0;
+    const wsFetch = createOpenAIResponsesWebSocketFetch({
+      mode: "auto",
+      fetch: (async (input: Parameters<typeof fetch>[0]) => {
+        calls++;
+        expect(input).toBe(request);
+        expect(await request.text()).toBe(body);
+        expect(request.headers.get("authorization")).toBe("Bearer test-token");
+        expect(request.signal.aborted).toBe(false);
+        return new Response("rate limited", { status: 429, headers: { "retry-after": "12" } });
+      }) as unknown as typeof fetch,
+      onAutoFallback: ({ reason }) => fallbacks.push(reason),
+    });
+    const pending = wsFetch(request);
+    await sent.promise;
+    FakeWebSocket.instances[0]!.close(1009);
+    const response = await pending;
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBe("12");
+    expect(await response.text()).toBe("rate limited");
+    expect(calls).toBe(1);
+    expect(fallbacks).toEqual(["websocket_message_too_big"]);
+    wsFetch.close();
+  });
+
+  it("normalizes SSE fallback output and forwards fallback fetch failures", async () => {
+    for (const fails of [false, true]) {
+      const sent = Promise.withResolvers<void>();
+      FakeWebSocket.onSend = () => sent.resolve();
+      const failure = new Error("SSE unavailable");
+      const wsFetch = createOpenAIResponsesWebSocketFetch({
+        mode: "auto",
+        normalizeEvent: (event) =>
+          event.type === "response.done" ? { ...event, type: "response.completed" } : event,
+        fetch: (async () => {
+          if (fails) throw failure;
+          return new Response('data: {"type":"response.done","response":{"id":"resp_sse"}}\n\n', {
+            headers: { "content-type": "text/event-stream" },
+          });
+        }) as unknown as typeof fetch,
+      });
+      const pending = wsFetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        body: JSON.stringify({ stream: true, input: "hi" }),
+      });
+      await sent.promise;
+      FakeWebSocket.instances.at(-1)!.close(1009);
+      if (fails) {
+        await expect(pending).rejects.toBe(failure);
+      } else {
+        const text = await (await pending).text();
+        expect(text).toContain('"type":"response.completed"');
+      }
+      wsFetch.close();
+    }
+  });
+
+  it.each([
+    { mode: "websocket" as const, code: 1009, metadata: false },
+    { mode: "auto" as const, code: 1006, metadata: false },
+    { mode: "auto" as const, code: 1009, metadata: true },
+  ])(
+    "does not replay unsafe or explicitly websocket requests: %j",
+    async ({ mode, code, metadata }) => {
+      const sent = Promise.withResolvers<void>();
+      FakeWebSocket.onSend = () => sent.resolve();
+      let calls = 0;
+      const wsFetch = createOpenAIResponsesWebSocketFetch({
+        mode,
+        fetch: (async () => {
+          calls++;
+          return new Response("unexpected");
+        }) as unknown as typeof fetch,
+      });
+      const pending = wsFetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        body: JSON.stringify({ stream: true, input: "hi" }),
+      });
+      await sent.promise;
+      const socket = FakeWebSocket.instances[0]!;
+      if (metadata)
+        socket.emitMessage(
+          JSON.stringify({ type: "response.created", response: { id: "accepted" } }),
+        );
+      socket.close(code);
+      const response = await pending;
+      await expect(response.text()).rejects.toThrow(`code: ${code}`);
+      expect(calls).toBe(0);
+      wsFetch.close();
+    },
+  );
+
+  it("opens a fresh websocket after falling back from a rejected request", async () => {
+    let calls = 0;
+    const wsFetch = createOpenAIResponsesWebSocketFetch({
+      mode: "auto",
+      fetch: (async () => {
+        calls++;
+        return new Response("fallback");
+      }) as unknown as typeof fetch,
+    });
+    FakeWebSocket.onSend = () => {
+      const socket = FakeWebSocket.instances.at(-1)!;
+      queueMicrotask(() => {
+        if (FakeWebSocket.instances.length === 1) {
+          socket.close(1009);
+          return;
+        }
+        socket.emitMessage(
+          JSON.stringify({ type: "response.completed", response: { id: "fresh" } }),
+        );
+      });
+    };
+    const init = { method: "POST", body: JSON.stringify({ stream: true, input: "hi" }) };
+    const first = await wsFetch("https://api.openai.com/v1/responses", init);
+    expect(await first.text()).toBe("fallback");
+    const second = await wsFetch("https://api.openai.com/v1/responses", init);
+    expect(await second.text()).toContain("response.completed");
+    expect(calls).toBe(1);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(JSON.parse(FakeWebSocket.instances[1]!.sent[0]!)).toEqual({
+      type: "response.create",
+      input: "hi",
+    });
+    wsFetch.close();
+  });
+
+  it("does not fall back when aborted immediately after a 1009 close", async () => {
+    const sent = Promise.withResolvers<void>();
+    FakeWebSocket.onSend = () => sent.resolve();
+    const abort = new AbortController();
+    let calls = 0;
+    const wsFetch = createOpenAIResponsesWebSocketFetch({
+      mode: "auto",
+      fetch: (async () => {
+        calls++;
+        return new Response("unexpected");
+      }) as unknown as typeof fetch,
+    });
+    const pending = wsFetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({ stream: true, input: "hi" }),
+      signal: abort.signal,
+    });
+    await sent.promise;
+    FakeWebSocket.instances[0]!.close(1009);
+    const reason = new DOMException("cancelled", "AbortError");
+    abort.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    expect(calls).toBe(0);
+    wsFetch.close();
   });
 
   it("errors when websocket closes before a terminal response event", async () => {

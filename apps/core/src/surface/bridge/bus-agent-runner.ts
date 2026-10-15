@@ -1,3 +1,10 @@
+import { autoInjectPlannerContext, decisionAutoInjectContext } from "./bus-agent-runner/text-units";
+import {
+  buildGeneratedMessage,
+  generatedMessageMetadata,
+  isGeneratedMessage,
+} from "@stanley2058/lilac-agent";
+import { customCommandUserContent } from "./bus-agent-runner/generated-command-content";
 import { expandConversationReferencesForModel } from "./conversation-references";
 import type { NativeOutputFrontier } from "@stanley2058/lilac-event-bus";
 import {
@@ -132,6 +139,7 @@ import {
   type RequestMessageCacheOwner,
 } from "../../tool-server/request-message-cache";
 import {
+  parseNativeRequestMetadata,
   AuthenticatedRequestProjectionInvalid,
   isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid,
   projectAuthenticatedRequest,
@@ -162,14 +170,16 @@ import {
   rankAutoInjectedThreadSearchResults,
   type RankedAutoInjectThread,
 } from "../../conversation/thread-auto-inject-ranking";
+import { collectDecisionAutoInjectImages } from "../../conversation/thread-auto-inject-images";
 import {
-  createJevAutoInjectEvaluator,
-  decideJevAutoInject,
-  type JevAutoInjectAnswers,
-  type JevAutoInjectDecision,
-  type JevAutoInjectEvaluator,
-  type JevAutoInjectUnavailable,
-} from "../../conversation/thread-auto-inject-jev";
+  createDecisionAutoInjectEvaluator,
+  decideDecisionAutoInject,
+  selectDecisionAutoInjectModel,
+  DecisionAutoInjectEvaluationFailed,
+  type DecisionAutoInjectAnswers,
+  type DecisionAutoInjectEvaluator,
+  type DecisionAutoInjectUnavailable,
+} from "../../conversation/thread-auto-inject-decision";
 import {
   createStoredMessageIdentityProjectionV1,
   materializeStoredMessagesV1,
@@ -218,6 +228,7 @@ import { type AnthropicFallbackBlobStore } from "./bus-agent-runner/anthropic-fa
 import { formatUnknownErrorForDisplay } from "./bus-agent-runner/error-display";
 import {
   nativeToolActivityDetail,
+  nativeToolActivityLabel,
   nativeToolActivityResult,
   type NativeToolActivityResult,
 } from "./bus-agent-runner/native-activity-result";
@@ -300,7 +311,7 @@ export {
 export {
   appendAdditionalSessionMemoBlock,
   appendConfiguredAliasPromptBlock,
-  buildAutoInjectedThreadSearchOverlay,
+  buildGeneratedMessageOverlay,
   buildHeartbeatOverlayForRequest,
   buildRestrictedSessionOverlay,
   buildSurfaceMetadataOverlay,
@@ -826,7 +837,7 @@ export function maybeMarkOldToolOutputsCompacted(params: {
   // This mirrors OpenCode's "turns < 2" behavior.
   outer: for (let msgIndex = params.messages.length - 1; msgIndex >= 0; msgIndex--) {
     const msg = params.messages[msgIndex]!;
-    if (msg.role === "user") turns++;
+    if (msg.role === "user" && !isGeneratedMessage(msg)) turns++;
     if (turns < 2) continue;
 
     if (msg.role !== "tool") continue;
@@ -912,13 +923,6 @@ export function scrubLargeBinaryForModelView(
   return boundToolResultMediaForModelView(messages, limits);
 }
 
-function getBatchOkFromResult(event: { readonly result: unknown }): boolean | null {
-  const { result } = event;
-  if (!result || typeof result !== "object" || Array.isArray(result)) return null;
-  const v = (result as Record<string, unknown>)["ok"];
-  return typeof v === "boolean" ? v : null;
-}
-
 function getSubagentOkFromResult(event: { readonly result: unknown }): boolean | null {
   const { result } = event;
   if (!result || typeof result !== "object" || Array.isArray(result)) return null;
@@ -999,36 +1003,26 @@ function buildCustomCommandMessages(params: {
   text: string;
   source: "text" | "discord-slash";
   output: CustomCommandResult;
+  provider: string;
 }): ModelMessage[] {
   return [
-    {
-      role: "assistant",
+    buildGeneratedMessage({
+      kind: "custom_command_result",
+      id: params.toolCallId,
       content: [
         {
-          type: "tool-call",
-          toolCallId: params.toolCallId,
-          toolName: CUSTOM_COMMAND_TOOL_NAME,
-          input: {
+          type: "text",
+          text: JSON.stringify({
             name: params.name,
             args: params.args,
-            ...(params.prompt ? { prompt: params.prompt } : {}),
+            prompt: params.prompt,
             text: params.text,
             source: params.source,
-          },
+          }),
         },
+        ...customCommandUserContent(params.output, params.provider),
       ],
-    },
-    {
-      role: "tool",
-      content: [
-        {
-          type: "tool-result",
-          toolCallId: params.toolCallId,
-          toolName: CUSTOM_COMMAND_TOOL_NAME,
-          output: params.output,
-        },
-      ],
-    },
+    }),
   ];
 }
 
@@ -1097,17 +1091,12 @@ type AutoInjectedThreadSearchAppendedEvent = {
   corpusDocumentCount: number;
 };
 
-type JevAutoInjectedThreadSearchEvent = {
-  toolCallId: string;
-  model: string;
-  source: "lexical" | "semantic";
-  candidateCount: number;
-  participantFilterUserCount: number;
-  gate: JevAutoInjectDecision["gate"];
-  gateProbabilities: Pick<JevAutoInjectAnswers, "asksToRecall" | "durableSubject" | "casual">;
-  selected: JevAutoInjectDecision["selected"];
-  highestRejected: JevAutoInjectDecision["highestRejected"];
-  entries: readonly AutoInjectedThreadSearchEntry[];
+type DecisionAutoInjectedThreadSearchEvent = {
+  mode: "off" | "shadow" | "enforce";
+  outcome: "search" | "skip" | "failed" | "length-skip";
+  model?: string;
+  probabilities?: Pick<DecisionAutoInjectAnswers, "mayHelp" | "clearlyUnneeded">;
+  elapsedMs: number;
 };
 
 type AutoInjectToolStatusUpdate = {
@@ -1136,33 +1125,15 @@ export function buildAutoInjectedThreadSearchMessages(params: {
   };
 
   return [
-    {
-      role: "assistant",
-      content: [
-        {
-          type: "tool-call",
-          toolCallId: params.toolCallId,
-          toolName: AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME,
-          input: {
-            note: params.note ?? "auto-injected after long user input",
-          },
-        },
-      ],
-    },
-    {
-      role: "tool",
-      content: [
-        {
-          type: "tool-result",
-          toolCallId: params.toolCallId,
-          toolName: AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME,
-          output: {
-            type: "json",
-            value: payload,
-          },
-        },
-      ],
-    },
+    buildGeneratedMessage({
+      kind: "conversation_recall",
+      id: params.toolCallId,
+      threadIds: payload.entries.map((entry) => entry.threadId),
+      content: JSON.stringify({
+        note: params.note ?? "auto-injected after long user input",
+        ...payload,
+      }),
+    }),
   ];
 }
 
@@ -1203,6 +1174,13 @@ function collectAutoInjectedThreadIds(messages: readonly ModelMessage[]): Set<st
   const threadIds = new Set<string>();
 
   for (const message of messages) {
+    const generated = generatedMessageMetadata(message);
+    if (generated?.kind === "conversation_recall" && Array.isArray(generated.threadIds)) {
+      for (const id of generated.threadIds) {
+        if (typeof id === "string") threadIds.add(id);
+      }
+      continue;
+    }
     const content: unknown = message.content;
     if (message.role !== "tool" || !Array.isArray(content)) continue;
 
@@ -1309,176 +1287,155 @@ type AutoInjectedThreadSearchParams = {
   userMessages: readonly ModelMessage[];
   publishToolStatus: (update: AutoInjectToolStatusUpdate) => Promise<void>;
   onInjected?: (event: AutoInjectedThreadSearchAppendedEvent) => void;
-  onJevEvaluated?: (event: JevAutoInjectedThreadSearchEvent) => void;
+  onDecisionEvaluated?: (event: DecisionAutoInjectedThreadSearchEvent) => void;
   onError: (message: string, error: BusAgentRunnerErrorProjection) => void;
   autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
-  /** Overrides the env-configured TypeSafe evaluator; used by tests. */
-  createJevEvaluator?: (
+  loadDecisionUserMessages?: () => Promise<readonly ModelMessage[]>;
+  /** Overrides the configured decision evaluator; used by tests. */
+  createDecisionEvaluator?: (
     model: string,
-  ) => ResultType<JevAutoInjectEvaluator, JevAutoInjectUnavailable>;
+  ) => ResultType<DecisionAutoInjectEvaluator, DecisionAutoInjectUnavailable>;
 };
 
-type JevEvaluatorResolution =
-  | { kind: "ready"; evaluator: JevAutoInjectEvaluator }
+type DecisionEvaluatorResolution =
+  | { kind: "ready"; model: string; evaluator: DecisionAutoInjectEvaluator }
   | { kind: "unavailable"; message: string };
 
-type JevEvaluationOutcome =
-  | { kind: "answered"; answers: JevAutoInjectAnswers }
+type DecisionEvaluationOutcome =
+  | { kind: "answered"; answers: DecisionAutoInjectAnswers }
   | { kind: "failed"; message: string };
 
-function createEnvJevAutoInjectEvaluator(
+function createEnvDecisionAutoInjectEvaluator(
   model: string,
-): ResultType<JevAutoInjectEvaluator, JevAutoInjectUnavailable> {
-  return createJevAutoInjectEvaluator({
-    apiKey: env.providers.typesafe.apiKey,
-    baseUrl: env.providers.typesafe.baseUrl,
+): ResultType<DecisionAutoInjectEvaluator, DecisionAutoInjectUnavailable> {
+  const settings = model.startsWith("openai/") ? env.providers.openai : env.providers.typesafe;
+  return createDecisionAutoInjectEvaluator({
+    apiKey: settings.apiKey,
+    baseUrl: settings.baseUrl,
     model,
   });
 }
 
-function resolveJevAutoInjectEvaluator(
+function resolveDecisionAutoInjectEvaluator(
   params: AutoInjectedThreadSearchParams,
-): JevEvaluatorResolution {
-  const create = params.createJevEvaluator ?? createEnvJevAutoInjectEvaluator;
-  return create(params.cfg.conversation.thread.jevAutoInject.model).match<JevEvaluatorResolution>({
-    ok: (evaluator) => ({ kind: "ready", evaluator }),
+  hasImages: boolean,
+): DecisionEvaluatorResolution {
+  const model = selectDecisionAutoInjectModel(
+    params.cfg.conversation.thread.autoInject.gate?.model ?? [],
+    hasImages,
+  );
+  const create = params.createDecisionEvaluator ?? createEnvDecisionAutoInjectEvaluator;
+  return create(model).match<DecisionEvaluatorResolution>({
+    ok: (evaluator) => ({ kind: "ready", model, evaluator }),
     err: (error) => ({ kind: "unavailable", message: error.message }),
   });
 }
 
-async function maybeBuildJevAutoInjectedThreadSearchMessages(
-  params: AutoInjectedThreadSearchParams & { conversationThreads: ConversationThreadToolService },
-): Promise<ModelMessage[]> {
-  const jev = params.cfg.conversation.thread.jevAutoInject;
-  const autoInject = params.cfg.conversation.thread.autoInject;
-  const shortlist = params.conversationThreads.shortlistAutoInjectCandidates;
-  if (!shortlist) return [];
+async function prepareDecisionAutoInjectImages(
+  params: AutoInjectedThreadSearchParams,
+): Promise<ResultType<string[], DecisionAutoInjectEvaluationFailed>> {
+  const latest = latestUserInput(params.userMessages);
+  const supportsImages = (params.cfg.conversation.thread.autoInject.gate?.model ?? []).some(
+    (model) => model.startsWith("openai/"),
+  );
+  if (!supportsImages || (!latest.hasAttachment && !params.loadDecisionUserMessages))
+    return Result.ok([]);
+  const prepared = await Result.tryPromise({
+    try: async () =>
+      latestUserInput(
+        await (params.loadDecisionUserMessages?.() ?? Promise.resolve(params.userMessages)),
+      ).content,
+    catch: (cause) =>
+      new DecisionAutoInjectEvaluationFailed({
+        message: opaqueErrorMessage(cause, "Decision image materialization failed"),
+      }),
+  });
+  return Result.gen(async function* () {
+    const content = yield* prepared;
+    const images = yield* Result.await(
+      collectDecisionAutoInjectImages({
+        content,
+        maxBytesPerPart: params.cfg.tools.media.maxInlineBytesPerPart,
+        maxBytesTotal: params.cfg.tools.media.maxInlineBytesTotal,
+      }),
+    );
+    return Result.ok(images);
+  });
+}
 
-  // Attachment marker lines would add filename and MIME words to the shortlist query.
-  const message = latestUserInput(params.userMessages).authoredText;
-  if (measureMeaningfulTextUnits(message) === 0) return [];
-
-  const resolution = resolveJevAutoInjectEvaluator(params);
-  if (resolution.kind === "unavailable") {
+async function shouldSkipAutoInjectByDecision(
+  params: AutoInjectedThreadSearchParams,
+  autoInjectUsage: ConversationThreadAutoInjectUsageAccumulator,
+): Promise<boolean> {
+  const gate = params.cfg.conversation.thread.autoInject.gate;
+  if (!gate || gate.mode === "off") return false;
+  const startedAt = performance.now();
+  const notify = (event: Omit<DecisionAutoInjectedThreadSearchEvent, "mode" | "elapsedMs">) =>
+    notifyAutoInjectObserverBestEffort(params.onError, () =>
+      params.onDecisionEvaluated?.({
+        ...event,
+        mode: gate.mode,
+        elapsedMs: performance.now() - startedAt,
+      }),
+    );
+  const prepared = (await prepareDecisionAutoInjectImages(params)).match<
+    { kind: "prepared"; images: string[] } | { kind: "failed"; message: string }
+  >({
+    ok: (images) => ({ kind: "prepared", images }),
+    err: (error) => ({ kind: "failed", message: error.message }),
+  });
+  if (prepared.kind === "failed") {
+    notify({ outcome: "failed" });
     params.onError(
-      "Jev auto-inject is unavailable; continuing without metadata",
+      "Decision image preparation failed; continuing to planner",
+      projectBusAgentRunnerError(new Error(prepared.message)),
+    );
+    return false;
+  }
+  const latest = latestUserInput(params.userMessages);
+  if (latest.hasAttachment && !latest.authoredText.trim() && prepared.images.length === 0) {
+    notify({ outcome: "search" });
+    return false;
+  }
+  const resolution = resolveDecisionAutoInjectEvaluator(params, prepared.images.length > 0);
+  if (resolution.kind === "unavailable") {
+    notify({ outcome: "failed" });
+    params.onError(
+      "Decision gate unavailable; continuing to planner",
       projectBusAgentRunnerError(new Error(resolution.message)),
     );
-    return [];
+    return false;
   }
-
-  const excludeThreadIds = [...collectAutoInjectedThreadIds(params.previousMessages ?? [])];
-  if (params.surface === "native" && params.sessionId) excludeThreadIds.push(params.sessionId);
-  const participantIds =
-    autoInject.filterCurrentParticipants && params.surface !== "native"
-      ? getParticipantUserIdsFromRaw(params.raw)
-      : [];
-  const autoInjectUsage =
-    params.autoInjectUsage ??
-    createConversationThreadAutoInjectUsageAccumulator({ requestId: params.requestId });
-  const toolCallId = buildAutoInjectedThreadSearchToolCallId(params.requestId);
-  const display = `${AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME} auto-injected metadata`;
-  const endToolStatus = async (
-    outcome:
-      | { failure: BusAgentRunnerErrorProjection }
-      | { entries: readonly AutoInjectedThreadSearchEntry[] },
-  ) =>
-    await publishAutoInjectToolStatusBestEffort(params, {
-      toolCallId,
-      status: "end",
-      display,
-      ...("failure" in outcome
-        ? { ok: false, error: outcome.failure.message }
-        : { ok: true, output: formatAutoInjectedThreadSearchOutput(outcome.entries) }),
-    });
-
-  const shortlistStartedAt = performance.now();
-  const shortlisted = await Result.tryPromise({
-    try: async () =>
-      await shortlist({
-        text: message,
-        limit: jev.candidateLimit,
-        semanticFallback: jev.semanticFallback,
-        excludeThreadIds,
-        autoInjectUsage,
-        ...(participantIds.length > 0
-          ? { participantIdsAny: participantIds, participantSurface: params.surface }
-          : {}),
-      }),
-    catch: captureError,
-  });
-  autoInjectUsage.recordTiming("shortlist", performance.now() - shortlistStartedAt);
-  if (shortlisted.isErr()) {
-    params.onError(
-      "auto-injected thread shortlist failed; continuing without metadata",
-      projectBusAgentRunnerError(shortlisted.error.cause),
-    );
-    autoInjectUsage.finish({ status: "failed" });
-    return [];
-  }
-  const { source, results } = shortlisted.value;
-  if (source === "none" || results.length === 0) {
-    autoInjectUsage.finish({ status: "abstained" });
-    return [];
-  }
-
-  // Without a length gate most messages end here, so status is shown only once Jev has work.
-  await publishAutoInjectToolStatusBestEffort(params, { toolCallId, status: "start", display });
   const evaluator = resolution.evaluator;
-  const jevStartedAt = performance.now();
   const evaluated = await evaluator.evaluate({
-    message,
-    candidates: results.map((result) => ({
-      threadId: result.threadId,
-      title: result.title,
-      brief: result.brief,
-    })),
+    message: decisionAutoInjectContext(
+      latestUserInput(params.userMessages).authoredText,
+      params.previousMessages ?? [],
+    ),
+    images: evaluator.supportsImages ? prepared.images : undefined,
   });
-  autoInjectUsage.recordTiming("jev", performance.now() - jevStartedAt);
-  const outcome = evaluated.match<JevEvaluationOutcome>({
+  autoInjectUsage.recordTiming("decision", performance.now() - startedAt);
+  const outcome = evaluated.match<DecisionEvaluationOutcome>({
     ok: (answers) => ({ kind: "answered", answers }),
     err: (error) => ({ kind: "failed", message: error.message }),
   });
   if (outcome.kind === "failed") {
-    const failure = projectBusAgentRunnerError(new Error(outcome.message));
-    await endToolStatus({ failure });
-    params.onError("Jev auto-inject evaluation failed; continuing without metadata", failure);
-    autoInjectUsage.finish({ status: "failed" });
-    return [];
+    notify({ outcome: "failed", model: evaluator.model });
+    params.onError(
+      "Decision gate evaluation failed; continuing to planner",
+      projectBusAgentRunnerError(new Error(outcome.message)),
+    );
+    return false;
   }
-
   const { answers } = outcome;
-  autoInjectUsage.recordJevUsage({ model: evaluator.model, ...answers.usage });
-  const decision = decideJevAutoInject({ answers, candidates: results, options: jev });
-  const entries = decision.selected.map((candidate) =>
-    formatAutoInjectedThreadSearchResult(results[candidate.index]!),
-  );
-  await endToolStatus({ entries });
-  notifyAutoInjectObserverBestEffort(params.onError, () =>
-    params.onJevEvaluated?.({
-      toolCallId,
-      model: evaluator.model,
-      source,
-      candidateCount: results.length,
-      participantFilterUserCount: participantIds.length,
-      gate: decision.gate,
-      gateProbabilities: {
-        asksToRecall: answers.asksToRecall,
-        durableSubject: answers.durableSubject,
-        casual: answers.casual,
-      },
-      selected: decision.selected,
-      highestRejected: decision.highestRejected,
-      entries,
-    }),
-  );
-  autoInjectUsage.finish({ status: entries.length > 0 ? "completed" : "abstained" });
-  if (entries.length === 0) return [];
-  return buildAutoInjectedThreadSearchMessages({
-    toolCallId,
-    entries,
-    note: "auto-injected for the latest user input",
+  autoInjectUsage.recordDecisionUsage({ model: evaluator.model, ...answers.usage });
+  const decision = decideDecisionAutoInject(answers, gate.skipMinProbability);
+  notify({
+    outcome: decision,
+    model: evaluator.model,
+    probabilities: { mayHelp: answers.mayHelp, clearlyUnneeded: answers.clearlyUnneeded },
   });
+  return gate.mode === "enforce" && decision === "skip";
 }
 
 export async function maybeBuildAutoInjectedThreadSearchMessages(
@@ -1488,12 +1445,11 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(
   if (!autoInject.enabled) return [];
   if (!params.conversationThreads) return [];
   const conversationThreads = params.conversationThreads;
-  if (params.cfg.conversation.thread.autoInjectMode === "jev") {
-    return await maybeBuildJevAutoInjectedThreadSearchMessages({ ...params, conversationThreads });
-  }
-
+  const autoInjectUsage =
+    params.autoInjectUsage ??
+    createConversationThreadAutoInjectUsageAccumulator({ requestId: params.requestId });
   const latestInput = latestUserInput(params.userMessages);
-  const text = latestInput.text;
+  const text = autoInjectPlannerContext(latestInput.text, params.previousMessages ?? []);
   const previouslyInjectedThreadIds = collectAutoInjectedThreadIds(params.previousMessages ?? []);
   const minTextUnits =
     previouslyInjectedThreadIds.size > 0
@@ -1506,6 +1462,18 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(
       minTextUnits,
     })
   ) {
+    notifyAutoInjectObserverBestEffort(params.onError, () =>
+      params.onDecisionEvaluated?.({
+        mode: autoInject.gate?.mode ?? "off",
+        outcome: "length-skip",
+        elapsedMs: 0,
+      }),
+    );
+    autoInjectUsage.finish({ status: "abstained" });
+    return [];
+  }
+  if (await shouldSkipAutoInjectByDecision(params, autoInjectUsage)) {
+    autoInjectUsage.finish({ status: "abstained" });
     return [];
   }
 
@@ -1514,9 +1482,6 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(
       ? getParticipantUserIdsFromRaw(params.raw)
       : [];
 
-  const autoInjectUsage =
-    params.autoInjectUsage ??
-    createConversationThreadAutoInjectUsageAccumulator({ requestId: params.requestId });
   let usageStatus: "completed" | "abstained" | "partial" | "failed" = "failed";
   let usageSearchCount = 0;
   let usageQueryCount = 0;
@@ -1534,7 +1499,13 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(
         const planningStartedAt = performance.now();
         const plan = await conversationThreads.planAutoInjectSearch({
           text,
-          content: latestInput.content,
+          content:
+            typeof latestInput.content === "string"
+              ? text
+              : [
+                  ...(text ? [{ type: "text" as const, text }] : []),
+                  ...latestInput.content.filter((part) => part.type !== "text"),
+                ],
           autoInjectUsage,
         });
         autoInjectUsage.recordTiming("planning", performance.now() - planningStartedAt);
@@ -1716,7 +1687,6 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(
 export function buildDeferredSubagentResultMessages(
   completion: WorkflowLiveParentCompletion,
 ): ModelMessage[] {
-  const toolCallId = buildSubagentResultToolCallId(completion.runId);
   const payload = {
     ok: completion.ok,
     mode: "deferred" as const,
@@ -1729,36 +1699,11 @@ export function buildDeferredSubagentResultMessages(
   };
 
   return [
-    {
-      role: "assistant",
-      content: [
-        {
-          type: "tool-call",
-          toolCallId,
-          toolName: "subagent_result",
-          input: {
-            profile: completion.profile,
-            sessionName: completion.sessionName,
-            status: completion.status,
-            workflowRunId: completion.runId,
-          },
-        },
-      ],
-    },
-    {
-      role: "tool",
-      content: [
-        {
-          type: "tool-result",
-          toolCallId,
-          toolName: "subagent_result",
-          output: {
-            type: "json",
-            value: payload,
-          },
-        },
-      ],
-    },
+    buildGeneratedMessage({
+      kind: "subagent_completion",
+      id: completion.runId,
+      content: JSON.stringify(payload),
+    }),
   ];
 }
 
@@ -1774,31 +1719,13 @@ function hasToolResult(messages: readonly ModelMessage[], toolCallId: string): b
   );
 }
 
-function hasDeferredSubagentWorkflowCall(
-  messages: readonly ModelMessage[],
-  workflowRunId: string,
-): boolean {
-  for (const message of messages) {
-    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
-    for (const part of message.content) {
-      if (
-        part.type === "tool-call" &&
-        part.toolName === "subagent_result" &&
-        isRecord(part.input) &&
-        part.input["workflowRunId"] === workflowRunId
-      ) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 function hasDeferredSubagentWorkflowResult(
   messages: readonly ModelMessage[],
   workflowRunId: string,
 ): boolean {
   for (const message of messages) {
+    const generated = generatedMessageMetadata(message);
+    if (generated?.kind === "subagent_completion" && generated.id === workflowRunId) return true;
     if (message.role !== "tool") continue;
     for (const part of message.content) {
       if (
@@ -1819,20 +1746,7 @@ function hasConsumedDeferredSubagentResult(
   messages: readonly ModelMessage[],
   completion: Pick<WorkflowLiveParentCompletion, "runId">,
 ): boolean {
-  for (const message of messages) {
-    if (message.role !== "tool") continue;
-    for (const part of message.content) {
-      if (part.type !== "tool-result" || part.toolName !== "subagent_result") continue;
-      if (
-        part.output.type === "json" &&
-        isRecord(part.output.value) &&
-        part.output.value["workflowRunId"] === completion.runId
-      ) {
-        return true;
-      }
-    }
-  }
-  return false;
+  return hasDeferredSubagentWorkflowResult(messages, completion.runId);
 }
 
 export function hasDeferredSubagentResult(
@@ -1846,14 +1760,34 @@ export function hasDeferredSubagentResult(
   );
 }
 
-function hasCurrentDeferredSubagentResult(
+function closeLegacyDeferredSubagentCalls(
   messages: readonly ModelMessage[],
-  completion: Pick<WorkflowLiveParentCompletion, "runId">,
-): boolean {
-  return (
-    hasDeferredSubagentWorkflowResult(messages, completion.runId) ||
-    hasToolResult(messages, buildSubagentResultToolCallId(completion.runId))
-  );
+  runId: string,
+): ModelMessage[] {
+  const closures: ModelMessage[] = [];
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type !== "tool-call" || part.toolName !== "subagent_result") continue;
+      if (!isRecord(part.input) || part.input["workflowRunId"] !== runId) continue;
+      if (hasToolResult(messages, part.toolCallId)) continue;
+      closures.push({
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolName: part.toolName,
+            toolCallId: part.toolCallId,
+            output: {
+              type: "text",
+              value: "Completion delivered in the following generated user message.",
+            },
+          },
+        ],
+      });
+    }
+  }
+  return closures;
 }
 
 export function planDeferredSubagentBoundary(input: {
@@ -1871,11 +1805,11 @@ export function planDeferredSubagentBoundary(input: {
   const consumed = new Set(consumedRunIds);
   const unconsumed = input.completions.filter((completion) => !consumed.has(completion.runId));
   const append = unconsumed.flatMap((completion) => {
-    if (hasCurrentDeferredSubagentResult(input.canonicalMessages, completion)) return [];
-    const messages = buildDeferredSubagentResultMessages(completion);
-    return hasDeferredSubagentWorkflowCall(input.canonicalMessages, completion.runId)
-      ? messages.slice(1)
-      : messages;
+    if (hasDeferredSubagentWorkflowResult(input.canonicalMessages, completion.runId)) return [];
+    return [
+      ...closeLegacyDeferredSubagentCalls(input.canonicalMessages, completion.runId),
+      ...buildDeferredSubagentResultMessages(completion),
+    ];
   });
 
   return {
@@ -2033,6 +1967,7 @@ export type NativeRunnerRequest = {
 };
 
 export type NativeRunnerLifecycle = {
+  compacted?(requestId: string, messages: readonly ModelMessage[]): void;
   rejected?(requestDeliveryId: string): Promise<ResultType<void, Error>>;
   validate(request: NativeRunnerRequest): ResultType<
     {
@@ -2081,7 +2016,9 @@ export function validateCorePrimaryLineageAtRunnerIntake(input: {
   if (input.requestClient !== "discord" || input.runProfile !== "primary") return undefined;
   const fallbackCurrentCanonicalStart = Math.max(
     0,
-    input.messages.findLastIndex((message) => message.role === "user"),
+    input.messages.findLastIndex(
+      (message) => message.role === "user" && !isGeneratedMessage(message),
+    ),
   );
   if (input.corePrimaryLineage === undefined) {
     return createFreshOnlyLineage("missing-manifest", fallbackCurrentCanonicalStart);
@@ -2146,7 +2083,9 @@ export function appendAutoInjectedThreadSearchLineage(input: {
     ? parsedShape.data.currentCanonicalStart
     : Math.max(
         0,
-        input.canonicalMessages.findLastIndex((message) => message.role === "user"),
+        input.canonicalMessages.findLastIndex(
+          (message) => message.role === "user" && !isGeneratedMessage(message),
+        ),
       );
   const failClosed = () =>
     degradeCorePrimaryLineageForMutation(
@@ -2731,7 +2670,6 @@ export async function refreshSelectedLevel1Tools(params: {
 }): Promise<BuiltLevel1Toolset> {
   const toolset = params.toolset;
   const activeToolNames = selectedLevel1ToolNames(toolset, params.listSelectedCatalogIds());
-  toolset.updateActiveBatchTools(activeToolNames);
   params.target.setActiveTools(activeToolNames);
   return toolset;
 }
@@ -2928,6 +2866,8 @@ export async function startBusAgentRunner(params: {
     readonly raw: AgentRunnerRaw | undefined;
     readonly recovering: boolean;
     readonly recoveryOutputFrontier?: NativeOutputFrontier;
+    readonly workflowRunId?: string;
+    readonly prompt: string;
   }) => NativeOutputPublisher | undefined;
   nativeExecution?: NativeRunnerLifecycle;
   nativeResourceAccess?: (
@@ -5258,6 +5198,18 @@ export async function startBusAgentRunner(params: {
       raw: next.raw,
       recovering: next.recovery !== undefined,
       recoveryOutputFrontier: next.recovery?.nativeOutputFrontier,
+      workflowRunId: workflowHint?.runId,
+      prompt: next.messages
+        .filter((message) => message.role === "user")
+        .map((message) =>
+          typeof message.content === "string"
+            ? message.content
+            : message.content
+                .filter((part) => part.type === "text")
+                .map((part) => part.text)
+                .join(""),
+        )
+        .join("\n\n"),
     });
     let nativeStep = 0;
     let nativeHasText = false;
@@ -5602,8 +5554,11 @@ export async function startBusAgentRunner(params: {
 
     let initialMessages: ModelMessage[] = [];
     const parsedCustomCommand = next.recovery ? null : parseCustomCommandFromRaw(next.raw);
-    let customCommandMessages: ModelMessage[] = [];
-    let initialMessagesEndWithInjectedTool = false;
+    let customCommandInput: Omit<
+      Parameters<typeof buildCustomCommandMessages>[0],
+      "provider"
+    > | null = null;
+    let initialMessagesEndWithGeneratedContext = false;
     let responseStartIndex = 0;
     let transcriptHasCompactionCheckpoint = corePrimaryLineageHasCompactionCheckpoint(
       next.corePrimaryLineage,
@@ -5969,7 +5924,7 @@ export async function startBusAgentRunner(params: {
               ),
             );
 
-            customCommandMessages = buildCustomCommandMessages({
+            customCommandInput = {
               toolCallId,
               name: parsedCustomCommand.name,
               args: parsedCustomCommand.args,
@@ -5977,7 +5932,7 @@ export async function startBusAgentRunner(params: {
               text: parsedCustomCommand.text,
               source: parsedCustomCommand.source,
               output,
-            });
+            };
 
             await publishNonAgentToolStatus({
               toolCallId,
@@ -5997,7 +5952,7 @@ export async function startBusAgentRunner(params: {
 
               if (params.transcriptStore) {
                 const storedCustomMessages = projectStoredMessagesV1([
-                  ...customCommandMessages,
+                  ...buildCustomCommandMessages({ ...customCommandInput, provider: "" }),
                   {
                     role: "assistant",
                     content: finalText,
@@ -6094,7 +6049,7 @@ export async function startBusAgentRunner(params: {
           const skillsSection =
             runProfile === "explore"
               ? null
-              : await waitForPreAgent(maybeBuildSkillsSectionForPrimary());
+              : await waitForPreAgent(maybeBuildSkillsSectionForPrimary(next.requestClient));
 
           const sessionConfigId = parseSessionConfigIdFromRaw(next.raw) ?? sessionId;
           const discordSessionContext =
@@ -6434,7 +6389,7 @@ export async function startBusAgentRunner(params: {
                   onMcpImageMaterialized: (reference) => mcpImages.remember(reference),
                   onSelectCatalogIds: (catalogIds) => toolAuthority.select(catalogIds),
                   reportToolStatus: (update) => {
-                    void publishAuxiliaryOutput("failed to publish batch tool status", () =>
+                    void publishAuxiliaryOutput("failed to publish tool status", () =>
                       outputPublisher.publishToolCall(update),
                     );
                   },
@@ -6476,6 +6431,7 @@ export async function startBusAgentRunner(params: {
             storedMessages: readonly StoredMessageV1[],
             binding: BuiltModelBinding,
             imageReferences?: readonly McpImageCheckpointReference[],
+            resourceTarget?: Parameters<typeof materializeStoredMessagesV1>[0]["resourceTarget"],
           ): Promise<ModelMessage[]> =>
             await materializeMcpImageCheckpoint({
               imageRegistry: mcpImages,
@@ -6492,10 +6448,12 @@ export async function startBusAgentRunner(params: {
                       raw: next.raw,
                     })
                   : params.resourceAccess,
-              resourceTarget: resolveStoredResourceProviderTarget({
-                provider: binding.resolved.provider,
-                capability: binding.capabilityInfo,
-              }),
+              resourceTarget:
+                resourceTarget ??
+                resolveStoredResourceProviderTarget({
+                  provider: binding.resolved.provider,
+                  capability: binding.capabilityInfo,
+                }),
             }).then((materialized) =>
               materialized.match({
                 ok: (messages) => () => messages,
@@ -6576,7 +6534,6 @@ export async function startBusAgentRunner(params: {
               nextBinding,
             );
             agent.replaceMessages(reboundMessages);
-            nextBinding.toolset.updateActiveBatchTools(nextBinding.activeToolNames);
             agent.setModel(
               nextBinding.resolved.model,
               nextBinding.providerOptionsForAgent,
@@ -6727,7 +6684,6 @@ export async function startBusAgentRunner(params: {
                 enqueueRunCheckpoint(activeRun, messages, canonicalInputIds, storedMessageIdentity);
               },
               normalizeToolResultOutput,
-              normalizeSettledToolResultOutputs: normalizeToolResultOutput.normalizeSettled,
               genericOutputNormalizerBypassTools:
                 activeBinding.toolset.genericOutputNormalizerBypassTools,
               aggregateOutputBudgetExemptTools:
@@ -6868,6 +6824,9 @@ export async function startBusAgentRunner(params: {
             attachAutoCompaction(agent, {
               model: activeBinding.resolved.spec,
               ...agentComposition.compaction,
+              compactOnStart:
+                next.requestClient === "native" &&
+                parseNativeRequestMetadata(next.raw)?.compact === true,
               modelCapability,
               resolveCurrentModelSpecifier: () =>
                 agent.state.modelSpecifier ?? activeBinding.resolved.spec,
@@ -7001,6 +6960,8 @@ export async function startBusAgentRunner(params: {
                 };
                 if (status === "completed") {
                   completedCompactionCount += 1;
+                  if (next.requestClient === "native")
+                    params.nativeExecution?.compacted?.(next.requestId, agent.state.messages);
                   if (runProfile === "primary" && next.requestClient === "discord") {
                     const previousLineage =
                       state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
@@ -7808,11 +7769,11 @@ export async function startBusAgentRunner(params: {
             }
 
             if (event.type === "tool_execution_start") {
-              if (nativeOutput && event.toolName !== "batch")
+              if (nativeOutput)
                 publishNativeToolActivity(
                   event.toolCallId,
                   "start",
-                  `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event, 8192)}`,
+                  nativeToolActivityLabel({ toolName: event.toolName, event }),
                   undefined,
                   nativeToolActivityDetail({ toolName: event.toolName, event }),
                 );
@@ -7824,7 +7785,7 @@ export async function startBusAgentRunner(params: {
                 startedAt,
               });
 
-              if (event.toolName !== "batch") {
+              {
                 void publishAuxiliaryOutput("failed to publish tool start", () =>
                   outputPublisher.publishToolCall({
                     toolCallId: event.toolCallId,
@@ -7851,9 +7812,6 @@ export async function startBusAgentRunner(params: {
 
               let ok: boolean;
               switch (event.toolName) {
-                case "batch":
-                  ok = getBatchOkFromResult(event) ?? toolFailure.ok;
-                  break;
                 case "subagent_delegate":
                   ok = getSubagentOkFromResult(event) ?? toolFailure.ok;
                   break;
@@ -7861,11 +7819,11 @@ export async function startBusAgentRunner(params: {
                   ok = toolFailure.ok;
                   break;
               }
-              if (nativeOutput && event.toolName !== "batch")
+              if (nativeOutput)
                 publishNativeToolActivity(
                   event.toolCallId,
                   "end",
-                  `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event, 8192)}`,
+                  nativeToolActivityLabel({ toolName: event.toolName, event }),
                   ok,
                   {
                     ...nativeToolActivityDetail({ toolName: event.toolName, event }),
@@ -7927,7 +7885,7 @@ export async function startBusAgentRunner(params: {
                 logger.debug("tool finished", toolCompletionLogContext);
               }
 
-              if (event.toolName === "batch" || deferredAccepted) {
+              if (deferredAccepted) {
                 return;
               }
 
@@ -7982,7 +7940,17 @@ export async function startBusAgentRunner(params: {
             initialMessages = [...next.messages];
             agent.appendMessages(initialMessages);
             responseStartIndex = agent.state.messages.length;
-            agent.appendMessages(customCommandMessages);
+            const commandModel = activeBinding.resolved.model;
+            const commandProvider =
+              typeof commandModel === "string" ? "gateway" : commandModel.provider.split(".")[0]!;
+            if (customCommandInput)
+              agent.appendMessages(
+                buildCustomCommandMessages({
+                  ...customCommandInput,
+                  provider:
+                    activeBinding.resolved.provider === "codex" ? "openai" : commandProvider,
+                }),
+              );
           } else {
             // First message should be a prompt.
             // If additional messages for the same request id were queued before the run started,
@@ -8058,23 +8026,29 @@ export async function startBusAgentRunner(params: {
                       raw: next.raw,
                       previousMessages: agent.state.messages,
                       userMessages: mergedInitial,
+                      loadDecisionUserMessages: coalesced.storedMessages.some(
+                        (message) =>
+                          message.role === "user" &&
+                          Array.isArray(message.content) &&
+                          message.content.some(
+                            (part) => part.type === "resource" || part.type === "blob",
+                          ),
+                      )
+                        ? () =>
+                            materializeForBinding(
+                              coalesced.storedMessages,
+                              activeBinding,
+                              undefined,
+                              { family: "ai-sdk", supportsImage: true, supportsPdf: false },
+                            )
+                        : undefined,
                       publishToolStatus: publishNonAgentToolStatus,
                       onError: reportAutoInjectedThreadSearchError,
-                      onJevEvaluated: (event) => {
-                        logger.info("conversation.thread.auto_inject.jev", {
+                      onDecisionEvaluated: (event) => {
+                        logger.info("conversation.thread.auto_inject.gate", {
                           requestId: headers.request_id,
                           sessionId: headers.session_id,
-                          toolCallId: event.toolCallId,
-                          model: event.model,
-                          source: event.source,
-                          candidateCount: event.candidateCount,
-                          participantFilterUserCount: event.participantFilterUserCount,
-                          gate: event.gate,
-                          gateProbabilities: event.gateProbabilities,
-                          selected: event.selected,
-                          highestRejected: event.highestRejected,
-                          appendedCount: event.entries.length,
-                          entries: event.entries,
+                          ...event,
                         });
                       },
                       onInjected: (event) => {
@@ -8116,7 +8090,7 @@ export async function startBusAgentRunner(params: {
               });
               if (state.activeRun) state.activeRun.corePrimaryLineage = next.corePrimaryLineage;
             }
-            initialMessagesEndWithInjectedTool = autoInjectedThreadSearchMessages.length > 0;
+            initialMessagesEndWithGeneratedContext = autoInjectedThreadSearchMessages.length > 0;
             responseStartIndex = agent.state.messages.length + initialMessages.length;
           }
 
@@ -8137,7 +8111,7 @@ export async function startBusAgentRunner(params: {
 
           if (parsedCustomCommand) {
             await waitForRunAtHost(agent.continue());
-          } else if (initialMessagesEndWithInjectedTool) {
+          } else if (initialMessagesEndWithGeneratedContext) {
             agent.appendMessages(initialMessages);
             await waitForRunAtHost(agent.continue());
           } else {

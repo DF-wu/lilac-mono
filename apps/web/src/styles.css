@@ -504,6 +504,10 @@
   .markdown-diagram svg tspan {
     fill: var(--ui-foreground);
   }
+  /* Sanitization removes Mermaid's stylesheet, including its node label alignment. */
+  .markdown-diagram svg.flowchart .node .label text {
+    text-anchor: middle;
+  }
   .markdown-diagram svg rect,
   .markdown-diagram svg circle,
   .markdown-diagram svg ellipse,

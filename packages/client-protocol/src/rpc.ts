@@ -40,6 +40,7 @@ import {
   sidebarSectionSchema,
   sidebarPreferencesSchema,
   sidebarPageSchema,
+  workingIndicatorsSchema,
 } from "./domain.ts";
 
 export const nativeErrorMap = {
@@ -59,6 +60,16 @@ const mutationInput = threadIdInput.extend({
 });
 const successSchema = z.strictObject({ ok: z.literal(true) });
 export const threadSyncInputSchema = threadIdInput.extend({
+  checkpoint: replayCheckpointSchema.optional(),
+});
+
+export const displayStreamTargetSchema = z.discriminatedUnion("kind", [
+  threadIdInput.extend({ kind: z.literal("thread") }),
+  threadIdInput.extend({ kind: z.literal("subagent"), agentId: runIdentitySchema }),
+]);
+export type DisplayStreamTarget = z.infer<typeof displayStreamTargetSchema>;
+const displayStreamInputSchema = z.strictObject({ target: displayStreamTargetSchema });
+const displayStreamSyncSchema = displayStreamInputSchema.extend({
   checkpoint: replayCheckpointSchema.optional(),
 });
 
@@ -91,6 +102,7 @@ export const bootstrapReplySchema = z.strictObject({
   selectedThread: replayReplySchema.optional(),
   selectedThreadUnavailable: z.literal(true).optional(),
   catalogCursor: identitySchema,
+  workingIndicators: workingIndicatorsSchema.optional(),
 });
 export const catalogEventSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("thread"), thread: nativeThreadSchema, cursor: identitySchema }),
@@ -128,6 +140,29 @@ export const turnPageSchema = z
     },
   );
 export const nativeContract = {
+  streams: {
+    sync: procedure.input(displayStreamSyncSchema).output(replayReplySchema),
+    watch: procedure.input(displayStreamSyncSchema).output(eventIterator(threadEventSchema)),
+    hydrate: procedure
+      .input(
+        displayStreamInputSchema.extend({
+          slotId: identitySchema,
+          historyGeneration: revisionSchema,
+          projectionRevision: revisionSchema,
+        }),
+      )
+      .output(hydrationSchema),
+    turnPage: procedure
+      .input(
+        displayStreamInputSchema.extend({
+          turnId: identitySchema,
+          historyGeneration: revisionSchema,
+          projectionRevision: revisionSchema,
+          cursor: identitySchema,
+        }),
+      )
+      .output(turnPageSchema),
+  },
   computer: {
     read: procedure.input(threadIdInput).output(
       z.strictObject({
@@ -187,6 +222,17 @@ export const nativeContract = {
       .output(eventIterator(catalogEventSchema)),
   },
   threads: {
+    context: procedure.input(threadIdInput).output(
+      z.strictObject({
+        historyGeneration: revisionSchema,
+        evaluatedAt: revisionSchema,
+        firstTurnPosition: revisionSchema.nullable(),
+        hasSummary: z.boolean(),
+        summarizedBeforePosition: revisionSchema.optional(),
+        active: z.boolean(),
+        expiresAt: revisionSchema.optional(),
+      }),
+    ),
     get: procedure.input(threadIdInput).output(nativeThreadSchema),
     list: procedure
       .input(

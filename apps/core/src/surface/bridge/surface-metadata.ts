@@ -1,3 +1,4 @@
+import { escapeGeneratedMessageTags } from "@stanley2058/lilac-agent";
 import { Result } from "better-result";
 
 export const SURFACE_METADATA_VERSION = 1;
@@ -72,7 +73,10 @@ function extractLeadingTextContent(content: SurfaceMetadataMessage["content"]): 
 }
 
 export function escapeSurfaceMetadataTags(text: string): string {
-  return text.replace(SURFACE_METADATA_TAG_RE, (match) => `&lt;${match.slice(1)}`);
+  return escapeGeneratedMessageTags(text).replace(
+    SURFACE_METADATA_TAG_RE,
+    (match) => `&lt;${match.slice(1)}`,
+  );
 }
 
 export function formatSurfaceMetadataLine(meta: {

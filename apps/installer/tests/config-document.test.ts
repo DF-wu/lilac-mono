@@ -30,7 +30,7 @@ describe("installer config documents", () => {
     setConfigValue(document, ["models", "main", "reasoning"], "medium");
     expect(validateConfigDocument(document).status).toBe("ok");
     expect(serializeConfigDocument(document)).toBe(
-      "configVersion: 2\nmodels:\n  main:\n    model: openai/gpt-5.6-sol\n    reasoning: medium\n",
+      "# yaml-language-server: $schema=./.schemas/core-config.schema.json\nconfigVersion: 2\nmodels:\n  main:\n    model: openai/gpt-5.6-sol\n    reasoning: medium\n",
     );
     expect(getConfigValue(document, ["agent"])).toBeUndefined();
   });

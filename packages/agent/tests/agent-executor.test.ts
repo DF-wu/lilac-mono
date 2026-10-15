@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Panic, Result } from "better-result";
+import { isRecord } from "@stanley2058/lilac-utils/runtime-utils";
 import { AgentExecutor } from "../agent-executor";
 import type { AgentExecutionHost } from "../agent-execution-host";
 import { tool, type ModelMessage } from "ai";
@@ -965,9 +966,8 @@ describe("provider-neutral agent executor", () => {
       throw new Error("Expected system message");
     system.content = "mutated system";
     const nestedOption = view.providerOptions?.test?.nested;
-    if (!nestedOption || typeof nestedOption !== "object" || Array.isArray(nestedOption))
-      throw new Error("Expected nested provider option");
-    nestedOption.value = "mutated option";
+    if (!isRecord(nestedOption)) throw new Error("Expected nested provider option");
+    Object.assign(nestedOption, { value: "mutated option" });
     (view.pendingToolCalls as Set<string>).add("forged-call");
     expect(host.readState().messages).toEqual([
       { role: "user", content: [{ type: "text", text: "question" }] },

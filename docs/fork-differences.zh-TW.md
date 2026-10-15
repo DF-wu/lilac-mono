@@ -4,7 +4,7 @@
 
 本文件描述 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) 相對於 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的現行差異。
 
-比較基準為 2026-10-06 時與 upstream `main` 的 merge base（sync merge [`ca808ccb`](https://github.com/DF-wu/lilac-mono/commit/ca808ccb)）：本 fork 已包含 upstream commit [`bde35937`](https://github.com/stanley2058/lilac-mono/commit/bde35937)，並在其上保留下列功能與維運修改。
+比較基準為 upstream commit [`0c906d23`](https://github.com/stanley2058/lilac-mono/commit/0c906d23)，於 2026-10-07 透過 fork PR [#85](https://github.com/DF-wu/lilac-mono/pull/85) 整合。本 fork 在其上保留下列功能與維運修改。
 
 > [!IMPORTANT]
 > 這是維護文件，不是永久相容性承諾。Upstream sync 後，已被上游接收或不再存在的差異必須從本表移除或重新分類。
@@ -18,9 +18,10 @@
 | OpenAI `web.search` provider | `tools.web.extract.providers` 可填 `openai`：`web.search` 會改走 OpenAI Responses 的 `web_search` 工具（以 `tool_choice: required` 強制搜尋），回傳答案的 URL citations，再附上未被引用的檢索來源；`tools.web.openai.{model,searchContextSize}` 可調整，`model` 填 `openai` / `openai-compatible` provider 的 `provider/model`。只做搜尋：`web.extract` 會略過它 | [`web-search-openai.md`](./web-search-openai.md)、[`core-config-migrations.md`](./core-config-migrations.md)、`apps/core/src/tool-server/tools/web-search/openai-web-search-provider.ts` | 準備回饋 upstream（尚未送出）；需要直連 `api.openai.com` 或有實作 Responses `web_search` 的 gateway；發布日期限制只能靠對模型的指示 |
 | GitHub final-publication policy | Issue 與 PR review 的 prompt 告知 agent 由 Lilac 自行發布最終回覆：agent 不得再透過 `gh`、GitHub API 或 `surface.messages.send` 重複發布；若已直接發布，或 `gh pr review` 送出成功，則回傳 `NO_REPLY` | `apps/core/src/github/webhook/github-webhook-server.ts`、fork PR [#56](https://github.com/DF-wu/lilac-mono/pull/56) | 只是 prompt 指引；模型若忽略仍可能重複發文 |
 | Custom media plugin example | 提供 external Level 2 image/video plugin，使用 OpenAI-compatible image API 與 QuantumNous/new-api-compatible video flow | [`custom-media/README.md`](../examples/plugins/custom-media/README.md)、fork PR [#30](https://github.com/DF-wu/lilac-mono/pull/30) | Plugin 是 trusted in-process code；restricted callers 目前不能直接使用 external callables |
+| 本次輸入的壓縮保護 | Core 在 threshold 檢查前驗證本次輸入邊界；沒有舊歷史時略過軟性壓縮，摘要舊歷史時保留本次輸入原文。未提供保護邊界的呼叫端維持上游的作用中請求壓縮行為 | `packages/agent/auto-compaction.ts`、`apps/core/src/surface/bridge/bus-agent-runner.ts`、fork PR [#82](https://github.com/DF-wu/lilac-mono/pull/82) | 真正 overflow 仍走既有恢復／失敗路徑；略過軟性壓縮不保證下一次請求能放入 context |
 | Compatible-provider tool calls | Compatible provider 即使回傳 `other` 等非標準 finish reason，只要已解析出 local tool calls 仍會執行並保存結果 | Commit [`1c58e532`](https://github.com/DF-wu/lilac-mono/commit/1c58e532201ee51782c98c1d8b16086f6bf45c34) | 只信任已通過 parser 的 local tool calls；不會把任意 provider text 當成 tool invocation |
 | Container delivery | Build workflow 發布經驗證的 `catalina`、`claudia` 與 SHA tags，`latest` 指向 `catalina`；每個 variant 都有各自的帳號與 home directory，image 另加入 `rsync` | [`build-image.yml`](../.github/workflows/build-image.yml)、[`Dockerfile`](../Dockerfile) | 兩個發布 variant 都使用 UID/GID 3000；host bind mounts 必須允許該數字身分存取 |
-| Upstream maintenance | Scheduled workflow 每 6 小時 fetch upstream `main`，有新 commits 時嘗試 merge，成功後觸發 image build | [`sync-upstream.yml`](../.github/workflows/sync-upstream.yml) | Merge conflict 會使 workflow 失敗，必須人工整合與驗證 |
+| Upstream maintenance | 每 6 小時檢查 upstream；乾淨候選合併通過完整 CI 後更新 `main` 並發布映像；Git 衝突開 PR，由 Claude 唯讀分析並要求 `Catalina-df` review | [`sync-upstream.yml`](../.github/workflows/sync-upstream.yml)、[設定說明](./upstream-sync.md) | CI 失敗停止更新；衝突解決與整合驗證由人工負責 |
 
 ## Telegram 現況
 
@@ -113,11 +114,12 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 
 ## Branch 政策
 
-`main` 是唯一的長期分支：upstream `main` 加上本 fork 的功能，且永遠保持綠燈。其他分支都是短命的，一律透過 pull request 合入 `main`，讓 CI（含 upstream-footprint job）先跑過。
+`main` 是唯一的長期分支：upstream `main` 加上本 fork 的功能，且永遠保持綠燈。其他分支都是短命的，透過 pull request 合入。乾淨的自動 upstream 候選分支是例外：完整 CI（含 upstream-footprint job）先跑過，再將 `main` 快轉至已存在的候選 commit；只有 Git 衝突才開同步 PR。
 
 | 前綴 | 用途 | 生命週期 |
 | --- | --- | --- |
-| `chore/sync-upstream-YYYYMMDD` | 合併 upstream `main`、解衝突，以及讓 fork 功能配合新 upstream 所需的後續修正 | PR 合併後刪除 |
+| `chore/sync-upstream-<run-id>-<attempt>` | 乾淨 upstream 合併候選，通過驗證才更新 `main` | 更新與發布 dispatch 成功後刪除；失敗時保留 |
+| `automation/sync-upstream` | Upstream 衝突 PR，由人工解決與 review | PR 合併後刪除 |
 | `feat/`、`fix/`、`refactor/`、`docs/`、`test/` | 一個分支一件事，以改動內容命名（`feat/telegram-forum-topics`） | PR 合併後刪除 |
 | `archive/<舊分支名>`（tag，不是 branch） | 已退役、commits 不在 `main` 但日後可能要查閱的工作 | 永久保留；不再從它開新工作 |
 
@@ -136,10 +138,15 @@ flowchart TD
     Fetch --> Behind{Fork behind upstream?}
     Behind -->|No| Stop[No change]
     Behind -->|Yes| Merge[Merge upstream main]
-    Merge --> Clean{Merge succeeds?}
-    Clean -->|Yes| Push[Push fork main]
+    Merge --> Clean{Git conflicts?}
+    Clean -->|No| CI[Full CI on candidate SHA]
+    CI --> Passed{All gates pass?}
+    Passed -->|No| Hold[Keep candidate; stop update]
+    Passed -->|Yes| Push[Fast-forward unchanged fork main]
     Push --> Build[Trigger image build]
-    Clean -->|No| Manual[Resolve and validate manually]
+    Clean -->|Yes| PR[Open PR; request Catalina-df review]
+    PR --> AI[Read-only Claude conflict analysis]
+    AI --> Manual[Human resolution and validation]
 ```
 
 同步原則：

@@ -18,6 +18,7 @@ const themeStore = createStore(() => ({
   selection: defaultSelection,
   themes: lilac,
   syntax: lilac.dark.syntax,
+  applied: { kind: "dark" as ThemeKind, theme: lilac.dark },
 }));
 
 export function useSyntaxTheme() {
@@ -26,6 +27,10 @@ export function useSyntaxTheme() {
 
 export function useThemeSelection() {
   return useStore(themeStore, (state) => state.selection);
+}
+
+export function useAppliedTheme() {
+  return useStore(themeStore, (state) => state.applied);
 }
 
 export function useInstalledThemes() {
@@ -96,6 +101,9 @@ function applyTheme() {
   root.style.colorScheme = kind;
   for (const [name, value] of Object.entries(theme.variables))
     root.style.setProperty(`--ui-${name}`, value);
+  const applied = themeStore.getState().applied;
+  if (applied.kind !== kind || applied.theme !== theme)
+    themeStore.setState({ applied: { kind, theme } });
   if (themeStore.getState().syntax !== theme.syntax) themeStore.setState({ syntax: theme.syntax });
 }
 

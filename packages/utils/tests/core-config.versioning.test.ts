@@ -244,6 +244,43 @@ describe("core config versioning", () => {
     expect(parsed.workflows.maxActiveRuns).toBe(64);
   });
 
+  it("isolates v2 surface defaults between parsed configs", () => {
+    const first = parseCoreConfigV2ToUniversal({ configVersion: 2 });
+    const second = parseCoreConfigV2ToUniversal({ configVersion: 2 });
+
+    first.surface.workingIndicators.push("First-only");
+    first.surface.discord.allowedChannelIds.push("first-only");
+    first.surface.telegram.allowedChatIds.push("first-only");
+    first.surface.telegram.workingIndicators.push("Telegram-only");
+
+    expect(second.surface.workingIndicators).not.toContain("First-only");
+    expect(second.surface.discord.workingIndicators).not.toContain("First-only");
+    expect(second.surface.discord.allowedChannelIds).not.toContain("first-only");
+    expect(second.surface.telegram.allowedChatIds).not.toContain("first-only");
+    expect(second.surface.telegram.workingIndicators).not.toContain("Telegram-only");
+  });
+
+  it("uses shared v2 working indicators unless Discord overrides them", () => {
+    const shared = ["Shared status"];
+    const parsed = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      surface: {
+        workingIndicators: shared,
+      },
+    });
+    const overridden = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      surface: {
+        workingIndicators: shared,
+        discord: { workingIndicators: ["Discord status"] },
+      },
+    });
+
+    expect(parsed.surface.discord.workingIndicators).toEqual(shared);
+    expect(overridden.surface.workingIndicators).toEqual(shared);
+    expect(overridden.surface.discord.workingIndicators).toEqual(["Discord status"]);
+  });
+
   it("parses the v2 global workflow active-run cap", async () => {
     const parsed = await parseCoreConfig({
       configVersion: 2,

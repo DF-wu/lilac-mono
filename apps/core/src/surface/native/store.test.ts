@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Result } from "better-result";
 import { NativeStore } from "./store";
+import { NativeSearchStore } from "./store-search";
 import { decodeNativeRecord, nativeRecordCodecCases } from "./codec";
 import { nativeFailure } from "./errors";
 
@@ -244,6 +245,14 @@ describe("native store replay durability", () => {
     const { store, db } = fixture();
     const thread = store.createThread("alice", { commandId: "new" }).unwrap();
     const receipt = store.acceptInput("alice", prompt(thread.id, "input")).unwrap();
+    // Simulate on-disk corruption beyond the expression indexes' write-time JSON validation.
+    for (const name of [
+      "native_input_request",
+      "native_input_delivery",
+      "native_input_created",
+      "native_pending_inputs",
+    ])
+      db.exec(`DROP INDEX ${name}`);
     db.query("UPDATE native_records SET data_json='{' WHERE kind='input' AND id=?").run(
       receipt.inputId,
     );
@@ -388,4 +397,82 @@ test("canonical history boundary pins once on admitted current-generation inputs
   expect(store.setInputCanonicalHistoryStart(second.inputId, firstInput.requestId).isErr()).toBe(
     true,
   );
+});
+
+test("DM is unique per user, private, permanent, and outside ordinary queues", () => {
+  const { store } = fixture();
+  const dm = store.ensureDirectThread("alice").unwrap();
+  expect(store.ensureDirectThread("alice").unwrap().id).toBe(dm.id);
+  expect(store.ensureDirectThread("bob").unwrap().id).not.toBe(dm.id);
+  expect(store.getThread("owner", dm.id).isErr()).toBe(true);
+  expect(store.getThread("bob", dm.id).isErr()).toBe(true);
+  expect(dm.capabilities).toEqual({ read: true, edit: true, share: false });
+  expect(store.deleteThread("alice", { threadId: dm.id, commandId: "delete" }).isErr()).toBe(true);
+  expect(
+    store.updateThread("alice", { threadId: dm.id, commandId: "archive", archived: true }).isErr(),
+  ).toBe(true);
+  expect(
+    store.shareThread("owner", { threadId: dm.id, userId: "bob", grant: "read" }).isErr(),
+  ).toBe(true);
+  const turn = store.acceptInput("alice", prompt(dm.id, "send")).unwrap();
+  expect(
+    store
+      .beginRewind("alice", {
+        threadId: dm.id,
+        commandId: "rewind",
+        turnId: turn.turnId!,
+        historyGeneration: 0,
+        revision: store.getThread("alice", dm.id).unwrap().revision,
+      })
+      .isErr(),
+  ).toBe(true);
+  expect(store.listExpiredThreadIds(Number.MAX_SAFE_INTEGER).unwrap()).not.toContain(dm.id);
+  expect(store.listThreads("alice").unwrap()).toEqual([]);
+  expect(store.listSidebar("alice", { section: "active" }).unwrap().items).toEqual([]);
+  expect(store.moveSidebarThread("alice", { threadId: dm.id, section: "pinned" }).isErr()).toBe(
+    true,
+  );
+  store.close();
+});
+
+test("DM summary previews its latest text message", () => {
+  const { store } = fixture();
+  const dm = store.ensureDirectThread("alice").unwrap();
+  expect(dm.preview).toBeUndefined();
+  const turn = store.acceptInput("alice", prompt(dm.id, "send", "Plan the\n\nlaunch")).unwrap();
+  expect(store.getThread("alice", dm.id).unwrap().preview).toEqual({
+    role: "user",
+    text: "Plan the launch",
+  });
+  store
+    .appendMessage(dm.id, 0, turn.turnId!, {
+      id: "reply",
+      role: "assistant",
+      parts: [
+        { type: "text", text: "Draft" },
+        { type: "text", text: "x".repeat(200) },
+      ],
+    })
+    .unwrap();
+  expect(store.getThread("alice", dm.id).unwrap().preview).toEqual({
+    role: "assistant",
+    text: `Draft ${"x".repeat(154)}`,
+  });
+  const thread = store.createThread("alice", { commandId: "create" }).unwrap();
+  store.acceptInput("alice", prompt(thread.id, "ordinary")).unwrap();
+  expect(store.getThread("alice", thread.id).unwrap().preview).toBeUndefined();
+  store.close();
+});
+
+test("unscoped search keeps another user's DM private from owners", () => {
+  const { store, db } = fixture();
+  const dm = store.ensureDirectThread("alice").unwrap();
+  store.acceptInput("alice", prompt(dm.id, "secret", "distinctive private message")).unwrap();
+  const search = new NativeSearchStore({ db, store });
+  expect(search.searchMessages("alice", { query: "distinctive", limit: 10 }).unwrap()).toHaveLength(
+    1,
+  );
+  expect(search.searchMessages("owner", { query: "distinctive", limit: 10 }).unwrap()).toEqual([]);
+  expect(search.searchMessages("bob", { query: "distinctive", limit: 10 }).unwrap()).toEqual([]);
+  store.close();
 });

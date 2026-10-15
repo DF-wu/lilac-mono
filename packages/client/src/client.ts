@@ -9,6 +9,7 @@ import type {
   NativeThread,
   ReplayCheckpoint,
   ThreadEvent,
+  DisplayStreamTarget,
 } from "@stanley2058/lilac-client-protocol";
 import { type CacheScope, type NativeCache, NoNativeCache } from "./cache.ts";
 import { DisplayCatalogCache } from "./catalog.ts";
@@ -62,9 +63,21 @@ function captureFailure(error: unknown): ClientFailure {
   return { kind: "network", message: error instanceof Error ? error.message : "Connection failed" };
 }
 
+export function displayStreamKey(target: DisplayStreamTarget): string {
+  return target.kind === "thread"
+    ? target.threadId
+    : `subagent:${target.threadId}:${target.agentId}`;
+}
+
 export const MAX_INACTIVE_THREAD_STORES = 8;
 
 export class NativeClient {
+  private readonly observedStreams = new Map<
+    string,
+    { target: DisplayStreamTarget; observers: number }
+  >();
+  private readonly streamTargets = new Map<string, DisplayStreamTarget>();
+  private readonly streamFailures = new Map<string, string>();
   private readonly stores = new Map<string, NativeThreadStore>();
   private readonly cache: NativeCache;
   readonly catalogs: DisplayCatalogCache;
@@ -142,6 +155,41 @@ export class NativeClient {
     this.trimStores(threadId);
     return store;
   }
+  stream(target: DisplayStreamTarget): NativeThreadStore {
+    const key = displayStreamKey(target);
+    this.streamTargets.set(key, target);
+    return this.thread(key);
+  }
+  streamError(target: DisplayStreamTarget): string | undefined {
+    return this.streamFailures.get(displayStreamKey(target));
+  }
+  observeStream(target: DisplayStreamTarget): () => void {
+    const key = displayStreamKey(target);
+    const existing = this.observedStreams.get(key);
+    this.observedStreams.set(key, { target, observers: (existing?.observers ?? 0) + 1 });
+    this.streamTargets.set(key, target);
+    this.streamFailures.delete(key);
+    void this.startObservedStream(target);
+    return () => {
+      const current = this.observedStreams.get(key);
+      if (!current) return;
+      if (current.observers > 1) {
+        current.observers--;
+        return;
+      }
+      this.observedStreams.delete(key);
+      if (key !== this.selectedThreadId) this.stopStream(key);
+      this.abortHistory(key);
+      this.trimStores();
+    };
+  }
+  private async startObservedStream(target: DisplayStreamTarget): Promise<void> {
+    const key = displayStreamKey(target);
+    if (!this.stream(target).checkpoint && !this.threadEpochs.has(target.threadId))
+      await this.loadCached(key);
+    if (!this.observedStreams.has(key) || this.stopped) return;
+    this.watchTarget(target);
+  }
   private trimStores(requestedThreadId?: string): void {
     const limit = this.cache instanceof NoNativeCache ? 0 : MAX_INACTIVE_THREAD_STORES;
     const inactive: string[] = [];
@@ -149,6 +197,7 @@ export class NativeClient {
       if (
         threadId === this.selectedThreadId ||
         this.streams.has(threadId) ||
+        this.observedStreams.has(threadId) ||
         store.observerCount > 1
       )
         continue;
@@ -159,6 +208,8 @@ export class NativeClient {
       if (excess <= 0) return;
       if (threadId === requestedThreadId) continue;
       this.stores.delete(threadId);
+      this.streamTargets.delete(threadId);
+      this.streamFailures.delete(threadId);
       excess--;
     }
   }
@@ -362,6 +413,8 @@ export class NativeClient {
       (!reply.selectedThreadUnavailable || this.selectedThreadId !== threadId)
     )
       this.watchThread(this.selectedThreadId);
+    for (const observed of this.observedStreams.values())
+      void this.startObservedStream(observed.target);
   }
   private retryBootstrap(): void {
     if (this.bootstrapTimer) clearTimeout(this.bootstrapTimer);
@@ -401,26 +454,32 @@ export class NativeClient {
     this.streams.clear();
   }
   private watchThread(threadId: string): void {
+    this.watchTarget({ kind: "thread", threadId });
+  }
+  private watchTarget(target: DisplayStreamTarget): void {
+    const threadId = displayStreamKey(target);
     const rpc = this.connection;
     if (!rpc || this.bootstrapPending || this.streams.has(threadId)) return;
+    this.streamTargets.set(threadId, target);
     const controller = new AbortController();
     this.streams.set(threadId, controller);
-    this.trackStream(this.consumeThread(rpc, threadId, controller));
+    this.trackStream(this.consumeThread(rpc, threadId, controller, target));
   }
   private async consumeThread(
     rpc: NativeRPC,
     threadId: string,
     controller: AbortController,
+    target: DisplayStreamTarget,
   ): Promise<void> {
     const captured = await Result.tryPromise({
       try: async () => {
-        const iterator = await rpc.threads.watch(
-          { threadId, checkpoint: this.thread(threadId).checkpoint },
+        const iterator = await rpc.streams.watch(
+          { target, checkpoint: this.thread(threadId).checkpoint },
           { signal: controller.signal },
         );
         for await (const event of iterator) {
           if (controller.signal.aborted) return;
-          await this.threadEvent(threadId, event);
+          await this.threadEvent(threadId, event, target);
         }
       },
       catch: captureFailure,
@@ -429,6 +488,7 @@ export class NativeClient {
     if (this.streams.get(threadId) === controller) this.streams.delete(threadId);
     const error = captured.match({ ok: () => undefined, err: (failure) => failure });
     if (error?.kind === "forbidden" || error?.kind === "rejected") {
+      this.streamFailures.set(threadId, error.message);
       await this.revoke(threadId);
       return;
     }
@@ -438,7 +498,11 @@ export class NativeClient {
     }
     if (!this.stopped) this.retryBootstrap();
   }
-  private async threadEvent(threadId: string, event: ThreadEvent): Promise<void> {
+  private async threadEvent(
+    threadId: string,
+    event: ThreadEvent,
+    target: DisplayStreamTarget,
+  ): Promise<void> {
     const store = this.thread(threadId);
     switch (event.kind) {
       case "replay":
@@ -458,6 +522,7 @@ export class NativeClient {
         return;
       case "deleted":
       case "revoked":
+        this.streamFailures.set(threadId, "Conversation is no longer available.");
         await this.revoke(threadId);
         return;
     }
@@ -465,7 +530,7 @@ export class NativeClient {
     const generation = this.generation;
     const threadEpoch = this.threadEpochs.get(threadId);
     const captured = await Result.tryPromise({
-      try: () => this.connection!.threads.sync({ threadId }),
+      try: () => this.connection!.streams.sync({ target }),
       catch: captureFailure,
     });
     if (
@@ -552,6 +617,10 @@ export class NativeClient {
     }
   }
   async hydrate(threadId: string, slotId: string): Promise<void> {
+    return this.hydrateStream({ kind: "thread", threadId }, slotId);
+  }
+  async hydrateStream(target: DisplayStreamTarget, slotId: string): Promise<void> {
+    const threadId = displayStreamKey(target);
     const rpc = this.connection;
     const store = this.thread(threadId);
     const checkpoint = store.checkpoint;
@@ -565,9 +634,9 @@ export class NativeClient {
     this.historyRequests.set(key, { threadId, controller });
     const captured = await Result.tryPromise({
       try: () =>
-        rpc.threads.hydrate(
+        rpc.streams.hydrate(
           {
-            threadId,
+            target,
             slotId,
             historyGeneration: checkpoint.historyGeneration,
             projectionRevision: checkpoint.projectionRevision,
@@ -592,20 +661,24 @@ export class NativeClient {
     });
   }
   async loadTurnPage(threadId: string, slotId: string): Promise<void> {
+    return this.loadStreamTurnPage({ kind: "thread", threadId }, slotId);
+  }
+  async loadStreamTurnPage(target: DisplayStreamTarget, slotId: string): Promise<void> {
+    const threadId = displayStreamKey(target);
     const rpc = this.connection;
     const store = this.thread(threadId);
     const checkpoint = store.checkpoint;
-    const target = store.getVersioned(slotId);
-    if (!rpc || !checkpoint || !target || target.slot.kind !== "ready" || !target.slot.partsCursor)
+    const stored = store.getVersioned(slotId);
+    if (!rpc || !checkpoint || !stored || stored.slot.kind !== "ready" || !stored.slot.partsCursor)
       return;
-    const cursor = target.slot.partsCursor;
-    const turnId = target.slot.turnId;
+    const cursor = stored.slot.partsCursor;
+    const turnId = stored.slot.turnId;
     const generation = this.generation;
     const threadEpoch = this.threadEpochs.get(threadId);
     const captured = await Result.tryPromise({
       try: () =>
-        rpc.threads.turnPage({
-          threadId,
+        rpc.streams.turnPage({
+          target,
           turnId,
           cursor,
           historyGeneration: checkpoint.historyGeneration,
@@ -757,6 +830,16 @@ export class NativeClient {
     this.emit({ kind: "error", error });
   }
   async revoke(threadId: string): Promise<void> {
+    const children = new Set(
+      [...this.streamTargets]
+        .filter(([key, target]) => key !== threadId && target.threadId === threadId)
+        .map(([key]) => key),
+    );
+    for (const key of this.cacheWrites.keys())
+      if (key.startsWith(`subagent:${threadId}:`)) children.add(key);
+    for (const key of children) await this.revoke(key);
+    this.observedStreams.delete(threadId);
+    this.streamTargets.delete(threadId);
     this.threadEpochs.set(threadId, (this.threadEpochs.get(threadId) ?? 0) + 1);
     for (const [id, input] of this.pending) {
       if (input.threadId === threadId) this.pending.delete(id);
@@ -780,6 +863,9 @@ export class NativeClient {
     void this.dispose();
     for (const store of this.stores.values()) store.clear();
     this.stores.clear();
+    this.observedStreams.clear();
+    this.streamTargets.clear();
+    this.streamFailures.clear();
     this.pending.clear();
     this.receipts.clear();
     this.catalogs.purge(this.options.scope);

@@ -8,11 +8,12 @@ import {
   type SurfaceRuntimeHealthPort,
   type SurfaceWorkflowProgressPort,
 } from "../runtime-descriptor";
+import type { NativeSurfaceAdapter } from "./adapter";
 import { nativeSurfaceProtocol } from "./native-protocol";
 
 export type NativeWorkflowAdapterResolver = (
   threadId: string,
-) => SurfaceOperationResult<SurfaceAdapter>;
+) => SurfaceOperationResult<NativeSurfaceAdapter>;
 
 export function createNativeWorkflowProgressPort(
   resolveAdapter: NativeWorkflowAdapterResolver,

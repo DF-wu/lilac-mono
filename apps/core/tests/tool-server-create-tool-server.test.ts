@@ -191,6 +191,170 @@ describe("createToolServer", () => {
     }
   });
 
+  it("refuses a live socket without disrupting its server", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-socket-live-"));
+    const socketPath = path.join(root, "server.sock");
+    const previousSocket = process.env.TOOL_SERVER_BACKEND_SOCKET;
+    process.env.TOOL_SERVER_BACKEND_SOCKET = socketPath;
+    const first = createToolServer({ tools: [] });
+    const second = createToolServer({ tools: [] });
+    try {
+      await first.init();
+      await first.start(0);
+      const identity = await fs.lstat(socketPath);
+      await second.init();
+      await expect(second.start(0)).rejects.toThrow("already in use");
+      expect((await fs.lstat(socketPath)).ino).toBe(identity.ino);
+      expect((await first.getHealthSnapshot()).ready).toBe(true);
+      expect(second.app.server).toBeNull();
+    } finally {
+      await second.stop();
+      await first.stop();
+      if (previousSocket === undefined) delete process.env.TOOL_SERVER_BACKEND_SOCKET;
+      else process.env.TOOL_SERVER_BACKEND_SOCKET = previousSocket;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("allows only one concurrent startup to publish the socket", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-socket-race-"));
+    const socketPath = path.join(root, "server.sock");
+    const previousSocket = process.env.TOOL_SERVER_BACKEND_SOCKET;
+    process.env.TOOL_SERVER_BACKEND_SOCKET = socketPath;
+    const servers = [createToolServer({ tools: [] }), createToolServer({ tools: [] })];
+    try {
+      await Promise.all(servers.map((server) => server.init()));
+      const results = await Promise.allSettled(servers.map((server) => server.start(0)));
+      expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+      const response = await fetch("http://localhost/readyz", { unix: socketPath });
+      expect(response.status).toBe(200);
+    } finally {
+      await Promise.all(servers.map((server) => server.stop()));
+      expect(await fs.readdir(root)).toEqual([]);
+      if (previousSocket === undefined) delete process.env.TOOL_SERVER_BACKEND_SOCKET;
+      else process.env.TOOL_SERVER_BACKEND_SOCKET = previousSocket;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds the readiness probe when the socket accepts but HTTP hangs", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-socket-hung-"));
+    const socketPath = path.join(root, "server.sock");
+    const previousSocket = process.env.TOOL_SERVER_BACKEND_SOCKET;
+    process.env.TOOL_SERVER_BACKEND_SOCKET = socketPath;
+    const server = createToolServer({ tools: [] });
+    try {
+      await server.init();
+      await server.start(0);
+      const originalFetch = server.app.fetch.bind(server.app);
+      jest.spyOn(server.app, "fetch").mockImplementation((request) => {
+        if (new URL(request.url).pathname === "/versionz") return new Promise<Response>(() => {});
+        return originalFetch(request);
+      });
+      const health = await server.getHealthSnapshot();
+      expect(health.ready).toBe(false);
+      expect(health.live).toBe(true);
+    } finally {
+      jest.restoreAllMocks();
+      await server.stop();
+      if (previousSocket === undefined) delete process.env.TOOL_SERVER_BACKEND_SOCKET;
+      else process.env.TOOL_SERVER_BACKEND_SOCKET = previousSocket;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reclaims a socket left by an exited process", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-socket-stale-"));
+    const socketPath = path.join(root, "server.sock");
+    const previousSocket = process.env.TOOL_SERVER_BACKEND_SOCKET;
+    process.env.TOOL_SERVER_BACKEND_SOCKET = socketPath;
+    const child = Bun.spawnSync([
+      process.execPath,
+      "-e",
+      `Bun.serve({unix:${JSON.stringify(socketPath)},fetch:()=>new Response()});process.exit(0);`,
+    ]);
+    expect(child.exitCode).toBe(0);
+    expect((await fs.lstat(socketPath)).isSocket()).toBe(true);
+    const server = createToolServer({ tools: [] });
+    try {
+      await server.init();
+      await server.start(0);
+      expect((await server.getHealthSnapshot()).ready).toBe(true);
+      await server.stop();
+      expect(await fs.readdir(root)).toEqual([]);
+    } finally {
+      await server.stop();
+      if (previousSocket === undefined) delete process.env.TOOL_SERVER_BACKEND_SOCKET;
+      else process.env.TOOL_SERVER_BACKEND_SOCKET = previousSocket;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("finishes pending startup before shutting down both listeners", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-socket-stop-start-"));
+    const socketPath = path.join(root, "server.sock");
+    const previousSocket = process.env.TOOL_SERVER_BACKEND_SOCKET;
+    process.env.TOOL_SERVER_BACKEND_SOCKET = socketPath;
+    const server = createToolServer({ tools: [] });
+    const httpStopped = Promise.withResolvers<void>();
+    server.app.onStop(() => httpStopped.resolve());
+    try {
+      const child = Bun.spawnSync([
+        process.execPath,
+        "-e",
+        `Bun.serve({unix:${JSON.stringify(socketPath)},fetch:()=>new Response()});process.exit(0);`,
+      ]);
+      expect(child.exitCode).toBe(0);
+      await server.init();
+      const starting = server.start(0);
+      await server.stop();
+      await starting;
+      await httpStopped.promise;
+      expect(server.app.server).toBeNull();
+      expect(await fs.readdir(root)).toEqual([]);
+      expect((await server.getHealthSnapshot()).ready).toBe(false);
+    } finally {
+      await server.stop();
+      if (previousSocket === undefined) delete process.env.TOOL_SERVER_BACKEND_SOCKET;
+      else process.env.TOOL_SERVER_BACKEND_SOCKET = previousSocket;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports an unlinked socket as unready and preserves its replacement on stop", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-socket-replaced-"));
+    const socketPath = path.join(root, "server.sock");
+    const previousSocket = process.env.TOOL_SERVER_BACKEND_SOCKET;
+    process.env.TOOL_SERVER_BACKEND_SOCKET = socketPath;
+    const first = createToolServer({ tools: [] });
+    const second = createToolServer({ tools: [] });
+    try {
+      await first.init();
+      await first.start(0);
+      await fs.unlink(socketPath);
+      const health = await first.getHealthSnapshot();
+      expect(health.live).toBe(true);
+      expect(health.ready).toBe(false);
+      expect(health.checks.find((check) => check.name === "tool-server.listening")?.ok).toBe(false);
+      expect((await first.app.handle(new Request("http://localhost/readyz"))).status).toBe(503);
+      await second.init();
+      await second.start(0);
+      expect((await first.getHealthSnapshot()).ready).toBe(false);
+      await first.stop();
+      expect((await second.getHealthSnapshot()).ready).toBe(true);
+      expect((await fetch("http://localhost/readyz", { unix: socketPath })).status).toBe(200);
+      await second.stop();
+      expect(await fs.readdir(root)).toEqual([]);
+    } finally {
+      await first.stop();
+      await second.stop();
+      if (previousSocket === undefined) delete process.env.TOOL_SERVER_BACKEND_SOCKET;
+      else process.env.TOOL_SERVER_BACKEND_SOCKET = previousSocket;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("refuses to replace a non-socket unix path", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-tool-server-file-"));
     const socketPath = path.join(root, "tool-server.sock");

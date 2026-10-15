@@ -1,6 +1,11 @@
 import { expect, test } from "bun:test";
 import type { NativeThread } from "@stanley2058/lilac-client-protocol";
-import { createNotificationPreferences, notificationTransition } from "../src/notifications";
+import {
+  createNotificationPreferences,
+  notificationScope,
+  notificationTransition,
+  watchNotifications,
+} from "../src/notifications";
 
 const working: NativeThread = {
   id: "thread",
@@ -13,7 +18,168 @@ const working: NativeThread = {
   activeRunId: "run",
   capabilities: { read: true, edit: true, share: true },
 };
-const complete: NativeThread = { ...working, revision: 2, displayStatus: "completed" };
+const complete: NativeThread = {
+  ...working,
+  revision: 2,
+  displayStatus: "completed",
+  activeRunId: undefined,
+};
+
+function notificationFixture(initial: NativeThread[] = []) {
+  type Listener = Parameters<Parameters<typeof watchNotifications>[0]["client"]["subscribe"]>[0];
+  let listener: Listener = () => {};
+  let viewed = false;
+  const scope = { installationId: "test", principalId: "user" };
+  const shown: NotificationOptions[] = [];
+  const originals = ["window", "navigator", "Notification"].map(
+    (key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const,
+  );
+  const notification = { permission: "granted" };
+  const globals = {
+    window: Object.assign(new EventTarget(), { isSecureContext: true, Notification: notification }),
+    Notification: notification,
+    navigator: {
+      locks: {
+        request: (_name: string, _options: object, callback: () => Promise<void>) => callback(),
+        query: async () => ({
+          held: viewed ? [{ name: `${notificationScope(scope)}:view:thread` }] : [],
+        }),
+      },
+      serviceWorker: {
+        getRegistration: async () => ({
+          active: true,
+          showNotification: async (_title: string, options: NotificationOptions) => {
+            shown.push(options);
+          },
+        }),
+      },
+    },
+  };
+  for (const [key, value] of Object.entries(globals))
+    Object.defineProperty(globalThis, key, { configurable: true, value });
+  const preferences = createNotificationPreferences(scope);
+  preferences.store.setState({ enabled: true, completion: true, failure: true });
+  const stop = watchNotifications({
+    client: {
+      connectionState: "online",
+      subscribe(callback) {
+        listener = callback;
+        return () => {};
+      },
+    },
+    initial,
+    scope,
+    preferences,
+    openThread: () => {},
+  });
+  return {
+    shown,
+    preferences,
+    deliver: (event: Parameters<Listener>[0]) => listener(event),
+    view: (value: boolean) => {
+      viewed = value;
+    },
+    [Symbol.dispose]() {
+      stop();
+      for (const [key, original] of originals) {
+        if (original) Object.defineProperty(globalThis, key, original);
+        else Reflect.deleteProperty(globalThis, key);
+      }
+    },
+  };
+}
+
+test.each(["completed", "error"] as const)(
+  "live %s after an intermediate idle status notifies once",
+  async (displayStatus) => {
+    using fixture = notificationFixture();
+    const running = { ...working, revision: 7 };
+    const idle: NativeThread = { ...complete, revision: 10, displayStatus: "idle" };
+    const terminal = { ...complete, revision: 12, displayStatus };
+    await fixture.deliver({ kind: "thread", thread: running });
+    await fixture.deliver({ kind: "thread", thread: idle });
+    await fixture.deliver({ kind: "thread", thread: running });
+    await fixture.deliver({ kind: "thread", thread: { ...terminal, revision: 9 } });
+    expect(fixture.shown).toHaveLength(0);
+    await fixture.deliver({ kind: "thread", thread: terminal });
+    expect(fixture.shown.map((item) => item.body)).toEqual([
+      displayStatus === "completed" ? "Response finished" : "Run failed",
+    ]);
+    expect(fixture.shown[0]?.tag).toContain(":12:");
+    await fixture.deliver({ kind: "thread", thread: terminal });
+    await fixture.deliver({ kind: "thread", thread: { ...idle, revision: 13 } });
+    await fixture.deliver({ kind: "thread", thread: { ...terminal, revision: 14 } });
+    expect(fixture.shown).toHaveLength(1);
+    await fixture.deliver({
+      kind: "thread",
+      thread: { ...running, revision: 15, activeRunId: "next-run" },
+    });
+    await fixture.deliver({ kind: "thread", thread: { ...idle, revision: 16 } });
+    await fixture.deliver({ kind: "thread", thread: { ...terminal, revision: 17 } });
+    expect(fixture.shown).toHaveLength(2);
+  },
+);
+
+test.each(["viewed", "disabled"] as const)(
+  "an intermediate idle status preserves %s suppression without a later catch-up alert",
+  async (reason) => {
+    using fixture = notificationFixture([working]);
+    fixture.view(reason === "viewed");
+    fixture.preferences.store.setState({ enabled: reason !== "disabled" });
+    await fixture.deliver({ kind: "thread", thread: { ...complete, displayStatus: "idle" } });
+    await fixture.deliver({ kind: "thread", thread: { ...complete, revision: 3 } });
+    expect(fixture.shown).toHaveLength(0);
+    fixture.view(false);
+    fixture.preferences.store.setState({ enabled: true });
+    await fixture.deliver({ kind: "thread", thread: { ...complete, revision: 4 } });
+    expect(fixture.shown).toHaveLength(0);
+  },
+);
+
+test.each(["removed", "reconnect", "bootstrap", "archived", "revoked"] as const)(
+  "%s clears a completion pending across idle",
+  async (reset) => {
+    using fixture = notificationFixture([working]);
+    const idle: NativeThread = { ...complete, displayStatus: "idle" };
+    await fixture.deliver({ kind: "thread", thread: idle });
+    switch (reset) {
+      case "removed":
+        await fixture.deliver({ kind: "removed", threadId: working.id });
+        break;
+      case "reconnect":
+        await fixture.deliver({ kind: "connection", state: "offline" });
+        await fixture.deliver({ kind: "connection", state: "online" });
+        break;
+      case "bootstrap":
+        await fixture.deliver({
+          kind: "bootstrap",
+          bootstrap: {
+            installationId: "test",
+            viewer: { id: "user", displayName: "User", role: "owner", toolMode: "full" },
+            threads: { items: [idle] },
+            catalog: { kind: "unchanged", revision: "catalog" },
+            catalogCursor: "cursor",
+          },
+        });
+        break;
+      case "archived":
+        await fixture.deliver({ kind: "thread", thread: { ...idle, revision: 3, archived: true } });
+        break;
+      case "revoked":
+        await fixture.deliver({
+          kind: "thread",
+          thread: {
+            ...idle,
+            revision: 3,
+            capabilities: { read: false, edit: false, share: false },
+          },
+        });
+        break;
+    }
+    await fixture.deliver({ kind: "thread", thread: { ...complete, revision: 4 } });
+    expect(fixture.shown).toHaveLength(0);
+  },
+);
 
 test("alerts require a new terminal transition from an observed working state", () => {
   expect(notificationTransition(working, complete)).toBe("completion");

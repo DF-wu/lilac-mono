@@ -16,7 +16,7 @@ import {
   rethrowAgentPanic,
   type OpaqueAgentValue,
 } from "./failure-adapters";
-import { isToolExpansion, type ExpandedToolCall, type ToolExpansion } from "./tool-call-expansion";
+import type { AgentToolCall } from "./tool-call";
 
 const logger = createLogger({ module: "atomic-tool-execution" });
 const UNSERIALIZABLE_TOOL_RESULT = "[tool result is not JSON-serializable]";
@@ -51,10 +51,6 @@ export type AtomicToolInputValidation =
   | { type: "invalid"; error?: OpaqueAgentValue }
   | { type: "validate" };
 
-export type AtomicToolExpansionHandling =
-  | { type: "capture" }
-  | { type: "reject"; message?: string };
-
 export type AtomicToolExecutionOutcomeKind = "success" | "invalid-input" | "denied" | "error";
 
 export type AtomicToolExecutionOutcome = {
@@ -62,7 +58,6 @@ export type AtomicToolExecutionOutcome = {
   isError: boolean;
   toolOutput: ToolResultOutput;
   outcome: AtomicToolExecutionOutcomeKind;
-  expansion?: ToolExpansion;
 };
 
 export class AtomicToolStreamFailed extends TaggedError("AtomicToolStreamFailed")<{
@@ -139,14 +134,13 @@ export type AtomicToolExecutionEvent =
     };
 
 export type ExecuteAtomicToolCallOptions = {
-  call: ExpandedToolCall;
+  call: AgentToolCall;
   tools: ToolSet;
   messages: ModelMessage[];
   context?: unknown;
   abortSignal?: AbortSignal;
   pendingToolCalls: Set<string>;
   inputValidation: AtomicToolInputValidation;
-  expansionHandling: AtomicToolExpansionHandling;
   normalizeToolResultOutput?: NormalizeToolResultOutputFn;
   bypassGenericOutputNormalizer?: boolean;
   aggregateOutputBudgetExempt?: boolean;
@@ -423,7 +417,6 @@ async function settleAtomicToolCallImpl(
       let result: unknown;
       let isError = false;
       let toolOutput: ToolResultOutput;
-      let expansion: ToolExpansion | undefined;
       let outcome: AtomicToolExecutionOutcomeKind = "success";
 
       if (options.executionRejection) {
@@ -503,19 +496,6 @@ async function settleAtomicToolCallImpl(
               outcome = "error";
               result = streamFailure.message;
               toolOutput = { type: "error-text", value: streamFailure.message };
-            } else if (isToolExpansion(rawResult)) {
-              if (options.expansionHandling.type === "reject") {
-                const message =
-                  options.expansionHandling.message ?? "Tool-call expansions are not supported.";
-                isError = true;
-                outcome = "error";
-                result = message;
-                toolOutput = { type: "error-text", value: message };
-              } else {
-                expansion = rawResult;
-                result = rawResult.result;
-                toolOutput = { type: "json", value: toJsonToolOutputValue(result) };
-              }
             } else {
               result = rawResult;
               toolOutput = tool.toModelOutput
@@ -545,7 +525,6 @@ async function settleAtomicToolCallImpl(
         isError,
         toolOutput,
         outcome,
-        ...(expansion ? { expansion } : {}),
       };
     }),
   );

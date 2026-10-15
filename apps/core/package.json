@@ -26,9 +26,9 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "@ai-sdk/google": "^4.0.12",
-    "@ai-sdk/mcp": "^2.0.39",
-    "@ai-sdk/typesafe-ai": "^3.0.10",
+    "@ai-sdk/google": "^4.0.90",
+    "@ai-sdk/mcp": "^2.0.69",
+    "@ai-sdk/typesafe-ai": "^3.0.15",
     "@clerk/backend": "3.18.1",
     "@ff-labs/fff-node": "^0.9.4",
     "@mozilla/readability": "^0.6.0",
@@ -50,7 +50,7 @@
     "@tavily/core": "^0.7.2",
     "@types/jsdom": "^28.0.1",
     "@types/turndown": "^5.0.6",
-    "ai": "^7.0.22",
+    "ai": "^7.0.130",
     "ajv": "^8.20.0",
     "better-result": "catalog:",
     "cron-parser": "^5.5.0",

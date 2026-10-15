@@ -35,7 +35,7 @@ function value<T, E>(result: ResultType<T, E>): T {
   });
 }
 
-function fixture(blobStore?: BlobStore) {
+function fixture(blobStore?: BlobStore, direct = false) {
   let now = 1_000;
   let maxAgeMs: number | undefined;
   const store = new NativeStore(new Database(":memory:"), () => now);
@@ -58,7 +58,11 @@ function fixture(blobStore?: BlobStore) {
       toolMode: "full",
     }),
   );
-  const thread = value(store.createThread("owner", { commandId: crypto.randomUUID() }));
+  const thread = value(
+    direct
+      ? store.ensureDirectThread("owner")
+      : store.createThread("owner", { commandId: crypto.randomUUID() }),
+  );
   const transcripts = new SqliteTranscriptStore(":memory:");
   const published: { data: CmdRequestMessageData; headers: Record<string, string> }[] = [];
   let cancellations = 0;
@@ -729,4 +733,92 @@ describe("native execution admission", () => {
       f.close();
     }
   });
+});
+
+test("DM uses its own three-hour cutoff and freezes the selected context during a run", async () => {
+  const f = fixture(undefined, true);
+  try {
+    f.setMaxAge(1);
+    f.submit("first topic");
+    value(await f.execution.kick(f.thread.id));
+    const first = f.request();
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...first,
+        requestClient: "native",
+        messages: [
+          ...storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages),
+          { role: "assistant", content: "answer" },
+        ],
+      }),
+    );
+    value(await f.execution.runnerLifecycle.settled(first, "completed"));
+    f.setNow(10_000);
+    expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBe(0);
+    f.submit("different topic");
+    value(await f.execution.kick(f.thread.id));
+    expect(f.published.at(-1)!.data.messages).toHaveLength(3);
+    const activeMessages = storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages);
+    f.execution.runnerLifecycle.compacted(f.request().requestId, [
+      { role: "user", content: "<context-compaction>Earlier topic summary</context-compaction>" },
+      { role: "user", content: JSON.parse(JSON.stringify(activeMessages.at(-1)!.content)) },
+    ]);
+    const compacted = value(f.execution.context("owner", f.thread.id));
+    expect(compacted.active).toBe(true);
+    expect(compacted.hasSummary).toBe(true);
+    expect(compacted.firstTurnPosition).toBe(0);
+    expect("summarizedBeforePosition" in compacted && compacted.summarizedBeforePosition).toBe(1);
+    f.setNow(20_000_000);
+    expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBe(0);
+    value(await f.execution.runnerLifecycle.settled(f.request(), "completed"));
+    expect(f.execution.context("guest", f.thread.id).isErr()).toBe(true);
+  } finally {
+    f.close();
+  }
+});
+
+test("DM keeps a recent direct suffix when the compacted summary ages out", async () => {
+  const f = fixture(undefined, true);
+  try {
+    for (let turn = 1; turn <= 3; turn++) {
+      f.setNow(turn * 1000);
+      f.submit(`topic ${turn}`);
+      value(await f.execution.kick(f.thread.id));
+      const request = f.request();
+      const messages = storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages);
+      value(
+        f.transcripts.saveRequestTranscript({
+          ...request,
+          requestClient: "native",
+          messages: [
+            ...(turn === 3
+              ? [
+                  {
+                    role: "user" as const,
+                    content: [
+                      {
+                        type: "text" as const,
+                        text: "<context-compaction>Earlier topics</context-compaction>",
+                      },
+                    ],
+                  },
+                  messages.at(-1)!,
+                ]
+              : messages),
+            { role: "assistant", content: "answer" },
+          ],
+        }),
+      );
+      value(await f.execution.runnerLifecycle.settled(request, "completed"));
+    }
+    f.setNow(10_802_500);
+    const context = value(f.execution.context("owner", f.thread.id));
+    expect(context.firstTurnPosition).toBe(2);
+    expect(context.hasSummary).toBe(false);
+    f.submit("next topic");
+    value(await f.execution.kick(f.thread.id));
+    expect(f.published.at(-1)!.data.messages).toHaveLength(3);
+  } finally {
+    f.close();
+  }
 });

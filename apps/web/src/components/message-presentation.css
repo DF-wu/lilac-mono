@@ -217,3 +217,7 @@
     animation: none;
   }
 }
+::highlight(lilac-citation-comment),
+::highlight(lilac-citation-source) {
+  background-color: color-mix(in srgb, var(--ui-primary) 32%, transparent);
+}

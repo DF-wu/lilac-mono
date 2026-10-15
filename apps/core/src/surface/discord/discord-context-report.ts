@@ -199,7 +199,7 @@ export function createDiscordContextReportProvider(params: {
     const additionalSessionPrompts = await resolveSessionAdditionalPrompts({
       entries: sessionConfig.additionalPrompts,
     });
-    const skillsSection = await maybeBuildSkillsSectionForPrimary();
+    const skillsSection = await maybeBuildSkillsSectionForPrimary("discord");
     const safetyMode = resolveSessionSafetyMode(
       request.config,
       request.sessionId,
@@ -284,7 +284,6 @@ export function createDiscordContextReportProvider(params: {
         transcriptStore: params.transcriptStore,
       });
       const activeToolNames = selectedLevel1ToolNames(toolset, selectedCatalogIds);
-      toolset.updateActiveBatchTools(activeToolNames);
       const activeTools = selectActiveTools(toolset.tools, activeToolNames);
       const estimate = estimateContextSnapshotTokens({
         system,

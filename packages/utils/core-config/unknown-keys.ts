@@ -3,6 +3,29 @@ import { isRecord } from "../runtime-utils";
 import type { CoreConfigKeyPath } from "./types";
 
 function aliasedTargetKey(path: CoreConfigKeyPath, sourceKey: string): string | undefined {
+  if (
+    path.length === 2 &&
+    path[0] === "conversation" &&
+    path[1] === "thread" &&
+    sourceKey === "jevAutoInject"
+  ) {
+    return "decisionAutoInject";
+  }
+
+  if (
+    path.length === 3 &&
+    path[0] === "conversation" &&
+    path[1] === "thread" &&
+    (path[2] === "decisionAutoInject" || path[2] === "jevAutoInject") &&
+    [
+      "recallMinProbability",
+      "durableSubjectMinProbability",
+      "casualMaxProbability",
+      "relevanceMinProbability",
+    ].includes(sourceKey)
+  )
+    return "jev";
+
   if (path.length === 2 && path[0] === "tools" && path[1] === "web" && sourceKey === "search") {
     return "extract";
   }

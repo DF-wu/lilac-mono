@@ -104,6 +104,7 @@ const requestRawSchema = z
       .optional(),
     native: z
       .strictObject({
+        compact: z.boolean().optional(),
         threadId: z.string().regex(/^[^:\s]+$/u),
         authorUserId: z.string().trim().min(1),
         starterUserId: z.string().trim().min(1),

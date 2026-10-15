@@ -269,6 +269,7 @@ function TextAttachmentPreview({
     >
       <div className="attachment-source-body h-full min-h-0 flex flex-col w-full max-w-[var(--ui-chat-width)] mx-auto">
         <FileSource
+          href={href}
           name={name}
           text={text ?? { status: "loading" }}
           line={line}

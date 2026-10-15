@@ -161,6 +161,7 @@ export type ToolServerHealthConfig = {
 
 type ToolServerHealthStateOptions = ToolServerHealthConfig & {
   logger: Logger;
+  listeningProbe?: () => Promise<boolean>;
   pluginManager?: ToolPluginManagerLike;
   externalHealthProvider?: (options?: {
     includeMemoryDiagnostics?: boolean;
@@ -484,6 +485,7 @@ export function createToolServerHealthState(options: ToolServerHealthStateOption
   }
 
   async function getSnapshot(): Promise<ToolServerHealthSnapshot> {
+    const transportListening = listening && ((await options.listeningProbe?.()) ?? true);
     const now = Date.now();
     const memory = process.memoryUsage();
     const memoryUsage: ToolServerMemoryUsage = {
@@ -515,9 +517,9 @@ export function createToolServerHealthState(options: ToolServerHealthStateOption
       },
       {
         name: "tool-server.listening",
-        ok: listening,
+        ok: transportListening,
         impact: "ready",
-        reason: listening ? undefined : "tool server is not listening",
+        reason: transportListening ? undefined : "tool server is not listening",
       },
       {
         name: "event-loop.lag",
@@ -635,7 +637,7 @@ export function createToolServerHealthState(options: ToolServerHealthStateOption
         },
         toolServer: {
           initialized,
-          listening,
+          listening: transportListening,
           totalCalls,
           timedOutCalls,
           failedCalls,

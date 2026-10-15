@@ -33,11 +33,13 @@ import { configureSqliteConnection } from "../../shared/sqlite";
 import { nativeThreadCapabilities, type NativeThreadGrant } from "./authority";
 import {
   decodeNativeRecord,
+  type NativeHtmlPreviewRecord,
   type NativeInputRecord,
   type NativeMutationResult,
   type NativePersistedRow,
   type NativeRecord,
   type NativeThreadRecord,
+  type NativeAgentStreamRecord,
   type NativeUploadRecord,
   type NativeUser,
 } from "./codec";
@@ -51,6 +53,12 @@ const REPLAY_BYTE_CAP = 128 * 1024 * 1024;
 const WINDOW_BYTES = 224 * 1024;
 const encoder = new TextEncoder();
 const sidebarActivity = `COALESCE((SELECT MAX(a.updated_at) FROM native_records a WHERE a.thread_id=r.id AND a.kind IN ('turn','input')),json_extract(r.data_json,'$.value.createdAt'))`;
+
+type OutputConversation = NativeThreadRecord | NativeAgentStreamRecord;
+type ReplayConversation = Pick<
+  OutputConversation,
+  "id" | "historyGeneration" | "revision" | "updatedAt"
+>;
 
 type StoredRow = NativePersistedRow & { id: string; position: number };
 
@@ -69,6 +77,10 @@ export function nativeStoreTransaction<T>(
 
 function fingerprint(value: object): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function htmlPreviewKey(turnId: string, path: string): string {
+  return fingerprint({ kind: "html-preview", turnId, path });
 }
 
 function commandKey(actorId: string, commandId: string): string {
@@ -150,12 +162,17 @@ export class NativeStore {
     return nativeStoreTransaction(this.db, () => {
       const version =
         this.db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
-      if (version > 1)
+      if (version > 2)
         return Result.err(
           nativeFailure("invalid", "Native store version is newer than this build"),
         );
       this.db
         .run(`CREATE TABLE IF NOT EXISTS native_records (kind TEXT NOT NULL, id TEXT NOT NULL, thread_id TEXT, position INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, format_version INTEGER NOT NULL, data_json TEXT NOT NULL, PRIMARY KEY(kind,id));
+        CREATE UNIQUE INDEX IF NOT EXISTS native_dm_user ON native_records(json_extract(data_json,'$.value.starterId')) WHERE kind='thread' AND json_extract(data_json,'$.value.kind')='dm';
+        CREATE INDEX IF NOT EXISTS native_input_delivery ON native_records(json_extract(data_json,'$.value.deliveryId')) WHERE kind='input';
+        CREATE INDEX IF NOT EXISTS native_input_request ON native_records(json_extract(data_json,'$.value.requestId')) WHERE kind='input';
+        CREATE INDEX IF NOT EXISTS native_pending_inputs ON native_records(thread_id,position) WHERE kind='input' AND json_extract(data_json,'$.value.completedAt') IS NULL AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted');
+        CREATE INDEX IF NOT EXISTS native_input_created ON native_records(thread_id,json_extract(data_json,'$.value.createdAt'),position) WHERE kind='input';
         CREATE INDEX IF NOT EXISTS native_records_thread_position ON native_records(kind,thread_id,position);
         CREATE INDEX IF NOT EXISTS native_records_updated ON native_records(kind,updated_at DESC,id);
         CREATE INDEX IF NOT EXISTS native_records_activity ON native_records(thread_id,kind,updated_at DESC);
@@ -169,7 +186,7 @@ export class NativeStore {
         CREATE TABLE IF NOT EXISTS native_user_preferences (user_id TEXT PRIMARY KEY,auto_settle_days INTEGER NOT NULL DEFAULT 3 CHECK(auto_settle_days IN (1,3,5,7,30)));
         CREATE TABLE IF NOT EXISTS native_thread_preferences (user_id TEXT NOT NULL,thread_id TEXT NOT NULL,section TEXT NOT NULL CHECK(section IN ('pinned','active','settled')),position INTEGER NOT NULL,last_activity INTEGER NOT NULL,touched_at INTEGER NOT NULL,PRIMARY KEY(user_id,thread_id));
         CREATE INDEX IF NOT EXISTS native_thread_preferences_order ON native_thread_preferences(user_id,section,position,thread_id);
-        PRAGMA user_version = 1;`);
+        PRAGMA user_version = 2;`);
       return Result.ok(undefined);
     });
   }
@@ -246,7 +263,14 @@ export class NativeStore {
           );
         if (fingerprint(current.settings) === fingerprint(input.settings))
           return Result.ok(current);
-        const value = { settings: input.settings, revision: current.revision + 1 };
+        const value = {
+          settings: {
+            ...input.settings,
+            dmContextMaxAgeMs:
+              input.settings.dmContextMaxAgeMs ?? current.settings.dmContextMaxAgeMs,
+          },
+          revision: current.revision + 1,
+        };
         this.writeRecord("instance", { kind: "deployment", value });
         return Result.ok(value);
       }, this),
@@ -398,6 +422,197 @@ export class NativeStore {
     );
   }
 
+  ensureAgentStream(input: {
+    parentThreadId: string;
+    parentRequestId: string;
+    runId: string;
+    requestId: string;
+    messages: DisplayMessage[];
+    state: ReadyTurnSlot["state"];
+    startedAt: number;
+  }): NativeStoreResult<NativeAgentStreamRecord> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const id = `agent_${fingerprint({ runId: input.runId }).slice(0, 48)}`;
+        const existing = yield* this.readRecord("agent-stream", id);
+        if (existing?.kind === "agent-stream") {
+          const turn = yield* this.readRecord("turn", existing.value.turnId);
+          if (turn?.kind !== "turn" || turn.value.messages.length || !input.messages.length)
+            return Result.ok(existing.value);
+          this.writeRecord(
+            turn.value.turnId,
+            { ...turn, value: { ...turn.value, messages: input.messages } },
+            id,
+          );
+          return Result.ok(this.bump(existing.value, "reset", turn.value.turnId));
+        }
+        const value: NativeAgentStreamRecord = {
+          id,
+          state: input.state === "pending" || !input.state ? "running" : input.state,
+          title: "Thinking…",
+          parentThreadId: input.parentThreadId,
+          parentRequestId: input.parentRequestId,
+          runId: input.runId,
+          requestId: input.requestId,
+          turnId: randomUUID(),
+          historyGeneration: 0,
+          revision: 0,
+          updatedAt: this.now(),
+          deleted: false,
+          mutationPending: false,
+        };
+        this.writeRecord(id, { kind: "agent-stream", value }, input.parentThreadId);
+        const slot: ReadyTurnSlot = {
+          kind: "ready",
+          slotId: value.turnId,
+          turnId: value.turnId,
+          position: 0,
+          state: input.state,
+          startedAt: input.startedAt,
+          messages: input.messages,
+        };
+        this.writeRecord(slot.turnId, { kind: "turn", value: slot }, id);
+        return Result.ok(this.bump(value, "turn", slot.turnId));
+      }, this),
+    );
+  }
+
+  findAgentStream(runId: string): NativeStoreResult<NativeAgentStreamRecord | null> {
+    const id = `agent_${fingerprint({ runId }).slice(0, 48)}`;
+    return this.readRecord("agent-stream", id).map((record) =>
+      record?.kind === "agent-stream" && !record.value.deleted ? record.value : null,
+    );
+  }
+
+  settleAgentStream(stream: NativeAgentStreamRecord, state: "complete" | "failed" | "canceled") {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const turn = yield* this.readRecord("turn", stream.turnId);
+        if (turn?.kind !== "turn" || turn.value.state === state) return Result.ok(undefined);
+        const settledAt = this.now();
+        return this.projectTurn(
+          stream.id,
+          stream.historyGeneration,
+          `agent_state_${stream.id}_${state}`,
+          stream.turnId,
+          (slot) =>
+            Result.ok({
+              slot: { ...slot, state, settledAt },
+              changes: [
+                {
+                  kind: "turn-state",
+                  turnId: slot.turnId,
+                  position: slot.position,
+                  state,
+                  settledAt,
+                },
+              ],
+            }),
+        );
+      }, this),
+    );
+  }
+
+  beginAgentOutput(streamId: string, requestId: string) {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const conversation = yield* this.getOutputConversation(streamId);
+        if (!("parentThreadId" in conversation))
+          return Result.err(nativeFailure("invalid", "Expected an agent stream"));
+        const next = {
+          ...conversation,
+          requestId,
+          attemptId: randomUUID(),
+          previousAttemptId: conversation.attemptId,
+        };
+        this.writeRecord(next.id, { kind: "agent-stream", value: next }, next.parentThreadId);
+        return Result.ok({
+          threadId: next.id,
+          parentThreadId: next.parentThreadId,
+          turnId: next.turnId,
+          generation: next.historyGeneration,
+          attemptId: next.attemptId,
+          previousAttemptId: next.previousAttemptId,
+        });
+      }, this),
+    );
+  }
+
+  private getOutputConversation(id: string): NativeStoreResult<OutputConversation> {
+    return Result.gen(function* () {
+      const thread = yield* this.readRecord("thread", id);
+      if (thread?.kind === "thread") return Result.ok(thread.value);
+      const record = yield* this.readRecord("agent-stream", id);
+      if (record?.kind !== "agent-stream")
+        return Result.err(nativeFailure("not-found", "Display stream is unavailable"));
+      const stream = record.value;
+      if (stream.deleted)
+        return Result.err(nativeFailure("stale", "Agent stream belongs to discarded history"));
+      const parent = yield* this.getThreadRecord(stream.parentThreadId);
+      const requests = yield* this.listCanonicalRequestIds(parent.id);
+      if (parent.deleted || !requests.includes(stream.parentRequestId))
+        return Result.err(nativeFailure("stale", "Agent stream belongs to discarded history"));
+      return Result.ok(stream);
+    }, this);
+  }
+
+  getDisplayThread(id: string): NativeStoreResult<NativeThreadRecord> {
+    return this.getOutputConversation(id).andThen((conversation) =>
+      "parentThreadId" in conversation
+        ? this.getThreadRecord(conversation.parentThreadId)
+        : Result.ok(conversation),
+    );
+  }
+
+  private authorizeAgentStream(actorId: string, parentThreadId: string, streamId: string) {
+    return Result.gen(function* () {
+      yield* this.authorizeThread(actorId, parentThreadId);
+      const stream = yield* this.getOutputConversation(streamId);
+      if (!("parentThreadId" in stream) || stream.parentThreadId !== parentThreadId)
+        return Result.err(nativeFailure("forbidden", "Agent stream belongs to another thread"));
+      return Result.ok(stream);
+    }, this);
+  }
+
+  syncAgentStream(
+    actorId: string,
+    parentThreadId: string,
+    streamId: string,
+    checkpoint?: ReplayCheckpoint,
+  ) {
+    return nativeStoreTransaction(this.db, () =>
+      this.authorizeAgentStream(actorId, parentThreadId, streamId).andThen((stream) =>
+        this.replay(stream, checkpoint),
+      ),
+    );
+  }
+
+  hydrateAgentStream(
+    actorId: string,
+    parentThreadId: string,
+    streamId: string,
+    input: Parameters<NativeStore["hydrate"]>[1],
+  ) {
+    return nativeStoreTransaction(this.db, () =>
+      this.authorizeAgentStream(actorId, parentThreadId, streamId).andThen((stream) =>
+        this.hydrateConversation(stream, input),
+      ),
+    );
+  }
+
+  pageAgentStream(
+    actorId: string,
+    parentThreadId: string,
+    streamId: string,
+    input: Parameters<NativeStore["turnPage"]>[1],
+  ) {
+    return nativeStoreTransaction(this.db, () =>
+      this.authorizeAgentStream(actorId, parentThreadId, streamId).andThen((stream) =>
+        this.pageConversation(stream, input),
+      ),
+    );
+  }
+
   authorizeThread(
     actorId: string,
     threadId: string,
@@ -421,24 +636,30 @@ export class NativeStore {
   private displayStatus(
     user: NativeUser,
     thread: NativeThreadRecord,
-  ): NativeStoreResult<NonNullable<NativeThread["displayStatus"]>> {
-    if (thread.activeRunId) return Result.ok("working");
+  ): NativeStoreResult<Pick<NativeThread, "displayStatus" | "workingSince">> {
     // The sidebar needs turn state and the read frontier, never transcript bodies.
     const row = this.db
-      .query<NativePersistedRow & { last_message_index: number }, [string]>(
-        `SELECT format_version,json_object('kind','turn','value',json_set(json_extract(data_json,'$.value'),'$.messages',json('[]'))) AS data_json,json_array_length(data_json,'$.value.messages')-1 AS last_message_index FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 1`,
+      .query<
+        NativePersistedRow & { last_message_index: number; first_created_at: number | null },
+        [string]
+      >(
+        `SELECT format_version,json_object('kind','turn','value',json_set(json_extract(data_json,'$.value'),'$.messages',json('[]'))) AS data_json,json_array_length(data_json,'$.value.messages')-1 AS last_message_index,json_extract(data_json,'$.value.messages[0].metadata.createdAt') AS first_created_at FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 1`,
       )
       .get(thread.id);
-    if (!row) return Result.ok("idle");
+    if (!row) return Result.ok({ displayStatus: thread.activeRunId ? "working" : "idle" });
     const db = this.db;
     return Result.gen(function* () {
       const { value: record } = yield* decodeNativeRecord(row);
       if (record.kind !== "turn")
         return Result.err(nativeFailure("invalid", "Thread display projection is not a turn"));
       const turn = record.value;
-      if (turn.state === "failed") return Result.ok("error" as const);
-      if (turn.state === "running") return Result.ok("working" as const);
-      if (turn.state !== "complete") return Result.ok("idle" as const);
+      if (thread.activeRunId || turn.state === "running")
+        return Result.ok({
+          displayStatus: "working" as const,
+          workingSince: turn.startedAt ?? row.first_created_at ?? undefined,
+        });
+      if (turn.state === "failed") return Result.ok({ displayStatus: "error" as const });
+      if (turn.state !== "complete") return Result.ok({ displayStatus: "idle" as const });
       const read = db
         .query<{ position: number; message_index: number }, [string, string, number]>(
           "SELECT position,message_index FROM native_surface_read WHERE thread_id=? AND reader_id=? AND generation=?",
@@ -448,7 +669,7 @@ export class NativeStore {
         read !== null &&
         (read.position > turn.position ||
           (read.position === turn.position && read.message_index >= row.last_message_index));
-      return Result.ok<NonNullable<NativeThread["displayStatus"]>>(checked ? "idle" : "completed");
+      return Result.ok({ displayStatus: checked ? ("idle" as const) : ("completed" as const) });
     });
   }
 
@@ -464,22 +685,36 @@ export class NativeStore {
   private summary(user: NativeUser, thread: NativeThreadRecord): NativeStoreResult<NativeThread> {
     return Result.gen(function* () {
       const starter = yield* this.getUser(thread.starterId);
-      const displayStatus = yield* this.displayStatus(user, thread);
+      const status = yield* this.displayStatus(user, thread);
       return Result.ok({
         id: thread.id,
+        kind: thread.kind,
         title: thread.title,
         starterId: thread.starterId,
         starterDisplayName: starter.displayName,
         starterAvatarUrl: nativeUserDisplay(starter).avatarUrl,
-        displayStatus,
+        ...status,
         archived: thread.archived,
         updatedAt: thread.updatedAt,
         revision: thread.revision,
         modelId: thread.modelId,
         activeRunId: thread.activeRunId,
         capabilities: this.capabilities(user, thread),
+        preview: thread.kind === "dm" ? this.latestTextPreview(thread.id) : undefined,
       });
     }, this);
+  }
+
+  private latestTextPreview(threadId: string): NativeThread["preview"] {
+    // DMs never end, so read only the newest turns instead of the whole transcript.
+    const row = this.db
+      .query<{ role: "user" | "assistant"; text: string }, [string]>(
+        `SELECT json_extract(m.value,'$.role') AS role,(SELECT group_concat(json_extract(p.value,'$.text'),' ' ORDER BY p.key) FROM json_each(m.value,'$.parts') p WHERE json_extract(p.value,'$.type')='text') AS text FROM (SELECT position,data_json FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 4) r,json_each(r.data_json,'$.value.messages') m WHERE json_extract(m.value,'$.role') IN ('user','assistant') AND EXISTS(SELECT 1 FROM json_each(m.value,'$.parts') p WHERE json_extract(p.value,'$.type')='text' AND trim(json_extract(p.value,'$.text'))<>'') ORDER BY r.position DESC,m.key DESC LIMIT 1`,
+      )
+      .get(threadId);
+    if (!row) return undefined;
+    const text = [...row.text.replace(/\s+/gu, " ").trim()].slice(0, 160).join("");
+    return { role: row.role, text };
   }
 
   getThread(actorId: string, threadId: string): NativeStoreResult<NativeThread> {
@@ -518,7 +753,7 @@ export class NativeStore {
         if (!Number.isSafeInteger(cursorTime) || cursorTime < 0)
           return Result.err(nativeFailure("invalid", "Thread cursor is invalid"));
         const records = yield* this.readRows(
-          `SELECT r.* FROM native_records r WHERE r.kind='thread' AND (r.updated_at < ? OR (r.updated_at = ? AND r.id > ?)) AND ( ? = 'owner' OR json_extract(r.data_json,'$.value.starterId') = ? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?)) AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.archived')=? AND json_extract(r.data_json,'$.value.title') LIKE ? ESCAPE '\\' AND (?=0 OR NOT EXISTS(SELECT 1 FROM native_thread_preferences p WHERE p.user_id=? AND p.thread_id=r.id AND p.section='settled')) ORDER BY r.updated_at DESC,r.id LIMIT ?`,
+          `SELECT r.* FROM native_records r WHERE r.kind='thread' AND (r.updated_at < ? OR (r.updated_at = ? AND r.id > ?)) AND ( ? = 'owner' OR json_extract(r.data_json,'$.value.starterId') = ? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?)) AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.kind') IS NULL AND json_extract(r.data_json,'$.value.archived')=? AND json_extract(r.data_json,'$.value.title') LIKE ? ESCAPE '\\' AND (?=0 OR NOT EXISTS(SELECT 1 FROM native_thread_preferences p WHERE p.user_id=? AND p.thread_id=r.id AND p.section='settled')) ORDER BY r.updated_at DESC,r.id LIMIT ?`,
           [
             cursorTime,
             cursorTime,
@@ -604,7 +839,7 @@ export class NativeStore {
     this.db
       .query(`INSERT OR IGNORE INTO native_thread_preferences(user_id,thread_id,section,position,last_activity,touched_at)
       SELECT ?,r.id,'active',MIN(COALESCE((SELECT MIN(p.position) FROM native_thread_preferences p WHERE p.user_id=? AND p.section='active'),0),-json_extract(r.data_json,'$.value.createdAt'))-1,${sidebarActivity},0
-      FROM native_records r WHERE r.kind='thread' AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL
+      FROM native_records r WHERE r.kind='thread' AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.kind') IS NULL
       AND (?='owner' OR json_extract(r.data_json,'$.value.starterId')=? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?))
       AND NOT EXISTS(SELECT 1 FROM native_thread_preferences p WHERE p.user_id=? AND p.thread_id=r.id)${recordFilter}`)
       .run(user.id, user.id, user.role, user.id, user.id, user.id, ...threadParams);
@@ -643,7 +878,7 @@ export class NativeStore {
         if (input.cursor && (separator < 1 || !Number.isSafeInteger(position) || !cursorId))
           return Result.err(nativeFailure("invalid", "Sidebar cursor is invalid"));
         const predicate = `FROM native_thread_preferences p JOIN native_records r ON r.kind='thread' AND r.id=p.thread_id
-        WHERE p.user_id=? AND p.section=? AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.archived')=0
+        WHERE p.user_id=? AND p.section=? AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.kind') IS NULL AND json_extract(r.data_json,'$.value.archived')=0
         AND (?='owner' OR json_extract(r.data_json,'$.value.starterId')=? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?))`;
         const params = [actorId, input.section, user.role, actorId, actorId];
         const total =
@@ -677,6 +912,8 @@ export class NativeStore {
       Result.gen(function* () {
         const user = yield* this.getUser(actorId);
         const thread = yield* this.authorizeThread(actorId, input.threadId);
+        if (thread.kind === "dm")
+          return Result.err(nativeFailure("forbidden", "The DM has a fixed sidebar position"));
         if (thread.archived)
           return Result.err(nativeFailure("invalid", "Archived conversations cannot be moved"));
         if (input.beforeId === input.threadId || input.afterId === input.threadId)
@@ -759,14 +996,16 @@ export class NativeStore {
     }, this);
   }
 
-  private bump(
-    thread: NativeThreadRecord,
+  private bump<T extends OutputConversation>(
+    thread: T,
     kind: string,
     recordId: string,
     changes: LiveUpdate["changes"] = [],
-  ): NativeThreadRecord {
+  ): T {
     const next = { ...thread, revision: thread.revision + 1, updatedAt: this.now() };
-    this.writeRecord(next.id, { kind: "thread", value: next }, next.id);
+    if ("parentThreadId" in next)
+      this.writeRecord(next.id, { kind: "agent-stream", value: next }, next.parentThreadId);
+    else this.writeRecord(next.id, { kind: "thread", value: next }, next.id);
     const boundedChanges =
       encoder.encode(JSON.stringify(changes)).byteLength < WINDOW_BYTES && changes.length <= 128
         ? changes
@@ -792,6 +1031,42 @@ export class NativeStore {
       );
     this.notify(thread.id);
     return next;
+  }
+
+  ensureDirectThread(actorId: string): NativeStoreResult<NativeThread> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const user = yield* this.getUser(actorId);
+        if (user.role === "service")
+          return Result.err(nativeFailure("forbidden", "Service identity cannot start a DM"));
+        const existing = yield* this.readRows(
+          "SELECT * FROM native_records WHERE kind='thread' AND json_extract(data_json,'$.value.kind')='dm' AND json_extract(data_json,'$.value.starterId')=?",
+          [actorId],
+        );
+        const record = existing[0];
+        if (record?.kind === "thread") return this.getThread(actorId, record.value.id);
+        const id = randomUUID();
+        this.bump(
+          {
+            id,
+            kind: "dm",
+            title: "Chat with Lilac",
+            starterId: actorId,
+            archived: false,
+            deleted: false,
+            createdAt: this.now(),
+            updatedAt: this.now(),
+            revision: 0,
+            historyGeneration: 0,
+            nextPosition: 0,
+            mutationPending: false,
+          },
+          "thread",
+          id,
+        );
+        return this.getThread(actorId, id);
+      }, this),
+    );
   }
 
   createThread(
@@ -901,6 +1176,8 @@ export class NativeStore {
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
         const thread = yield* this.authorizeThread(actorId, input.threadId, true);
+        if (thread.kind === "dm" && (input.title !== undefined || input.archived !== undefined))
+          return Result.err(nativeFailure("forbidden", "The DM cannot be renamed or archived"));
         yield* this.command(actorId, input.commandId, { operation: "update", ...input }, () => {
           if (input.revision !== undefined && input.revision !== thread.revision)
             return Result.err(nativeFailure("stale", "Thread changed before this update"));
@@ -1009,6 +1286,8 @@ export class NativeStore {
       Result.gen(function* () {
         yield* this.requireOwner(actorId);
         const thread = yield* this.authorizeThread(actorId, input.threadId);
+        if (thread.kind === "dm")
+          return Result.err(nativeFailure("forbidden", "The DM cannot be shared"));
         yield* this.getUser(input.userId);
         if (input.grant === null)
           this.db
@@ -1030,7 +1309,7 @@ export class NativeStore {
     return this.authorizeThread(actorId, threadId).map((thread) => this.checkpoint(thread));
   }
 
-  private checkpoint(thread: NativeThreadRecord): ReplayCheckpoint {
+  private checkpoint(thread: ReplayConversation): ReplayCheckpoint {
     return {
       protocolVersion: 1,
       historyGeneration: thread.historyGeneration,
@@ -1040,7 +1319,7 @@ export class NativeStore {
   }
 
   private window(
-    thread: NativeThreadRecord,
+    thread: ReplayConversation,
     before = Number.MAX_SAFE_INTEGER,
     limit = 5,
   ): NativeStoreResult<TurnSlot[]> {
@@ -1085,55 +1364,61 @@ export class NativeStore {
     checkpoint?: ReplayCheckpoint,
   ): NativeStoreResult<ReplayReply> {
     return nativeStoreTransaction(this.db, () =>
-      Result.gen(function* () {
-        const thread = yield* this.authorizeThread(actorId, threadId);
-        const next = this.checkpoint(thread);
-        if (
-          checkpoint?.cursor === next.cursor &&
-          checkpoint.historyGeneration === thread.historyGeneration &&
-          checkpoint.projectionRevision === thread.revision
-        )
-          return Result.ok({ kind: "unchanged" as const, checkpoint: next });
-        if (
-          checkpoint &&
-          checkpoint.cursor ===
-            `n_${thread.id}_${checkpoint.historyGeneration}_${checkpoint.projectionRevision}` &&
-          checkpoint.historyGeneration === thread.historyGeneration &&
-          checkpoint.projectionRevision < thread.revision
-        ) {
-          const rows = this.db
-            .query<NativePersistedRow & { revision: number; kind: string }, [string, number]>(
-              "SELECT format_version,data_json,revision,kind FROM native_changes WHERE thread_id=? AND revision>? ORDER BY revision LIMIT 65",
-            )
-            .all(thread.id, checkpoint.projectionRevision);
-          if (
-            rows.length > 0 &&
-            rows.length <= 64 &&
-            rows[0]?.revision === checkpoint.projectionRevision + 1 &&
-            rows.at(-1)?.revision === thread.revision
-          ) {
-            const decoded = yield* Result.all(rows.map((row) => decodeNativeRecord(row)));
-            const changes = decoded.flatMap((record) =>
-              record.value.kind === "replay" ? record.value.value.changes : [],
-            );
-            const complete = rows.every((row) => row.kind !== "reset");
-            if (
-              complete &&
-              changes.length <= 128 &&
-              encoder.encode(JSON.stringify(changes)).byteLength < WINDOW_BYTES
-            )
-              return Result.ok({
-                kind: "delta" as const,
-                checkpoint: next,
-                fromRevision: checkpoint.projectionRevision,
-                changes,
-              });
-          }
-        }
-        const slots = yield* this.window(thread);
-        return Result.ok({ kind: "window" as const, checkpoint: next, slots });
-      }, this),
+      this.authorizeThread(actorId, threadId).andThen((thread) => this.replay(thread, checkpoint)),
     );
+  }
+
+  private replay(
+    thread: ReplayConversation,
+    checkpoint?: ReplayCheckpoint,
+  ): NativeStoreResult<ReplayReply> {
+    return Result.gen(function* () {
+      const next = this.checkpoint(thread);
+      if (
+        checkpoint?.cursor === next.cursor &&
+        checkpoint.historyGeneration === thread.historyGeneration &&
+        checkpoint.projectionRevision === thread.revision
+      )
+        return Result.ok({ kind: "unchanged" as const, checkpoint: next });
+      if (
+        checkpoint &&
+        checkpoint.cursor ===
+          `n_${thread.id}_${checkpoint.historyGeneration}_${checkpoint.projectionRevision}` &&
+        checkpoint.historyGeneration === thread.historyGeneration &&
+        checkpoint.projectionRevision < thread.revision
+      ) {
+        const rows = this.db
+          .query<NativePersistedRow & { revision: number; kind: string }, [string, number]>(
+            "SELECT format_version,data_json,revision,kind FROM native_changes WHERE thread_id=? AND revision>? ORDER BY revision LIMIT 65",
+          )
+          .all(thread.id, checkpoint.projectionRevision);
+        if (
+          rows.length > 0 &&
+          rows.length <= 64 &&
+          rows[0]?.revision === checkpoint.projectionRevision + 1 &&
+          rows.at(-1)?.revision === thread.revision
+        ) {
+          const decoded = yield* Result.all(rows.map((row) => decodeNativeRecord(row)));
+          const changes = decoded.flatMap((record) =>
+            record.value.kind === "replay" ? record.value.value.changes : [],
+          );
+          const complete = rows.every((row) => row.kind !== "reset");
+          if (
+            complete &&
+            changes.length <= 128 &&
+            encoder.encode(JSON.stringify(changes)).byteLength < WINDOW_BYTES
+          )
+            return Result.ok({
+              kind: "delta" as const,
+              checkpoint: next,
+              fromRevision: checkpoint.projectionRevision,
+              changes,
+            });
+        }
+      }
+      const slots = yield* this.window(thread);
+      return Result.ok({ kind: "window" as const, checkpoint: next, slots });
+    }, this);
   }
 
   hydrate(
@@ -1148,29 +1433,44 @@ export class NativeStore {
     },
   ): NativeStoreResult<Hydration> {
     return nativeStoreTransaction(this.db, () =>
-      Result.gen(function* () {
-        const thread = yield* this.authorizeThread(actorId, input.threadId);
-        if (
-          thread.historyGeneration !== input.historyGeneration ||
-          thread.revision !== input.projectionRevision
-        )
-          return Result.err(nativeFailure("stale", "History changed before hydration"));
-        const endPosition = Number(input.slotId.split("_")[3]);
-        if (
-          !Number.isSafeInteger(endPosition) ||
-          endPosition <= 0 ||
-          input.slotId !== `range_${thread.historyGeneration}_0_${endPosition}`
-        )
-          return Result.err(nativeFailure("invalid", "Hydration slot is invalid"));
-        const slots = yield* this.window(thread, endPosition);
-        return Result.ok({
-          historyGeneration: thread.historyGeneration,
-          projectionRevision: thread.revision,
-          slotId: input.slotId,
-          slots,
-        });
-      }, this),
+      this.authorizeThread(actorId, input.threadId).andThen((thread) =>
+        this.hydrateConversation(thread, input),
+      ),
     );
+  }
+
+  private hydrateConversation(
+    thread: ReplayConversation,
+    input: {
+      threadId: string;
+      historyGeneration: number;
+      projectionRevision: number;
+      slotId: string;
+      position?: number;
+      endPosition?: number;
+    },
+  ): NativeStoreResult<Hydration> {
+    return Result.gen(function* () {
+      if (
+        thread.historyGeneration !== input.historyGeneration ||
+        thread.revision !== input.projectionRevision
+      )
+        return Result.err(nativeFailure("stale", "History changed before hydration"));
+      const endPosition = Number(input.slotId.split("_")[3]);
+      if (
+        !Number.isSafeInteger(endPosition) ||
+        endPosition <= 0 ||
+        input.slotId !== `range_${thread.historyGeneration}_0_${endPosition}`
+      )
+        return Result.err(nativeFailure("invalid", "Hydration slot is invalid"));
+      const slots = yield* this.window(thread, endPosition);
+      return Result.ok({
+        historyGeneration: thread.historyGeneration,
+        projectionRevision: thread.revision,
+        slotId: input.slotId,
+        slots,
+      });
+    }, this);
   }
 
   getInput(inputId: string): NativeStoreResult<NativeInputRecord> {
@@ -1207,7 +1507,7 @@ export class NativeStore {
 
   listPendingInputs(threadId?: string): NativeStoreResult<NativeInputRecord[]> {
     const sql =
-      "SELECT * FROM native_records WHERE kind='input' AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL";
+      "SELECT * FROM native_records INDEXED BY native_pending_inputs WHERE kind='input' AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL";
     return nativeStoreTransaction(this.db, () =>
       this.readRows(
         `${sql}${threadId ? " AND thread_id=?" : ""} ORDER BY position,id`,
@@ -1295,7 +1595,7 @@ export class NativeStore {
               const pendingCount =
                 this.db
                   .query<{ count: number }, [string]>(
-                    "SELECT COUNT(*) AS count FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.state') IN ('uploading','queued')",
+                    "SELECT COUNT(*) AS count FROM native_records INDEXED BY native_pending_inputs WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.completedAt') IS NULL AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.state') IN ('uploading','queued')",
                   )
                   .get(thread.id)?.count ?? 0;
               if (pendingCount >= 128)
@@ -1352,7 +1652,7 @@ export class NativeStore {
               };
               const earlierFull = this.db
                 .query(
-                  "SELECT 1 FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.mode')!='steer' AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL LIMIT 1",
+                  "SELECT 1 FROM native_records INDEXED BY native_pending_inputs WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.mode')!='steer' AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL LIMIT 1",
                 )
                 .get(thread.id);
               if (effectiveMode === "prompt" && !earlierFull)
@@ -1593,6 +1893,35 @@ export class NativeStore {
     );
   }
 
+  selectCanonicalInput(
+    threadId: string,
+    options: { since?: number; before?: number } = {},
+  ): NativeStoreResult<NativeInputRecord | null> {
+    const index =
+      options.before === undefined ? "native_input_created" : "native_records_thread_position";
+    const order =
+      options.before === undefined
+        ? "json_extract(i.data_json,'$.value.createdAt'),i.position"
+        : "i.position DESC";
+    return nativeStoreTransaction(this.db, () =>
+      this.readRows(
+        `SELECT i.* FROM native_records i INDEXED BY ${index} WHERE i.kind='input' AND i.thread_id=? AND json_extract(i.data_json,'$.value.createdAt')>=? AND i.position<? AND json_extract(i.data_json,'$.value.completedAt') IS NOT NULL AND json_extract(i.data_json,'$.value.mode')!='steer' AND json_extract(i.data_json,'$.value.state') IN ('admitted','canceled') AND EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.id=json_extract(i.data_json,'$.value.turnId')) ORDER BY ${order} LIMIT 1`,
+        [threadId, options.since ?? 0, options.before ?? Number.MAX_SAFE_INTEGER],
+      ).map((records) => {
+        const record = records[0];
+        return record?.kind === "input" ? record.value : null;
+      }),
+    );
+  }
+
+  getTurnPosition(turnId: string): NativeStoreResult<number> {
+    return this.readRecord("turn", turnId).andThen((record) =>
+      record?.kind === "turn"
+        ? Result.ok(record.value.position)
+        : Result.err(nativeFailure("not-found", "Turn is unavailable")),
+    );
+  }
+
   getLatestCanonicalRequestId(threadId: string): NativeStoreResult<string | null> {
     return nativeStoreTransaction(this.db, () =>
       this.readRows(
@@ -1634,7 +1963,7 @@ export class NativeStore {
         const targetRun = runId ?? thread.activeRunId;
         let current = thread;
         const inputs = yield* this.readRows(
-          "SELECT * FROM native_records WHERE kind='input' AND thread_id=?",
+          "SELECT * FROM native_records INDEXED BY native_pending_inputs WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.completedAt') IS NULL AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted')",
           [threadId],
         );
         for (const record of inputs) {
@@ -1906,6 +2235,8 @@ export class NativeStore {
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
         const thread = yield* this.authorizeThread(actorId, input.threadId, true);
+        if (thread.kind === "dm")
+          return Result.err(nativeFailure("forbidden", "The DM cannot be rewound"));
         return this.command(actorId, input.commandId, { operation: "rewind", ...input }, () =>
           Result.gen(function* () {
             if (
@@ -1971,6 +2302,8 @@ export class NativeStore {
       Result.gen(function* () {
         const user = yield* this.getUser(actorId);
         const thread = yield* this.getThreadRecord(input.threadId);
+        if (thread.kind === "dm")
+          return Result.err(nativeFailure("forbidden", "The DM cannot be deleted"));
         const old = yield* this.readRecord("command", commandKey(actorId, input.commandId));
         if (old?.kind === "command")
           return this.command(actorId, input.commandId, { operation: "delete", ...input }, () =>
@@ -2023,6 +2356,7 @@ export class NativeStore {
           return Result.err(nativeFailure("stale", "Mutation belongs to an older generation"));
         if (!thread.mutationPending) return Result.ok(undefined);
         const cleaned = thread.deleted ? yield* this.cleanupDeletedThread(thread) : thread;
+        yield* this.cleanupAgentStreams(thread);
         this.bump({ ...cleaned, mutationPending: false }, "mutation", thread.id);
         return Result.ok(undefined);
       }, this),
@@ -2174,7 +2508,7 @@ export class NativeStore {
   ): NativeStoreResult<void> {
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* this.getThreadRecord(threadId);
+        const thread = yield* this.getOutputConversation(threadId);
         if (
           thread.deleted ||
           thread.mutationPending ||
@@ -2207,6 +2541,22 @@ export class NativeStore {
           changed.slot.position,
         );
         let current = thread;
+        if ("parentThreadId" in thread) {
+          const state =
+            changed.slot.state === "pending" || !changed.slot.state
+              ? "running"
+              : changed.slot.state;
+          const part = changed.slot.messages
+            .flatMap((message) => message.parts)
+            .findLast((part) => part.type === "data-activity" && part.data.state === "running");
+          const titles = {
+            complete: "Completed",
+            failed: "Failed",
+            canceled: "Canceled",
+            running: part?.type === "data-activity" ? part.data.label : "Thinking…",
+          };
+          current = { ...thread, state, title: titles[state].slice(0, 256) };
+        }
         let batch: LiveUpdate["changes"] = [];
         let bytes = 0;
         for (const change of changed.changes) {
@@ -2411,6 +2761,37 @@ export class NativeStore {
     );
   }
 
+  saveHtmlPreview(value: Omit<NativeHtmlPreviewRecord, "id">): NativeStoreResult<void> {
+    return nativeStoreTransaction(this.db, () => {
+      const id = htmlPreviewKey(value.turnId, value.path);
+      this.writeRecord(id, { kind: "html-preview", value: { ...value, id } }, value.threadId);
+      return Result.ok(undefined);
+    });
+  }
+
+  readHtmlPreview(
+    actorId: string,
+    target: { threadId: string; messageId: string; path: string },
+  ): NativeStoreResult<NativeHtmlPreviewRecord> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        yield* this.authorizeThread(actorId, target.threadId);
+        const turn = this.db
+          .query<{ id: string; thread_id: string }, [string, string, string]>(
+            "SELECT r.id,r.thread_id FROM native_records r,json_each(r.data_json,'$.value.messages') m WHERE r.kind='turn' AND (r.thread_id=? OR EXISTS(SELECT 1 FROM native_records s WHERE s.kind='agent-stream' AND s.id=r.thread_id AND s.thread_id=?)) AND json_extract(m.value,'$.id')=? LIMIT 1",
+          )
+          .get(target.threadId, target.threadId, target.messageId);
+        if (!turn) return Result.err(nativeFailure("not-found", "Message is unavailable"));
+        if (turn.thread_id !== target.threadId)
+          yield* this.authorizeAgentStream(actorId, target.threadId, turn.thread_id);
+        const record = yield* this.readRecord("html-preview", htmlPreviewKey(turn.id, target.path));
+        if (record?.kind !== "html-preview" || record.value.threadId !== target.threadId)
+          return Result.err(nativeFailure("not-found", "Preview is unavailable"));
+        return Result.ok(record.value);
+      }, this),
+    );
+  }
+
   private boundedTurn(slot: ReadyTurnSlot): ReadyTurnSlot {
     const indexed = slot.messages.map((message, position) => ({
       ...message,
@@ -2461,86 +2842,100 @@ export class NativeStore {
     },
   ): NativeStoreResult<TurnPage> {
     return nativeStoreTransaction(this.db, () =>
-      Result.gen(function* () {
-        const thread = yield* this.authorizeThread(actorId, input.threadId);
-        if (
-          thread.historyGeneration !== input.historyGeneration ||
-          thread.revision !== input.projectionRevision
-        )
-          return Result.err(nativeFailure("stale", "Turn changed before paging"));
-        const record = yield* this.readRecord("turn", input.turnId);
-        if (record?.kind !== "turn")
-          return Result.err(nativeFailure("not-found", "Turn is unavailable"));
-        const owner = this.db
-          .query<{ thread_id: string }, [string]>(
-            "SELECT thread_id FROM native_records WHERE kind='turn' AND id=?",
-          )
-          .get(input.turnId);
-        if (owner?.thread_id !== thread.id)
-          return Result.err(nativeFailure("forbidden", "Turn belongs to another thread"));
-        const segments = input.cursor.split("_");
-        let messageIndex = Number(segments[1]);
-        let partIndex = Number(segments[2]);
-        if (
-          segments.length !== 3 ||
-          segments[0] !== "p" ||
-          !Number.isSafeInteger(messageIndex) ||
-          !Number.isSafeInteger(partIndex) ||
-          messageIndex < 0 ||
-          partIndex < 0
-        )
-          return Result.err(nativeFailure("invalid", "Turn cursor is invalid"));
-        const messages: DisplayMessage[] = [];
-        const chunks: NonNullable<TurnPage["chunks"]> = [];
-        let bytes = 0;
-        while (messageIndex < record.value.messages.length) {
-          const message = record.value.messages[messageIndex];
-          if (!message) break;
-          if (partIndex === 0) {
-            const header = {
-              ...message,
-              metadata: { ...message.metadata, position: messageIndex },
-              parts: [],
-            };
-            const size = encoder.encode(JSON.stringify(header)).byteLength;
-            if (bytes + size > WINDOW_BYTES || messages.length >= 64) break;
-            messages.push(header);
-            bytes += size;
-          }
-          while (partIndex < message.parts.length) {
-            const part = message.parts[partIndex];
-            if (!part) break;
-            const chunk = { messageId: message.id, partIndex, part };
-            const size = encoder.encode(JSON.stringify(chunk)).byteLength;
-            if (bytes + size > WINDOW_BYTES || chunks.length >= 64)
-              return Result.ok({
-                turnId: input.turnId,
-                historyGeneration: thread.historyGeneration,
-                projectionRevision: thread.revision,
-                messages,
-                chunks,
-                nextCursor: `p_${messageIndex}_${partIndex}`,
-              });
-            chunks.push(chunk);
-            bytes += size;
-            partIndex++;
-          }
-          messageIndex++;
-          partIndex = 0;
-        }
-        return Result.ok({
-          turnId: input.turnId,
-          historyGeneration: thread.historyGeneration,
-          projectionRevision: thread.revision,
-          messages,
-          chunks,
-          nextCursor:
-            messageIndex < record.value.messages.length
-              ? `p_${messageIndex}_${partIndex}`
-              : undefined,
-        });
-      }, this),
+      this.authorizeThread(actorId, input.threadId).andThen((thread) =>
+        this.pageConversation(thread, input),
+      ),
     );
+  }
+
+  private pageConversation(
+    thread: ReplayConversation,
+    input: {
+      threadId: string;
+      turnId: string;
+      historyGeneration: number;
+      projectionRevision: number;
+      cursor: string;
+    },
+  ): NativeStoreResult<TurnPage> {
+    return Result.gen(function* () {
+      if (
+        thread.historyGeneration !== input.historyGeneration ||
+        thread.revision !== input.projectionRevision
+      )
+        return Result.err(nativeFailure("stale", "Turn changed before paging"));
+      const record = yield* this.readRecord("turn", input.turnId);
+      if (record?.kind !== "turn")
+        return Result.err(nativeFailure("not-found", "Turn is unavailable"));
+      const owner = this.db
+        .query<{ thread_id: string }, [string]>(
+          "SELECT thread_id FROM native_records WHERE kind='turn' AND id=?",
+        )
+        .get(input.turnId);
+      if (owner?.thread_id !== thread.id)
+        return Result.err(nativeFailure("forbidden", "Turn belongs to another thread"));
+      const segments = input.cursor.split("_");
+      let messageIndex = Number(segments[1]);
+      let partIndex = Number(segments[2]);
+      if (
+        segments.length !== 3 ||
+        segments[0] !== "p" ||
+        !Number.isSafeInteger(messageIndex) ||
+        !Number.isSafeInteger(partIndex) ||
+        messageIndex < 0 ||
+        partIndex < 0
+      )
+        return Result.err(nativeFailure("invalid", "Turn cursor is invalid"));
+      const messages: DisplayMessage[] = [];
+      const chunks: NonNullable<TurnPage["chunks"]> = [];
+      let bytes = 0;
+      while (messageIndex < record.value.messages.length) {
+        const message = record.value.messages[messageIndex];
+        if (!message) break;
+        if (partIndex === 0) {
+          const header = {
+            ...message,
+            metadata: { ...message.metadata, position: messageIndex },
+            parts: [],
+          };
+          const size = encoder.encode(JSON.stringify(header)).byteLength;
+          if (bytes + size > WINDOW_BYTES || messages.length >= 64) break;
+          messages.push(header);
+          bytes += size;
+        }
+        while (partIndex < message.parts.length) {
+          const part = message.parts[partIndex];
+          if (!part) break;
+          const chunk = { messageId: message.id, partIndex, part };
+          const size = encoder.encode(JSON.stringify(chunk)).byteLength;
+          if (bytes + size > WINDOW_BYTES || chunks.length >= 64)
+            return Result.ok({
+              turnId: input.turnId,
+              historyGeneration: thread.historyGeneration,
+              projectionRevision: thread.revision,
+              messages,
+              chunks,
+              nextCursor: `p_${messageIndex}_${partIndex}`,
+            });
+          chunks.push(chunk);
+          bytes += size;
+          partIndex++;
+        }
+        messageIndex++;
+        partIndex = 0;
+      }
+      return Result.ok({
+        turnId: input.turnId,
+        historyGeneration: thread.historyGeneration,
+        projectionRevision: thread.revision,
+        messages,
+        chunks,
+        nextCursor:
+          messageIndex < record.value.messages.length
+            ? `p_${messageIndex}_${partIndex}`
+            : undefined,
+      });
+    }, this);
   }
 
   publishUpload(actorId: string, id: string): NativeStoreResult<void> {
@@ -2573,7 +2968,7 @@ export class NativeStore {
         [threadId],
       );
       const inputs = yield* this.readRows(
-        "SELECT * FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL",
+        "SELECT * FROM native_records INDEXED BY native_pending_inputs WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL",
         [threadId],
       );
       for (const record of uploads) {
@@ -2650,7 +3045,7 @@ export class NativeStore {
   listExpiredThreadIds(cutoff: number, limit = 100): NativeStoreResult<string[]> {
     return nativeStoreTransaction(this.db, () =>
       this.readRows(
-        "SELECT * FROM native_records WHERE kind='thread' AND updated_at<? AND json_extract(data_json,'$.value.deleted')=0 AND json_extract(data_json,'$.value.activeRunId') IS NULL AND json_extract(data_json,'$.value.mutationPending')=0 ORDER BY updated_at,id LIMIT ?",
+        "SELECT * FROM native_records WHERE kind='thread' AND json_extract(data_json,'$.value.kind') IS NULL AND updated_at<? AND json_extract(data_json,'$.value.deleted')=0 AND json_extract(data_json,'$.value.activeRunId') IS NULL AND json_extract(data_json,'$.value.mutationPending')=0 ORDER BY updated_at,id LIMIT ?",
         [cutoff, Math.max(1, Math.min(limit, 100))],
       ).map((records) =>
         records.flatMap((record) => (record.kind === "thread" ? [record.value.id] : [])),
@@ -2671,7 +3066,7 @@ export class NativeStore {
           return Result.ok(pending.map(inputReceipt));
         }
         const records = yield* this.readRows(
-          "SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND EXISTS(SELECT 1 FROM native_changes c WHERE c.thread_id=i.thread_id AND c.kind='input' AND c.record_id=i.id AND c.revision>?) ORDER BY i.position",
+          "SELECT i.* FROM native_records i WHERE i.kind='input' AND i.id IN (SELECT c.record_id FROM native_changes c WHERE c.thread_id=? AND c.kind='input' AND c.revision>?) ORDER BY i.position",
           [threadId, options.afterRevision],
         );
         return Result.ok(
@@ -2797,13 +3192,47 @@ export class NativeStore {
       }
       this.db
         .query(
-          "DELETE FROM native_records WHERE thread_id=? AND kind IN ('turn','upload','path','message')",
+          "DELETE FROM native_records WHERE thread_id=? AND kind IN ('turn','upload','path','message','html-preview')",
         )
         .run(thread.id);
       this.db.query("DELETE FROM native_changes WHERE thread_id=?").run(thread.id);
       this.db.query("DELETE FROM native_grants WHERE thread_id=?").run(thread.id);
       this.db.query("DELETE FROM native_projection_receipts WHERE thread_id=?").run(thread.id);
       return Result.ok({ ...thread, title: "Deleted thread", modelId: undefined });
+    }, this);
+  }
+
+  private cleanupAgentStreams(thread: NativeThreadRecord): NativeStoreResult<void> {
+    return Result.gen(function* () {
+      const canonical = new Set(yield* this.listCanonicalRequestIds(thread.id));
+      const records = yield* this.readRows(
+        "SELECT * FROM native_records WHERE kind='agent-stream' AND thread_id=?",
+        [thread.id],
+      );
+      for (const record of records) {
+        if (record.kind !== "agent-stream" || canonical.has(record.value.parentRequestId)) continue;
+        const id = record.value.id;
+        this.db.query("DELETE FROM native_records WHERE thread_id=?").run(id);
+        this.writeRecord(
+          id,
+          {
+            kind: "agent-stream",
+            value: {
+              ...record.value,
+              deleted: true,
+              title: "Unavailable",
+              state: "canceled",
+              attemptId: undefined,
+              previousAttemptId: undefined,
+            },
+          },
+          thread.id,
+        );
+        this.db.query("DELETE FROM native_changes WHERE thread_id=?").run(id);
+        this.db.query("DELETE FROM native_projection_receipts WHERE thread_id=?").run(id);
+        this.notify(id);
+      }
+      return Result.ok(undefined);
     }, this);
   }
 }
