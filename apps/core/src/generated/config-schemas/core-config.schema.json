@@ -836,58 +836,6 @@
           "type": "object",
           "properties": {
             "fsBackend": { "default": "fff", "type": "string", "enum": ["fff", "node-rg"] },
-            "generate": {
-              "type": "object",
-              "properties": {
-                "image": {
-                  "type": "object",
-                  "properties": {
-                    "provider": {
-                      "default": "default",
-                      "type": "string",
-                      "enum": ["default", "openai-compatible"]
-                    },
-                    "models": {
-                      "minItems": 1,
-                      "type": "array",
-                      "items": {
-                        "type": "string",
-                        "enum": [
-                          "gpt-image-2",
-                          "gpt-5-image",
-                          "nanobanana",
-                          "nanobanana-2",
-                          "nanobanana-2-lite",
-                          "nanobanana-pro",
-                          "grok-imagine-image",
-                          "grok-imagine-image-pro"
-                        ]
-                      }
-                    },
-                    "routes": {
-                      "type": "object",
-                      "propertyNames": {
-                        "type": "string",
-                        "enum": [
-                          "gpt-image-2",
-                          "gpt-5-image",
-                          "nanobanana",
-                          "nanobanana-2",
-                          "nanobanana-2-lite",
-                          "nanobanana-pro",
-                          "grok-imagine-image",
-                          "grok-imagine-image-pro"
-                        ]
-                      },
-                      "additionalProperties": { "type": "string" }
-                    },
-                    "openaiCompatible": { "not": {} }
-                  },
-                  "additionalProperties": false
-                }
-              },
-              "additionalProperties": false
-            },
             "web": {
               "type": "object",
               "properties": {

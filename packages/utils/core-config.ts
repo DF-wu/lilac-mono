@@ -73,15 +73,6 @@ export {
   MODEL_REASONING_EFFORTS,
 } from "./core-config/types";
 export {
-  IMAGE_GENERATION_MODEL_ALIASES,
-  defaultGenerateToolsConfig,
-  type GenerateToolsConfig,
-  type ImageGenerationModelAlias,
-  IMAGE_ROUTE_PROVIDERS,
-  type ImageModelRoute,
-  type ImageRouteProvider,
-} from "./core-config/generate-image";
-export {
   TELEGRAM_SURFACE_DEFAULTS,
   cloneDefaultTelegramSurface,
   type TelegramSurfaceConfig,

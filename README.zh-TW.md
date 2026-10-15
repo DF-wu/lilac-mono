@@ -24,7 +24,7 @@
 </p>
 
 > [!IMPORTANT]
-> 這是以 Git history 與 `upstream` remote 持續追蹤 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的 downstream fork，不是上游官方發行版。本專案定期合併上游更新，同時維護 Telegram、相容式圖像路由、OpenAI `web.search` 與部署自動化等獨立功能。
+> 這是以 Git history 與 `upstream` remote 持續追蹤 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的 downstream fork，不是上游官方發行版。本專案定期合併上游更新，同時維護 Telegram、相容式圖像生成、OpenAI `web.search` 與部署自動化等獨立功能。
 
 Lilac 把平台訊息、路由、模型執行、工具、Skills 與可恢復工作流程放在同一套 Core runtime 中。
 
@@ -35,7 +35,7 @@ Lilac 把平台訊息、路由、模型執行、工具、Skills 與可恢復工�
 | 領域 | 本 fork 提供的差異 | 重要限制 |
 | --- | --- | --- |
 | Telegram surface | DMs、群組、forum topics、串流 HTML 回覆、取消、reaction、command menu、inbound/outbound attachments、workflow cards、同 surface tools，以及納入跨 surface 對話記憶的 Telegram 歷史 | 預設停用；僅 long polling；記憶以每個聊天或 topic 為一個 thread |
-| OpenAI-compatible 圖像路由 | 將既有 `generate.image` aliases 路由到 operator 指定的 OpenAI-compatible endpoint，並支援 per-alias `provider/model` routes | 僅 `configVersion: 2`；provider 之間無自動 fallback |
+| OpenAI-compatible 圖像 provider | 將 operator 的 OpenAI-compatible endpoint 以 `providers.openaiCompatible` 提供給上游的 `generate.image` scripts，並在 `image-generation` skill 附上 gateway recipe | 需要 `OPENAI_COMPATIBLE_BASE_URL`；restricted caller 不能執行圖像 script；provider 之間無自動 fallback |
 | OpenAI `web.search` provider | `tools.web.extract.providers` 填入 `openai` 後，`web.search` 改走 OpenAI Responses 的 `web_search` 工具，回傳答案引用的來源 | 僅 `configVersion: 2`；只做搜尋（`web.extract` 會略過）；日期限制只是對模型的指示 |
 | Custom media plugin | 可部署的 Level 2 image/video plugin 範例，示範嚴格設定與檔案安全處理 | Plugin 是 trusted in-process code；restricted caller 目前不能使用 external callables |
 | 維運與交付 | 每 6 小時檢查 upstream、發布經驗證的 GHCR `catalina`/`claudia` tags，CI 並強制執行 upstream-footprint allowlist | 自動合併發生衝突時仍需人工處理 |
@@ -209,30 +209,9 @@ curl -s localhost:8080/readyz | jq '.checks[] | select(.name == "telegram.ready"
 
 群組 privacy mode、forum topic session IDs、streaming、command menu 與 troubleshooting 見 [`docs/telegram-surface.md`](./docs/telegram-surface.md)。
 
-### 路由圖像生成到相容 endpoint
+### 透過相容 endpoint 生成圖像
 
-```yaml
-configVersion: 2
-
-tools:
-  generate:
-    image:
-      provider: openai-compatible
-```
-
-要路由個別 alias，請以 `<provider>/<model id>` 加入 `routes` 項目，provider 可為 `openai`、`openrouter`、`xai` 或 `openai-compatible`；未列出的 alias 依 `provider` 路由，舊的 `openaiCompatible` 區塊會在解析時被拒絕：
-
-```yaml
-tools:
-  generate:
-    image:
-      provider: openai-compatible
-      routes:
-        nanobanana-2: openai-compatible/gemini-3.1-flash-image-preview
-        gpt-image-2: openai/gpt-image-2
-```
-
-Docker Compose 請把 endpoint 與 credential 寫入已由 `compose.override.yaml` 載入的 `.env`：
+`generate.image` 執行 agent 依內建 `image-generation` skill 撰寫的 JavaScript 圖像請求（上游的 script runner）。本 fork 另外把 OpenAI-compatible gateway（例如 new-api）以 `providers.openaiCompatible` 提供給這些 script，不需要任何 `core-config.yaml` 欄位。Docker Compose 請把 endpoint 與 credential 寫入已由 `compose.override.yaml` 載入的 `.env`：
 
 ```dotenv
 OPENAI_COMPATIBLE_BASE_URL=https://provider.example.com/v1
@@ -245,9 +224,9 @@ OPENAI_COMPATIBLE_API_KEY=replace-with-api-key
 docker compose up -d --force-recreate --wait --wait-timeout 120 lilac
 ```
 
-從 source 執行時，改為 `export` 同名變數後再啟動 Core。
+從 source 執行時，改為 `export` 同名變數後再啟動 Core。只有設定 `OPENAI_COMPATIBLE_BASE_URL` 時才會出現這個 provider；API key 可省略。
 
-Alias、`models` allowlist 與 per-alias `routes`（`<provider>/<model id>`）、從已移除的 `openaiCompatible` 區塊遷移、generation/edit endpoints、結果中的 `providerMetadata`、無 fallback 行為與 colon-form `size` aspect-ratio 轉送見 [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md)。
+Script 契約、provider 對照表、gateway recipe 與注意事項，以及如何從已移除的結構化工具與 `tools.generate.image` 路由遷移，見 [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md)。
 
 ### 透過 OpenAI 搜尋網頁
 
@@ -324,7 +303,7 @@ bun run fmt:check
 
 `.github/workflows/sync-upstream.yml` 每 6 小時檢查 upstream `main`。乾淨合併先在候選分支建立 commit，通過完整 CI 後才快轉更新 `main` 並發布映像。只有 Git 衝突會開 PR 並要求 `Catalina-df` review；Claude Action 提供唯讀分析，不自動修復程式或解衝突。詳見 [workflow 與 prompt 設定](./docs/upstream-sync.md)。
 
-- 本 fork 新功能、部署 workflow、Telegram、OpenAI `web.search` 或相容式圖像路由問題：請在 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues) 回報。
+- 本 fork 新功能、部署 workflow、Telegram、OpenAI `web.search` 或相容式圖像生成問題：請在 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono/issues) 回報。
 - 可在未修改 upstream 重現的問題：先確認 upstream 狀態，再向 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono/issues) 回報。
 - 歷史上由本 fork 回饋並已被 upstream 接收的功能，不再列為當前差異。清單見 [`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md#已被上游接收的貢獻)。
 - Fork 的行為放在 fork 自有模組；upstream 檔案只保留很薄的接縫。`bun run fork:footprint` 會把每個被修改的 upstream 檔案對照 [`scripts/fork/upstream-footprint.txt`](./scripts/fork/upstream-footprint.txt)，[`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md#fork-程式碼配置) 則列出每項功能對應的模組與接縫。

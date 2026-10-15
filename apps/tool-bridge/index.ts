@@ -1,13 +1,16 @@
-import { createLogger, env } from "@stanley2058/lilac-utils";
-import { createProcessHandlers, createToolServer } from "@stanley2058/lilac-core";
-
-import { createToolBridgePluginManager } from "./create-plugin-manager";
+import { createLogger, env, getCoreConfig } from "@stanley2058/lilac-utils";
+import {
+  createCoreToolPluginManager,
+  createProcessHandlers,
+  createToolServer,
+} from "@stanley2058/lilac-core";
 
 const logger = createLogger({
   module: "tool-bridge",
 });
 
-const pluginManager = createToolBridgePluginManager({
+const pluginManager = createCoreToolPluginManager({
+  runtime: { getConfig: () => getCoreConfig() },
   dataDir: env.dataDir,
 });
 

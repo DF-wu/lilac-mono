@@ -7,8 +7,9 @@
 #
 # Keep entries to thin seams: imports, one-line registrations, closed-union
 # members, and re-exports. Behavior belongs in fork-owned modules
-# (`apps/core/src/surface/telegram/`, `apps/core/src/tool-server/tools/generate-image/`,
-# `packages/utils/core-config/{telegram-surface,generate-image}.ts`, ...).
+# (`apps/core/src/surface/telegram/`,
+# `apps/core/src/tool-server/tools/image-script-openai-compatible.ts`,
+# `packages/utils/core-config/telegram-surface.ts`, ...).
 
 # --- Repository, CI, and container delivery
 .env.example  # documents fork-only environment variables
@@ -35,15 +36,12 @@ packages/utils/tests/core-config.web-search-provider.test.ts  # covers the opena
 
 # --- Documentation
 README.md  # fork entry point; describes fork features and maintenance
-PROJECT.md  # documents the Telegram surface and structured generate.image
-MIGRATIONS.md  # documents fork v2 config keys (surface.telegram, tools.generate)
+PROJECT.md  # documents the Telegram surface and the OpenAI-compatible image script provider
+MIGRATIONS.md  # documents fork v2 config keys (surface.telegram) and the removed tools.generate block
 docs/core-config-migrations.md  # documents fork v2 config keys
 docs/docker-deployment.md  # documents the container identity variants
-packages/utils/config-templates/core-config.example.yaml  # example keys for surface.telegram and tools.generate
-packages/utils/builtin-skills/image-generation/SKILL.md  # skill describes the structured generate.image contract
-packages/utils/builtin-skills/image-generation/references/openai.md  # superseded script recipe removed
-packages/utils/builtin-skills/image-generation/references/openrouter.md  # superseded script recipe removed
-packages/utils/builtin-skills/image-generation/references/xai.md  # superseded script recipe removed
+packages/utils/config-templates/core-config.example.yaml  # example keys for surface.telegram
+packages/utils/builtin-skills/image-generation/SKILL.md  # catalog row for the openaiCompatible provider recipe
 packages/utils/builtin-skills/workflow-authoring/SKILL.md  # documents Telegram workflow targets
 packages/utils/builtin-skills/workflow-authoring/REFERENCE.md  # documents Telegram workflow targets
 packages/utils/builtin-skills/workflow-authoring/RUNTIME.md  # documents Telegram workflow targets
@@ -93,18 +91,15 @@ apps/core/src/workflow/workflow-progress-view.ts  # Telegram progress card rende
 apps/core/src/workflow/workflow-trigger-scheduler.ts  # rechecks Telegram target authorization before fire
 apps/core/src/workflow/workflow-waits.ts  # Telegram reply waits
 
-# --- Tool server: origin-session authority and structured generate.image
+# --- Tool server: origin-session authority and the OpenAI-compatible image script provider
 apps/core/src/tool-server/create-tool-server.ts  # x-lilac-origin-session-id header and initiator-scoped restricted calls
 apps/core/src/tool-server/request-control-authority.ts  # origin session authority
 apps/core/src/tool-server/tools/surface.ts  # Telegram allowlist filtering for list-sessions and initiator session defaults
-apps/core/src/tool-server/tools/generate.ts  # hooks the structured generate.image callable; exports shared helpers
-apps/core/src/tool-server/tools/image-script.ts  # upstream script runner replaced by the structured tool (deleted)
-apps/core/src/tool-server/tools/image-script-preload.ts  # upstream script runner replaced by the structured tool (deleted)
+apps/core/src/tool-server/tools/image-script.ts  # adds the openaiCompatible provider to the script providers
 apps/core/src/tools/bash-impl.ts  # forwards LILAC_ORIGIN_SESSION_ID to tool processes
-apps/core/src/plugins/builtin/server-tools.ts  # passes core config into the Generate tool
 apps/core/src/custom-commands/manager.ts  # menu alias index and @target-aware command parsing
 apps/tool-bridge/client.ts  # forwards the origin session header
-apps/tool-bridge/index.ts  # tool-bridge plugin manager wiring
+apps/tool-bridge/index.ts  # preserves lazy runtime configuration for content.inspect in the standalone bridge
 packages/plugin-runtime/types.ts  # originSessionId / requestInitiator in RequestContext
 
 # --- GitHub final-publication policy (reply permalinks were accepted upstream in PR #35)
@@ -113,15 +108,15 @@ apps/core/src/github/webhook/github-webhook-server.ts  # prompts forbid duplicat
 # --- Config layer seams
 packages/utils/model-provider.ts  # wires provider-local tool-image middleware; transformation lives in a fork-owned module
 packages/utils/core-config.ts  # re-exports fork config modules
-packages/utils/core-config/types.ts  # UniversalCoreConfig gains surface.telegram and tools.generate
+packages/utils/core-config/types.ts  # UniversalCoreConfig gains surface.telegram
 packages/utils/core-config/v1.ts  # v1 fallbacks for fork config keys
 packages/utils/core-config/v2.ts  # v2 schema includes fork config modules
-apps/core/scripts/generate-config-schemas.ts  # represents rejected legacy image config fields in the editor schema without accepting unsupported Zod types
-apps/core/src/generated/config-schemas/core-config.schema.json  # generated from the fork input schemas including Telegram, image routing, and OpenAI search
-apps/core/tests/runtime/config-schemas.test.ts  # verifies fork runtime and editor schema acceptance and legacy image field rejection
+apps/core/scripts/generate-config-schemas.ts  # preserves the existing fail-closed editor-schema conversion for unsupported Zod inputs
+apps/core/src/generated/config-schemas/core-config.schema.json  # generated from fork input schemas including Telegram and OpenAI search
+apps/core/tests/runtime/config-schemas.test.ts  # verifies fork editor schema acceptance and removed image config diagnostics
 apps/web/src/generated/tool-activities.ts  # generated from fork tool definitions and workflow progress content
 apps/core/scripts/generate-design-tool-activities.ts  # includes the existing fork workflow content format in generated fixture types
-packages/utils/index.ts  # re-exports the custom-command menu and compatible image provider modules
+packages/utils/index.ts  # re-exports the custom-command menu module
 
 # --- Agent and event bus fixes carried by the fork
 packages/agent/auto-compaction.ts  # applies the existing current-input boundary in compaction preflight; selection policy is owned by this upstream module
@@ -140,7 +135,7 @@ apps/core/tests/surface/bridge/subscribe-from-bus.test.ts  # platform-generic re
 apps/core/tests/surface/operation-contract.test.ts  # resolve-attachment operation
 apps/core/tests/surface/runtime-descriptor.test.ts  # Telegram descriptor
 apps/core/tests/tool-server-create-tool-server.test.ts  # origin-session authority
-apps/core/tests/tool-server-image-generation.test.ts  # structured generate.image
+apps/core/tests/tool-server-image-generation.test.ts  # isolates the openaiCompatible provider from the environment
 apps/core/tests/tool-server-surface.test.ts  # Telegram session listing
 apps/core/tests/tools/subagent.test.ts  # origin session context
 apps/core/tests/transcript/transcript-store.test.ts  # Telegram platform filters

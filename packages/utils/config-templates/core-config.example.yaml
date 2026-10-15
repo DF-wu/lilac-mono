@@ -98,27 +98,6 @@ tools:
     # Oversized/unsupported binary parts degrade to metadata/resource markers.
     maxInlineBytesPerPart: 10MiB
     maxInlineBytesTotal: 20MiB
-  generate:
-    image:
-      # Route for aliases without an entry in `routes`.
-      # - default: the first configured provider in openai, openrouter, xai
-      #   that serves the alias, with the alias's catalog model ID.
-      # - openai-compatible: every alias goes to OPENAI_COMPATIBLE_BASE_URL
-      #   (with OPENAI_COMPATIBLE_API_KEY) using its catalog model ID.
-      # No route falls back to another provider after a failure.
-      provider: default
-      # Optional allowlist of Lilac aliases to advertise and serve. Omit to
-      # consider every alias. Default-routed aliases without a configured
-      # provider are not advertised; explicit routes and openai-compatible
-      # routes stay advertised when their credentials are missing, so a call
-      # reports the exact gap.
-      # models: [nanobanana-2, gpt-image-2]
-      # Optional per-alias routes as "<provider>/<model id>" with provider
-      # openai, openrouter, xai, or openai-compatible. The model id may itself
-      # contain slashes (OpenRouter slugs). Unlisted aliases follow `provider`.
-      # routes:
-      #   nanobanana-2: openai-compatible/gemini-3.1-flash-image-preview
-      #   gpt-image-2: openrouter/openai/gpt-image-2
 
 # External plugins are discovered under <DATA_DIR>/plugins; see PLUGIN_AUTHORING.md.
 # Policy/config changes reload with tools. Plugin-specific schemas and lifecycle

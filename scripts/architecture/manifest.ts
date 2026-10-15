@@ -1018,6 +1018,7 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     ["src/tool-server/tools/conversation-thread.ts", "conversationThreadFailure"],
     ["src/tool-server/tools/generate.ts", "readImageDataFromPath"],
     ["src/tool-server/tools/generate.ts", "buildVideoGenerationPrompt"],
+    ["src/tool-server/tools/image-script.ts", "runImageScript"],
     ["src/tool-server/tools/generate.ts", "Generate.callGenerateVideo"],
     ["src/tool-server/tools/mcp.ts", "McpManagement.callAuth"],
     ["src/tool-server/tools/mcp.ts", "McpManagement.reconcileProviders"],

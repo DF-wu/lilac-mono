@@ -47,18 +47,6 @@ test("Core schemas accept both versions, friendly units, and legacy web inputs",
     {
       configVersion: 2,
       tools: {
-        generate: {
-          image: {
-            provider: "openai-compatible",
-            models: ["nanobanana-2"],
-            routes: { "nanobanana-2": "openai/gpt-image-2" },
-          },
-        },
-      },
-    },
-    {
-      configVersion: 2,
-      tools: {
         web: {
           extract: { providers: ["openai"] },
           openai: { model: "openai/gpt-5-mini", searchContextSize: "high" },
@@ -84,13 +72,26 @@ test("Core schemas accept both versions, friendly units, and legacy web inputs",
 });
 
 test("Core editor diagnostics reject wrong versions, fields, types, and units", () => {
+  const leftoverImageConfig = {
+    configVersion: 2,
+    tools: {
+      generate: {
+        image: {
+          provider: "openai-compatible",
+          models: ["nanobanana-2"],
+          routes: { "nanobanana-2": "openai/gpt-image-2" },
+        },
+      },
+    },
+  };
+  expect(validateCore(leftoverImageConfig), JSON.stringify(validateCore.errors)).toBe(false);
+  expect(parseCoreConfigResult(leftoverImageConfig).isOk()).toBe(true);
+
   for (const input of [
     { configVersion: 3 },
     { configVersion: "2" },
     { configVersion: null },
     { configVersion: 2, typo: true },
-    { configVersion: 2, tools: { generate: { image: { openaiCompatible: null } } } },
-    { configVersion: 2, tools: { generate: { image: { openaiCompatible: {} } } } },
     { tools: { output: { artifactTtl: "3h" } } },
     { configVersion: 2, tools: { output: { artifactTtl: true } } },
     { configVersion: 2, tools: { output: { artifactTtl: "3MB" } } },
