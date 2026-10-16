@@ -296,17 +296,21 @@ while a reply runs.
 Bootstrap creates it on first use. Its history stays available indefinitely. Sharing, renaming,
 archiving, deletion, rewind, and storage-retention cleanup do not apply to this conversation.
 
-Deployment settings expose "DM context max age (ms)", initially 10,800,000 ms. The age window is
-selected when a request starts and stays fixed for that reply. New requests select a fresh window.
-Older messages remain searchable by their owner. An owner account cannot browse another user's DM.
+Deployment settings expose "DM context gap (ms)", initially 7,200,000 ms. A request's context starts
+at the first turn after the most recent pause longer than the gap, measured from a reply's completion
+to the next message. The start stays fixed while the conversation continues, so the model sees a
+stable prefix. A request sent after a longer pause starts with no earlier history. Automatic or manual
+compaction bounds a long session. Older messages remain searchable by their owner. An owner account cannot browse another user's DM.
 The agent receives a brief instruction to follow the current topic in a mixed-topic conversation.
 
-Message dimming reflects the next request when idle and the current request while running.
-Messages outside selected history use 0.8 opacity. Messages represented by a summary have a tooltip.
+The DM shows a timestamp above the first turn and above any turn sent at least "DM timestamp gap (ms)"
+after the previous one, initially 1,800,000 ms, or on a new day. The turn where the selected context
+starts adds "New context" to its timestamp. The marker reflects the next request when idle and the
+current request while running. Messages represented by a summary have a tooltip.
 During a reply the context refreshes once per second to reflect compaction. `/compact` summarizes
 current model context through the existing compaction engine, even when automatic compaction is off.
 It preserves the displayed messages and queues behind a running reply. It accepts no arguments,
-skills, or attachments. Recent direct messages survive age expiry of an older summary.
+skills, or attachments. Recent direct messages survive a shortened gap that excludes an older summary.
 
 ### Background notifications
 

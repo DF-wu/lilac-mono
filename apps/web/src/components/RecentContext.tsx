@@ -42,11 +42,9 @@ export function RecentContextProvider({
 }
 
 export function ContextMessage({
-  outside,
   summarized,
   children,
 }: {
-  outside?: boolean;
   summarized?: boolean;
   children: ReactNode;
 }) {
@@ -54,10 +52,32 @@ export function ContextMessage({
     <div
       title={summarized ? "Represented in the context summary" : undefined}
       data-summarized={summarized || undefined}
-      data-context={outside ? "outside" : "recent"}
-      className={outside ? "opacity-[var(--ui-context-outside-opacity)]" : undefined}
     >
       {children}
     </div>
+  );
+}
+
+function separatorTime(at: number): string {
+  const date = new Date(at);
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    ...(date.getFullYear() === new Date().getFullYear() ? {} : { year: "numeric" }),
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+export function TimestampSeparator({ at, contextStart }: { at: number; contextStart?: boolean }) {
+  return (
+    <p
+      data-ui="timestamp-separator"
+      data-context-start={contextStart || undefined}
+      className="px-6 pt-4 pb-1 text-center text-xs text-muted-foreground"
+    >
+      <time dateTime={new Date(at).toISOString()}>{separatorTime(at)}</time>
+      {contextStart ? " · New context" : null}
+    </p>
   );
 }

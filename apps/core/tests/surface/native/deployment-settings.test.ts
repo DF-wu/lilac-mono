@@ -10,7 +10,8 @@ import { createNativeIntegrationFixture } from "./integration-fixture";
 const initial = {
   titleModel: "main",
   outputStreaming: "complete" as const,
-  dmContextMaxAgeMs: 10_800_000,
+  dmContextGapMs: 7_200_000,
+  dmTimestampGapMs: 1_800_000,
   oldMessageSelectionMaxAgeMs: 60000,
   storageRetentionMaxAgeMs: 86400000,
   crossThreadSend: { triggerRun: false },
@@ -82,7 +83,8 @@ test("deployment RPC imports all legacy fields and saves without touching commen
     const settings = {
       ...initial,
       titleModel: "fast",
-      dmContextMaxAgeMs: 10_800_000,
+      dmContextGapMs: 3_600_000,
+      dmTimestampGapMs: 600_000,
       oldMessageSelectionMaxAgeMs: null,
       storageRetentionMaxAgeMs: null,
       crossThreadSend: { triggerRun: true },
@@ -107,7 +109,6 @@ test("deployment contract rejects invalid fields and permits unlimited ages", ()
   expect(
     nativeDeploymentSettingsSchema.safeParse({
       ...initial,
-      dmContextMaxAgeMs: 10_800_000,
       oldMessageSelectionMaxAgeMs: null,
       storageRetentionMaxAgeMs: null,
     }).success,
@@ -115,10 +116,29 @@ test("deployment contract rejects invalid fields and permits unlimited ages", ()
   for (const patch of [
     { titleModel: " " },
     { outputStreaming: "invalid" },
-    { dmContextMaxAgeMs: 10_800_000, oldMessageSelectionMaxAgeMs: 0 },
+    { oldMessageSelectionMaxAgeMs: 0 },
+    { dmContextGapMs: 0 },
+    { dmTimestampGapMs: 1.5 },
+    { dmContextMaxAgeMs: 10_800_000 },
     { storageRetentionMaxAgeMs: -1 },
     { storageRetentionMaxAgeMs: 1.5 },
     { crossThreadSend: { triggerRun: "yes" } },
   ])
     expect(nativeDeploymentSettingsSchema.safeParse({ ...initial, ...patch }).success).toBe(false);
+});
+
+test("stored deployment settings drop the legacy DM context age", () => {
+  const store = new NativeStore(new Database(":memory:"));
+  try {
+    store.initialize().unwrap();
+    const { dmContextGapMs: _gap, dmTimestampGapMs: _timestamp, ...legacy } = initial;
+    store.initializeDeployment({ ...legacy, dmContextMaxAgeMs: 10_800_000 } as never).unwrap();
+    expect(store.getDeployment().unwrap().settings).toEqual({
+      ...legacy,
+      dmContextGapMs: 7_200_000,
+      dmTimestampGapMs: 1_800_000,
+    });
+  } finally {
+    store.close();
+  }
 });

@@ -256,10 +256,13 @@ export type SubagentSummary = z.infer<typeof subagentSummarySchema>;
 
 export const workingIndicatorsSchema = z.array(z.string().trim().min(1)).min(1);
 
+export const DEFAULT_DM_CONTEXT_GAP_MS = 7_200_000;
+export const DEFAULT_DM_TIMESTAMP_GAP_MS = 1_800_000;
 export const nativeDeploymentSettingsSchema = z.strictObject({
   titleModel: z.string().trim().min(1),
   outputStreaming: z.enum(["paragraph", "complete"]),
-  dmContextMaxAgeMs: z.number().int().positive().default(10_800_000),
+  dmContextGapMs: z.number().int().positive().default(DEFAULT_DM_CONTEXT_GAP_MS),
+  dmTimestampGapMs: z.number().int().positive().default(DEFAULT_DM_TIMESTAMP_GAP_MS),
   oldMessageSelectionMaxAgeMs: z.number().int().positive().nullable(),
   storageRetentionMaxAgeMs: z.number().int().positive().nullable(),
   crossThreadSend: z.strictObject({ triggerRun: z.boolean() }),

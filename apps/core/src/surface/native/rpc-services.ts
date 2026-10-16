@@ -698,7 +698,12 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
     },
     threads: {
       context(principal, input) {
-        return execution.context(principal.userId, input.threadId);
+        return execution.context(principal.userId, input.threadId).andThen((context) =>
+          store.getDeployment().map((deployment) => ({
+            ...context,
+            timestampGapMs: deployment.settings.dmTimestampGapMs,
+          })),
+        );
       },
       get(principal, input) {
         return auth

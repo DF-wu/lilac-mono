@@ -1,4 +1,4 @@
-import { ContextMessage, useRecentContext } from "./RecentContext";
+import { ContextMessage, TimestampSeparator, useRecentContext } from "./RecentContext";
 import { LoadingSpinner } from "./ui/loading-spinner";
 import { AddReaction, MessageReactions } from "./MessageReactions";
 import { OptimisticTurns, type OptimisticTurn } from "../optimistic-turns";
@@ -39,10 +39,12 @@ import {
 import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronDown, ChevronRight, RotateCcw, Copy, CopyCheck } from "lucide-react";
 import type { NativeClient, NativeThreadStore } from "@stanley2058/lilac-client";
-import type {
-  DisplayMessage,
-  ReadyTurnSlot,
-  DisplayPart,
+import {
+  DEFAULT_DM_TIMESTAMP_GAP_MS,
+  type DisplayMessage,
+  type ReadyTurnSlot,
+  type DisplayPart,
+  type TurnSlot,
 } from "@stanley2058/lilac-client-protocol";
 import { IconButton, attempt } from "./ui";
 import { WorkingText } from "./ui/working-text";
@@ -76,6 +78,26 @@ export function useSlot(store: NativeThreadStore, slotId: string | undefined) {
   const snapshot = useCallback(() => (slotId ? store.get(slotId) : undefined), [store, slotId]);
   return useSyncExternalStore(subscribe, snapshot, snapshot);
 }
+function turnTime(slot: TurnSlot | undefined): number | undefined {
+  if (slot?.kind !== "ready") return undefined;
+  return (
+    slot.messages.find((message) => message.role === "user")?.metadata?.createdAt ?? slot.startedAt
+  );
+}
+function useSlotTime(store: NativeThreadStore, slotId: string | undefined) {
+  const subscribe = useCallback(
+    (listener: () => void) => (slotId ? store.subscribeSlot(slotId, listener) : () => {}),
+    [store, slotId],
+  );
+  const snapshot = useCallback(
+    () => (slotId ? turnTime(store.get(slotId)) : undefined),
+    [store, slotId],
+  );
+  return useSyncExternalStore(subscribe, snapshot, snapshot);
+}
+function startsNewDay(previous: number, next: number): boolean {
+  return new Date(previous).toDateString() !== new Date(next).toDateString();
+}
 export function useSlotIds(store: NativeThreadStore) {
   const subscribe = useCallback(
     (listener: () => void) =>
@@ -99,8 +121,9 @@ export type TimelineProps = MessageServices & {
   emptyContent?: ReactNode;
   optimisticTurn?: OptimisticTurn;
   onOptimisticResolved?: () => void;
+  timestamps?: boolean;
 };
-type TimelineServices = Pick<TimelineProps, "client" | "threadId" | "onRewind"> & {
+type TimelineServices = Pick<TimelineProps, "client" | "threadId" | "onRewind" | "timestamps"> & {
   measureTurn: (content: HTMLElement) => void;
 };
 const TimelineContext = createContext<TimelineServices | undefined>(undefined);
@@ -250,9 +273,10 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       client: props.client,
       threadId: props.threadId,
       onRewind: props.onRewind,
+      timestamps: props.timestamps,
       measureTurn,
     }),
-    [props.client, props.threadId, props.onRewind, measureTurn],
+    [props.client, props.threadId, props.onRewind, props.timestamps, measureTurn],
   );
   const measureHeader = useCallback(
     (element: HTMLDivElement | null) => {
@@ -372,6 +396,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
                 >
                   <SlotRow
                     slotId={ids[row.index - 1]!}
+                    previousSlotId={ids[row.index - 2]}
                     store={store}
                     renderKey={identities.key(ids[row.index - 1]!)}
                     fallback={
@@ -428,12 +453,14 @@ export function ThinkingIndicator({ spinner }: { spinner?: ReactNode } = {}) {
 const SlotRow = memo(function SlotRow(props: {
   store: NativeThreadStore;
   slotId: string;
+  previousSlotId?: string;
   renderKey: string;
   fallback?: ReadyTurnSlot;
 }) {
-  const { client, threadId, onRewind } = useContext(TimelineContext)!;
+  const { client, threadId, onRewind, timestamps } = useContext(TimelineContext)!;
   const recentContext = useRecentContext();
   const stored = useSlot(props.store, props.slotId);
+  const previousTime = useSlotTime(props.store, timestamps ? props.previousSlotId : undefined);
   const slot = stored?.kind === "ready" ? stored : (props.fallback ?? stored);
   useEffect(() => {
     if (stored?.kind === "deferred") void client.hydrate(threadId, props.slotId);
@@ -454,23 +481,28 @@ const SlotRow = memo(function SlotRow(props: {
         )}
       </div>
     );
-  const outside =
-    recentContext &&
-    recentContext.historyGeneration === props.store.checkpoint?.historyGeneration &&
-    slot.state !== "pending" &&
-    slot.state !== "running" &&
-    (recentContext.firstTurnPosition === null || slot.position < recentContext.firstTurnPosition);
+  const currentContext =
+    recentContext?.historyGeneration === props.store.checkpoint?.historyGeneration
+      ? recentContext
+      : undefined;
+  const contextStart = currentContext?.firstTurnPosition === slot.position && slot.position > 0;
+  const firstTurnPosition = currentContext?.firstTurnPosition ?? null;
   const summarized =
-    !outside &&
-    recentContext?.summarizedBeforePosition !== undefined &&
-    slot.position < recentContext.summarizedBeforePosition;
+    firstTurnPosition !== null &&
+    slot.position >= firstTurnPosition &&
+    slot.position < (currentContext?.summarizedBeforePosition ?? 0);
+  const time = turnTime(slot);
+  const gapMs = recentContext?.timestampGapMs ?? DEFAULT_DM_TIMESTAMP_GAP_MS;
+  const separated =
+    timestamps &&
+    time !== undefined &&
+    (contextStart ||
+      props.previousSlotId === undefined ||
+      (previousTime !== undefined &&
+        (time - previousTime >= gapMs || startsNewDay(previousTime, time))));
   return (
-    <ContextMessage outside={!!outside} summarized={summarized}>
-      {recentContext?.firstTurnPosition === slot.position && slot.position > 0 ? (
-        <p className="px-6 pt-3 text-xs text-muted-foreground">
-          Earlier messages outside recent context
-        </p>
-      ) : null}
+    <ContextMessage summarized={summarized}>
+      {separated ? <TimestampSeparator at={time} contextStart={contextStart} /> : null}
       <Turn
         slot={slot}
         optimistic={!!props.fallback && stored?.kind !== "ready"}

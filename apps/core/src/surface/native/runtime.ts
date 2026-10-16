@@ -11,6 +11,10 @@ import type { DurableWorkflowStore } from "../../workflow/durable-workflow-store
 import path from "node:path";
 import { Panic, Result, type Result as ResultType } from "better-result";
 import { FileSystem } from "@stanley2058/lilac-fs";
+import {
+  DEFAULT_DM_CONTEXT_GAP_MS,
+  DEFAULT_DM_TIMESTAMP_GAP_MS,
+} from "@stanley2058/lilac-client-protocol";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import {
   lilacEventTypes,
@@ -114,7 +118,8 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   const deploymentInitialized = store.initializeDeployment({
     titleModel: legacy.titleModel,
     outputStreaming: legacy.outputStreaming,
-    dmContextMaxAgeMs: 10_800_000,
+    dmContextGapMs: DEFAULT_DM_CONTEXT_GAP_MS,
+    dmTimestampGapMs: DEFAULT_DM_TIMESTAMP_GAP_MS,
     oldMessageSelectionMaxAgeMs: legacy.oldMessageSelectionMaxAgeMs,
     storageRetentionMaxAgeMs: legacy.storageRetentionMaxAgeMs,
     crossThreadSend: legacy.crossThreadSend,
@@ -180,7 +185,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     customCommands: options.customCommands,
     validateSkill: (id) => skills.some((skill) => skill.name === id),
     deliveryState: options.deliveryState,
-    getDmContextMaxAgeMs: () => deployment().dmContextMaxAgeMs,
+    getDmContextGapMs: () => deployment().dmContextGapMs,
     getOldMessageSelectionMaxAgeMs: () => deployment().oldMessageSelectionMaxAgeMs ?? undefined,
   });
   const operator = options.operatorTokenSha256

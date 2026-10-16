@@ -4,6 +4,7 @@ import {
   expandAssistantCitations,
   collectCitations,
   CITATION_INPUT_LIMIT,
+  DEFAULT_DM_CONTEXT_GAP_MS,
 } from "@stanley2058/lilac-client-protocol";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import {
@@ -25,7 +26,7 @@ import {
   parseSurfaceMetadataLine,
 } from "../bridge/surface-metadata";
 import type { NativeRunnerLifecycle, NativeRunnerRequest } from "../bridge/bus-agent-runner";
-import type { NativeInputRecord } from "./codec";
+import type { NativeInputRecord, NativeThreadRecord } from "./codec";
 import { nativeFailure, NativeStoreFailure } from "./errors";
 import { nativeSessionId } from "./native-protocol";
 import type { NativeStore } from "./store";
@@ -49,7 +50,7 @@ export function createNativeExecution(options: {
   ) => Promise<ResultType<string, Error>> | ResultType<string, Error>;
   validateSkill?: (skillId: string, starterId: string) => boolean;
   getOldMessageSelectionMaxAgeMs?: () => number | undefined;
-  getDmContextMaxAgeMs?: () => number;
+  getDmContextGapMs?: () => number;
   now?: () => number;
   deliveryState?: (
     deliveryId: string,
@@ -130,24 +131,34 @@ export function createNativeExecution(options: {
     });
   }
 
+  function selectFirstInput(
+    thread: NativeThreadRecord,
+    sessionAt: number,
+  ): ResultType<NativeInputRecord | null, Error> {
+    if (thread.kind === "dm")
+      return store.selectSessionStartInput(thread.id, {
+        gapMs: options.getDmContextGapMs?.() ?? DEFAULT_DM_CONTEXT_GAP_MS,
+        at: sessionAt,
+      });
+    const maxAgeMs = options.getOldMessageSelectionMaxAgeMs?.();
+    const cutoff =
+      maxAgeMs === undefined ? 0 : Math.max(0, (options.now?.() ?? Date.now()) - maxAgeMs);
+    return store.selectCanonicalInput(thread.id, { since: cutoff });
+  }
+
   function selectedHistory(
     input: NativeInputRecord,
     latestRequestId: string,
     canonical: readonly StoredMessageV1[],
+    sessionAt: number,
   ): ResultType<{ messages: readonly StoredMessageV1[]; firstRequestId?: string }, Error> {
     return Result.gen(function* () {
       const empty = { messages: [] as readonly StoredMessageV1[] };
       if (input.canonicalHistoryStartRequestId === input.requestId) return Result.ok(empty);
       const thread = yield* store.getThreadRecord(input.threadId);
-      const maxAgeMs =
-        thread.kind === "dm"
-          ? (options.getDmContextMaxAgeMs?.() ?? 10_800_000)
-          : options.getOldMessageSelectionMaxAgeMs?.();
-      const cutoff =
-        maxAgeMs === undefined ? 0 : Math.max(0, (options.now?.() ?? Date.now()) - maxAgeMs);
       const first = input.canonicalHistoryStartRequestId
         ? yield* store.getInputByRequestId(input.canonicalHistoryStartRequestId)
-        : yield* store.selectCanonicalInput(input.threadId, { since: cutoff });
+        : yield* selectFirstInput(thread, sessionAt);
       if (!first) return Result.ok(empty);
       const latest = yield* store.getInputByRequestId(latestRequestId);
       if (!latest)
@@ -271,7 +282,12 @@ export function createNativeExecution(options: {
         return Result.err(
           nativeFailure("conflict", "The retained canonical transcript is unavailable"),
         );
-      const history = yield* selectedHistory(input, previousRequestId, previous.messages);
+      const history = yield* selectedHistory(
+        input,
+        previousRequestId,
+        previous.messages,
+        input.createdAt,
+      );
       yield* store.setInputCanonicalHistoryStart(
         input.id,
         history.messages.length > 0 ? (history.firstRequestId ?? input.requestId) : input.requestId,
@@ -593,10 +609,6 @@ export function createNativeExecution(options: {
       const thread = yield* store.authorizeThread(actorId, threadId);
       const evaluatedAt = options.now?.() ?? Date.now();
       const latestId = yield* store.getLatestCanonicalRequestId(threadId);
-      const maxAgeMs =
-        thread.kind === "dm"
-          ? (options.getDmContextMaxAgeMs?.() ?? 10_800_000)
-          : options.getOldMessageSelectionMaxAgeMs?.();
       const empty = {
         historyGeneration: thread.historyGeneration,
         evaluatedAt,
@@ -619,7 +631,17 @@ export function createNativeExecution(options: {
         requestId: "preview",
         canonicalHistoryStartRequestId: undefined,
       };
-      const history = yield* selectedHistory(selector, latestId, snapshot.messages);
+      const history = yield* selectedHistory(
+        selector,
+        latestId,
+        snapshot.messages,
+        active?.createdAt ?? evaluatedAt,
+      );
+      if (active?.turnId && active.canonicalHistoryStartRequestId === active.requestId)
+        return Result.ok({
+          ...empty,
+          firstTurnPosition: yield* store.getTurnPosition(active.turnId),
+        });
       if (!history.firstRequestId) return Result.ok(empty);
       const first = yield* store.getInputByRequestId(history.firstRequestId);
       if (!first?.turnId) return Result.ok(empty);
@@ -649,12 +671,26 @@ export function createNativeExecution(options: {
         firstTurnPosition,
         hasSummary,
         summarizedBeforePosition,
-        expiresAt:
-          !active && maxAgeMs !== undefined
-            ? Math.max(evaluatedAt + 1, first.createdAt + maxAgeMs + 1)
-            : undefined,
+        expiresAt: active ? undefined : contextExpiry(thread, first, latest, evaluatedAt),
       });
     });
+  }
+
+  function dmContextExpiry(latest: NativeInputRecord, evaluatedAt: number): number {
+    const gapMs = options.getDmContextGapMs?.() ?? DEFAULT_DM_CONTEXT_GAP_MS;
+    return Math.max(evaluatedAt + 1, (latest.completedAt ?? evaluatedAt) + gapMs + 1);
+  }
+
+  function contextExpiry(
+    thread: NativeThreadRecord,
+    first: NativeInputRecord,
+    latest: NativeInputRecord,
+    evaluatedAt: number,
+  ): number | undefined {
+    if (thread.kind === "dm") return dmContextExpiry(latest, evaluatedAt);
+    const maxAgeMs = options.getOldMessageSelectionMaxAgeMs?.();
+    if (maxAgeMs === undefined) return undefined;
+    return Math.max(evaluatedAt + 1, first.createdAt + maxAgeMs + 1);
   }
 
   function validateCommand(input: Pick<NativeInputRecord, "command">): ResultType<void, Error> {

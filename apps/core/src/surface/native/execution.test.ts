@@ -38,6 +38,7 @@ function value<T, E>(result: ResultType<T, E>): T {
 function fixture(blobStore?: BlobStore, direct = false) {
   let now = 1_000;
   let maxAgeMs: number | undefined;
+  let dmGapMs: number | undefined;
   const store = new NativeStore(new Database(":memory:"), () => now);
   value(store.initialize());
   value(
@@ -88,6 +89,7 @@ function fixture(blobStore?: BlobStore, direct = false) {
     bus,
     now: () => now,
     getOldMessageSelectionMaxAgeMs: () => maxAgeMs,
+    getDmContextGapMs: () => dmGapMs ?? 7_200_000,
     runner: () => ({
       cancelNativeSession: async () => {
         cancellations += 1;
@@ -148,6 +150,9 @@ function fixture(blobStore?: BlobStore, direct = false) {
     },
     setMaxAge: (value: number | undefined) => {
       maxAgeMs = value;
+    },
+    setDmGap: (value: number) => {
+      dmGapMs = value;
     },
     failPublication: (error: EventPublishContractInvalid | EventPublishTransportFailed) => {
       publicationFailure = error;
@@ -715,6 +720,61 @@ describe("native execution admission", () => {
     }
   });
 
+  test("keeps a DM session start fixed until a pause exceeds the context gap", async () => {
+    const f = fixture(undefined, true);
+    const finish = async () => {
+      const request = f.request();
+      value(
+        f.transcripts.saveRequestTranscript({
+          ...request,
+          requestClient: "native",
+          messages: [
+            ...storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages),
+            { role: "assistant", content: "same" },
+          ],
+        }),
+      );
+      value(await f.execution.runnerLifecycle.settled(request, "completed"));
+    };
+    const send = async (at: number) => {
+      f.setNow(at);
+      const receipt = f.submit("continue");
+      value(await f.execution.kick(f.thread.id));
+      return value(f.store.getInput(receipt.inputId));
+    };
+    try {
+      f.setDmGap(1_000);
+      const first = await send(1_000);
+      await finish();
+      for (const [index, at] of [1_900, 2_800, 3_700, 4_600].entries()) {
+        const input = await send(at);
+        expect(f.published.at(-1)!.data.messages).toHaveLength(3 + index * 2);
+        expect(input.canonicalHistoryStartRequestId).toBe(first.requestId);
+        await finish();
+      }
+      f.setNow(5_500);
+      expect(value(f.execution.context("owner", f.thread.id))).toMatchObject({
+        firstTurnPosition: 0,
+        expiresAt: 4_600 + 1_000 + 1,
+      });
+      f.setNow(5_601);
+      expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBeNull();
+      const fresh = await send(5_601);
+      expect(f.published.at(-1)!.data.messages).toHaveLength(1);
+      expect(value(f.execution.context("owner", f.thread.id))).toMatchObject({
+        active: true,
+        firstTurnPosition: 5,
+      });
+      expect(fresh.canonicalHistoryStartRequestId).toBe(fresh.requestId);
+      await finish();
+      const next = await send(5_700);
+      expect(f.published.at(-1)!.data.messages).toHaveLength(3);
+      expect(next.canonicalHistoryStartRequestId).toBe(fresh.requestId);
+    } finally {
+      f.close();
+    }
+  });
+
   test("rejects forged native input identities before model admission", async () => {
     const f = fixture();
     try {
@@ -777,7 +837,7 @@ test("DM uses its own three-hour cutoff and freezes the selected context during 
   }
 });
 
-test("DM keeps a recent direct suffix when the compacted summary ages out", async () => {
+test("DM keeps a recent direct suffix when a shorter context gap excludes the compacted summary", async () => {
   const f = fixture(undefined, true);
   try {
     for (let turn = 1; turn <= 3; turn++) {
@@ -811,7 +871,8 @@ test("DM keeps a recent direct suffix when the compacted summary ages out", asyn
       );
       value(await f.execution.runnerLifecycle.settled(request, "completed"));
     }
-    f.setNow(10_802_500);
+    f.setDmGap(500);
+    f.setNow(3_100);
     const context = value(f.execution.context("owner", f.thread.id));
     expect(context.firstTurnPosition).toBe(2);
     expect(context.hasSummary).toBe(false);

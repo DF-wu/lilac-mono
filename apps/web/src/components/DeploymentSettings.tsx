@@ -29,7 +29,8 @@ export function DeploymentSettingsForm({
 }) {
   const [titleModel, setTitleModel] = useState(value.titleModel);
   const [streaming, setStreaming] = useState(value.outputStreaming);
-  const [dmAge, setDmAge] = useState(String(value.dmContextMaxAgeMs));
+  const [dmGap, setDmGap] = useState(String(value.dmContextGapMs));
+  const [timestampGap, setTimestampGap] = useState(String(value.dmTimestampGapMs));
   const [selectionAge, setSelectionAge] = useState(
     value.oldMessageSelectionMaxAgeMs?.toString() ?? "",
   );
@@ -47,7 +48,8 @@ export function DeploymentSettingsForm({
         onSave({
           titleModel: titleModel.trim(),
           outputStreaming: streaming,
-          dmContextMaxAgeMs: Number(dmAge),
+          dmContextGapMs: Number(dmGap),
+          dmTimestampGapMs: Number(timestampGap),
           oldMessageSelectionMaxAgeMs: selectionAge === "" ? null : Number(selectionAge),
           storageRetentionMaxAgeMs: retentionAge === "" ? null : Number(retentionAge),
           crossThreadSend: { triggerRun },
@@ -86,20 +88,37 @@ export function DeploymentSettingsForm({
           />
         </div>
         <label className="grid gap-2">
-          <span>DM context max age (ms)</span>
+          <span>DM context gap (ms)</span>
           <Input
             type="number"
             min={1}
             step={1}
             required
-            value={dmAge}
+            value={dmGap}
             onChange={(event) => {
               onEdit?.();
-              setDmAge(event.target.value);
+              setDmGap(event.target.value);
             }}
           />
           <span className="text-sm text-muted-foreground">
-            Default: 3 hours. Messages remain in your DM.
+            Default: 2 hours. A longer pause starts a new context. Messages remain in your DM.
+          </span>
+        </label>
+        <label className="grid gap-2">
+          <span>DM timestamp gap (ms)</span>
+          <Input
+            type="number"
+            min={1}
+            step={1}
+            required
+            value={timestampGap}
+            onChange={(event) => {
+              onEdit?.();
+              setTimestampGap(event.target.value);
+            }}
+          />
+          <span className="text-sm text-muted-foreground">
+            Default: 30 minutes. Timestamps also appear when the day changes.
           </span>
         </label>
         <label className="grid gap-2">

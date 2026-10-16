@@ -1,4 +1,4 @@
-import { ContextMessage } from "./components/RecentContext";
+import { ContextMessage, TimestampSeparator } from "./components/RecentContext";
 import { DirectThreadCard } from "./components/DirectThreadCard";
 import { ComputerViewer } from "./components/ComputerViewer";
 import computerDemoUrl from "./assets/computer-demo.html?url";
@@ -1393,9 +1393,9 @@ function Controls() {
                 onSelect={() => {}}
               />
             ))}
-            <ContextMessage outside>
-              <p className="px-6 text-sm">Earlier conversation, outside context.</p>
-            </ContextMessage>
+            <TimestampSeparator at={now - 7_200_000} />
+            <p className="px-6 text-sm">Earlier conversation.</p>
+            <TimestampSeparator at={now - 1_800_000} contextStart />
             <ContextMessage summarized>
               <p className="px-6 text-sm">Earlier conversation, represented in the summary.</p>
             </ContextMessage>
@@ -1827,7 +1827,8 @@ export default function DesignSystem() {
                   value={{
                     titleModel: "fast",
                     outputStreaming: "complete",
-                    dmContextMaxAgeMs: 10_800_000,
+                    dmContextGapMs: 7_200_000,
+                    dmTimestampGapMs: 1_800_000,
                     oldMessageSelectionMaxAgeMs: null,
                     storageRetentionMaxAgeMs: null,
                     crossThreadSend: { triggerRun: true },

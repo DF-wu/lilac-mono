@@ -1090,3 +1090,13 @@ open tabs. Presence is scoped to the authenticated user and tab, remains in memo
 60 seconds without a heartbeat. A focused thread suppresses that user's completion and failure pushes
 on all devices, including when push is disabled or unsupported on the viewing device. There is no
 stored-data migration.
+
+## Gap-based native DM context
+
+Deployment settings replace `dmContextMaxAgeMs` with `dmContextGapMs` (default 7,200,000 ms) and add
+`dmTimestampGapMs` (default 1,800,000 ms). Decoding a stored deployment record drops
+`dmContextMaxAgeMs` and applies both defaults; the next save writes the new fields. A custom DM age
+is not carried over because an age limit does not translate to a pause length. `threads.context`
+gains required `timestampGapMs`, and its `expiresAt` for a DM is the latest completion plus the gap.
+Deploy Core and web together. Older strict validators reject the new fields, and older clients that
+send `dmContextMaxAgeMs` are rejected. There is no other stored-data migration.

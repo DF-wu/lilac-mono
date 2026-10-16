@@ -122,6 +122,9 @@ function nullableAuthority<T>(result: NativeStoreResult<T>): NativeStoreResult<T
   });
 }
 
+const CANONICAL_INPUT_FILTER =
+  "json_extract(i.data_json,'$.value.completedAt') IS NOT NULL AND json_extract(i.data_json,'$.value.mode')!='steer' AND json_extract(i.data_json,'$.value.state') IN ('admitted','canceled') AND EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.id=json_extract(i.data_json,'$.value.turnId'))";
+
 export class NativeStore {
   private readonly listeners = new Set<(threadId: string) => void>();
   private readonly pendingNotifications = new Set<string>();
@@ -268,8 +271,8 @@ export class NativeStore {
         const value = {
           settings: {
             ...input.settings,
-            dmContextMaxAgeMs:
-              input.settings.dmContextMaxAgeMs ?? current.settings.dmContextMaxAgeMs,
+            dmContextGapMs: input.settings.dmContextGapMs ?? current.settings.dmContextGapMs,
+            dmTimestampGapMs: input.settings.dmTimestampGapMs ?? current.settings.dmTimestampGapMs,
           },
           revision: current.revision + 1,
         };
@@ -1931,13 +1934,39 @@ export class NativeStore {
         : "i.position DESC";
     return nativeStoreTransaction(this.db, () =>
       this.readRows(
-        `SELECT i.* FROM native_records i INDEXED BY ${index} WHERE i.kind='input' AND i.thread_id=? AND json_extract(i.data_json,'$.value.createdAt')>=? AND i.position<? AND json_extract(i.data_json,'$.value.completedAt') IS NOT NULL AND json_extract(i.data_json,'$.value.mode')!='steer' AND json_extract(i.data_json,'$.value.state') IN ('admitted','canceled') AND EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.id=json_extract(i.data_json,'$.value.turnId')) ORDER BY ${order} LIMIT 1`,
+        `SELECT i.* FROM native_records i INDEXED BY ${index} WHERE i.kind='input' AND i.thread_id=? AND json_extract(i.data_json,'$.value.createdAt')>=? AND i.position<? AND ${CANONICAL_INPUT_FILTER} ORDER BY ${order} LIMIT 1`,
         [threadId, options.since ?? 0, options.before ?? Number.MAX_SAFE_INTEGER],
       ).map((records) => {
         const record = records[0];
         return record?.kind === "input" ? record.value : null;
       }),
     );
+  }
+
+  selectSessionStartInput(
+    threadId: string,
+    options: { gapMs: number; at: number },
+  ): NativeStoreResult<NativeInputRecord | null> {
+    return nativeStoreTransaction(this.db, () => {
+      const statement = this.db.prepare<
+        { id: string; created_at: number; completed_at: number },
+        [string]
+      >(
+        `SELECT i.id,json_extract(i.data_json,'$.value.createdAt') created_at,json_extract(i.data_json,'$.value.completedAt') completed_at FROM native_records i INDEXED BY native_records_thread_position WHERE i.kind='input' AND i.thread_id=? AND ${CANONICAL_INPUT_FILTER} ORDER BY i.position DESC`,
+      );
+      let startId: string | undefined;
+      let nextAt = options.at;
+      for (const row of statement.iterate(threadId)) {
+        if (nextAt - row.completed_at > options.gapMs) break;
+        startId = row.id;
+        nextAt = row.created_at;
+      }
+      statement.finalize();
+      if (!startId) return Result.ok(null);
+      return this.readRecord("input", startId).map((record) =>
+        record?.kind === "input" ? record.value : null,
+      );
+    });
   }
 
   getTurnPosition(turnId: string): NativeStoreResult<number> {
@@ -1951,7 +1980,7 @@ export class NativeStore {
   getLatestCanonicalRequestId(threadId: string): NativeStoreResult<string | null> {
     return nativeStoreTransaction(this.db, () =>
       this.readRows(
-        "SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND json_extract(i.data_json,'$.value.completedAt') IS NOT NULL AND json_extract(i.data_json,'$.value.mode')!='steer' AND json_extract(i.data_json,'$.value.state') IN ('admitted','canceled') AND EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.id=json_extract(i.data_json,'$.value.turnId')) ORDER BY i.position DESC LIMIT 1",
+        `SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND ${CANONICAL_INPUT_FILTER} ORDER BY i.position DESC LIMIT 1`,
         [threadId],
       ).map((records) => {
         const record = records[0];

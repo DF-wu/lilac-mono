@@ -1,5 +1,5 @@
 import {
-  nativeDeploymentDocumentSchema,
+  nativeDeploymentSettingsSchema,
   displayMessageSchema,
   displayPartSchema,
   readyTurnSlotSchema,
@@ -142,8 +142,16 @@ export const nativeAgentStreamRecordSchema = z.strictObject({
   deleted: z.boolean(),
   mutationPending: z.boolean(),
 });
+// Records written before gap-based DM context carry `dmContextMaxAgeMs`. Its age semantics do not
+// map onto a session gap, so decoding drops it and the gap settings take their defaults.
+const storedDeploymentSettingsSchema = nativeDeploymentSettingsSchema
+  .extend({ dmContextMaxAgeMs: z.number().int().positive().optional() })
+  .transform(({ dmContextMaxAgeMs: _legacy, ...settings }) => settings);
 export const nativeRecordSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("deployment"), value: nativeDeploymentDocumentSchema }),
+  z.strictObject({
+    kind: z.literal("deployment"),
+    value: z.strictObject({ settings: storedDeploymentSettingsSchema, revision }),
+  }),
   z.strictObject({ kind: z.literal("user"), value: nativeUserSchema }),
   z.strictObject({ kind: z.literal("thread"), value: nativeThreadRecordSchema }),
   z.strictObject({ kind: z.literal("agent-stream"), value: nativeAgentStreamRecordSchema }),

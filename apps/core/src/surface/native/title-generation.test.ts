@@ -18,7 +18,8 @@ function fixture(autoTitle = true) {
     .initializeDeployment({
       titleModel: "fast",
       outputStreaming: "paragraph",
-      dmContextMaxAgeMs: 10_800_000,
+      dmContextGapMs: 7_200_000,
+      dmTimestampGapMs: 1_800_000,
       oldMessageSelectionMaxAgeMs: null,
       storageRetentionMaxAgeMs: null,
       crossThreadSend: { triggerRun: true },

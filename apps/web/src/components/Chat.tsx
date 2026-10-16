@@ -809,6 +809,7 @@ export function Chat(props: ChatProps) {
               upload={recoveryUpload}
               onRewind={setRewindTarget}
               rewindDisabled={active || thread?.kind === "dm"}
+              timestamps={thread?.kind === "dm"}
               onAction={onAction}
               onReaction={onReaction}
             />

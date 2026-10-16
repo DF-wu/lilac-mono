@@ -262,6 +262,7 @@ export const nativeContract = {
         summarizedBeforePosition: revisionSchema.optional(),
         active: z.boolean(),
         expiresAt: revisionSchema.optional(),
+        timestampGapMs: z.number().int().positive(),
       }),
     ),
     get: procedure.input(threadIdInput).output(nativeThreadSchema),
