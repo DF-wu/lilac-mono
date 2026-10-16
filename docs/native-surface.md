@@ -305,7 +305,7 @@ The agent receives a brief instruction to follow the current topic in a mixed-to
 
 The DM shows a timestamp above the first turn and above any turn sent at least "DM timestamp gap (ms)"
 after the previous one, initially 1,800,000 ms, or on a new day. The turn where the selected context
-starts adds "New context" to its timestamp. The marker reflects the next request when idle and the
+starts adds a list-start icon to its timestamp, with a "Context starts here" tooltip. The marker reflects the next request when idle and the
 current request while running. Messages represented by a summary have a tooltip.
 During a reply the context refreshes once per second to reflect compaction. `/compact` summarizes
 current model context through the existing compaction engine, even when automatic compaction is off.

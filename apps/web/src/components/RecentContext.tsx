@@ -1,8 +1,10 @@
 import { createContext, useContext, useEffect, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { ListStart } from "lucide-react";
 import type { NativeRpcOutputs, NativeThread } from "@stanley2058/lilac-client-protocol";
 import { useWorkspace } from "../workspace-context";
 import { useNativeOnline } from "../queries";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
 type Context = NativeRpcOutputs["threads"]["context"];
 const RecentContext = createContext<Context | undefined>(undefined);
@@ -74,10 +76,25 @@ export function TimestampSeparator({ at, contextStart }: { at: number; contextSt
     <p
       data-ui="timestamp-separator"
       data-context-start={contextStart || undefined}
-      className="px-6 pt-4 pb-1 text-center text-xs text-muted-foreground"
+      className="flex items-center justify-center gap-1.5 px-6 pt-4 pb-1 text-xs text-muted-foreground"
     >
       <time dateTime={new Date(at).toISOString()}>{separatorTime(at)}</time>
-      {contextStart ? " · New context" : null}
+      {contextStart ? (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <button
+                type="button"
+                className="flex p-0 border-0 bg-transparent text-inherit cursor-default"
+                aria-label="Context starts here"
+              />
+            }
+          >
+            <ListStart className="size-3.5" aria-hidden />
+          </TooltipTrigger>
+          <TooltipContent>Context starts here</TooltipContent>
+        </Tooltip>
+      ) : null}
     </p>
   );
 }
