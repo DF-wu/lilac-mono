@@ -1235,6 +1235,8 @@ export class NativeStore {
     assistant?: string;
   } | null> {
     return Result.gen(function* () {
+      const agentStream = yield* this.readRecord("agent-stream", threadId);
+      if (agentStream?.kind === "agent-stream") return Result.ok(null);
       const thread = yield* this.getThreadRecord(threadId);
       const state = thread.titleGeneration;
       if (

@@ -112,6 +112,37 @@ function controlled(f: ReturnType<typeof fixture>) {
   return { service, first, second, firstResult, secondResult, calls, warnings, fatal };
 }
 
+test("subagent display changes skip title generation without warnings", async () => {
+  const f = fixture(false);
+  const c = controlled(f);
+  const stream = f.store
+    .ensureAgentStream({
+      parentThreadId: f.thread.id,
+      parentRequestId: "parent-request",
+      runId: "child-run",
+      requestId: "child-request",
+      messages: [],
+      state: "running",
+      startedAt: Date.now(),
+    })
+    .unwrap();
+  expect(f.store.getTitleGeneration(stream.id).unwrap()).toBeNull();
+  await new Promise<void>((resolve) => {
+    const unsubscribe = f.store.subscribe((id) => {
+      if (id !== stream.id) return;
+      unsubscribe();
+      resolve();
+    });
+    f.store.notifyDisplayChanged(stream.id);
+  });
+  await c.service.stop();
+  expect(c.calls).toEqual([]);
+  expect(c.warnings).toEqual([]);
+  expect(c.fatal).toEqual([]);
+  expect(f.store.getTitleGeneration("missing-thread").isErr()).toBe(true);
+  f.store.close();
+});
+
 test("initial title is non-blocking and requests only user context", async () => {
   const f = fixture();
   const c = controlled(f);
