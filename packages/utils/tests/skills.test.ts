@@ -443,6 +443,11 @@ describe("bundled skills", () => {
     expect(skillAvailableOn(scoped, "native")).toBe(true);
     expect(skillAvailableOn(scoped, "discord")).toBe(false);
     expect(skillAvailableOn(scoped, undefined)).toBe(false);
+    expect(skillAvailableOn(scoped, "unknown", "native")).toBe(true);
+    expect(skillAvailableOn(scoped, "unknown", "discord")).toBe(false);
+    expect(skillAvailableOn(scoped, "unknown")).toBe(false);
+    expect(skillAvailableOn(scoped, "discord", "native")).toBe(false);
+    expect(skillAvailableOn(scoped, undefined, "native")).toBe(false);
     const open = parseSkillMarkdown("---\nname: a\ndescription: d\n---\n");
     expect(open.surfaces).toBeUndefined();
     expect(skillAvailableOn(open, "discord")).toBe(true);

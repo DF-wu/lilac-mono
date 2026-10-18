@@ -11,6 +11,7 @@ import { Result } from "better-result";
 
 export async function maybeBuildSkillsSectionForPrimary(
   requestClient: string,
+  authenticatedOriginPlatform?: string,
 ): Promise<string | null> {
   const workspaceRoot = findWorkspaceRootResult();
   const root = workspaceRoot.match({ ok: (value) => value, err: () => null });
@@ -23,7 +24,9 @@ export async function maybeBuildSkillsSectionForPrimary(
         dataDir: env.dataDir,
       });
       return formatAvailableSkillsSection(
-        skills.filter((skill) => skillAvailableOn(skill, requestClient)),
+        skills.filter((skill) =>
+          skillAvailableOn(skill, requestClient, authenticatedOriginPlatform),
+        ),
       );
     },
     catch: captureError,

@@ -144,4 +144,28 @@ ${"Complete instructions.\n".repeat(12_000)}Last instruction.
       error: { kind: "not_found" },
     });
   });
+  it("lists and reads native skills for delegated native requests", async () => {
+    const tool = new Skills();
+    for (const platform of ["native", "discord", undefined] as const) {
+      const context = {
+        cwd: process.cwd(),
+        requestClient: "unknown",
+        ...(platform ? { requestInitiator: { platform, userId: "user-1" } } : {}),
+      };
+      const listed = await tool.call("skills.list", { query: "visualize" }, { context });
+      expect(listed.status).toBe("ok");
+      if (listed.status !== "ok") throw new Error(listed.error.message);
+      const expected = {
+        skills: expect.arrayContaining([expect.objectContaining({ name: "visualize" })]),
+      };
+      if (platform === "native") expect(listed.value).toMatchObject(expected);
+      else expect(listed.value).not.toMatchObject(expected);
+      const read = await tool.call("skills.read", { name: "visualize" }, { context });
+      expect(read).toMatchObject(
+        platform === "native"
+          ? { status: "ok" }
+          : { status: "error", error: { kind: "not_found" } },
+      );
+    }
+  });
 });
