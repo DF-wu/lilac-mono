@@ -13,6 +13,8 @@ handoffs. Core preserves existing files on startup; installing the new skill doe
 3. Use the current skill assets as a guide. Allow ordinary conversations to edit workflow and working
    notes. Remove obsolete instructions requiring all changes to pass through an inbox. Reconcile the
    same rule in active `AGENTS.md`; preserve unrelated policies and the user's stricter preferences.
+   Include routing to the skill's conversation reconciliation procedure for replies to proactive
+   updates and changes to ongoing matters, including those missing from current context.
    If a `.new` or merge candidate exists, inspect its relevant changes rather than replacing the file.
 4. Preserve `surface.heartbeat.defaultOutputSession` when configured. If missing, ask where default
    output should go and resolve the answer. Keep per-watch targets separate. “Here” in an old note

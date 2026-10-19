@@ -84,6 +84,7 @@ export function buildOrdinaryHeartbeatOverlay(params: {
 }): string {
   return [
     "## Heartbeat Context",
+    "For replies to proactive updates, resolutions, corrections, or changed commitments, use the heartbeat skill to reconcile shared working notes before finishing. Consult those notes when the relevant ongoing matter is missing from context.",
     `For monitoring or later follow-up, use the heartbeat skill. Record sourceSessionId='${params.sessionId}' and sourceRequestId='${params.requestId}' with the watch. Capture the concrete current thread when the user says 'keep me posted here'.`,
   ].join("\n");
 }

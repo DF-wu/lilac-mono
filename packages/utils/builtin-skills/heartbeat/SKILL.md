@@ -1,6 +1,6 @@
 ---
 name: heartbeat
-description: Set up or verify proactive heartbeat checks, watch an event, keep the user posted in a thread, or maintain ongoing follow-ups. Use during heartbeat wakes and when a conversation identifies something worth checking later.
+description: Set up or verify heartbeat, watch an event, and run proactive follow-ups. Use on heartbeat wakes, when a conversation identifies a later check, or when the user replies to a proactive update, resolves or corrects an ongoing matter, changes a commitment, or refers to ongoing work missing from context.
 ---
 
 # Heartbeat
@@ -16,6 +16,8 @@ exact-time delivery guarantee.
 - When an installation still uses heartbeat-owned `HEARTBEAT.md`, inbox handoffs, or archives, read
   [references/migration.md](references/migration.md) before changing that setup. Preserve its work.
 - When creating or changing a watch, follow the watch instructions below.
+- When a conversation answers a proactive question or changes an ongoing matter, follow
+  "Reconcile a conversation" below, including when the watch is missing from current context.
 - On a heartbeat wake, read the active `HEARTBEAT.md` and follow its workflow. Its linked working notes
   are the continuity between wakes. Do not reload setup or migration instructions on every wake.
 
@@ -42,6 +44,26 @@ When research reveals a useful later check, offer to track it if the user has no
 During heartbeat, the standing discovery instructions may authorize starting a watch without another
 question. Inferred watches are best effort; explicit watches are recorded commitments subject to the
 lane's availability. Access to a source does not make every topic in it a user responsibility.
+
+## Reconcile a conversation
+
+1. Consult `heartbeat/WORK.md` in the active prompt directory. Match the topic against active and
+   completed entries using source threads and last-notification references. When context is missing,
+   retrieve the linked notification or source conversation through surface tools. Ask a focused
+   question only if the relevant matter remains ambiguous after lookup.
+2. Apply the user's answer to that matter. Accept their account of their own actions as user-confirmed
+   evidence. Distinguish completion from a request to stop following up; either can end a watch.
+   Keep corrections and preferences scoped to the matter they described.
+3. Re-read the entry and make a targeted update before finishing the turn. Record the changed
+   understanding, the current conversation reference, and the remaining next check or reason for
+   completion/stopping. Preserve unrelated entries and explicit delivery targets. A closed watch
+   needs no next check. Retain a brief outcome and source references in completed watches so old
+   evidence does not reopen it. Materially new evidence may reopen completed work; a watch the user
+   stopped stays stopped until they ask to resume it.
+4. Acknowledge the result after the edit succeeds. If the notes are unavailable or the edit fails,
+   state that the watch update is still pending. If no matching watch exists, continue the conversation
+   and use the creation route only when further monitoring is warranted. Reconciliation does not
+   require enabling heartbeat or rerunning setup.
 
 ## File ownership
 

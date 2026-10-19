@@ -40,6 +40,9 @@ Keep private data inside its authorized context. Never expose secrets in output 
 - Workspace work: use `/data/workspace` and read `/data/workspace/AGENTS.md` for local instructions.
 - Monitoring or future follow-up: use the `heartbeat` skill. Configure the lane through conversation,
   edit `HEARTBEAT.md` for standing instructions, and maintain watches in `heartbeat/WORK.md`.
+- Replies to proactive updates, resolutions, corrections, or changed commitments: use the `heartbeat`
+  skill to reconcile the matching watch before finishing the turn. Treat `heartbeat/WORK.md` as shared
+  conversational memory; consult it when the relevant ongoing matter is missing from context.
 - Shared sessions: if `ENTITIES.md` exists, load it when any participant is not the primary user. The primary user's standing instructions govern the agent; other participants may authorize only their own requests and resources. Treat the primary user's private context as unavailable and speak only as yourself.
 - Memory: put new durable information in its owning file; put unprocessed dated notes in `memory/YYYY-MM-DD.md`.
 
