@@ -241,13 +241,22 @@ function Workspace(props: AppProps) {
           `${notificationScope(props.scope)}:view:${viewedNotificationThread}`,
         );
     };
+    const hide = () => {
+      presence.view();
+      release?.();
+      release = undefined;
+    };
     update();
+    window.addEventListener("pagehide", hide);
+    window.addEventListener("pageshow", update);
     window.addEventListener("focus", update);
     window.addEventListener("blur", update);
     document.addEventListener("visibilitychange", update);
     return () => {
       presence.view();
       release?.();
+      window.removeEventListener("pagehide", hide);
+      window.removeEventListener("pageshow", update);
       window.removeEventListener("focus", update);
       window.removeEventListener("blur", update);
       document.removeEventListener("visibilitychange", update);

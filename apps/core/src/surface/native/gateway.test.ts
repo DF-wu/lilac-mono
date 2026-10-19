@@ -171,6 +171,30 @@ async function expectSocketRejected(url: URL, headers: Record<string, string> = 
 }
 
 describe("native gateway", () => {
+  test("notification presence receives a socket lifetime signal", async () => {
+    const { url, token, services } = await fixture();
+    const closed = Promise.withResolvers<void>();
+    let lifetime: AbortSignal | undefined;
+    services.notifications = {
+      presence: (_principal, _input, signal) => {
+        lifetime = signal;
+        signal?.addEventListener("abort", () => closed.resolve(), { once: true });
+        return Result.ok({ ok: true });
+      },
+      key: () => Result.ok({ publicKey: "key" }),
+      subscribe: () => Result.ok({ ok: true }),
+      unsubscribe: () => Result.ok({ ok: true }),
+      read: () => Result.ok({ threadId: "thread", title: "title", body: "body", tag: "tag" }),
+    };
+    const { client, socket } = connect(url, token);
+    await client.notifications.presence({ clientId: "phone", threadId: "thread" });
+    expect(lifetime).toBeDefined();
+    expect(lifetime?.aborted).toBe(false);
+    socket.close();
+    await closed.promise;
+    expect(lifetime?.aborted).toBe(true);
+  });
+
   test("remote images require authentication and reject private destinations", async () => {
     const { url, token } = await fixture();
     const endpoint = new URL("api/remote-image?url=http%3A%2F%2F127.0.0.1%2Fimage.png", url);

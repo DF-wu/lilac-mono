@@ -264,3 +264,45 @@ for (const mode of ["notify", "silent", "viewed", "disabled"] as const) {
     f.db.close();
   });
 }
+
+test("a disconnected viewer no longer suppresses push on another device", async () => {
+  let sent = 0;
+  const f = fixture(async () => {
+    sent++;
+    return { statusCode: 201, headers: {}, body: "" };
+  });
+  const connection = new AbortController();
+  f.push
+    .presence("alice", { clientId: "phone", threadId: f.thread.id }, connection.signal)
+    .unwrap();
+  f.push.posted(f.thread.id);
+  expect(sent).toBe(0);
+  connection.abort();
+  f.push.posted(f.thread.id);
+  await f.push.stop();
+  expect(sent).toBe(1);
+  f.db.close();
+});
+
+test("an old socket cannot clear or restore presence after reconnect", async () => {
+  let sent = 0;
+  const f = fixture(async () => {
+    sent++;
+    return { statusCode: 201, headers: {}, body: "" };
+  });
+  const old = new AbortController();
+  const current = new AbortController();
+  const input = { clientId: "phone", threadId: f.thread.id };
+  f.push.presence("alice", input, old.signal).unwrap();
+  f.push.presence("alice", input, current.signal).unwrap();
+  old.abort();
+  f.push.presence("alice", { clientId: "phone" }, old.signal).unwrap();
+  f.push.posted(f.thread.id);
+  expect(sent).toBe(0);
+  current.abort();
+  f.push.presence("alice", input, old.signal).unwrap();
+  f.push.posted(f.thread.id);
+  await f.push.stop();
+  expect(sent).toBe(1);
+  f.db.close();
+});

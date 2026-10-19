@@ -31,6 +31,7 @@ export type NativeRpcServices = {
 };
 export type NativeRpcContext = {
   principal: NativePrincipal;
+  connectionSignal?: AbortSignal;
   request: Request;
   auth: NativeAuthenticator;
   refreshed: () => void;
@@ -90,7 +91,9 @@ export function createNativeRouter(
   return api.router({
     notifications: {
       presence: secured.notifications.presence.handler(async ({ context, input }) =>
-        nativeRpcValue(await services.notifications.presence(context.principal, input)),
+        nativeRpcValue(
+          await services.notifications.presence(context.principal, input, context.connectionSignal),
+        ),
       ),
       key: secured.notifications.key.handler(async ({ context, input }) =>
         nativeRpcValue(await services.notifications.key(context.principal, input)),

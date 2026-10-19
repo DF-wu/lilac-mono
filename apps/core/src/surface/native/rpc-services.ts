@@ -577,8 +577,8 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
   const success = () => ({ ok: true as const });
   return {
     notifications: {
-      presence: (principal, input) =>
-        options.push?.presence(principal.userId, input) ?? Result.ok({ ok: true as const }),
+      presence: (principal, input, signal) =>
+        options.push?.presence(principal.userId, input, signal) ?? Result.ok({ ok: true as const }),
       key: () =>
         options.push?.key() ??
         Result.err(nativeFailure("invalid", "Background push is unavailable")),

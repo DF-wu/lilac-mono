@@ -41,6 +41,7 @@ export type NativeGatewayOptions = {
 };
 type Peer = { send: (message: string | ArrayBufferLike | Uint8Array) => number };
 type SocketData = {
+  connection: AbortController;
   metrics: ReturnType<NativeMetrics["connection"]>;
   context: NativeRpcContext;
   peer?: Peer;
@@ -290,7 +291,9 @@ export function createNativeGateway(options: NativeGatewayOptions) {
     const user = decision.principal;
     if (isSocket) {
       if (request.method !== "GET") return privateJson({ error: "Method not allowed" }, 405);
+      const connection = new AbortController();
       const context: NativeRpcContext = {
+        connectionSignal: connection.signal,
         principal: user,
         request,
         auth: options.auth,
@@ -300,6 +303,7 @@ export function createNativeGateway(options: NativeGatewayOptions) {
       if (
         running.upgrade(original, {
           data: {
+            connection,
             context,
             metrics: metrics.connection(),
             inflight: 0,
@@ -504,6 +508,7 @@ export function createNativeGateway(options: NativeGatewayOptions) {
               return operation;
             },
             close(socket, code) {
+              socket.data.connection.abort();
               socket.data.metrics.closed(code);
               sockets.delete(socket);
               clearTimeout(socket.data.expiry);
@@ -531,6 +536,7 @@ export function createNativeGateway(options: NativeGatewayOptions) {
     if (stopPromise) return stopPromise;
     accepting = false;
     for (const socket of sockets) {
+      socket.data.connection.abort();
       clearTimeout(socket.data.expiry);
       socket.close(1001, "Server stopping");
       if (socket.data.peer) handler.close(socket.data.peer);

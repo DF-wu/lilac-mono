@@ -29,7 +29,10 @@ export function allowedPushEndpoint(endpoint: string): boolean {
 }
 
 export class NativePush {
-  private readonly viewing = new Map<string, { userId: string; threadId: string; until: number }>();
+  private readonly viewing = new Map<
+    string,
+    { userId: string; threadId: string; until: number; signal?: AbortSignal; onAbort?: () => void }
+  >();
   private readonly working = new Map<string, NativeThread>();
   private readonly pending = new Set<Promise<void>>();
   private stopListening?: () => void;
@@ -110,16 +113,31 @@ export class NativePush {
     return Result.ok({ ok: true as const });
   }
 
-  presence(userId: string, input: NativeRpcInputs["notifications"]["presence"]) {
-    for (const [key, view] of this.viewing) if (view.until <= Date.now()) this.viewing.delete(key);
+  private clearPresence(key: string) {
+    const view = this.viewing.get(key);
+    if (view?.onAbort) view.signal?.removeEventListener("abort", view.onAbort);
+    this.viewing.delete(key);
+  }
+
+  presence(
+    userId: string,
+    input: NativeRpcInputs["notifications"]["presence"],
+    signal?: AbortSignal,
+  ) {
+    if (signal?.aborted) return Result.ok({ ok: true as const });
+    for (const [key, view] of this.viewing) if (view.until <= Date.now()) this.clearPresence(key);
     const key = JSON.stringify([userId, input.clientId]);
-    if (input.threadId)
-      this.viewing.set(key, {
-        userId,
-        threadId: input.threadId,
-        until: Date.now() + 60_000,
-      });
-    else this.viewing.delete(key);
+    this.clearPresence(key);
+    if (!input.threadId) return Result.ok({ ok: true as const });
+    const onAbort = () => this.clearPresence(key);
+    this.viewing.set(key, {
+      userId,
+      threadId: input.threadId,
+      until: Date.now() + 60_000,
+      signal,
+      onAbort,
+    });
+    signal?.addEventListener("abort", onAbort, { once: true });
     return Result.ok({ ok: true as const });
   }
 
@@ -224,6 +242,6 @@ export class NativePush {
     this.stopListening = undefined;
     await Promise.all(this.pending);
     this.working.clear();
-    this.viewing.clear();
+    for (const key of this.viewing.keys()) this.clearPresence(key);
   }
 }
