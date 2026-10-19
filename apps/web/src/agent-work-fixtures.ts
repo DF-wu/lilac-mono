@@ -526,6 +526,38 @@ const foldedActivityMessages = [
 
 export const agentWorkStages: AgentWorkStage[] = [
   {
+    id: "grouped-messages",
+    label: "Grouped messages",
+    description: "Nearby posts share an avatar. Right-click any message to copy, link, or react.",
+    frames: [
+      {
+        ...turn([], "complete"),
+        messages: [
+          message("grouped_work", [forecast]),
+          message(
+            "grouped_first",
+            [{ type: "text", text: "The forecast is ready. The morning looks clear." }],
+            "final",
+          ),
+        ],
+        following: {
+          kind: "ready",
+          slotId: "grouped_post",
+          turnId: "grouped_post",
+          position: 1,
+          state: "complete",
+          messages: [
+            message(
+              "grouped_second",
+              [{ type: "text", text: "Bring a light jacket for the riverside walk." }],
+              "final",
+            ),
+          ],
+        },
+      },
+    ],
+  },
+  {
     id: "surface-message",
     label: "Cross-thread message",
     description: "An incoming agent message stays visible above the destination run's work.",

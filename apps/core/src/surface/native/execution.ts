@@ -214,6 +214,120 @@ export function createNativeExecution(options: {
     });
   }
 
+  function messageHeader(message: StoredMessageV1) {
+    const text =
+      typeof message.content === "string"
+        ? message.content
+        : (message.content.find((part) => part.type === "text")?.text ?? "");
+    return parseSurfaceMetadataLine(text.split("\n")[0] ?? "");
+  }
+
+  function includeDeliveredPosts(input: NativeInputRecord, canonical: readonly StoredMessageV1[]) {
+    return Result.gen(function* () {
+      const thread = yield* store.getThreadRecord(input.threadId);
+      if (thread.kind !== "dm") return Result.ok([...canonical]);
+      const session = yield* store.selectSessionWindow(input.threadId, {
+        gapMs: options.getDmContextGapMs?.() ?? DEFAULT_DM_CONTEXT_GAP_MS,
+        at: input.createdAt,
+        beforePosition: input.position,
+        includePosts: true,
+      });
+      const history = canonical.filter((message) => {
+        if (message.role !== "assistant" || session.firstAt === null) return true;
+        const header = messageHeader(message);
+        if (
+          header?.meta.platform !== "native" ||
+          header.meta.thread_id !== input.threadId ||
+          typeof header.meta.message_time !== "string"
+        )
+          return true;
+        return !(Date.parse(header.meta.message_time) < session.firstAt);
+      });
+      const knownIds = new Set(
+        history.flatMap((message) => {
+          const header = messageHeader(message);
+          return header?.meta.thread_id === input.threadId &&
+            typeof header.meta.message_id === "string"
+            ? [header.meta.message_id]
+            : [];
+        }),
+      );
+      const anchors: { index: number; position: number }[] = [];
+      for (const [index, message] of history.entries()) {
+        if (message.role !== "user") continue;
+        const header = messageHeader(message);
+        if (header?.meta.platform !== "native" || header.meta.thread_id !== input.threadId)
+          continue;
+        const source = yield* store.getInputByRequestId(
+          `native:${input.threadId}:${header.meta.message_id}`,
+        );
+        if (source) anchors.push({ index, position: source.position });
+      }
+      const hasSummary = history.some((message) => {
+        const text =
+          typeof message.content === "string"
+            ? message.content
+            : message.content
+                .flatMap((part) => (part.type === "text" ? [part.text] : []))
+                .join("\n");
+        return text.startsWith("<context-compaction>");
+      });
+      const insertions = new Map<number, StoredMessageV1[]>();
+      for (const turn of session.postedTurns) {
+        if (hasSummary && turn.position < (anchors[0]?.position ?? input.position)) continue;
+        for (const posted of turn.messages) {
+          if (
+            posted.role !== "assistant" ||
+            posted.metadata?.inputId ||
+            posted.id !== turn.turnId ||
+            knownIds.has(posted.id)
+          )
+            continue;
+          const content: Extract<StoredMessageV1, { role: "assistant" }>["content"] = [];
+          const author = yield* store.getUser(posted.metadata?.authorId ?? "lilac");
+          const text = posted.parts
+            .flatMap((part) => (part.type === "text" ? [part.text] : []))
+            .join("");
+          content.push({
+            type: "text",
+            text: `${formatSurfaceMetadataLine({
+              platform: "native",
+              thread_id: input.threadId,
+              user_id: author.id,
+              user_name: author.displayName,
+              message_id: posted.id,
+              message_time: new Date(posted.metadata?.createdAt ?? session.latestAt).toISOString(),
+            })}\n${escapeSurfaceMetadataTags(text)}`,
+          });
+          for (const part of posted.parts) {
+            if (part.type !== "data-resource") continue;
+            const upload = yield* store.getUpload(part.data.resourceId);
+            if (upload.state !== "ready" || !upload.resourceUri) continue;
+            yield* store.authorizeThread(thread.starterId, upload.threadId);
+            content.push({
+              type: "resource",
+              uri: upload.resourceUri,
+              filename: upload.filename,
+              mediaType: upload.mediaType,
+              size: upload.size,
+            });
+          }
+          const index =
+            anchors.find((anchor) => anchor.position > turn.position)?.index ?? history.length;
+          const messages = insertions.get(index) ?? [];
+          messages.push({ role: "assistant", content });
+          insertions.set(index, messages);
+        }
+      }
+      const messages = history.flatMap((message, index) => [
+        ...(insertions.get(index) ?? []),
+        message,
+      ]);
+      messages.push(...(insertions.get(history.length) ?? []));
+      return Result.ok(messages);
+    });
+  }
+
   async function inputMessages(
     input: NativeInputRecord,
   ): Promise<ResultType<StoredMessageV1[], Error>> {
@@ -272,7 +386,8 @@ export function createNativeExecution(options: {
       const previousRequestId = yield* store.getLatestCanonicalRequestId(input.threadId);
       if (!previousRequestId) {
         yield* store.setInputCanonicalHistoryStart(input.id, input.requestId);
-        return Result.ok([message]);
+        const posts = yield* includeDeliveredPosts(input, []);
+        return Result.ok([...posts, message]);
       }
       const previous = yield* (
         options.transcriptStore.getRequestTranscript?.({ requestId: previousRequestId }) ??
@@ -292,7 +407,8 @@ export function createNativeExecution(options: {
         input.id,
         history.messages.length > 0 ? (history.firstRequestId ?? input.requestId) : input.requestId,
       );
-      return Result.ok([...history.messages, message]);
+      const messages = yield* includeDeliveredPosts(input, history.messages);
+      return Result.ok([...messages, message]);
     });
   }
 
@@ -604,7 +720,7 @@ export function createNativeExecution(options: {
     return Result.all(await Promise.all(publications.values())).map(() => undefined);
   }
 
-  function context(actorId: string, threadId: string) {
+  function canonicalContext(actorId: string, threadId: string) {
     return Result.gen(function* () {
       const thread = yield* store.authorizeThread(actorId, threadId);
       const evaluatedAt = options.now?.() ?? Date.now();
@@ -672,6 +788,29 @@ export function createNativeExecution(options: {
         hasSummary,
         summarizedBeforePosition,
         expiresAt: active ? undefined : contextExpiry(thread, first, latest, evaluatedAt),
+      });
+    });
+  }
+
+  function context(actorId: string, threadId: string) {
+    return Result.gen(function* () {
+      const result = yield* canonicalContext(actorId, threadId);
+      const thread = yield* store.authorizeThread(actorId, threadId);
+      if (thread.kind !== "dm") return Result.ok(result);
+      const active = thread.activeRunId
+        ? yield* store.getInputByRequestId(thread.activeRunId)
+        : null;
+      const gapMs = options.getDmContextGapMs?.() ?? DEFAULT_DM_CONTEXT_GAP_MS;
+      const session = yield* store.selectSessionWindow(threadId, {
+        gapMs,
+        at: active?.createdAt ?? result.evaluatedAt,
+        beforePosition: active ? active.position + 1 : undefined,
+      });
+      return Result.ok({
+        ...result,
+        firstTurnPosition: session.firstPosition,
+        expiresAt:
+          active || session.firstPosition === null ? undefined : session.latestAt + gapMs + 1,
       });
     });
   }

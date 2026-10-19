@@ -1949,24 +1949,73 @@ export class NativeStore {
     threadId: string,
     options: { gapMs: number; at: number },
   ): NativeStoreResult<NativeInputRecord | null> {
+    return this.selectSessionWindow(threadId, options).andThen((session) => {
+      const firstPosition = session.firstPosition;
+      if (firstPosition === null) return Result.ok(null);
+      return this.readRows(
+        `SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND i.position>=? AND ${CANONICAL_INPUT_FILTER} ORDER BY i.position LIMIT 1`,
+        [threadId, firstPosition],
+      ).map((records) => {
+        const record = records[0];
+        return record?.kind === "input" ? record.value : null;
+      });
+    });
+  }
+
+  selectSessionWindow(
+    threadId: string,
+    options: { gapMs: number; at: number; beforePosition?: number; includePosts?: boolean },
+  ): NativeStoreResult<{
+    firstPosition: number | null;
+    firstAt: number | null;
+    postedTurns: ReadyTurnSlot[];
+    latestAt: number;
+  }> {
     return nativeStoreTransaction(this.db, () => {
       const statement = this.db.prepare<
-        { id: string; created_at: number; completed_at: number },
-        [string]
+        {
+          id: string;
+          position: number;
+          posted: number;
+          created_at: number | null;
+          completed_at: number | null;
+        },
+        [string, number]
       >(
-        `SELECT i.id,json_extract(i.data_json,'$.value.createdAt') created_at,json_extract(i.data_json,'$.value.completedAt') completed_at FROM native_records i INDEXED BY native_records_thread_position WHERE i.kind='input' AND i.thread_id=? AND ${CANONICAL_INPUT_FILTER} ORDER BY i.position DESC`,
+        `SELECT t.id,t.position,json_extract(t.data_json,'$.value.messages[0].id')=t.id AS posted,
+          COALESCE((SELECT MIN(json_extract(m.value,'$.metadata.createdAt')) FROM json_each(t.data_json,'$.value.messages') m),json_extract(t.data_json,'$.value.startedAt')) created_at,
+          MAX(COALESCE(json_extract(t.data_json,'$.value.settledAt'),0),
+            COALESCE((SELECT MAX(json_extract(i.data_json,'$.value.completedAt')) FROM native_records i WHERE i.kind='input' AND i.thread_id=t.thread_id AND i.position=t.position),0),
+            COALESCE((SELECT MAX(json_extract(m.value,'$.metadata.createdAt')) FROM json_each(t.data_json,'$.value.messages') m),0)) completed_at
+        FROM native_records t INDEXED BY native_records_thread_position
+        WHERE t.kind='turn' AND t.thread_id=? AND t.position<? ORDER BY t.position DESC`,
       );
-      let startId: string | undefined;
+      const ids: string[] = [];
+      let firstPosition: number | null = null;
+      let firstAt: number | null = null;
       let nextAt = options.at;
-      for (const row of statement.iterate(threadId)) {
+      let latestAt = 0;
+      for (const row of statement.iterate(
+        threadId,
+        options.beforePosition ?? Number.MAX_SAFE_INTEGER,
+      )) {
+        if (row.created_at === null || row.completed_at === null || row.created_at > options.at)
+          continue;
         if (nextAt - row.completed_at > options.gapMs) break;
-        startId = row.id;
+        latestAt = Math.max(latestAt, row.completed_at);
+        firstPosition = row.position;
+        firstAt = row.created_at;
+        if (row.posted && options.includePosts) ids.push(row.id);
         nextAt = row.created_at;
       }
       statement.finalize();
-      if (!startId) return Result.ok(null);
-      return this.readRecord("input", startId).map((record) =>
-        record?.kind === "input" ? record.value : null,
+      return Result.all(ids.toReversed().map((id) => this.readRecord("turn", id))).map(
+        (records) => ({
+          firstPosition,
+          firstAt,
+          postedTurns: records.flatMap((record) => (record?.kind === "turn" ? [record.value] : [])),
+          latestAt,
+        }),
       );
     });
   }

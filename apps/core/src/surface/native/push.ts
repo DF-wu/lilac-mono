@@ -127,6 +127,19 @@ export class NativePush {
     this.stopListening = this.store.subscribe((threadId) => this.changed(threadId));
   }
 
+  posted(threadId: string) {
+    const subscriptions = this.db
+      .query<Subscription, []>("SELECT * FROM native_push_subscriptions")
+      .all();
+    for (const userId of new Set(subscriptions.map((entry) => entry.user_id))) {
+      const thread = this.store
+        .getThread(userId, threadId)
+        .match({ ok: (value) => value, err: () => undefined });
+      if (!thread || thread.archived || !thread.capabilities.read) continue;
+      this.notify(userId, threadId, "completion", subscriptions);
+    }
+  }
+
   private changed(threadId: string) {
     if (!threadId) return;
     const subscriptions = this.db
@@ -149,27 +162,38 @@ export class NativePush {
       const previous = this.working.get(key);
       this.working.delete(key);
       if (!previous || thread.revision <= previous.revision) continue;
-      if (
-        [...this.viewing.values()].some(
-          (viewing) =>
-            viewing.userId === userId &&
-            viewing.threadId === threadId &&
-            viewing.until > Date.now(),
-        )
+      this.notify(
+        userId,
+        threadId,
+        thread.displayStatus === "error" ? "failure" : "completion",
+        subscriptions,
+      );
+    }
+  }
+
+  private notify(
+    userId: string,
+    threadId: string,
+    kind: "completion" | "failure",
+    subscriptions: Subscription[],
+  ) {
+    if (
+      [...this.viewing.values()].some(
+        (viewing) =>
+          viewing.userId === userId && viewing.threadId === threadId && viewing.until > Date.now(),
       )
-        continue;
-      const kind = thread.displayStatus === "error" ? "failure" : "completion";
-      const payload = this.store
-        .notificationContent(userId, threadId)
-        .match({ ok: (value) => value, err: () => undefined });
-      const keys = this.keys();
-      if (!payload || !keys) continue;
-      for (const subscription of subscriptions) {
-        if (subscription.user_id !== userId || !subscription[kind]) continue;
-        const delivery = this.deliver(subscription, JSON.stringify(payload), keys);
-        this.pending.add(delivery);
-        void delivery.finally(() => this.pending.delete(delivery));
-      }
+    )
+      return;
+    const payload = this.store
+      .notificationContent(userId, threadId)
+      .match({ ok: (value) => value, err: () => undefined });
+    const keys = this.keys();
+    if (!payload || !keys) return;
+    for (const subscription of subscriptions) {
+      if (subscription.user_id !== userId || !subscription[kind]) continue;
+      const delivery = this.deliver(subscription, JSON.stringify(payload), keys);
+      this.pending.add(delivery);
+      void delivery.finally(() => this.pending.delete(delivery));
     }
   }
 

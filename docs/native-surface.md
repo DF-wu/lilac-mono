@@ -305,11 +305,15 @@ Bootstrap creates it on first use. Its history stays available indefinitely. Sha
 archiving, deletion, rewind, and storage-retention cleanup do not apply to this conversation.
 
 Deployment settings expose "DM context gap (ms)", initially 7,200,000 ms. A request's context starts
-at the first turn after the most recent pause longer than the gap, measured from a reply's completion
-to the next message. The start stays fixed while the conversation continues, so the model sees a
+at the first visible turn after the most recent pause longer than the gap. Delivered heartbeat and
+surface messages participate in the same time group as human messages and primary replies. The gap
+runs from a reply's completion or a delivered post's timestamp to the next message. The start stays
+fixed while the conversation continues, so the model sees a
 stable prefix. A request sent after a longer pause starts with no earlier history. Automatic or manual
 compaction bounds a long session. Older messages remain searchable by their owner. An owner account cannot browse another user's DM.
 The agent receives a brief instruction to follow the current topic in a mixed-topic conversation.
+Delivered posts in that group enter the next primary request in timeline order without starting a run
+themselves. Existing posts are included from retained display history; no database migration is needed.
 
 The DM shows a timestamp above the first turn and above any turn sent at least "DM timestamp gap (ms)"
 after the previous one, initially 1,800,000 ms, or on a new day. The turn where the selected context
@@ -324,7 +328,9 @@ skills, or attachments. Recent direct messages survive a shortened gap that excl
 
 Settings → Notifications has separate event choices and a Background push toggle. Enabling background
 push registers this browser with Core, which sends encrypted Web Push when a response finishes or a
-run fails. Notifications show Lilac, the thread title, and a short assistant-response preview. Clicking
+run fails. A surface post that does not start a run also sends a push under the completion preference,
+unless the send uses `silent: true`. Notifications show Lilac, the thread title, and a short
+assistant-response preview. Clicking
 opens the thread. Viewing a visible, focused thread suppresses that user's background pushes on all
 devices, even when push is disabled or unsupported on the viewing device. Focus clears when the tab
 is hidden or blurred; disconnected tabs expire after 60 seconds without a presence heartbeat.

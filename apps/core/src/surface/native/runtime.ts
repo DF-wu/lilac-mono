@@ -249,6 +249,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       requestModelOverride: modelId,
     }).map((plan) => toDurableResolvedModelPlan(plan, cfg.agent.reasoningDisplay));
   };
+  const push = new NativePush(database, store);
   const adapter = new NativeSurfaceAdapter({
     store,
     surface,
@@ -257,6 +258,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     shouldTriggerRun: () => deployment().crossThreadSend.triggerRun,
     streamingMode: () => deployment().outputStreaming,
     kick,
+    notifyPostedMessage: (threadId) => push.posted(threadId),
   });
   const descriptor = createNativeSurfaceRuntimeDescriptor({
     adapter,
@@ -302,7 +304,6 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     live: options.runner,
     streamingMode: () => deployment().outputStreaming,
   });
-  const push = new NativePush(database, store);
   const services = createNativeRpcServices({
     push,
     computer: new NativeComputer(store, options.mcpRegistry),

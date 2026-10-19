@@ -4,6 +4,8 @@ import { Result } from "better-result";
 import { WebPushError, type sendNotification } from "web-push";
 import { NativePush, allowedPushEndpoint } from "./push";
 import { NativeStore } from "./store";
+import { NativeSurfaceAdapter } from "./adapter";
+import { NativeSurfaceStore } from "./store-surface";
 
 function fixture(
   send: typeof sendNotification = async () => ({ statusCode: 201, headers: {}, body: "" }),
@@ -218,3 +220,47 @@ test("enabling push during a run delivers its completion", async () => {
   expect(JSON.parse(sent[0]!).threadId).toBe(f.thread.id);
   f.db.close();
 });
+
+for (const mode of ["notify", "silent", "viewed", "disabled"] as const) {
+  test(`surface post without a run respects notification policy: ${mode}`, async () => {
+    const sent: string[] = [];
+    const f = fixture(async (_subscription, payload) => {
+      sent.push(String(payload));
+      return { statusCode: 201, headers: {}, body: "" };
+    });
+    const target = f.store.ensureDirectThread("alice").unwrap();
+    const surface = new NativeSurfaceStore(f.db, f.store);
+    surface.initialize().unwrap();
+    const kicks: string[] = [];
+    const adapter = new NativeSurfaceAdapter({
+      store: f.store,
+      surface,
+      shouldTriggerRun: () => true,
+      kick: (id) => {
+        kicks.push(id);
+      },
+      notifyPostedMessage: (id) => f.push.posted(id),
+    }).forRequest({ principalId: "alice", sourceThreadId: f.thread.id });
+    if (mode === "viewed")
+      f.push.presence("alice", { threadId: target.id, clientId: "view" }).unwrap();
+    if (mode === "disabled")
+      f.push.subscribe("alice", { ...f.subscription, completion: false }).unwrap();
+    (
+      await adapter.sendMsg(
+        { platform: "native", channelId: target.id },
+        { text: "Notification without a run" },
+        { suppressRun: true, silent: mode === "silent" },
+      )
+    ).unwrap();
+    await f.push.stop();
+    expect(kicks).toEqual([]);
+    expect(f.store.listPendingInputs(target.id).unwrap()).toEqual([]);
+    expect(sent).toHaveLength(mode === "notify" ? 1 : 0);
+    if (mode === "notify")
+      expect(JSON.parse(sent[0]!)).toMatchObject({
+        threadId: target.id,
+        body: "Notification without a run",
+      });
+    f.db.close();
+  });
+}

@@ -64,6 +64,7 @@ export type NativeAdapterDependencies = {
   readonly resolveModel?: (modelId?: string) => Result<DurableResolvedModelRequest, Error>;
   readonly streamingMode?: () => "paragraph" | "complete";
   readonly kick: (threadId: string) => void;
+  readonly notifyPostedMessage?: (threadId: string) => void;
   readonly now?: () => number;
 };
 
@@ -546,6 +547,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
       yield* this.dependencies.store
         .postMessage(request.principalId, ref.channelId, message)
         .mapError((error) => nativeSurfaceError("send-message", error));
+      if (!opts?.silent) this.dependencies.notifyPostedMessage?.(ref.channelId);
       return Result.ok({ platform: "native" as const, channelId: ref.channelId, messageId: id });
     }, this);
   }

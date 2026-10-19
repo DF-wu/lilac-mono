@@ -1,3 +1,4 @@
+import { ContextMenuItem } from "./ui/context-menu";
 import { useState } from "react";
 import { FaceSlightlySmilingPlus } from "lucide-react";
 import type { DisplayPart } from "@stanley2058/lilac-client-protocol";
@@ -53,10 +54,12 @@ export function AddReaction({
   messageId,
   items,
   disabled,
+  menu,
 }: {
   messageId: string;
   items: Reaction[];
   disabled?: boolean;
+  menu?: boolean;
 }) {
   const { canEdit, onReaction } = useMessageServices();
   const [open, setOpen] = useState(false);
@@ -68,8 +71,17 @@ export function AddReaction({
   }
   return (
     <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger render={<IconButton label="Add reaction" disabled={!canEdit || disabled} />}>
+      <PopoverTrigger
+        render={
+          menu ? (
+            <ContextMenuItem closeOnClick={false} disabled={!canEdit || disabled} />
+          ) : (
+            <IconButton label="Add reaction" disabled={!canEdit || disabled} />
+          )
+        }
+      >
         <FaceSlightlySmilingPlus />
+        {menu ? "Add reaction" : null}
       </PopoverTrigger>
       <PopoverContent aria-label="Choose a reaction" className="w-64 p-2" align="end">
         <div className="grid grid-cols-6 gap-1">
