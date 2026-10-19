@@ -929,7 +929,16 @@ test("authenticated heartbeat discovers native history and delivers to a chosen 
     expect(f.store.listPendingInputs().unwrap()).toHaveLength(0);
     expect(f.kicks).toEqual([]);
     const messages = (await f.scoped.listMsg(f.ref)).unwrap();
-    expect(messages.some((m) => m.text === "Forecast changed")).toBe(true);
+    const delivered = messages.find((m) => m.text === "Forecast changed");
+    expect(delivered).toBeDefined();
+    const displayed = f.surface
+      .readMessage("owner", f.source.id, delivered!.ref.messageId)
+      .unwrap()!.message;
+    expect(displayed).toMatchObject({
+      role: "assistant",
+      metadata: { authorId: "lilac", phase: "final" },
+      parts: [{ type: "text", text: "Forecast changed" }],
+    });
     expect(
       JSON.stringify(await call("surface.activities.recentAgentWrites", { client: "native" })),
     ).toContain("Forecast changed");

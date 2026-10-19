@@ -493,6 +493,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         id,
         role: "assistant",
         metadata: {
+          phase: "final",
           authorId: this.serviceUserId,
           createdAt: (this.dependencies.now ?? Date.now)(),
           ...(opts?.replyTo ? { replyToMessageId: opts.replyTo.messageId } : {}),
