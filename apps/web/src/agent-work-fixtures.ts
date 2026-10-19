@@ -526,6 +526,41 @@ const foldedActivityMessages = [
 
 export const agentWorkStages: AgentWorkStage[] = [
   {
+    id: "surface-message",
+    label: "Cross-thread message",
+    description: "An incoming agent message stays visible above the destination run's work.",
+    frames: [
+      {
+        ...turn([], "complete"),
+        messages: [
+          {
+            ...message(
+              "demo_surface_message",
+              [{ type: "text", text: "Notification test. Did your phone blink?" }],
+              "final",
+            ),
+            metadata: {
+              authorId: "demo_agent",
+              createdAt: demoTime,
+              phase: "final",
+              inputId: "demo_surface_input",
+              inputMode: "prompt",
+            },
+          },
+          message("demo_surface_recall", [
+            activity(
+              "demo_surface_recall",
+              "tool",
+              "conversation_thread_search auto-injected metadata",
+              "complete",
+              "Related conversation context was added to the destination run.",
+            ),
+          ]),
+        ],
+      },
+    ],
+  },
+  {
     id: "sent",
     label: "Message sent",
     description: "The agent shows Thinking immediately after sending.",

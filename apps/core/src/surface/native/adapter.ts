@@ -507,6 +507,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
       if (
         trigger &&
         !request.suppressRun &&
+        !opts?.suppressRun &&
         ref.channelId !== request.sourceThreadId &&
         this.dependencies.shouldTriggerRun()
       ) {

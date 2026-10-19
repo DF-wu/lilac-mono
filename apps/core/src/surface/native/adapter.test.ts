@@ -754,6 +754,23 @@ test("DM aliases resolve per authenticated user and surface tools return concret
   (
     await tool.call(
       "surface.messages.send",
+      { client: "native", sessionId: "dm", text: "Notification only", suppressRun: true },
+      { context },
+    )
+  ).unwrap();
+  expect(f.store.listPendingInputs().unwrap()).toHaveLength(0);
+  expect(f.kicks).toEqual([]);
+  const notification = (
+    await f.scoped.listMsg({ platform: "native", channelId: ownerDm.id })
+  ).unwrap()[0]!;
+  expect(notification.text).toBe("Notification only");
+  expect(
+    f.surface.readMessage("owner", ownerDm.id, notification.ref.messageId).unwrap()?.message
+      .metadata?.phase,
+  ).toBe("final");
+  (
+    await tool.call(
+      "surface.messages.send",
       { client: "native", sessionId: "dm", text: "For my DM" },
       { context },
     )
@@ -763,6 +780,8 @@ test("DM aliases resolve per authenticated user and surface tools return concret
       .unwrap()
       .map((message) => message.text),
   ).toContain("For my DM");
+  expect(f.store.listPendingInputs().unwrap()).toHaveLength(1);
+  expect(f.kicks).toEqual([ownerDm.id]);
   const other = f.adapter.forRequest({
     principalId: "other",
     sourceThreadId: f.destination.id,

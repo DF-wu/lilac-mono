@@ -143,6 +143,10 @@ values once without rewriting the YAML file. Later YAML edits do not override da
 Saves reject stale revisions. New title jobs, output attempts, selections, and retention passes use
 the latest settings; active output attempts keep their original streaming mode.
 
+For a notification-only native post, pass `suppressRun: true` to `surface.messages.send`.
+The message remains visible and notification delivery is unchanged. Omit the option or pass `false`
+to follow the deployment's cross-thread execution setting. Heartbeat posts always suppress runs.
+
 Core and MCP configuration editors are also owner-only. Save validates and atomically updates the
 selected file, using revisions to reject concurrent edits. Core keeps its existing reload behavior. MCP
 Save writes the document; Reload applies it through the existing MCP registry. The UI does not edit

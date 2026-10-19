@@ -572,10 +572,21 @@ function AgentTurn(props: TurnProps) {
   const firstUser = slot.messages.find(
     (message) => message.role === "user" && message.metadata?.inputMode !== "steer",
   );
+  const incomingMessage = slot.messages.find(
+    (message) =>
+      message.role === "assistant" &&
+      message.metadata?.inputId &&
+      message.metadata.inputMode !== "steer",
+  );
   const settled = slot.state === "complete" || slot.state === "failed" || slot.state === "canceled";
   const remaining = useMemo(
-    () => groupActivityMessages(slot.messages.filter((message) => message.id !== firstUser?.id)),
-    [slot.messages, firstUser?.id],
+    () =>
+      groupActivityMessages(
+        slot.messages.filter(
+          (message) => message.id !== firstUser?.id && message.id !== incomingMessage?.id,
+        ),
+      ),
+    [slot.messages, firstUser?.id, incomingMessage?.id],
   );
   // Start times never change, so one stable map keeps streaming updates from rerendering every row.
   const [times] = useState(() => new Map<string, number>());
@@ -586,7 +597,8 @@ function AgentTurn(props: TurnProps) {
   const intermediate = remaining.slice(0, lastIntermediate + 1);
   const finals = remaining.slice(lastIntermediate + 1);
   const identities = useContext(MessageIdentityContext);
-  const startedAt = slot.startedAt ?? firstUser?.metadata?.createdAt;
+  const startedAt =
+    slot.startedAt ?? firstUser?.metadata?.createdAt ?? incomingMessage?.metadata?.createdAt;
   const duration =
     startedAt !== undefined && slot.settledAt !== undefined
       ? Math.max(0, slot.settledAt - startedAt)
@@ -624,6 +636,16 @@ function AgentTurn(props: TurnProps) {
                 ) : null}
               </>
             }
+          />
+        </div>
+      ) : null}
+      {incomingMessage ? (
+        <div className="mb-6">
+          <MessageBody
+            message={incomingMessage}
+            live={props.animateArrivals ?? true}
+            showAvatar
+            showControls
           />
         </div>
       ) : null}

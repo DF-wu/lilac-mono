@@ -190,6 +190,7 @@ export type ContentOpts = {
 
 export type SendOpts = {
   replyTo?: MsgRef;
+  suppressRun?: boolean;
   /** Notify the author of replyTo. Shared action cards otherwise remain quiet. */
   notifyReply?: boolean;
   /** Disable all Discord notifications for this send (mentions + reply ping). */

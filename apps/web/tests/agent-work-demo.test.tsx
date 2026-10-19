@@ -351,6 +351,22 @@ test("a sent prompt immediately shows thinking and suppresses the queue marker",
   expect(html.match(/aria-label="About Lilac"/gu)).toHaveLength(1);
 });
 
+test("incoming surface messages remain visible outside folded destination work", () => {
+  const frame = agentWorkStages.find((stage) => stage.id === "surface-message")!.frames[0]!;
+  for (const phase of ["final", undefined] as const) {
+    const slot = {
+      ...frame,
+      messages: frame.messages.map((message, index) =>
+        index === 0 ? { ...message, metadata: { ...message.metadata, phase } } : message,
+      ),
+    };
+    const html = renderStage("surface-message", slot);
+    expect(html).toContain("Notification test. Did your phone blink?");
+    expect(html.indexOf("Notification test.")).toBeLessThan(html.indexOf('data-ui="work-summary"'));
+    expect(html).not.toContain("Related conversation context was added");
+  }
+});
+
 test("work duration uses the prompt timestamp for older turns without a start timestamp", () => {
   const complete = agentWorkStages.find((stage) => stage.id === "complete")!.frames[0]!;
   expect(renderStage("complete", { ...complete, startedAt: undefined })).toContain(
