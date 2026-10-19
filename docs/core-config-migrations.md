@@ -189,7 +189,9 @@ New v2 fields:
   auto-injected metadata; defaults to `0.1`.
 - `conversation.thread.autoInject.expansionMinConfidence`: minimum ranking confidence for optional
   auto-injected results after the single recall-floor result; accepts `0` through `1` and defaults to
-  `0.57`. Frozen v1 configs receive the same universal default but cannot override it.
+  `0.65`. Frozen v1 configs receive the same universal default but cannot override it.
+  The default increased from `0.57` after production recall auditing. Explicit v2 overrides
+  retain their configured value; remove the override or set it to `0.65` to adopt the new cutoff.
 - `conversation.thread.autoInject.mode`: search mode (`hybrid`, `semantic`, or `lexical`); defaults to
   `hybrid`.
 - `conversation.thread.autoInject.filterCurrentParticipants`: optionally restricts search to threads

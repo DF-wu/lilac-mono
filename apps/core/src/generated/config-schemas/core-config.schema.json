@@ -1131,7 +1131,7 @@
                     },
                     "minScore": { "default": 0.1, "type": "number", "minimum": 0 },
                     "expansionMinConfidence": {
-                      "default": 0.57,
+                      "default": 0.65,
                       "type": "number",
                       "minimum": 0,
                       "maximum": 1

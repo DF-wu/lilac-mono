@@ -121,7 +121,7 @@ conversation:
       # candidate is kept when search returns one. 0.45-0.55 favors recall;
       # 0.65-0.75 favors precision. Tune this before minScore, which removes
       # candidates before confidence ranking.
-      expansionMinConfidence: 0.57
+      expansionMinConfidence: 0.65
       # Search mode for auto-injected metadata: hybrid, semantic, or lexical.
       mode: hybrid
       # Restricts Discord-origin recall of Discord threads to participants visible
