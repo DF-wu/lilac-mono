@@ -433,7 +433,7 @@ const cronExpr5Schema = z
 const heartbeatOutputSessionSchema = z
   .string()
   .trim()
-  .regex(/^(discord|github)\/.+$/u, "expected <client>/<sessionIdOrAlias>");
+  .regex(/^(discord|github|native)\/.+$/u, "expected <client>/<sessionIdOrAlias>");
 
 export const heartbeatSchema = z
   .object({

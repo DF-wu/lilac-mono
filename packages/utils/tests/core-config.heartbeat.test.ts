@@ -42,29 +42,35 @@ describe("core-config heartbeat", () => {
     ).toThrow("surface.heartbeat.every has been removed; use surface.heartbeat.cron");
   });
 
-  it("accepts a valid default output session", () => {
-    const parsed = coreConfigSchema.parse({
-      surface: {
-        heartbeat: {
-          enabled: true,
-          defaultOutputSession: "discord/ops",
-        },
-      },
-    });
-
-    expect(parsed.surface.heartbeat.defaultOutputSession).toBe("discord/ops");
-  });
-
-  it("rejects an invalid default output session format", () => {
-    expect(() =>
-      coreConfigSchema.parse({
+  it.each(["discord/ops", "github/owner/repo#1", "native/thread-123"])(
+    "accepts default output session %s",
+    (destination) => {
+      const parsed = coreConfigSchema.parse({
         surface: {
           heartbeat: {
             enabled: true,
-            defaultOutputSession: "ops",
+            defaultOutputSession: destination,
           },
         },
-      }),
-    ).toThrow("expected <client>/<sessionIdOrAlias>");
-  });
+      });
+
+      expect(parsed.surface.heartbeat.defaultOutputSession).toBe(destination);
+    },
+  );
+
+  it.each(["ops", "native/", "unsupported/thread-123"])(
+    "rejects invalid default output session %s",
+    (destination) => {
+      expect(() =>
+        coreConfigSchema.parse({
+          surface: {
+            heartbeat: {
+              enabled: true,
+              defaultOutputSession: destination,
+            },
+          },
+        }),
+      ).toThrow("expected <client>/<sessionIdOrAlias>");
+    },
+  );
 });
