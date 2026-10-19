@@ -147,7 +147,22 @@ export const nativeAgentStreamRecordSchema = z.strictObject({
 const storedDeploymentSettingsSchema = nativeDeploymentSettingsSchema
   .extend({ dmContextMaxAgeMs: z.number().int().positive().optional() })
   .transform(({ dmContextMaxAgeMs: _legacy, ...settings }) => settings);
+export const nativeSendGroupSchema = z.strictObject({
+  id,
+  requestId: id,
+  deliveryId: id.optional(),
+  transcriptRequestId: id.optional(),
+  actorId: id,
+  threadId: id,
+  historyGeneration: revision,
+  settled: z.boolean(),
+  delivered: z.boolean(),
+  messages: z.array(z.strictObject({ message: displayMessageSchema, silent: z.boolean() })),
+});
+export type NativeSendGroup = z.infer<typeof nativeSendGroupSchema>;
+
 export const nativeRecordSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("send-group"), value: nativeSendGroupSchema }),
   z.strictObject({
     kind: z.literal("deployment"),
     value: z.strictObject({ settings: storedDeploymentSettingsSchema, revision }),

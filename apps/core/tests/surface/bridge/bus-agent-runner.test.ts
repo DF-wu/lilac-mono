@@ -96,6 +96,7 @@ import {
   planDeferredSubagentBoundary,
   maybeBuildAutoInjectedThreadSearchMessages,
   buildPersistedHeartbeatMessages,
+  persistHeartbeatSurfaceHandoffs,
   buildSurfaceMetadataOverlay,
   corePrimaryLineageHasCompactionCheckpoint,
   isActiveRuntimeModelCompatible,
@@ -14040,3 +14041,54 @@ function readGeneratedPayload(messages: readonly ModelMessage[]) {
   if (body?.type !== "text") throw new Error("expected generated payload");
   return JSON.parse(body.text);
 }
+
+it("persists heartbeat handoff before deferred messages have surface references", () => {
+  const store = new SqliteTranscriptStore(":memory:");
+  try {
+    persistHeartbeatSurfaceHandoffs({
+      logger: createLogger({}),
+      transcriptStore: store,
+      requestId: "heartbeat:deferred",
+      requestClient: "unknown",
+      sessionId: "__heartbeat__",
+      modelLabel: "test",
+      responseMessages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "send",
+              toolName: "surface.messages.send",
+              input: { client: "native", sessionId: "dm", text: "Forecast changed" },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "send",
+              toolName: "surface.messages.send",
+              output: { type: "json", value: { status: "queued" } },
+            },
+          ],
+        },
+        { role: "assistant", content: "HEARTBEAT_OK" },
+      ],
+    });
+    const transcript = store
+      .getRequestTranscript({ requestId: "heartbeat:deferred:heartbeat-handoff:deferred" })
+      .unwrap();
+    expect(transcript?.finalText).toBe("Forecast changed");
+    expect(JSON.stringify(transcript?.messages)).toContain("Forecast changed");
+    expect(
+      store.listSurfaceMessagesForRequest({
+        requestId: "heartbeat:deferred:heartbeat-handoff:deferred",
+      }),
+    ).toEqual([]);
+  } finally {
+    store.close();
+  }
+});

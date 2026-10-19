@@ -1,5 +1,26 @@
 # MIGRATIONS.md
 
+## Native schema 4: deferred surface sends
+
+Native `surface.messages.send` calls with effective `suppressRun=true`, including heartbeat, now
+return `{ ok: true, status: "queued", message, session }` without a message reference. Other sends
+retain their existing result and run-triggering behavior. Deploy Core and its tools together.
+
+Schema 4 stores request-grouped sends in native records. Groups retain first-send order per destination
+and become visible only after the sender settles and the destination has no active or pending input.
+Lifecycle bus events wake delivery checks; the durable request outcome distinguishes settlement from
+recoverable failure. Startup and maintenance reconcile retained groups, and runner settlement wakes
+delivery immediately. Repeated delivery does not duplicate messages. Pending
+messages remain absent from history, search and transcript links. Attachments retain their bytes while
+pending. Deleting a destination removes its groups; a history-generation change or lost write access
+discards pending groups when delivery is checked. Completed groups retain delivery links for recovery. Heartbeat handoffs are prepared before settlement
+and linked only after delivery.
+There is no expiry, coalescing, operation-status API, or change to edits and deletes.
+
+Existing data needs no rewrite. Older binaries reject schema 4; rollback requires a pre-upgrade backup.
+Existing customized HEARTBEAT.md files remain unchanged. A queued acknowledgment means acceptance;
+heartbeat should continue and avoid resending the same finding while it waits for delivery.
+
 ## File-based heartbeat workflow and native agent access
 
 No config version, wire schema, or database schema changes. Core seeds missing `prompts/HEARTBEAT.md`

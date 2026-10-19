@@ -92,6 +92,11 @@ admits execution. Stable delivery identities bridge these stores; the native sur
 second model-execution queue. Each human user also has one permanent native DM, with gap-based
 context sessions and manual compaction through the shared agent engine. DM display history
 is retained, and search/read authority remains restricted to its starter. Starter authority and history generation are rechecked at admission.
+Native surface-tool sends with effective `suppressRun=true` are persisted in request groups. The request
+lifecycle bus closes groups; native thread activity gates atomic delivery in first-group order. The tool
+returns a queued acknowledgment while messages remain absent from history. Normal sends retain their
+existing cross-thread execution behavior. See [native deferred-send migration](MIGRATIONS.md#native-schema-4-deferred-surface-sends).
+
 Semantic output uses the nonexpiring `evt.native.output` topic. Projection and deduplication receipts
 commit before bus acknowledgement; WAL checkpoints wait for the output publication frontier they
 cover. Rewind fences the discarded generation, waits for runner cancellation, reconciles canonical

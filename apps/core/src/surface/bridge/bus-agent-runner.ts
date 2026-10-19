@@ -151,6 +151,7 @@ import { isHeartbeatAckText, isHeartbeatSessionId } from "../../heartbeat/common
 
 import {
   buildHeartbeatHandoffTranscript,
+  heartbeatDeferredHandoffRequestId,
   extractHeartbeatSurfaceSendHandoffs,
   HEARTBEAT_HANDOFF_SESSION_ID,
 } from "../../transcript/heartbeat-handoff";
@@ -1812,7 +1813,7 @@ function buildHeartbeatHandoffRequestId(requestId: string, index: number): strin
   return `${requestId}:heartbeat-handoff:${index + 1}`;
 }
 
-function persistHeartbeatSurfaceHandoffs(params: {
+export function persistHeartbeatSurfaceHandoffs(params: {
   logger: ReturnType<typeof createLogger>;
   transcriptStore: TranscriptStore;
   requestId: string;
@@ -1826,11 +1827,35 @@ function persistHeartbeatSurfaceHandoffs(params: {
   const refs = params.transcriptStore.listSurfaceMessagesForRequest?.({
     requestId: params.requestId,
   });
-  if (!refs || refs.length === 0) return;
-
   const extracted = extractHeartbeatSurfaceSendHandoffs(params.responseMessages);
   const fallback = buildHeartbeatHandoffTranscript(params.responseMessages);
   if (!fallback) return;
+
+  if (extracted.length > 0) {
+    const deferredMessages = projectStoredMessagesV1(fallback.messages);
+    const saved = deferredMessages.andThen((messages) =>
+      params.transcriptStore.saveRequestTranscript({
+        requestId: heartbeatDeferredHandoffRequestId(params.requestId),
+        sessionId: HEARTBEAT_HANDOFF_SESSION_ID,
+        requestClient: params.requestClient,
+        messages,
+        finalText: extracted
+          .map((handoff) => handoff.finalText)
+          .filter(Boolean)
+          .join("\n\n"),
+        modelLabel: params.modelLabel,
+      }),
+    );
+    saved.match({
+      ok: () => undefined,
+      err: (error) =>
+        params.logger.warn(
+          "deferred heartbeat handoff persistence failed",
+          formatBridgeTaggedErrorForLog(error, { requestId: params.requestId }),
+        ),
+    });
+  }
+  if (!refs || refs.length === 0) return;
 
   if (extracted.length !== refs.length) {
     params.logger.warn("heartbeat handoff transcript count mismatch", {

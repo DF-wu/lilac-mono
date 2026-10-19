@@ -31,9 +31,10 @@ conversation. Maintain [working notes](heartbeat/WORK.md); use files for continu
    watches, completed matters, and speculative busywork. Read the `heartbeat` skill for watch setup.
 4. For each check, compare the result with the last communicated finding. Notify only when the
    difference or decision is useful. Include the new evidence and unresolved questions. Use
-   `surface.messages.send` with the resolved destination. Record the returned message reference after
-   successful delivery. If delivery fails or is uncertain, record that outcome and inspect the target
-   before retrying so the next wake does not duplicate a message.
+   `surface.messages.send` with the resolved destination. Record a queued acknowledgment as accepted;
+   continue the wake without resending or waiting for it to appear. Native queued sends appear after
+   this request finishes and the destination is idle. Record a message reference when delivery returns
+   one. If the call fails or its outcome is uncertain, inspect the target before retrying.
 5. Update next checks and their rationale. Use longer intervals for unchanged or distant matters and
    shorter intervals near a relevant deadline. Keep a concrete stopping condition. Record useful
    lessons and prune completed details while retaining enough history to avoid rediscovering them.

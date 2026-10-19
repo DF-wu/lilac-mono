@@ -1,3 +1,4 @@
+import { reconcileNativeDeferredSends, subscribeNativeDeferredSends } from "./deferred-sends";
 import { NativePush } from "./push";
 import { NativeComputer } from "./computer";
 import { NativeReferences } from "./references";
@@ -234,6 +235,10 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   const initializationError = initialized.match({ ok: () => null, err: (error) => error });
   if (initializationError) return Result.err(initializationError);
   const kick = (threadId: string) => {
+    flushSurfaceSends(threadId).match({
+      ok: () => undefined,
+      err: (error) => options.warn("Native deferred sends delayed", error),
+    });
     void execution.kick(threadId).then((result) =>
       result.match({
         ok: () => undefined,
@@ -406,6 +411,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   }
   let output: NativeOutputSubscription | undefined;
   let workflowOutput: NativeOutputSubscription | undefined;
+  let sendOutput: NativeOutputSubscription | undefined;
   let outputStopping = false;
   let unsubscribe: (() => void) | undefined;
   const nativeAdapterForContext: NonNullable<CoreToolPluginRuntime["nativeAdapterForContext"]> = (
@@ -474,6 +480,16 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
             .mapError((error) => nativeFailure("sqlite", error.message));
         }
       }
+      return Result.ok(undefined);
+    });
+  }
+
+  function flushSurfaceSends(threadId?: string) {
+    return Result.gen(function* () {
+      yield* reconcileNativeDeferredSends(store, options.deliveryState);
+      const delivered = yield* store.deliverSurfaceSends(threadId);
+      for (const requestId of delivered.requestIds) yield* linkProjectedMessages(requestId);
+      for (const id of delivered.notifications) push.posted(id);
       return Result.ok(undefined);
     });
   }
@@ -581,6 +597,24 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       const workflowHandle = yield* workflowStarted;
       workflowOutput = workflowHandle;
       observeOutput(workflowHandle);
+      const sendStarted = await subscribeNativeDeferredSends({
+        bus: options.bus,
+        subscriptionPrefix: options.subscriptionPrefix,
+        store,
+        flush: flushSurfaceSends,
+      });
+      const sendError = sendStarted.match({ ok: () => undefined, err: (error) => error });
+      if (sendError) {
+        yield* Result.await(workflowHandle.stop());
+        yield* Result.await(handle.stop());
+        workflowOutput = undefined;
+        output = undefined;
+        return Result.err(sendError);
+      }
+      const sendHandle = yield* sendStarted;
+      sendOutput = sendHandle;
+      observeOutput(sendHandle);
+      yield* flushSurfaceSends();
       return Result.ok(undefined);
     });
   }
@@ -753,6 +787,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     return Result.gen(async function* () {
       yield* Result.await(execution.recoverMutations());
       yield* Result.await(execution.kick());
+      yield* flushSurfaceSends();
       return Result.ok(undefined);
     });
   }
@@ -789,7 +824,9 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     output = undefined;
     const workflowActive = workflowOutput;
     workflowOutput = undefined;
-    const stopped = await Promise.all([active?.stop(), workflowActive?.stop()]);
+    const sendActive = sendOutput;
+    sendOutput = undefined;
+    const stopped = await Promise.all([active?.stop(), workflowActive?.stop(), sendActive?.stop()]);
     for (const result of stopped) if (result) nativeRuntimeResultToHost(result);
   }
   async function updateCatalog() {
@@ -816,6 +853,8 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
             }),
           );
       }
+      yield* flushSurfaceSends();
+      yield* linkProjectedMessages();
       yield* resources.reconcileReferences();
       yield* surface.pruneDeleted();
       yield* store.pruneReplay();
@@ -845,6 +884,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       ref: Parameters<typeof hydrateNativeConversationAttachments>[1],
       remainingBytes: number,
     ) => hydrateNativeConversationAttachments({ store, surface, resources }, ref, remainingBytes),
+    flushSurfaceSends,
     startOutput,
     startIngress,
     stopIngress,

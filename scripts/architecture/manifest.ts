@@ -3351,6 +3351,14 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
 const CORE_EVENT_DELIVERY_CONSUMERS = [
   {
     identity: {
+      module: "src/surface/native/deferred-sends.ts",
+      exportName: "subscribeNativeDeferredSends",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+  {
+    identity: {
       module: "src/surface/native/runtime.ts",
       exportName: "createNativeRuntime.startOutput",
     },
@@ -4782,6 +4790,11 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "NativeStore.cleanupAgentStreams",
               "NativeStore.projectTurn",
               "NativeStore.postMessage",
+              "NativeStore.queueSurfaceSend",
+              "NativeStore.hasDeferredUpload",
+              "NativeStore.settleSurfaceSends",
+              "NativeStore.listUnsettledSurfaceSends",
+              "NativeStore.deliverSurfaceSends",
               "NativeStore.acceptSurfaceInput",
               "NativeStore.updateSurfaceMessage",
               "NativeStore.registerPublishedPath",

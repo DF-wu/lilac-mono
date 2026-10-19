@@ -899,7 +899,7 @@ const messagesSendInputSchema = baseInputSchema.extend({
     .boolean()
     .optional()
     .describe(
-      "Native only: post without starting a destination agent run. Defaults to false, which follows the deployment's cross-thread execution setting. Notifications are unchanged.",
+      "Native only: queue without starting a destination agent run. Messages appear after the originating request finishes and the destination is idle. Defaults to false, which preserves cross-thread execution.",
     ),
   silent: z.coerce
     .boolean()
@@ -1075,7 +1075,8 @@ export class Surface implements ServerTool {
         }),
         "surface.messages.send": callable({
           name: "Surface Messages Send",
-          description: "Send a message to a session.",
+          description:
+            "Send a message to a session. Native suppressRun sends return a queued acknowledgment and become visible after the originating request finishes and the destination is idle.",
           inputSchema: messagesSendInputSchema,
           validation: "zod",
           primaryPositional: "text",
@@ -1216,7 +1217,7 @@ export class Surface implements ServerTool {
           ],
           replyToMessageId: "When sending a message, optionally reply to an existing messageId.",
           suppressRun:
-            "Native only: post without starting a destination agent run. Notifications are unchanged.",
+            "Native only: queue messages by originating request without starting a destination agent run. Delivery waits for the originating request to finish and the destination to have no active or pending requests. Queued messages are absent from reads until delivered.",
           silent: "When true, suppress all notifications for this send (mentions + reply ping).",
           style:
             "Discord send style: 'plain' (default) sends regular message content; 'embed' puts text in an embed.",
@@ -1958,17 +1959,25 @@ export class Surface implements ServerTool {
           })
         : Result.ok([]);
 
-      const ref = yield* surfaceOperationResult(
-        await target.resolved.adapter.sendMsg(
-          target.sessionRef,
-          {
-            text: input.text,
-            style: input.style,
-            attachments,
-          },
-          sendOpts,
-        ),
+      const content = { text: input.text, style: input.style, attachments };
+      const adapter = target.resolved.adapter;
+      const sent = yield* surfaceOperationResult(
+        adapter.sendToolMsg
+          ? await adapter.sendToolMsg(target.sessionRef, content, sendOpts)
+          : (await adapter.sendMsg(target.sessionRef, content, sendOpts)).map((ref) => ({
+              status: "sent" as const,
+              ref,
+            })),
       );
+      if (sent.status === "queued")
+        return Result.ok({
+          ok: true as const,
+          status: "queued" as const,
+          message:
+            "Message queued. It will appear after this request finishes and the destination session is idle. It is not yet included in session history.",
+          session: toSessionMeta(target.sessionRef, target.cfg),
+        });
+      const ref = sent.ref;
 
       yield* linkSentMessageToTranscript(ref, ctx);
 

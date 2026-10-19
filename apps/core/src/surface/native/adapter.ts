@@ -1,3 +1,4 @@
+import { heartbeatDeferredHandoffRequestId } from "../../transcript/heartbeat-handoff";
 import { isNativeServiceMessage } from "./message-ownership";
 import { randomUUID } from "node:crypto";
 import {
@@ -16,6 +17,7 @@ import {
   SurfacePlatformMismatch,
   SurfaceSessionMismatch,
   SurfaceUnavailable,
+  type SurfaceToolSendResult,
   type StartOutputOpts,
   type StartTypingOpts,
   type SurfaceAdapter,
@@ -53,6 +55,8 @@ export type NativeAdapterRequest = {
   readonly principalId: string;
   readonly sourceThreadId: string;
   readonly requestId?: string;
+  readonly requestDeliveryId?: string;
+  readonly heartbeat?: boolean;
   readonly suppressRun?: boolean;
 };
 export type NativeAdapterDependencies = {
@@ -196,6 +200,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
             principalId: principal.userId,
             sourceThreadId: nativeThreadId(sourceThread),
             requestId: context.requestId,
+            requestDeliveryId: context.requestDeliveryId,
           }),
         );
       }
@@ -230,6 +235,8 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
           principalId: owner.id,
           sourceThreadId: dm.id,
           requestId: context.requestId,
+          requestDeliveryId: context.requestDeliveryId,
+          heartbeat: context.controlPolicy.kind === "heartbeat",
           suppressRun: context.controlPolicy.kind === "heartbeat",
         }),
       );
@@ -417,6 +424,26 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
       return Result.ok(undefined);
     }, this);
   }
+  async sendToolMsg(
+    sessionRef: SessionRef,
+    content: ContentOpts,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<SurfaceToolSendResult>> {
+    const deferred = this.request?.suppressRun === true || opts?.suppressRun === true;
+    if (!deferred)
+      return (await this.sendMsg(sessionRef, content, opts)).map((ref) => ({
+        status: "sent",
+        ref,
+      }));
+    if (!this.request?.requestId)
+      return Result.err(
+        invalid("send-message", "requestId", "Deferred sends require an originating request"),
+      );
+    return (await this.post(sessionRef, content, opts, true, true)).map(() => ({
+      status: "queued",
+    }));
+  }
+
   async sendMsg(
     sessionRef: SessionRef,
     content: NativeContentOpts,
@@ -429,6 +456,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
     content: NativeContentOpts,
     opts: SendOpts | undefined,
     trigger: boolean,
+    deferred = false,
   ): Promise<SurfaceOperationResult<MsgRef>> {
     return Result.gen(async function* () {
       yield* Result.await(
@@ -505,6 +533,24 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         return Result.err(
           invalid("send-message", "content", "Message exceeds native display limits"),
         );
+      if (deferred && request.requestId) {
+        yield* this.dependencies.store
+          .queueSurfaceSend(
+            request.principalId,
+            ref.channelId,
+            request.requestId,
+            message,
+            opts?.silent === true,
+            {
+              deliveryId: request.requestDeliveryId,
+              transcriptRequestId: request.heartbeat
+                ? heartbeatDeferredHandoffRequestId(request.requestId)
+                : undefined,
+            },
+          )
+          .mapError((error) => nativeSurfaceError("send-message", error));
+        return Result.ok({ platform: "native" as const, channelId: ref.channelId, messageId: id });
+      }
       if (
         trigger &&
         !request.suppressRun &&

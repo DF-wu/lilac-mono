@@ -1087,3 +1087,30 @@ test("shortening the DM gap excludes delivered posts outside the selected group"
     f.close();
   }
 });
+
+test("DM context includes a deferred notification after delivery", async () => {
+  const f = fixture(undefined, true);
+  try {
+    value(
+      f.store.queueSurfaceSend(
+        "owner",
+        f.thread.id,
+        "heartbeat:deferred",
+        {
+          id: "deferred-notice",
+          role: "assistant",
+          metadata: { authorId: "lilac", createdAt: 1000, phase: "final" },
+          parts: [{ type: "text", text: "Forecast changed" }],
+        },
+        false,
+      ),
+    );
+    value(f.store.settleSurfaceSends("heartbeat:deferred"));
+    value(f.store.deliverSurfaceSends());
+    f.submit("Tell me about the forecast");
+    value(await f.execution.kick(f.thread.id));
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).toContain("Forecast changed");
+  } finally {
+    f.close();
+  }
+});

@@ -476,3 +476,100 @@ test("unscoped search keeps another user's DM private from owners", () => {
   expect(search.searchMessages("bob", { query: "distinctive", limit: 10 }).unwrap()).toEqual([]);
   store.close();
 });
+
+describe("deferred surface sends", () => {
+  function setup() {
+    const { store, db } = fixture();
+    const thread = store.createThread("owner", { commandId: "deferred" }).unwrap();
+    const send = (request: string, id: string, silent = false) =>
+      store
+        .queueSurfaceSend(
+          "owner",
+          thread.id,
+          request,
+          {
+            id,
+            role: "assistant",
+            metadata: { authorId: "lilac", createdAt: 1000, phase: "final" },
+            parts: [{ type: "text", text: id }],
+          },
+          silent,
+        )
+        .unwrap();
+    const texts = () =>
+      db
+        .query<{ text: string }, [string]>(
+          "SELECT json_extract(p.value,'$.text') AS text FROM native_records r, json_each(r.data_json,'$.value.messages') m, json_each(m.value,'$.parts') p WHERE r.kind='turn' AND r.thread_id=? AND json_extract(p.value,'$.type')='text' ORDER BY r.position,m.key,p.key",
+        )
+        .all(thread.id)
+        .map((row) => row.text);
+    return { store, db, thread, send, texts };
+  }
+
+  test("settled groups preserve first-send order, survive reopen, and deliver once", () => {
+    const f = setup();
+    f.send("A", "A-1");
+    f.send("B", "B-2");
+    f.send("A", "A-3");
+    expect(f.texts()).toEqual([]);
+    f.store.settleSurfaceSends("B").unwrap();
+    expect(f.store.deliverSurfaceSends().unwrap().notifications).toEqual([]);
+    expect(f.texts()).toEqual([]);
+    const reopened = new NativeStore(f.db);
+    reopened.initialize().unwrap();
+    reopened.settleSurfaceSends("A").unwrap();
+    expect(reopened.deliverSurfaceSends().unwrap().notifications).toEqual([f.thread.id]);
+    expect(f.texts()).toEqual(["A-1", "A-3", "B-2"]);
+    reopened.settleSurfaceSends("A").unwrap();
+    expect(reopened.deliverSurfaceSends().unwrap().notifications).toEqual([]);
+    expect(f.texts()).toEqual(["A-1", "A-3", "B-2"]);
+    expect(reopened.listProjectedMessageLinks("A").unwrap()).toEqual([
+      { requestId: "A", threadId: f.thread.id, messageIds: ["A-1", "A-3"] },
+    ]);
+    f.db.close();
+  });
+
+  test("pending user work blocks delivery; canceled work releases silent messages", () => {
+    const f = setup();
+    f.store.acceptInput("owner", prompt(f.thread.id, "user")).unwrap();
+    f.send("A", "A-1", true);
+    f.store.settleSurfaceSends("A").unwrap();
+    expect(f.store.deliverSurfaceSends().unwrap().notifications).toEqual([]);
+    expect(f.texts()).not.toContain("A-1");
+    f.store.cancelRun("owner", f.thread.id).unwrap();
+    expect(f.store.deliverSurfaceSends().unwrap().notifications).toEqual([]);
+    expect(f.texts()).toContain("A-1");
+    f.db.close();
+  });
+
+  test("deleting a destination removes open and settled groups", () => {
+    const f = setup();
+    f.send("A", "A-1");
+    f.send("B", "B-2");
+    f.store.settleSurfaceSends("B").unwrap();
+    f.store.deleteThread("owner", { threadId: f.thread.id, commandId: "delete" }).unwrap();
+    expect(f.db.query("SELECT id FROM native_records WHERE kind='send-group'").all()).toEqual([]);
+    f.store.settleSurfaceSends("A").unwrap();
+    expect(f.store.deliverSurfaceSends().unwrap().notifications).toEqual([]);
+    f.db.close();
+  });
+
+  test("a blocked destination does not hold up a different destination", () => {
+    const f = setup();
+    f.send("A", "A-1");
+    const other = f.store.createThread("owner", { commandId: "other" }).unwrap();
+    f.store
+      .queueSurfaceSend(
+        "owner",
+        other.id,
+        "B",
+        { id: "B-1", role: "assistant", parts: [{ type: "text", text: "B-1" }] },
+        false,
+      )
+      .unwrap();
+    f.store.settleSurfaceSends("B").unwrap();
+    expect(f.store.deliverSurfaceSends().unwrap().notifications).toEqual([other.id]);
+    expect(f.texts()).toEqual([]);
+    f.db.close();
+  });
+});

@@ -197,6 +197,7 @@ interface SurfaceAdapterSignatureFixture {
     input: SurfaceSendPreparationInput,
     opts?: SendOpts,
   ): Promise<SurfaceOperationResult<void>>;
+  sendToolMsg?: SurfaceAdapter["sendToolMsg"];
   sendMsg(
     sessionRef: SessionRef,
     content: ContentOpts,

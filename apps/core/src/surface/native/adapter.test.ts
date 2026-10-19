@@ -760,6 +760,8 @@ test("DM aliases resolve per authenticated user and surface tools return concret
   ).unwrap();
   expect(f.store.listPendingInputs().unwrap()).toHaveLength(0);
   expect(f.kicks).toEqual([]);
+  f.store.settleSurfaceSends("request").unwrap();
+  f.store.deliverSurfaceSends().unwrap();
   const notification = (
     await f.scoped.listMsg({ platform: "native", channelId: ownerDm.id })
   ).unwrap()[0]!;
@@ -939,12 +941,37 @@ test("authenticated heartbeat discovers native history and delivers to a chosen 
         finalText: "HEARTBEAT_OK",
       })
       .unwrap();
+    transcript
+      .saveRequestTranscript({
+        requestId: "heartbeat:test:heartbeat-handoff:deferred",
+        sessionId: "__heartbeat__:handoff",
+        requestClient: "unknown",
+        messages: [{ role: "assistant", content: "Forecast changed" }],
+        finalText: "Forecast changed",
+      })
+      .unwrap();
     const sent = await call("surface.messages.send", {
       client: "native",
       sessionId: f.source.id,
       text: "Forecast changed",
     });
-    expect(sent).toMatchObject({ status: "ok" });
+    expect(sent).toMatchObject({ status: "ok", value: { status: "queued" } });
+    expect((await f.scoped.listMsg(f.ref)).unwrap()).toHaveLength(0);
+    f.store.settleSurfaceSends("heartbeat:test").unwrap();
+    f.store.deliverSurfaceSends().unwrap();
+    for (const link of f.store.listProjectedMessageLinks("heartbeat:test").unwrap()) {
+      const refs = link.messageIds.map((messageId) => ({
+        platform: "native" as const,
+        channelId: link.threadId,
+        messageId,
+      }));
+      transcript.linkSurfaceMessagesToRequest({
+        requestId: link.requestId,
+        created: refs,
+        last: refs.at(-1)!,
+      });
+    }
+
     expect(f.store.listPendingInputs().unwrap()).toHaveLength(0);
     expect(f.kicks).toEqual([]);
     const messages = (await f.scoped.listMsg(f.ref)).unwrap();

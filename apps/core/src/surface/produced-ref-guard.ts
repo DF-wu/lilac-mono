@@ -2,6 +2,7 @@ import { Panic, Result } from "better-result";
 
 import type {
   SurfaceAdapter,
+  SurfaceToolSendResult,
   SurfaceAdapterEventSource,
   SurfaceCacheBurstProvider,
   SurfaceOperationError,
@@ -389,6 +390,35 @@ class DescriptorBoundSurfaceAdapter implements SurfaceAdapter {
       sessionRef.channelId,
     );
     return prepared;
+  }
+
+  async sendToolMsg(
+    sessionRef: SessionRef,
+    content: Parameters<SurfaceAdapter["sendMsg"]>[1],
+    opts?: Parameters<SurfaceAdapter["sendMsg"]>[2],
+  ): Promise<SurfaceOperationResult<SurfaceToolSendResult>> {
+    if (!this.adapter.sendToolMsg)
+      return (await this.sendMsg(sessionRef, content, opts)).map((ref) => ({
+        status: "sent",
+        ref,
+      }));
+    const sent = await this.adapter.sendToolMsg(sessionRef, content, opts);
+    requireOperationResult(
+      this.descriptorPlatform,
+      sent,
+      "sendToolMsg",
+      sessionRef.channelId,
+      (value) => {
+        if (value.status === "sent")
+          requireProducedMsgRef(
+            this.descriptorPlatform,
+            value.ref,
+            "sendToolMsg.result",
+            sessionRef.channelId,
+          );
+      },
+    );
+    return sent;
   }
 
   async sendMsg(

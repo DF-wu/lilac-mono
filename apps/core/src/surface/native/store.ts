@@ -33,6 +33,7 @@ import { configureSqliteConnection } from "../../shared/sqlite";
 import { nativeThreadCapabilities, type NativeThreadGrant } from "./authority";
 import {
   decodeNativeRecord,
+  type NativeSendGroup,
   type NativeHtmlPreviewRecord,
   type NativeInputRecord,
   type NativeMutationResult,
@@ -165,7 +166,7 @@ export class NativeStore {
     return nativeStoreTransaction(this.db, () => {
       const version =
         this.db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
-      if (version > 3)
+      if (version > 4)
         return Result.err(
           nativeFailure("invalid", "Native store version is newer than this build"),
         );
@@ -191,7 +192,7 @@ export class NativeStore {
         CREATE INDEX IF NOT EXISTS native_thread_preferences_order ON native_thread_preferences(user_id,section,position,thread_id);
         CREATE TABLE IF NOT EXISTS native_push_keys (id INTEGER PRIMARY KEY CHECK(id=1),public_key TEXT NOT NULL,private_key TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS native_push_subscriptions (endpoint TEXT PRIMARY KEY,user_id TEXT NOT NULL,p256dh TEXT NOT NULL,auth TEXT NOT NULL,completion INTEGER NOT NULL,failure INTEGER NOT NULL);
-        PRAGMA user_version = 3;`);
+        PRAGMA user_version = 4;`);
       return Result.ok(undefined);
     });
   }
@@ -2424,6 +2425,9 @@ export class NativeStore {
           return Result.err(nativeFailure("forbidden", "Thread access is denied"));
         return this.command(actorId, input.commandId, { operation: "delete", ...input }, () =>
           Result.gen(function* () {
+            this.db
+              .query("DELETE FROM native_records WHERE kind='send-group' AND thread_id=?")
+              .run(thread.id);
             const pending = yield* this.listPendingInputs(thread.id);
             for (const item of pending)
               this.writeRecord(
@@ -2683,6 +2687,161 @@ export class NativeStore {
           )
           .run(eventId, threadId, historyGeneration);
         return Result.ok(undefined);
+      }, this),
+    );
+  }
+
+  queueSurfaceSend(
+    actorId: string,
+    threadId: string,
+    requestId: string,
+    message: DisplayMessage,
+    silent: boolean,
+    origin: { deliveryId?: string; transcriptRequestId?: string } = {},
+  ): NativeStoreResult<void> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const thread = yield* this.authorizeThread(actorId, threadId, true);
+        if (thread.mutationPending)
+          return Result.err(nativeFailure("stale", "Thread history is changing"));
+        const id = fingerprint({ kind: "send-group", threadId, requestId });
+        const existing = yield* this.readRecord("send-group", id);
+        if (existing?.kind === "send-group" && existing.value.settled)
+          return Result.err(nativeFailure("conflict", "Originating request has already settled"));
+        const value: NativeSendGroup =
+          existing?.kind === "send-group"
+            ? existing.value
+            : {
+                id,
+                requestId,
+                ...origin,
+                actorId,
+                threadId,
+                historyGeneration: thread.historyGeneration,
+                settled: false,
+                delivered: false,
+                messages: [],
+              };
+        const position =
+          this.db
+            .query<{ position: number }, [string]>(
+              "SELECT COALESCE(MAX(position)+1,0) AS position FROM native_records WHERE kind='send-group' AND thread_id=?",
+            )
+            .get(threadId)?.position ?? 0;
+        const oldPosition = this.db
+          .query<{ position: number }, [string]>(
+            "SELECT position FROM native_records WHERE kind='send-group' AND id=?",
+          )
+          .get(id)?.position;
+        this.writeRecord(
+          id,
+          {
+            kind: "send-group",
+            value: { ...value, messages: [...value.messages, { message, silent }] },
+          },
+          threadId,
+          oldPosition ?? position,
+        );
+        return Result.ok(undefined);
+      }, this),
+    );
+  }
+
+  hasDeferredUpload(uploadId: string): NativeStoreResult<boolean> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.ok(
+        !!this.db
+          .query<{ id: string }, [string]>(
+            "SELECT r.id FROM native_records r, json_each(r.data_json,'$.value.messages') m, json_each(m.value,'$.message.parts') p WHERE r.kind='send-group' AND json_extract(r.data_json,'$.value.delivered')=0 AND json_extract(p.value,'$.type')='data-resource' AND json_extract(p.value,'$.data.resourceId')=? LIMIT 1",
+          )
+          .get(uploadId),
+      ),
+    );
+  }
+
+  listUnsettledSurfaceSends(): NativeStoreResult<Array<{ requestId: string; deliveryId: string }>> {
+    return nativeStoreTransaction(this.db, () =>
+      this.readRows(
+        "SELECT * FROM native_records WHERE kind='send-group' AND json_extract(data_json,'$.value.settled')=0",
+        [],
+      ).map((groups) =>
+        groups.flatMap((group) =>
+          group.kind === "send-group" && group.value.deliveryId
+            ? [{ requestId: group.value.requestId, deliveryId: group.value.deliveryId }]
+            : [],
+        ),
+      ),
+    );
+  }
+
+  settleSurfaceSends(requestId: string, untrackedOnly = false): NativeStoreResult<void> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const groups = yield* this.readRows(
+          "SELECT * FROM native_records WHERE kind='send-group' AND json_extract(data_json,'$.value.requestId')=?",
+          [requestId],
+        );
+        for (const group of groups) {
+          if (group.kind !== "send-group" || group.value.settled) continue;
+          if (untrackedOnly && group.value.deliveryId) continue;
+          this.db
+            .query(
+              "UPDATE native_records SET data_json=json_set(data_json,'$.value.settled',json('true')) WHERE kind='send-group' AND id=?",
+            )
+            .run(group.value.id);
+        }
+        return Result.ok(undefined);
+      }, this),
+    );
+  }
+
+  deliverSurfaceSends(
+    threadId?: string,
+  ): NativeStoreResult<{ requestIds: string[]; notifications: string[] }> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const groups = yield* this.readRows(
+          "SELECT * FROM native_records WHERE kind='send-group' AND json_extract(data_json,'$.value.delivered')=0 AND (?='' OR thread_id=?) ORDER BY thread_id,position",
+          [threadId ?? "", threadId ?? ""],
+        );
+        const blocked = new Set<string>();
+        const notify = new Set<string>();
+        const requestIds = new Set<string>();
+        for (const record of groups) {
+          if (record.kind !== "send-group") continue;
+          const group = record.value;
+          if (blocked.has(group.threadId)) continue;
+          const thread = yield* nullableAuthority(
+            this.authorizeThread(group.actorId, group.threadId, true),
+          );
+          if (!thread || thread.historyGeneration !== group.historyGeneration) {
+            this.db
+              .query("DELETE FROM native_records WHERE kind='send-group' AND id=?")
+              .run(group.id);
+            continue;
+          }
+          const pending = yield* this.listPendingInputs(thread.id);
+          if (
+            !group.settled ||
+            thread.activeRunId ||
+            thread.mutationPending ||
+            pending.length > 0
+          ) {
+            blocked.add(thread.id);
+            continue;
+          }
+          for (const entry of group.messages) {
+            yield* this.postMessage(group.actorId, thread.id, entry.message);
+            if (!entry.silent) notify.add(thread.id);
+          }
+          requestIds.add(group.transcriptRequestId ?? group.requestId);
+          this.db
+            .query(
+              "UPDATE native_records SET data_json=json_set(data_json,'$.value.delivered',json('true')) WHERE kind='send-group' AND id=?",
+            )
+            .run(group.id);
+        }
+        return Result.ok({ requestIds: [...requestIds], notifications: [...notify] });
       }, this),
     );
   }
@@ -3125,6 +3284,18 @@ export class NativeStore {
             requestId: input.value.requestId,
             threadId: input.value.threadId,
             messageIds,
+          });
+        }
+        const groups = yield* this.readRows(
+          "SELECT * FROM native_records WHERE kind='send-group' AND json_extract(data_json,'$.value.delivered')=1 AND (?='' OR json_extract(data_json,'$.value.requestId')=? OR json_extract(data_json,'$.value.transcriptRequestId')=?)",
+          [requestId ?? "", requestId ?? "", requestId ?? ""],
+        );
+        for (const group of groups) {
+          if (group.kind !== "send-group") continue;
+          links.push({
+            requestId: group.value.transcriptRequestId ?? group.value.requestId,
+            threadId: group.value.threadId,
+            messageIds: group.value.messages.map((entry) => entry.message.id),
           });
         }
         return Result.ok(links);

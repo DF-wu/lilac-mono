@@ -27,6 +27,10 @@ type HeartbeatInputValue =
   | HeartbeatInputObject;
 const heartbeatInputSchema: z.ZodType<HeartbeatInputValue> = z.json();
 
+export function heartbeatDeferredHandoffRequestId(requestId: string): string {
+  return `${requestId}:heartbeat-handoff:deferred`;
+}
+
 export type HeartbeatHandoffTranscript = {
   messages: ModelMessage[];
   finalText?: string;
