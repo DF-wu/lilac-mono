@@ -573,3 +573,52 @@ describe("deferred surface sends", () => {
     f.db.close();
   });
 });
+
+test("deferred posts use delivery time after the active reply finishes", () => {
+  using db = new Database(":memory:");
+  let now = 1000;
+  const store = new NativeStore(db, () => now);
+  store.initialize().unwrap();
+  store
+    .upsertUser({
+      id: "owner",
+      providerId: "owner",
+      displayName: "Owner",
+      role: "owner",
+      toolMode: "full",
+    })
+    .unwrap();
+  const thread = store.createThread("owner", { commandId: "thread" }).unwrap();
+  store.setActiveRun(thread.id, 0, "active").unwrap();
+  store
+    .queueSurfaceSend(
+      "owner",
+      thread.id,
+      "sender",
+      {
+        id: "queued",
+        role: "assistant",
+        metadata: { authorId: "lilac", createdAt: now },
+        parts: [{ type: "text", text: "Later post" }],
+      },
+      false,
+    )
+    .unwrap();
+  store.settleSurfaceSends("sender").unwrap();
+  now = 31_000;
+  store
+    .postMessage("owner", thread.id, {
+      id: "reply",
+      role: "assistant",
+      metadata: { authorId: "lilac", createdAt: now },
+      parts: [{ type: "text", text: "Finished reply" }],
+    })
+    .unwrap();
+  store.setActiveRun(thread.id, 0, undefined).unwrap();
+  now = 32_000;
+  store.deliverSurfaceSends().unwrap();
+  const window = store.sync("owner", thread.id).unwrap();
+  if (window.kind !== "window") throw new Error("Expected window");
+  const post = window.slots.find((slot) => slot.slotId === "queued");
+  expect(post?.kind === "ready" && post.messages[0]?.metadata?.createdAt).toBe(32_000);
+});

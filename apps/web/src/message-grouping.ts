@@ -50,9 +50,11 @@ export function joinMessageTurns(
   const before = lastTurnMessageTime(left);
   const after = first?.metadata?.createdAt ?? right.startedAt;
   if (before === undefined || after === undefined) return false;
+  // Older queued posts carry acceptance time even though their turn follows delivery order.
+  const posted =
+    right.state === "complete" && first?.id === right.turnId && !first.metadata?.inputId;
+  const gap = posted && first?.role === "assistant" ? Math.abs(after - before) : after - before;
   return (
-    after >= before &&
-    after - before < gapMs &&
-    new Date(before).toDateString() === new Date(after).toDateString()
+    gap >= 0 && gap < gapMs && new Date(before).toDateString() === new Date(after).toDateString()
   );
 }

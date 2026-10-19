@@ -1,5 +1,13 @@
 # MIGRATIONS.md
 
+## Native surface sends opt in to execution
+
+`surface.messages.send` replaces `suppressRun` with `triggerRun`, defaulting to false. Native sends
+now queue by default; pass `triggerRun: true` to request the existing cross-thread execution behavior.
+Heartbeat remains notification-only. The strict input schema rejects the removed flag. Update callers
+and deploy Core and tools together; there is no stored-data or configuration migration. Other surfaces
+retain their send behavior. Deferred native messages now receive their visible timestamp at delivery.
+
 ## Native schema 4: deferred surface sends
 
 Native `surface.messages.send` calls with effective `suppressRun=true`, including heartbeat, now

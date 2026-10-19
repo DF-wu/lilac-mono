@@ -100,3 +100,17 @@ test("a completed incoming post joins the following bubble without its old botto
   expect(html.match(/data-slot="message-avatar"/g)).toHaveLength(1);
   expect(html.match(/data-ui="message-controls"/g)).toHaveLength(1);
 });
+
+test("a deferred assistant post with an older acceptance timestamp still joins the completed reply", () => {
+  const first = post(0);
+  const next = post(1);
+  next.messages[0]!.id = next.turnId;
+  next.messages[0]!.metadata!.createdAt = time - 30_000;
+  expect(joinMessageTurns(first, next)).toBe(true);
+  expect(joinMessageTurns(first, next, undefined, 1000)).toBe(false);
+  expect(joinMessageTurns({ ...first, state: "running" }, next)).toBe(false);
+  expect(joinMessageTurns(first, next, next.position)).toBe(false);
+  expect(
+    joinMessageTurns(first, { ...next, messages: [{ ...next.messages[0]!, role: "user" }] }),
+  ).toBe(false);
+});

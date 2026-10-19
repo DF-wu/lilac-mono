@@ -528,7 +528,8 @@ export const agentWorkStages: AgentWorkStage[] = [
   {
     id: "grouped-messages",
     label: "Grouped messages",
-    description: "Nearby posts share an avatar. Right-click any message to copy, link, or react.",
+    description:
+      "A deferred post shares the completed reply’s avatar, including older queued timestamps.",
     frames: [
       {
         ...turn([], "complete"),
@@ -547,11 +548,14 @@ export const agentWorkStages: AgentWorkStage[] = [
           position: 1,
           state: "complete",
           messages: [
-            message(
-              "grouped_second",
-              [{ type: "text", text: "Bring a light jacket for the riverside walk." }],
-              "final",
-            ),
+            {
+              ...message(
+                "grouped_post",
+                [{ type: "text", text: "Bring a light jacket for the riverside walk." }],
+                "final",
+              ),
+              metadata: { authorId: "demo_agent", createdAt: demoTime - 30_000, phase: "final" },
+            },
           ],
         },
       },

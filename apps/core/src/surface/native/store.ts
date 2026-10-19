@@ -2831,7 +2831,10 @@ export class NativeStore {
             continue;
           }
           for (const entry of group.messages) {
-            yield* this.postMessage(group.actorId, thread.id, entry.message);
+            yield* this.postMessage(group.actorId, thread.id, {
+              ...entry.message,
+              metadata: { ...entry.message.metadata, createdAt: this.now() },
+            });
             if (!entry.silent) notify.add(thread.id);
           }
           requestIds.add(group.transcriptRequestId ?? group.requestId);

@@ -143,9 +143,10 @@ values once without rewriting the YAML file. Later YAML edits do not override da
 Saves reject stale revisions. New title jobs, output attempts, selections, and retention passes use
 the latest settings; active output attempts keep their original streaming mode.
 
-For a notification-only native post, pass `suppressRun: true` to `surface.messages.send`.
-The message remains visible and notification delivery is unchanged. Omit the option or pass `false`
-to follow the deployment's cross-thread execution setting. Heartbeat posts always suppress runs.
+Native `surface.messages.send` defaults to `triggerRun: false`. Core queues the message until the
+sender finishes and the destination is idle, without starting a destination run. Pass `triggerRun: true`
+only when the destination agent should respond, subject to the deployment's cross-thread execution
+setting. Heartbeat always queues. `silent` independently controls notifications.
 
 Core and MCP configuration editors are also owner-only. Save validates and atomically updates the
 selected file, using revisions to reject concurrent edits. Core keeps its existing reload behavior. MCP
@@ -211,8 +212,8 @@ Restricted and unverified requests cannot use this cross-surface access. Other u
 inaccessible to the owner. The alias is documented in `surface.help` and native agent instructions.
 For deferred delivery, call `surface.messages.list` with the same target and save the concrete
 `meta.session.channelId` returned by Core. Heartbeat messages are visible assistant posts and do not
-start another agent run in the destination thread. Ordinary cross-thread agent messages retain the
-configured cross-thread execution behavior. Native is optional for heartbeat; see [heartbeat](heartbeat.md).
+start another agent run in the destination thread. Cross-thread agent messages trigger a run only with explicit
+`triggerRun: true` and the deployment setting enabled. Native is optional for heartbeat; see [heartbeat](heartbeat.md).
 
 ## Diagnostics and compatibility
 

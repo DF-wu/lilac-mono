@@ -705,7 +705,13 @@ test("native sends appear in recent writes and deletion removes their links", as
         finalText: "Old final text",
       })
       .unwrap();
-    (await tool.call("surface.messages.send", { text: "Sent by tool" }, { context })).unwrap();
+    (
+      await tool.call(
+        "surface.messages.send",
+        { text: "Sent by tool", triggerRun: true },
+        { context },
+      )
+    ).unwrap();
     expect(
       (await tool.call("surface.activities.recentAgentWrites", {}, { context })).unwrap(),
     ).toMatchObject([{ preview: "Sent by tool", requestId: "request" }]);
@@ -754,7 +760,7 @@ test("DM aliases resolve per authenticated user and surface tools return concret
   (
     await tool.call(
       "surface.messages.send",
-      { client: "native", sessionId: "dm", text: "Notification only", suppressRun: true },
+      { client: "native", sessionId: "dm", text: "Notification only" },
       { context },
     )
   ).unwrap();
@@ -773,7 +779,7 @@ test("DM aliases resolve per authenticated user and surface tools return concret
   (
     await tool.call(
       "surface.messages.send",
-      { client: "native", sessionId: "dm", text: "For my DM" },
+      { client: "native", sessionId: "dm", text: "For my DM", triggerRun: true },
       { context },
     )
   ).unwrap();
@@ -826,6 +832,18 @@ test("DM aliases resolve per authenticated user and surface tools return concret
   ).toBe(true);
   const help = (await tool.call("surface.help", { client: "native" }, { context })).unwrap();
   expect(JSON.stringify(help)).toContain('"format":"dm"');
+  expect(JSON.stringify(help)).toContain("triggerRun");
+  expect(JSON.stringify(help)).toContain("Defaults to false");
+  expect(JSON.stringify(help)).not.toContain("suppressRun");
+  expect(
+    (
+      await tool.call(
+        "surface.messages.send",
+        { client: "native", sessionId: "dm", text: "Old flag", suppressRun: true },
+        { context },
+      )
+    ).isErr(),
+  ).toBe(true);
 });
 
 test("trusted cross-surface capabilities use owner access without exposing other private DMs", async () => {
