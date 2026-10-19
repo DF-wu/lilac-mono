@@ -1,5 +1,20 @@
 # MIGRATIONS.md
 
+## File-based heartbeat workflow and native agent access
+
+No config version, wire schema, or database schema changes. Core seeds missing `prompts/HEARTBEAT.md`
+and `prompts/heartbeat/WORK.md` from the built-in heartbeat skill. Existing files and legacy inbox/archive
+notes remain unchanged. Ask the agent to use the heartbeat skill's migration reference to merge old
+responsibilities and active prompt instructions, preserve destinations, and verify delivery. Startup
+no longer creates empty legacy inbox/archive directories. The default destination remains optional in
+configuration and is selected through conversation during setup; native is not required.
+
+Trusted cross-surface agent capabilities now grant the configured native owner's existing thread access.
+Native-origin runs retain their original principal. Restricted or unverified requests receive no owner
+fallback, and other users' private DMs remain inaccessible. Heartbeat posts are notifications and do not
+admit another agent turn in their destination. This is a deliberate authority-policy change, not a change
+to human login or thread-sharing permissions. Deploy Core; web clients need no protocol upgrade.
+
 ## Permanent native DM
 
 Native thread records and summaries gain optional `kind: "dm"`. Absence retains ordinary-thread

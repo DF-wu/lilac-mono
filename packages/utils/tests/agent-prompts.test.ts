@@ -87,35 +87,39 @@ describe("agent prompts", () => {
     });
   });
 
-  it("seeds heartbeat workspace artifacts", async () => {
+  it("seeds heartbeat workflow assets without creating legacy inbox directories", async () => {
     await withTempDataDir(async (dataDir) => {
       await ensurePromptWorkspace({ dataDir });
+      const promptDir = path.join(dataDir, DEFAULT_PROMPT_DIRNAME);
+      for (const [active, asset] of [
+        [HEARTBEAT_PROMPT_FILENAME, "HEARTBEAT.md"],
+        [path.join(HEARTBEAT_PROMPT_DIRNAME, "WORK.md"), "WORK.md"],
+      ]) {
+        expect(await Bun.file(path.join(promptDir, active!)).text()).toBe(
+          await Bun.file(
+            path.join(import.meta.dir, "..", "builtin-skills", "heartbeat", "assets", asset!),
+          ).text(),
+        );
+      }
+      expect(await Bun.file(path.join(promptDir, "heartbeat", "inbox")).exists()).toBe(false);
+    });
+  });
 
-      expect(
-        await Bun.file(
-          path.join(dataDir, DEFAULT_PROMPT_DIRNAME, HEARTBEAT_PROMPT_FILENAME),
-        ).exists(),
-      ).toBe(true);
-      const heartbeatText = await Bun.file(
-        path.join(dataDir, DEFAULT_PROMPT_DIRNAME, HEARTBEAT_PROMPT_FILENAME),
-      ).text();
-      expect(heartbeatText).toContain("## Ownership");
-      expect(heartbeatText).toContain("heartbeat/inbox/");
-      expect(heartbeatText).toContain("HEARTBEAT_OK");
-      expect(
-        (
-          await Bun.file(
-            path.join(dataDir, DEFAULT_PROMPT_DIRNAME, HEARTBEAT_PROMPT_DIRNAME, "inbox"),
-          ).stat()
-        ).isDirectory(),
-      ).toBe(true);
-      expect(
-        (
-          await Bun.file(
-            path.join(dataDir, DEFAULT_PROMPT_DIRNAME, HEARTBEAT_PROMPT_DIRNAME, "archive"),
-          ).stat()
-        ).isDirectory(),
-      ).toBe(true);
+  it("preserves customized heartbeat files and pending legacy work on startup", async () => {
+    await withTempDataDir(async (dataDir) => {
+      const promptDir = path.join(dataDir, DEFAULT_PROMPT_DIRNAME);
+      const files = [
+        [HEARTBEAT_PROMPT_FILENAME, "Legacy workflow with a flight watch"],
+        ["heartbeat/WORK.md", "Existing watch: post to discord/thread-1"],
+        ["heartbeat/inbox/pending.md", "Recheck the forecast"],
+        ["heartbeat/archive/previous.md", "Previously communicated finding"],
+      ] as const;
+      for (const [relative, content] of files)
+        await Bun.write(path.join(promptDir, relative), content);
+      await ensurePromptWorkspace({ dataDir });
+      await ensurePromptWorkspace({ dataDir });
+      for (const [relative, content] of files)
+        expect(await Bun.file(path.join(promptDir, relative)).text()).toBe(content);
     });
   });
 

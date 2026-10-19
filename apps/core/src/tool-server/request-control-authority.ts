@@ -16,6 +16,10 @@ type RequestControlPolicyBase = {
 };
 
 export const HEARTBEAT_LEVEL2_CALLABLES = [
+  "skills.list",
+  "skills.read",
+  "surface.help",
+  "surface.activities.recentAgentWrites",
   "fetch",
   "search",
   "discovery.search",

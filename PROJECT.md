@@ -385,6 +385,20 @@ Persisted formats are trust boundaries. Their codecs distinguish current, migrat
 
 Run `bun run lint:architecture` for the semantic and production-syntax architecture gate. The root `bun run check` overlaps generated-code, lint, tests, typecheck, architecture, and format gates; `bun run ci` runs the conservative serial sequence.
 
+## Proactive heartbeat
+
+The existing idle-only heartbeat lane runs an editable workflow in `prompts/HEARTBEAT.md` and maintains
+Markdown watches in `prompts/heartbeat/WORK.md`. The built-in `heartbeat` skill owns setup, verification,
+and progressive migration guidance. Core seeds missing files from its assets without overwriting
+customized files or migrating legacy notes automatically. Watch due times, discovery progress, lessons,
+and delivery overrides are agent-maintained prose, not scheduler or database contracts.
+
+Setup asks for a default surface destination; native is optional. Explicit watch targets retain their
+concrete thread IDs. Heartbeat capabilities allow skill reads and recent-agent-write discovery. Native
+surface tools accept verified native authority or trusted cross-surface agent capabilities; the latter
+use the configured owner's existing thread access, while other users' DMs remain private. Heartbeat
+posts do not trigger destination runs. See `docs/heartbeat.md` for deployment tests and limitations.
+
 ## Runtime Lifecycle Invariants
 
 `apps/core/src/runtime/create-core-runtime.ts` is the composition root. Its exact startup ordering is an implementation detail; preserve these phases and invariants:

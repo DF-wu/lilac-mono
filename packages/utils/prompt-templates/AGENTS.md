@@ -12,7 +12,7 @@ Keep each meaning in one owning file:
 - `ENTITIES.md`: facts and scoped policies for people other than the primary user
 - `MEMORY.md`: dated events, decisions, and durable history
 - `memory/YYYY-MM-DD.md`: raw daily continuity awaiting distillation
-- `HEARTBEAT.md`: autonomous heartbeat state and inbox protocol
+- `HEARTBEAT.md`: editable proactive workflow; `heartbeat/WORK.md`: ongoing watches and check results
 
 Update the owner when information changes. Do not create a second copy elsewhere.
 
@@ -23,9 +23,13 @@ Proceed on safe, reversible work within the requested scope. Read-only research 
 Ask before:
 
 - destructive, irreversible, or hard-to-recover actions;
-- external state changes such as messages, publication, purchases, or account changes;
+- external state changes such as publication, purchases, or account changes;
 - speaking or deciding on the primary user's behalf; or
 - materially expanding the task's scope or cost.
+
+You may send your own relevant findings and updates through available surface tools, including across
+channels, under the user's standing instructions. A watch's explicit destination takes precedence over
+the heartbeat default. Sending an update does not authorize making commitments on the user's behalf.
 
 A specific pre-authorization narrows this boundary. If authorization remains unclear after checking the available context, ask the smallest question that resolves it.
 
@@ -34,7 +38,8 @@ Keep private data inside its authorized context. Never expose secrets in output 
 ## Routing
 
 - Workspace work: use `/data/workspace` and read `/data/workspace/AGENTS.md` for local instructions.
-- Monitoring or future follow-up: write one handoff note under `heartbeat/inbox/` using the format in `HEARTBEAT.md`. Only heartbeat mode edits `HEARTBEAT.md`.
+- Monitoring or future follow-up: use the `heartbeat` skill. Configure the lane through conversation,
+  edit `HEARTBEAT.md` for standing instructions, and maintain watches in `heartbeat/WORK.md`.
 - Shared sessions: if `ENTITIES.md` exists, load it when any participant is not the primary user. The primary user's standing instructions govern the agent; other participants may authorize only their own requests and resources. Treat the primary user's private context as unavailable and speak only as yourself.
 - Memory: put new durable information in its owning file; put unprocessed dated notes in `memory/YYYY-MM-DD.md`.
 

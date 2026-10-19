@@ -22,6 +22,7 @@ export type HeartbeatPromptPaths = {
   promptDir: string;
   heartbeatFilePath: string;
   heartbeatDir: string;
+  workFilePath: string;
   inboxDir: string;
   archiveDir: string;
 };
@@ -92,7 +93,13 @@ function templatePath(name: CorePromptFileName): string {
 }
 
 function heartbeatTemplatePath(): string {
-  return path.join(import.meta.dir, "prompt-templates", HEARTBEAT_PROMPT_FILENAME);
+  return path.join(
+    import.meta.dir,
+    "builtin-skills",
+    "heartbeat",
+    "assets",
+    HEARTBEAT_PROMPT_FILENAME,
+  );
 }
 
 export function resolvePromptDir(options?: { dataDir?: string }): string {
@@ -109,6 +116,7 @@ export function resolveHeartbeatPromptPaths(options?: { dataDir?: string }): Hea
     promptDir,
     heartbeatFilePath: path.join(promptDir, HEARTBEAT_PROMPT_FILENAME),
     heartbeatDir,
+    workFilePath: path.join(heartbeatDir, "WORK.md"),
     inboxDir: path.join(heartbeatDir, "inbox"),
     archiveDir: path.join(heartbeatDir, "archive"),
   };
@@ -117,11 +125,17 @@ export function resolveHeartbeatPromptPaths(options?: { dataDir?: string }): Hea
 async function ensureHeartbeatWorkspace(options?: { dataDir?: string }): Promise<void> {
   const paths = resolveHeartbeatPromptPaths(options);
   await safeMkdir(paths.heartbeatDir);
-  await safeMkdir(paths.inboxDir);
-  await safeMkdir(paths.archiveDir);
 
   if (!(await exists(paths.heartbeatFilePath))) {
     await Bun.write(paths.heartbeatFilePath, await Bun.file(heartbeatTemplatePath()).text());
+  }
+  if (!(await exists(paths.workFilePath))) {
+    await Bun.write(
+      paths.workFilePath,
+      await Bun.file(
+        path.join(import.meta.dir, "builtin-skills", "heartbeat", "assets", "WORK.md"),
+      ).text(),
+    );
   }
 }
 

@@ -200,11 +200,15 @@ access to the operator token, just like the container command.
 Open `/dm` to return to your permanent DM. Its existing `/threads/<threadId>` URL remains valid
 for links to that specific conversation.
 
-From a native request, agents can use `surface.messages.send` with `client=native` and
-`sessionId=dm`. Core resolves `dm` using the authenticated requesting user. The alias is documented
-in `surface.help` and native agent instructions. Requests without native user authority cannot use it.
+Agents can use `surface.messages.send` with `client=native` and `sessionId=dm`. Native requests
+resolve `dm` using the authenticated requesting user. Trusted agent runs from another surface, and
+heartbeat runs, use the configured native owner's access after Core validates their control capability.
+Restricted and unverified requests cannot use this cross-surface access. Other users' private DMs stay
+inaccessible to the owner. The alias is documented in `surface.help` and native agent instructions.
 For deferred delivery, call `surface.messages.list` with the same target and save the concrete
-`meta.session.channelId` returned by Core.
+`meta.session.channelId` returned by Core. Heartbeat messages are visible assistant posts and do not
+start another agent run in the destination thread. Ordinary cross-thread agent messages retain the
+configured cross-thread execution behavior. Native is optional for heartbeat; see [heartbeat](heartbeat.md).
 
 ## Diagnostics and compatibility
 

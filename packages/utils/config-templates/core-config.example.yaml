@@ -288,8 +288,9 @@ surface:
     # Optional heartbeat model override lives under:
     # surface.router.sessionModes."__heartbeat__".model
     # The alias key "heartbeat" is also accepted.
-    # Optional default output destination for proactive heartbeat messages.
-    # Format: <client>/<sessionIdOrAlias>, for example: discord/ops
+    # Set through conversation with the heartbeat skill: ask where default updates should go.
+    # Native is optional. Per-watch concrete thread destinations override this default.
+    # Format: <client>/<sessionIdOrAlias>, for example: discord/ops. Prefer concrete IDs.
     # defaultOutputSession: "discord/ops"
     # When heartbeat gets a chance to think (5-field minute-precision cron).
     cron: "*/30 * * * *"

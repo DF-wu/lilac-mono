@@ -410,22 +410,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   const nativeAdapterForContext: NonNullable<CoreToolPluginRuntime["nativeAdapterForContext"]> = (
     context,
   ) => {
-    const principal = context.requestInitiator;
-    const threadId = context.requestInitiatorSessionId ?? context.sessionId;
-    if (!context.serverOwnedRequest || principal?.platform !== "native" || !threadId)
-      return Result.err(
-        nativeSurfaceError(
-          "list-sessions",
-          nativeFailure("forbidden", "Native tools require starter authority"),
-        ),
-      );
-    return Result.ok(
-      adapter.forRequest({
-        principalId: principal.userId,
-        sourceThreadId: nativeThreadId(threadId),
-        requestId: context.requestId,
-      }),
-    );
+    return adapter.forToolContext(context, options.getConfig().surface.native.auth.ownerId);
   };
 
   const resourceAccessForContext: NonNullable<CoreToolPluginRuntime["resourceAccessForContext"]> = (

@@ -6,6 +6,8 @@ import {
   type WorkflowCard,
 } from "@stanley2058/lilac-client-protocol";
 import { Result } from "better-result";
+import type { RequestContext } from "../../tool-server/types";
+import { nativeThreadId } from "./native-protocol";
 import type { DurableResolvedModelRequest } from "@stanley2058/lilac-utils";
 import {
   SurfaceInvalidInput,
@@ -51,6 +53,7 @@ export type NativeAdapterRequest = {
   readonly principalId: string;
   readonly sourceThreadId: string;
   readonly requestId?: string;
+  readonly suppressRun?: boolean;
 };
 export type NativeAdapterDependencies = {
   readonly store: NativeStore;
@@ -170,6 +173,66 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
   }
   forRequest(request: NativeAdapterRequest): NativeSurfaceAdapter {
     return new NativeSurfaceAdapter(this.dependencies, request);
+  }
+  forToolContext(
+    context: RequestContext,
+    ownerId: string,
+  ): SurfaceOperationResult<NativeSurfaceAdapter> {
+    return Result.gen(function* () {
+      if (!context.serverOwnedRequest)
+        return Result.err(
+          new SurfacePermissionDenied({
+            platform: "native",
+            operation: "list-sessions",
+            message: "Native tools require server-owned request authority",
+          }),
+        );
+      const principal = context.requestInitiator;
+      const sourceThread = context.requestInitiatorSessionId ?? context.sessionId;
+      if (principal?.platform === "native" && sourceThread) {
+        return Result.ok(
+          this.forRequest({
+            principalId: principal.userId,
+            sourceThreadId: nativeThreadId(sourceThread),
+            requestId: context.requestId,
+          }),
+        );
+      }
+      if (
+        principal?.platform === "native" ||
+        context.safetyMode !== "trusted" ||
+        !context.controlPolicy
+      )
+        return Result.err(
+          new SurfacePermissionDenied({
+            platform: "native",
+            operation: "list-sessions",
+            message: "Cross-surface native tools require a trusted agent capability",
+          }),
+        );
+      const owner = yield* this.dependencies.store
+        .getUser(ownerId)
+        .mapError((error) => nativeSurfaceError("list-sessions", error));
+      if (owner.role !== "owner")
+        return Result.err(
+          new SurfacePermissionDenied({
+            platform: "native",
+            operation: "list-sessions",
+            message: "Configured native owner is unavailable",
+          }),
+        );
+      const dm = yield* this.dependencies.store
+        .ensureDirectThread(owner.id)
+        .mapError((error) => nativeSurfaceError("list-sessions", error));
+      return Result.ok(
+        this.forRequest({
+          principalId: owner.id,
+          sourceThreadId: dm.id,
+          requestId: context.requestId,
+          suppressRun: context.controlPolicy.kind === "heartbeat",
+        }),
+      );
+    }, this);
   }
   async connect(): Promise<void> {}
   async disconnect(): Promise<void> {}
@@ -442,6 +505,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         );
       if (
         trigger &&
+        !request.suppressRun &&
         ref.channelId !== request.sourceThreadId &&
         this.dependencies.shouldTriggerRun()
       ) {
