@@ -289,6 +289,6 @@ need HTTPS/WSS viewer access through the deployment's TLS proxy. The proxy must 
 site to embed `/lilac-viewer.html` and forward `/websockify` upgrades.
 
 For an isolated real-desktop browser check, build with `bun run docker:build:computer-use`, then run
-`bun apps/core/tests/surface/native/computer-browser-fixture.ts` and `bun run dev:web`. Use the ordinary
+`bun apps/core/tests/surface/native/computer-browser-fixture.ts` and `bun --cwd=apps/web run dev`. Use the ordinary
 browser fixture login and the printed thread link with the Vite port. The fixture starts a dedicated
 desktop, uses the real native RPC and MCP registry, and removes its desktop on SIGINT/SIGTERM.

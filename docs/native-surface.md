@@ -37,9 +37,15 @@ For a remote installation, put the native listener behind HTTPS and set `publicU
 `allowedOrigins` to the externally visible origin. Auth uses the configured public URL; arbitrary
 forwarded headers cannot change it.
 
-For frontend development, run `bun run dev:web`. Vite proxies `/api` and WebSocket upgrades to
-`http://127.0.0.1:8789`; `LILAC_WEB_BACKEND_URL` overrides that development target. Add the development
-origin, normally `http://localhost:5173`, to `allowedOrigins`.
+For frontend development, run `bun run dev:web`. It starts the deterministic browser fixture and Vite
+on free ports and prints the web URL, login and seeded thread links. `--replace` stops the dev servers on
+ports 5173 and 8789 and starts there instead. `--clerk` uses Clerk authentication with the keys in
+`apps/web/.env.local` and prints a single-use sign-in link; `--clerk-owner <user_id>` picks the owner
+when the Clerk instance has more than one user.
+
+To develop against a real Core installation, run `bun --cwd=apps/web run dev`. Vite proxies `/api` and
+WebSocket upgrades to `http://127.0.0.1:8789`; `LILAC_WEB_BACKEND_URL` overrides that development
+target. Add the development origin, normally `http://localhost:5173`, to `allowedOrigins`.
 
 ## Design system
 
