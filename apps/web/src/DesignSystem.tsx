@@ -1,4 +1,4 @@
-import { ContextMessage, TimestampSeparator } from "./components/RecentContext";
+import { ContextMessage, NextContextStart, TimestampSeparator } from "./components/RecentContext";
 import { DirectThreadCard } from "./components/DirectThreadCard";
 import { ComputerViewer } from "./components/ComputerViewer";
 import computerDemoUrl from "./assets/computer-demo.html?url";
@@ -1399,6 +1399,7 @@ function Controls() {
             <ContextMessage summarized>
               <p className="px-6 text-sm">Earlier conversation, represented in the summary.</p>
             </ContextMessage>
+            <NextContextStart />
             <span className="ds-muted" role="status">
               {search ? `Search: ${search}` : ""}
             </span>

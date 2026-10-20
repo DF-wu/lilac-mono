@@ -5,7 +5,12 @@ import {
   ContextMenuContent,
   ContextMenuItem,
 } from "./ui/context-menu";
-import { ContextMessage, TimestampSeparator, useRecentContext } from "./RecentContext";
+import {
+  ContextMessage,
+  NextContextStart,
+  TimestampSeparator,
+  useRecentContext,
+} from "./RecentContext";
 import { LoadingSpinner } from "./ui/loading-spinner";
 import { AddReaction, MessageReactions } from "./MessageReactions";
 import { OptimisticTurns, type OptimisticTurn } from "../optimistic-turns";
@@ -559,6 +564,16 @@ const SlotRow = memo(function SlotRow(props: {
       props.previousSlotId === undefined ||
       (previousTime !== undefined &&
         (time - previousTime >= gapMs || startsNewDay(previousTime, time))));
+  // An idle DM without a current window means the server will open a new context on the next send.
+  const nextContextStart =
+    timestamps &&
+    props.nextSlotId === undefined &&
+    !props.fallback &&
+    slot.state !== "pending" &&
+    slot.state !== "running" &&
+    currentContext !== undefined &&
+    !currentContext.active &&
+    currentContext.firstTurnPosition === null;
   return (
     <ContextMessage summarized={summarized}>
       {separated ? <TimestampSeparator at={time} contextStart={contextStart} /> : null}
@@ -574,6 +589,7 @@ const SlotRow = memo(function SlotRow(props: {
         onRewind={onRewind}
         onLoadMore={() => void client.loadTurnPage(threadId, slot.slotId)}
       />
+      {nextContextStart ? <NextContextStart /> : null}
     </ContextMessage>
   );
 });
