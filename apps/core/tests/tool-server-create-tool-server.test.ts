@@ -1006,120 +1006,124 @@ describe("createToolServer", () => {
     }
   });
 
-  it("enforces the capability-bound native profile without trusting the profile header", async () => {
-    const authority = new RequestControlAuthority();
-    const capability = authority.issue({
-      kind: "primary",
-      requestId: "native-profile-capability",
-      sessionId: "native-profile-session",
-      platform: "discord",
-      principal: null,
-      authenticatedOrigin: null,
-      allowedCallables: null,
-      profile: "general",
-      canonicalCwd: "/workspace",
-      safetyMode: "trusted",
-      expiresAt: Date.now() + 60_000,
-    });
-    const calls: string[] = [];
-    const tool: ServerTool = {
-      id: "profile-plugin",
-      async init() {},
-      async destroy() {},
-      async list() {
-        return ["profile.allowed", "profile.denied"].map((callableId) => ({
-          callableId,
-          name: callableId,
-          description: callableId,
-          shortInput: [],
-        }));
-      },
-      async call(callableId) {
-        calls.push(callableId);
-        return Result.ok({ callableId });
-      },
-    };
-    const pluginManager = {
-      async init() {
-        return Result.ok();
-      },
-      async destroy() {
-        return Result.ok();
-      },
-      async reload() {
-        return Result.ok();
-      },
-      async ensureFresh() {
-        return Result.ok();
-      },
-      getLevel2Tools: () => [tool],
-      getLevel2ContributionInfo: () =>
-        new Map([[tool, { pluginId: "profile-plugin", source: "builtin" as const }]]),
-    };
-    const config = parseCoreConfigV2ToUniversal({
-      configVersion: 2,
-      agent: {
-        subagents: {
-          profiles: {
-            general: {
-              level2: {
-                callables: ["profile.allowed"],
-                plugins: ["profile-plugin"],
+  it.each(["primary", "heartbeat"] as const)(
+    "enforces the %s capability-bound profile without trusting the profile header",
+    async (kind) => {
+      const authority = new RequestControlAuthority();
+      const capability = authority.issue({
+        ...(kind === "heartbeat"
+          ? { kind, allowedCallables: ["profile.allowed", "profile.denied"] }
+          : { kind, allowedCallables: null }),
+        requestId: "native-profile-capability",
+        sessionId: "native-profile-session",
+        platform: "discord",
+        principal: null,
+        authenticatedOrigin: null,
+        profile: "general",
+        canonicalCwd: "/workspace",
+        safetyMode: "trusted",
+        expiresAt: Date.now() + 60_000,
+      });
+      const calls: string[] = [];
+      const tool: ServerTool = {
+        id: "profile-plugin",
+        async init() {},
+        async destroy() {},
+        async list() {
+          return ["profile.allowed", "profile.denied"].map((callableId) => ({
+            callableId,
+            name: callableId,
+            description: callableId,
+            shortInput: [],
+          }));
+        },
+        async call(callableId) {
+          calls.push(callableId);
+          return Result.ok({ callableId });
+        },
+      };
+      const pluginManager = {
+        async init() {
+          return Result.ok();
+        },
+        async destroy() {
+          return Result.ok();
+        },
+        async reload() {
+          return Result.ok();
+        },
+        async ensureFresh() {
+          return Result.ok();
+        },
+        getLevel2Tools: () => [tool],
+        getLevel2ContributionInfo: () =>
+          new Map([[tool, { pluginId: "profile-plugin", source: "builtin" as const }]]),
+      };
+      const config = parseCoreConfigV2ToUniversal({
+        configVersion: 2,
+        agent: {
+          subagents: {
+            profiles: {
+              general: {
+                level2: {
+                  callables: ["profile.allowed"],
+                  plugins: ["profile-plugin"],
+                },
               },
             },
           },
         },
-      },
-    });
-    const server = createToolServer({
-      pluginManager,
-      getConfig: async () => config,
-      requestMessageCache: {
-        get: () => [{ role: "user", content: "cached" }],
-        getOrigin: (requestId) =>
-          discordRequestProjection({ requestId, sessionId: "native-profile-session" }),
-      },
-      authorizeControlRequest: (input) => authority.authorize(input),
-    });
-    await server.init();
-    const headers = {
-      "x-lilac-request-id": "native-profile-capability",
-      "x-lilac-session-id": "native-profile-session",
-      "x-lilac-request-client": "discord",
-      "x-lilac-cwd": "/workspace",
-      "x-lilac-control-capability": capability,
-    };
-    try {
-      const list = await server.app.handle(new Request("http://localhost/list", { headers }));
-      expect(await list.json()).toMatchObject({
-        tools: [{ callableId: "profile.allowed" }],
       });
-
-      const denied = await server.app.handle(
-        new Request("http://localhost/call", {
-          method: "POST",
-          headers: {
-            ...headers,
-            "content-type": "application/json",
-            "x-lilac-subagent-profile": "self",
-          },
-          body: JSON.stringify({ callableId: "profile.denied", input: {} }),
-        }),
-      );
-      expect(await denied.json()).toEqual({
-        status: "error",
-        error: {
-          kind: "denied",
-          code: "profile_denied",
-          message: "Tool 'profile.denied' is not enabled for this subagent profile",
-          retryable: false,
+      const server = createToolServer({
+        pluginManager,
+        getConfig: async () => config,
+        requestMessageCache: {
+          get: () => [{ role: "user", content: "cached" }],
+          getOrigin: (requestId) =>
+            discordRequestProjection({ requestId, sessionId: "native-profile-session" }),
         },
+        authorizeControlRequest: (input) => authority.authorize(input),
       });
-      expect(calls).toEqual([]);
-    } finally {
-      await server.stop();
-    }
-  });
+      await server.init();
+      const headers = {
+        "x-lilac-request-id": "native-profile-capability",
+        "x-lilac-session-id": "native-profile-session",
+        "x-lilac-request-client": "discord",
+        "x-lilac-cwd": "/workspace",
+        "x-lilac-control-capability": capability,
+      };
+      try {
+        const list = await server.app.handle(new Request("http://localhost/list", { headers }));
+        expect(await list.json()).toMatchObject({
+          tools: [{ callableId: "profile.allowed" }],
+        });
+
+        const denied = await server.app.handle(
+          new Request("http://localhost/call", {
+            method: "POST",
+            headers: {
+              ...headers,
+              "content-type": "application/json",
+              "x-lilac-subagent-profile": "self",
+            },
+            body: JSON.stringify({ callableId: "profile.denied", input: {} }),
+          }),
+        );
+        expect(await denied.json()).toEqual({
+          status: "error",
+          error: {
+            kind: "denied",
+            code: "profile_denied",
+            message: "Tool 'profile.denied' is not enabled for this subagent profile",
+            retryable: false,
+          },
+        });
+        expect(calls).toEqual([]);
+      } finally {
+        await server.stop();
+      }
+    },
+  );
 
   it("requires a request-bound control capability on list, help, and call", async () => {
     const contexts: RequestContext[] = [];

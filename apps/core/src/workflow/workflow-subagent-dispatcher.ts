@@ -10,6 +10,7 @@ import type {
   SubagentDelegationRegistration,
   TrustedSubagentDelegationRegistration,
 } from "../tools/subagent";
+import { HEARTBEAT_SESSION_ID } from "../heartbeat/common";
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
 import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
 import { DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS, DurableWorkflowStore } from "./durable-workflow-store";
@@ -310,7 +311,7 @@ export class WorkflowSubagentDispatcher {
         kind: "live_parent",
         parentRequestId: registration.parentRequestId,
         parentSessionId: registration.parentSessionId,
-        parentRequestClient: registration.fallbackSurface.platform,
+        parentRequestClient: registration.fallbackSurface?.platform ?? "unknown",
         parentToolCallId: registration.parentToolCallId,
         childRequestId: registration.childRequestId,
         childSessionId: registration.childSessionId,
@@ -332,9 +333,9 @@ export class WorkflowSubagentDispatcher {
         argsSha256: canonicalJsonSha256(args),
         origin: {
           requestId: registration.parentRequestId,
-          sessionId: registration.fallbackSurface.sessionId,
-          client: registration.fallbackSurface.platform,
-          userId: registration.fallbackSurface.userId,
+          sessionId: registration.fallbackSurface?.sessionId ?? HEARTBEAT_SESSION_ID,
+          client: registration.fallbackSurface?.platform ?? "unknown",
+          userId: registration.fallbackSurface?.userId ?? null,
           projectCwd: definitions.canonicalWorkspaceRoot,
         },
         completionTarget,

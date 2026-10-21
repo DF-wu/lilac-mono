@@ -4044,7 +4044,7 @@ export async function createCoreRuntime(
                 principal: null,
                 authenticatedOrigin: null,
                 allowedCallables: HEARTBEAT_LEVEL2_CALLABLES,
-                profile: "primary",
+                profile: input.profile,
                 canonicalCwd: input.canonicalCwd,
                 safetyMode: "trusted",
                 expiresAt: input.expiresAt,

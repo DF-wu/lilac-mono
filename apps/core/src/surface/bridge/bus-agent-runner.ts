@@ -2951,6 +2951,7 @@ export async function startBusAgentRunner(params: {
         safetyMode?: SessionSafetyMode;
       }>;
   issueHeartbeatCapability?: (input: {
+    profile: AgentRunProfile;
     requestId: string;
     sessionId: string;
     requestClient: AdapterPlatform;
@@ -6097,13 +6098,19 @@ export async function startBusAgentRunner(params: {
                   discordSessionContext?.parentChannelId ?? undefined,
                   discordSessionContext?.guildId ?? undefined,
                 ));
-          if (runProfile === "primary" && !workflowPolicy && isHeartbeatSessionId(next.sessionId)) {
+          const heartbeatAuthority = workflowPolicy
+            ? workflowPolicy.originSession.client === "unknown" &&
+              workflowPolicy.originSession.userId === null &&
+              isHeartbeatSessionId(workflowPolicy.originSession.sessionId ?? "")
+            : runProfile === "primary" && isHeartbeatSessionId(next.sessionId);
+          if (heartbeatAuthority) {
             controlCapability =
               (await params.issueHeartbeatCapability?.({
+                profile: runProfile,
                 requestId: next.requestId,
                 sessionId: next.sessionId,
                 requestClient: next.requestClient,
-                canonicalCwd: cwd,
+                canonicalCwd: workflowPolicy?.cwd ?? cwd,
                 expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1_000,
               })) ?? null;
             if (!controlCapability) {
@@ -6382,7 +6389,9 @@ export async function startBusAgentRunner(params: {
                 readFileDirectPdfSupported: resourceProviderTarget.supportsPdf,
                 onActivity: (source: "tool" | "subagent") => markRunActivity(source),
                 onSubagentDelegate:
-                  workflowSubagentDispatcher && liveParentSession && fallbackSurfaceForDelegation
+                  workflowSubagentDispatcher &&
+                  liveParentSession &&
+                  (fallbackSurfaceForDelegation || heartbeatAuthority)
                     ? async (registration: SubagentDelegationRegistration) =>
                         await workflowSubagentDispatcher.delegate({
                           ...registration,

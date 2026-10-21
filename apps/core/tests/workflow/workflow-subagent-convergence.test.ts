@@ -156,6 +156,7 @@ it("times out an accepted subagent before agent dispatch", async () => {
 function registration(
   projectRoot: string,
   parentRequestId = "parent:1",
+  heartbeat = false,
 ): TrustedSubagentDelegationRegistration {
   return {
     mode: "deferred",
@@ -166,7 +167,7 @@ function registration(
     idleTimeoutMs: 2000,
     depth: 1,
     parentRequestId,
-    parentSessionId: "channel:1",
+    parentSessionId: heartbeat ? "__heartbeat__" : "channel:1",
     parentRequestClient: "discord",
     parentToolCallId: "tool:delegate",
     childRequestId: "sub:child:1",
@@ -187,16 +188,18 @@ function registration(
     },
     initialMessages: [{ role: "user", content: "Audit the authentication flow" }],
     projectRoot,
-    fallbackSurface: {
-      ...AUTHENTICATED_PARENT,
-      sessionId: "channel:1",
-    },
+    fallbackSurface: heartbeat
+      ? null
+      : {
+          ...AUTHENTICATED_PARENT,
+          sessionId: "channel:1",
+        },
   };
 }
-async function createRun(parentRequestId = "parent:1") {
+async function createRun(parentRequestId = "parent:1", heartbeat = false) {
   const setupResult = await setup();
   const handle = await setupResult.dispatcher.delegate(
-    registration(setupResult.projectRoot, parentRequestId),
+    registration(setupResult.projectRoot, parentRequestId, heartbeat),
   );
   const run = workflowStoreValue(setupResult.store.getRun(handle.runId));
   if (!run) throw new Error("generated subagent run not found");
@@ -829,193 +832,209 @@ describe("workflow subagent convergence", () => {
     await bus.close();
     store.close();
   });
-  it("dispatches the generated agent operation through the workflow engine", async () => {
-    const { store, handle, run, dataDir } = await createRun();
-    const bus = createLilacBus(createInMemoryRawBus());
-    let childSessionId: string | undefined;
-    let childRequestId: string | undefined;
-    let hasWorkflowIdentity = false;
-    const progress: string[] = [];
-    await startResultForTest(
-      bus.subscribeTopic(
-        outReqTopic("parent:1"),
-        { mode: "tail", offset: { type: "begin" } },
-        async (message) => {
-          if (message.type === lilacEventTypes.EvtAgentOutputToolCall) {
-            progress.push(message.data.display);
-          }
-          return okResultForTest();
-        },
-        () => "commit",
-      ),
-    );
-    const bridge = new WorkflowLiveParentBridge({
-      bus,
-      blobStore,
-      store,
-      subscriptionId: "generated-subagent-parent-bridge",
-    });
-    await bridge.start();
-    const parent = bridge.registerParent({ parentRequestId: "parent:1" });
-    await parent.ready;
-    await startResultForTest(
-      bus.subscribeTopic(
-        "cmd.request",
-        { mode: "fanout", subscriptionId: "generated-agent" },
-        async (message) => {
-          if (
-            message.type === lilacEventTypes.CmdRequestMessage &&
-            message.data.queue === "prompt"
-          ) {
-            childSessionId = message.headers?.session_id;
-            childRequestId = message.headers?.request_id;
-            const workflow = z
-              .object({
-                workflow: z.strictObject({
-                  runId: z.string(),
-                  operationId: z.string(),
-                  dispatchEpoch: z.string(),
-                }),
-              })
-              .parse(message.data.raw).workflow;
-            hasWorkflowIdentity = true;
-            if (!childRequestId || !childSessionId) {
-              throw new Error("generated workflow request authority is incomplete");
+  it.each([false, true])(
+    "dispatches the generated agent operation through the workflow engine (heartbeat=%s)",
+    async (heartbeat) => {
+      const { store, handle, run, dataDir } = await createRun("parent:1", heartbeat);
+      const bus = createLilacBus(createInMemoryRawBus());
+      let childSessionId: string | undefined;
+      let childRequestId: string | undefined;
+      let hasWorkflowIdentity = false;
+      const progress: string[] = [];
+      await startResultForTest(
+        bus.subscribeTopic(
+          outReqTopic("parent:1"),
+          { mode: "tail", offset: { type: "begin" } },
+          async (message) => {
+            if (message.type === lilacEventTypes.EvtAgentOutputToolCall) {
+              progress.push(message.data.display);
             }
-            const authorized = store.authorizeWorkflowRequest({
-              requestId: childRequestId,
-              sessionId: childSessionId,
-              platform: "unknown",
-            });
-            if (!authorized) throw new Error("generated workflow request was not authorized");
-            expect(authorized.policy).toMatchObject({
-              profile: "explore",
-              model: null,
-              reasoning: null,
-            });
-            expect(
-              store.claimWorkflowRequest({
+            return okResultForTest();
+          },
+          () => "commit",
+        ),
+      );
+      const bridge = new WorkflowLiveParentBridge({
+        bus,
+        blobStore,
+        store,
+        subscriptionId: "generated-subagent-parent-bridge",
+      });
+      await bridge.start();
+      const parent = bridge.registerParent({ parentRequestId: "parent:1" });
+      await parent.ready;
+      await startResultForTest(
+        bus.subscribeTopic(
+          "cmd.request",
+          { mode: "fanout", subscriptionId: "generated-agent" },
+          async (message) => {
+            if (
+              message.type === lilacEventTypes.CmdRequestMessage &&
+              message.data.queue === "prompt"
+            ) {
+              childSessionId = message.headers?.session_id;
+              childRequestId = message.headers?.request_id;
+              const workflow = z
+                .object({
+                  workflow: z.strictObject({
+                    runId: z.string(),
+                    operationId: z.string(),
+                    dispatchEpoch: z.string(),
+                  }),
+                })
+                .parse(message.data.raw).workflow;
+              hasWorkflowIdentity = true;
+              if (!childRequestId || !childSessionId) {
+                throw new Error("generated workflow request authority is incomplete");
+              }
+              const authorized = store.authorizeWorkflowRequest({
                 requestId: childRequestId,
-                dispatchEpoch: workflow.dispatchEpoch,
-                ownerId: "generated-runner",
-                now: Date.now(),
-              }),
-            ).toBe(true);
-            expect(
-              store.recordWorkflowRequestTerminal({
-                requestId: childRequestId,
-                runId: authorized.policy.runId,
-                operationId: authorized.policy.operationId,
-                dispatchEpoch: workflow.dispatchEpoch,
-                ownerId: "generated-runner",
-                state: "resolved",
-                output: "engine result",
-                now: Date.now(),
-              }),
-            ).toBe(true);
-            await bus.publish(
-              lilacEventTypes.EvtAgentOutputDeltaText,
-              { delta: "checking authentication middleware" },
-              { headers: message.headers },
-            );
-            await bus.publish(
-              lilacEventTypes.EvtAgentOutputResponseText,
-              { finalText: "engine result" },
-              { headers: message.headers },
-            );
-            await bus.publish(
-              lilacEventTypes.EvtRequestLifecycleChanged,
-              { state: "resolved" },
-              { headers: message.headers },
-            );
-          }
-          return okResultForTest();
-        },
-        () => "commit",
-      ),
-    );
-    const engine = new WorkflowEngine({
-      bus,
-      blobStore,
-      store,
-      dataDir,
-      subscriptionId: "generated-subagent-engine",
-      pollMs: 5,
-    });
-    await engine.start();
-    await waitFor(() => workflowStoreValue(store.getRun(run.runId))?.state === "succeeded");
-    await waitFor(() =>
-      progress.some((display) => display.includes("checking authentication middleware")),
-    );
-    expect(childSessionId).toBe("sub:channel:1:named:audit");
-    expect(hasWorkflowIdentity).toBe(true);
-    expect(
-      childRequestId
-        ? workflowStoreValue(store.getWorkflowRequestTerminalReceipt(childRequestId))
-        : null,
-    ).toMatchObject({ state: "resolved", output: "engine result" });
-    expect(progress.some((display) => display.includes("subagent (explore;"))).toBe(true);
-    expect(progress.some((display) => display.includes("checking authentication middleware"))).toBe(
-      true,
-    );
-    expect(parent.listPending().map((completion) => completion.runId)).toEqual([run.runId]);
-    await expect(handle.completion).resolves.toEqual({
-      status: "resolved",
-      finalText: "engine result",
-    });
-    await engine.stop();
-    await parent.acknowledge([run.runId]);
-    expect(parent.listPending()).toEqual([]);
-    await parent.close();
-    await bridge.stop();
-    await bus.close();
-    store.close();
-  });
-  it("recovers and acknowledges pending completions in terminal order", async () => {
-    const { store, run } = await createRun();
-    store.transitionRun({ runId: run.runId, from: "queued", to: "running", now: 10 });
-    store.transitionRun({
-      runId: run.runId,
-      from: "running",
-      to: "succeeded",
-      now: 20,
-      result: "done",
-    });
-    const bus = createLilacBus(createInMemoryRawBus());
-    const bridge = new WorkflowLiveParentBridge({
-      bus,
-      blobStore,
-      store,
-      subscriptionId: "test-live-parent",
-    });
-    const parent = bridge.registerParent({ parentRequestId: "parent:1" });
-    await parent.ready;
-    expect(parent.snapshot()).toMatchObject({
-      hasPendingCompletions: true,
-      hasOutstandingRuns: false,
-    });
-    expect(store.getLiveParentDeliverySnapshot("parent:1")).toEqual({
-      pendingCompletionCount: 1,
-      outstandingRunCount: 0,
-    });
-    const pending = parent.listPending();
-    expect(pending).toHaveLength(1);
-    expect(pending[0]).toMatchObject({
-      runId: run.runId,
-      status: "resolved",
-      finalText: "done",
-    });
-    parent.acknowledge([run.runId]);
-    expect(parent.snapshot().hasPendingCompletions).toBe(false);
-    expect(store.getLiveParentDeliverySnapshot("parent:1")).toEqual({
-      pendingCompletionCount: 0,
-      outstandingRunCount: 0,
-    });
-    await parent.close();
-    await bridge.stop();
-    await bus.close();
-    store.close();
-  });
+                sessionId: childSessionId,
+                platform: "unknown",
+              });
+              if (!authorized) throw new Error("generated workflow request was not authorized");
+              expect(authorized.policy.originSession).toEqual({
+                requestId: "parent:1",
+                sessionId: heartbeat ? "__heartbeat__" : "channel:1",
+                client: heartbeat ? "unknown" : "discord",
+                userId: heartbeat ? null : "user-1",
+              });
+              expect(authorized.policy).toMatchObject({
+                profile: "explore",
+                model: null,
+                reasoning: null,
+              });
+              expect(
+                store.claimWorkflowRequest({
+                  requestId: childRequestId,
+                  dispatchEpoch: workflow.dispatchEpoch,
+                  ownerId: "generated-runner",
+                  now: Date.now(),
+                }),
+              ).toBe(true);
+              expect(
+                store.recordWorkflowRequestTerminal({
+                  requestId: childRequestId,
+                  runId: authorized.policy.runId,
+                  operationId: authorized.policy.operationId,
+                  dispatchEpoch: workflow.dispatchEpoch,
+                  ownerId: "generated-runner",
+                  state: "resolved",
+                  output: "engine result",
+                  now: Date.now(),
+                }),
+              ).toBe(true);
+              await bus.publish(
+                lilacEventTypes.EvtAgentOutputDeltaText,
+                { delta: "checking authentication middleware" },
+                { headers: message.headers },
+              );
+              await bus.publish(
+                lilacEventTypes.EvtAgentOutputResponseText,
+                { finalText: "engine result" },
+                { headers: message.headers },
+              );
+              await bus.publish(
+                lilacEventTypes.EvtRequestLifecycleChanged,
+                { state: "resolved" },
+                { headers: message.headers },
+              );
+            }
+            return okResultForTest();
+          },
+          () => "commit",
+        ),
+      );
+      const engine = new WorkflowEngine({
+        bus,
+        blobStore,
+        store,
+        dataDir,
+        subscriptionId: "generated-subagent-engine",
+        pollMs: 5,
+      });
+      await engine.start();
+      await waitFor(() => workflowStoreValue(store.getRun(run.runId))?.state === "succeeded");
+      await waitFor(() =>
+        progress.some((display) => display.includes("checking authentication middleware")),
+      );
+      expect(childSessionId).toBe("sub:channel:1:named:audit");
+      expect(hasWorkflowIdentity).toBe(true);
+      expect(
+        childRequestId
+          ? workflowStoreValue(store.getWorkflowRequestTerminalReceipt(childRequestId))
+          : null,
+      ).toMatchObject({ state: "resolved", output: "engine result" });
+      expect(progress.some((display) => display.includes("subagent (explore;"))).toBe(true);
+      expect(
+        progress.some((display) => display.includes("checking authentication middleware")),
+      ).toBe(true);
+      expect(parent.listPending().map((completion) => completion.runId)).toEqual([run.runId]);
+      await expect(handle.completion).resolves.toEqual({
+        status: "resolved",
+        finalText: "engine result",
+      });
+      await engine.stop();
+      await parent.acknowledge([run.runId]);
+      expect(parent.listPending()).toEqual([]);
+      await parent.close();
+      await bridge.stop();
+      await bus.close();
+      store.close();
+    },
+  );
+  it.each([false, true])(
+    "recovers and acknowledges pending completions in terminal order (heartbeat=%s)",
+    async (heartbeat) => {
+      const setupResult = await createRun("parent:1", heartbeat);
+      const { run } = setupResult;
+      setupResult.store.close();
+      const store = new DurableWorkflowStore(setupResult.dbPath);
+      expect(workflowStoreValue(store.getRun(run.runId))?.origin).toEqual(run.origin);
+      store.transitionRun({ runId: run.runId, from: "queued", to: "running", now: 10 });
+      store.transitionRun({
+        runId: run.runId,
+        from: "running",
+        to: "succeeded",
+        now: 20,
+        result: "done",
+      });
+      const bus = createLilacBus(createInMemoryRawBus());
+      const bridge = new WorkflowLiveParentBridge({
+        bus,
+        blobStore,
+        store,
+        subscriptionId: "test-live-parent",
+      });
+      const parent = bridge.registerParent({ parentRequestId: "parent:1" });
+      await parent.ready;
+      expect(parent.snapshot()).toMatchObject({
+        hasPendingCompletions: true,
+        hasOutstandingRuns: false,
+      });
+      expect(store.getLiveParentDeliverySnapshot("parent:1")).toEqual({
+        pendingCompletionCount: 1,
+        outstandingRunCount: 0,
+      });
+      const pending = parent.listPending();
+      expect(pending).toHaveLength(1);
+      expect(pending[0]).toMatchObject({
+        runId: run.runId,
+        status: "resolved",
+        finalText: "done",
+      });
+      parent.acknowledge([run.runId]);
+      expect(parent.snapshot().hasPendingCompletions).toBe(false);
+      expect(store.getLiveParentDeliverySnapshot("parent:1")).toEqual({
+        pendingCompletionCount: 0,
+        outstandingRunCount: 0,
+      });
+      await parent.close();
+      await bridge.stop();
+      await bus.close();
+      store.close();
+    },
+  );
   it("keeps artifact-backed completion pending when artifact loading fails", async () => {
     const { store, run } = await createRun();
     store.transitionRun({ runId: run.runId, from: "queued", to: "running", now: 10 });
@@ -1166,28 +1185,31 @@ describe("workflow subagent convergence", () => {
     await bus.close();
     setupResult.store.close();
   });
-  it("cascades parent cancellation to active generated runs", async () => {
-    const { store, run } = await createRun();
-    const bus = createLilacBus(createInMemoryRawBus());
-    const bridge = new WorkflowLiveParentBridge({
-      bus,
-      blobStore,
-      store,
-      subscriptionId: "test-live-parent-cancel",
-    });
-    const parent = bridge.registerParent({ parentRequestId: "parent:1" });
-    await parent.ready;
-    await parent.cancelAll("parent request cancelled");
-    expect(workflowStoreValue(store.getRun(run.runId))?.state).toBe("cancelled");
-    expect(parent.snapshot()).toMatchObject({
-      hasPendingCompletions: false,
-      hasOutstandingRuns: false,
-    });
-    await parent.close();
-    await bridge.stop();
-    await bus.close();
-    store.close();
-  });
+  it.each([false, true])(
+    "cascades parent cancellation to active generated runs (heartbeat=%s)",
+    async (heartbeat) => {
+      const { store, run } = await createRun("parent:1", heartbeat);
+      const bus = createLilacBus(createInMemoryRawBus());
+      const bridge = new WorkflowLiveParentBridge({
+        bus,
+        blobStore,
+        store,
+        subscriptionId: "test-live-parent-cancel",
+      });
+      const parent = bridge.registerParent({ parentRequestId: "parent:1" });
+      await parent.ready;
+      await parent.cancelAll("parent request cancelled");
+      expect(workflowStoreValue(store.getRun(run.runId))?.state).toBe("cancelled");
+      expect(parent.snapshot()).toMatchObject({
+        hasPendingCompletions: false,
+        hasOutstandingRuns: false,
+      });
+      await parent.close();
+      await bridge.stop();
+      await bus.close();
+      store.close();
+    },
+  );
   it("cancels an active orphan before the workflow engine can claim it", async () => {
     const { store, run, dataDir } = await createRun("parent:lost");
     const raw = createInMemoryRawBus();

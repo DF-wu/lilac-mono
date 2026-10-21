@@ -345,11 +345,12 @@ export type SubagentDelegationRegistration = {
 
 export type TrustedSubagentDelegationRegistration = SubagentDelegationRegistration & {
   projectRoot: string;
+  // Heartbeat has no surface principal; null preserves its authority through workflow recovery.
   fallbackSurface: {
     platform: SurfacePrincipal["platform"];
     sessionId: string;
     userId: string;
-  };
+  } | null;
 };
 
 export type SubagentDelegationOutcome = {
