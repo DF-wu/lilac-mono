@@ -79,23 +79,25 @@ describe("github user token secret", () => {
   });
 
   it("does not throw when user token secret is malformed", async () => {
-    await mkdir(path.join(dataDir, "secret"), { recursive: true });
+    const malformedDataDir = path.join(dataDir, "abc");
+    const secretPath = resolveGithubUserTokenSecretPath(malformedDataDir);
+    await mkdir(path.join(malformedDataDir, "secret"), { recursive: true });
     await writeFile(
-      resolveGithubUserTokenSecretPath(dataDir),
+      secretPath,
       JSON.stringify({ type: "github_user_token", token: "abc", host: "" }),
       "utf8",
     );
 
-    await expect(getGithubEnvForBash({ dataDir })).resolves.toEqual({});
+    await expect(getGithubEnvForBash({ dataDir: malformedDataDir })).resolves.toEqual({});
 
-    const read = await readGithubUserTokenSecretResult(dataDir);
+    const read = await readGithubUserTokenSecretResult(malformedDataDir);
     expect(read.status).toBe("error");
     if (read.status === "error") {
       expect(read.error).toMatchObject({
         _tag: "GithubUserTokenSecretReadError",
-        secretPath: resolveGithubUserTokenSecretPath(dataDir),
+        secretPath,
       });
-      expect(read.error.message).not.toContain("abc");
+      expect(read.error.message).toBe(`Invalid GitHub user token secret at ${secretPath}`);
     }
   });
 
