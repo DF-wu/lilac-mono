@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Database } from "bun:sqlite";
 import { generateVAPIDKeys, sendNotification, WebPushError } from "web-push";
 import { Result } from "better-result";
@@ -12,6 +13,15 @@ type Subscription = {
   auth: string;
   completion: number;
   failure: number;
+};
+export const PUSH_ESCALATION_MS = 60_000;
+type Escalation = {
+  userId: string;
+  threadId: string;
+  turnId: string;
+  generation: number;
+  endpoint: string;
+  timer: ReturnType<typeof setTimeout>;
 };
 type Keys = { publicKey: string; privateKey: string };
 
@@ -34,7 +44,9 @@ export class NativePush {
     { userId: string; threadId: string; until: number; signal?: AbortSignal; onAbort?: () => void }
   >();
   private readonly working = new Map<string, NativeThread>();
-  private readonly pending = new Set<Promise<void>>();
+  private readonly pending = new Set<Promise<boolean | void>>();
+  private readonly escalations = new Map<string, Escalation>();
+  private stopped = false;
   private stopListening?: () => void;
   constructor(
     private readonly db: Database,
@@ -142,6 +154,7 @@ export class NativePush {
   }
 
   start() {
+    this.stopped = false;
     this.stopListening = this.store.subscribe((threadId) => this.changed(threadId));
   }
 
@@ -160,6 +173,10 @@ export class NativePush {
 
   private changed(threadId: string) {
     if (!threadId) return;
+    for (const [key, escalation] of this.escalations) {
+      if (escalation.threadId === threadId && !this.unreadCompletion(escalation))
+        this.cancelEscalation(key);
+    }
     const subscriptions = this.db
       .query<Subscription, []>("SELECT * FROM native_push_subscriptions")
       .all();
@@ -185,6 +202,7 @@ export class NativePush {
         threadId,
         thread.displayStatus === "error" ? "failure" : "completion",
         subscriptions,
+        true,
       );
     }
   }
@@ -194,6 +212,7 @@ export class NativePush {
     threadId: string,
     kind: "completion" | "failure",
     subscriptions: Subscription[],
+    stageCompletion = false,
   ) {
     if (
       [...this.viewing.values()].some(
@@ -207,12 +226,104 @@ export class NativePush {
       .match({ ok: (value) => value, err: () => undefined });
     const keys = this.keys();
     if (!payload || !keys) return;
-    for (const subscription of subscriptions) {
-      if (subscription.user_id !== userId || !subscription[kind]) continue;
-      const delivery = this.deliver(subscription, JSON.stringify(payload), keys);
-      this.pending.add(delivery);
-      void delivery.finally(() => this.pending.delete(delivery));
-    }
+    const eligible = subscriptions.filter((entry) => entry.user_id === userId && entry[kind]);
+    if (
+      stageCompletion &&
+      kind === "completion" &&
+      this.stageCompletion(userId, threadId, eligible, JSON.stringify(payload), keys)
+    )
+      return;
+    for (const subscription of eligible)
+      this.track(this.deliver(subscription, JSON.stringify(payload), keys));
+  }
+
+  private stageCompletion(
+    userId: string,
+    threadId: string,
+    eligible: Subscription[],
+    payload: string,
+    keys: Keys,
+  ): boolean {
+    const origin = this.store
+      .notificationOrigin(userId, threadId)
+      .match({ ok: (value) => value, err: () => undefined });
+    if (!origin || origin.userId !== userId || !origin.deviceId) return false;
+    const primary = eligible.find(
+      (entry) => createHash("sha256").update(entry.endpoint).digest("hex") === origin.deviceId,
+    );
+    if (!primary) return false;
+    this.stage(
+      { userId, threadId, turnId: origin.turnId, generation: origin.generation },
+      primary,
+      payload,
+      keys,
+    );
+    return true;
+  }
+
+  private track(delivery: Promise<boolean | void>) {
+    this.pending.add(delivery);
+    void delivery.finally(() => this.pending.delete(delivery));
+  }
+
+  private cancelEscalation(key: string) {
+    const escalation = this.escalations.get(key);
+    if (!escalation) return;
+    clearTimeout(escalation.timer);
+    this.escalations.delete(key);
+  }
+
+  private unreadCompletion(escalation: Omit<Escalation, "timer" | "endpoint">) {
+    const thread = this.store
+      .getThread(escalation.userId, escalation.threadId)
+      .match({ ok: (value) => value, err: () => undefined });
+    if (
+      !thread ||
+      thread.archived ||
+      !thread.capabilities.read ||
+      thread.displayStatus !== "completed"
+    )
+      return false;
+    const origin = this.store
+      .notificationOrigin(escalation.userId, escalation.threadId)
+      .match({ ok: (value) => value, err: () => undefined });
+    return origin?.turnId === escalation.turnId && origin.generation === escalation.generation;
+  }
+
+  private stage(
+    completion: Omit<Escalation, "timer" | "endpoint">,
+    primary: Subscription,
+    payload: string,
+    keys: Keys,
+  ) {
+    const key = JSON.stringify([completion.userId, completion.threadId]);
+    this.cancelEscalation(key);
+    const escalation: Escalation = {
+      ...completion,
+      endpoint: primary.endpoint,
+      timer: setTimeout(() => this.escalate(key, escalation), PUSH_ESCALATION_MS),
+    };
+    this.escalations.set(key, escalation);
+    this.track(
+      this.deliver(primary, payload, keys).then((delivered) => {
+        if (!delivered) this.escalate(key, escalation);
+      }),
+    );
+  }
+
+  private escalate(key: string, escalation: Escalation) {
+    if (this.stopped || this.escalations.get(key) !== escalation) return;
+    this.cancelEscalation(key);
+    if (!this.unreadCompletion(escalation)) return;
+    const subscriptions = this.db
+      .query<Subscription, []>("SELECT * FROM native_push_subscriptions")
+      .all();
+    this.notify(
+      escalation.userId,
+      escalation.threadId,
+      "completion",
+      subscriptions.filter((entry) => entry.endpoint !== escalation.endpoint),
+    );
   }
 
   private async deliver(subscription: Subscription, payload: string, keys: Keys) {
@@ -235,9 +346,12 @@ export class NativePush {
     const status = result.match({ ok: () => 201, err: (value) => value });
     if (status === 404 || status === 410)
       this.unsubscribe(subscription.user_id, subscription.endpoint);
+    return status >= 200 && status < 300;
   }
 
   async stop() {
+    this.stopped = true;
+    for (const key of this.escalations.keys()) this.cancelEscalation(key);
     this.stopListening?.();
     this.stopListening = undefined;
     await Promise.all(this.pending);

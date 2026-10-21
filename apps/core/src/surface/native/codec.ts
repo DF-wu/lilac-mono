@@ -66,6 +66,10 @@ export const nativeInputRecordSchema = z.strictObject({
   threadId: id,
   authorId: id,
   initiatingUserId: id,
+  deviceId: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
   requestId: id,
   deliveryId: id,
   messageId: id,

@@ -1,4 +1,5 @@
 import { RecentContextProvider } from "./RecentContext";
+import { currentPushDeviceId } from "../push-device";
 import { watchReadLifecycle } from "../read-lifecycle";
 import { rewindDraft } from "../rewind-draft";
 import type { OptimisticTurn } from "../optimistic-turns";
@@ -375,6 +376,7 @@ export function Chat(props: ChatProps) {
       threadId: threadId,
       commandId: entry.commandId,
       historyGeneration: checkpoint.historyGeneration,
+      deviceId: await currentPushDeviceId(),
       text: entry.submission.attachmentText
         ? resolveComposerAttachments(
             entry.submission.attachmentText,

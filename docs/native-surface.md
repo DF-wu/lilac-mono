@@ -342,6 +342,22 @@ opens the thread. Viewing a visible, focused thread suppresses that user's backg
 devices, even when push is disabled or unsupported on the viewing device. Focus clears when the tab
 is hidden or blurred; disconnected tabs expire after 60 seconds without a presence heartbeat.
 
+Successful responses notify the browser that submitted the turn first. If the response remains unread
+60 seconds later, Core notifies the user's other eligible devices. Reading the response on any device
+cancels that escalation. The read acknowledgment requires the selected conversation's latest completed
+turn to be visible in a focused window; returning focus or reconnecting retries it.
+
+If the initiating browser has no eligible push subscription, or its push request fails, Core sends to
+other eligible devices immediately. Run failures and agent-initiated posts retain immediate broadcast
+delivery. The initiating browser is identified by a hash of its push endpoint on the accepted input;
+steering does not replace the turn's initiating device. Existing inputs without an identifier retain
+broadcast behavior. Each user's subscriptions and read state remain separate in shared threads.
+
+Delayed notifications are held only in memory. A Core restart during the 60-second delay drops the
+pending escalation; startup does not replay it. Before sending, Core rechecks the same turn and history
+generation, read status, access, archive state, viewing presence and current notification preferences.
+Newer work cancels the earlier escalation.
+
 Use HTTPS. On iOS/iPadOS 16.4 or newer, add Lilac to the Home Screen and enable notifications from the
 installed web app. Core generates and retains signing keys automatically. No Firebase project or Apple
 developer account is required. Core needs outbound HTTPS access to the browser's push service. Delivery

@@ -110,6 +110,10 @@ export const nativeInputSchema = z
     threadId: identitySchema,
     commandId: identitySchema,
     historyGeneration: revisionSchema,
+    deviceId: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
     text: z.string().max(65_536),
     mode: z.enum(["prompt", "steer", "followup"]),
     attachmentIds: z.array(identitySchema).max(32),

@@ -1,4 +1,5 @@
 import { DirectThreadCard, DirectThreadTitle } from "./components/DirectThreadCard";
+import { currentPushDeviceId } from "./push-device";
 import { NativeComputerViewer } from "./components/ComputerViewer";
 import { FloatingChatMenu } from "./components/FloatingChatMenu";
 import { useWorkspaceViewport } from "./use-workspace-viewport";
@@ -694,6 +695,7 @@ function Workspace(props: AppProps) {
           threadId: created.id,
           commandId: entry.commandId,
           historyGeneration: replay.checkpoint.historyGeneration,
+          deviceId: await currentPushDeviceId(),
           text: entry.submission.attachmentText
             ? resolveComposerAttachments(
                 entry.submission.attachmentText,

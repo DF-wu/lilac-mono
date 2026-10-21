@@ -1,5 +1,22 @@
 # MIGRATIONS.md
 
+## Native schema 5: initiating notification device
+
+Native input submissions and persisted input records gain optional `deviceId`, the lowercase SHA-256
+hex digest of the initiating browser's push subscription endpoint. Core matches it only against the
+authenticated initiating user's subscriptions. Existing inputs without this field keep immediate
+broadcast delivery. The existing subscription table remains unchanged; no device registry is added.
+
+Initialization advances SQLite schema 4 to 5 without rewriting existing records. Older binaries reject
+schema 5. Deploy Core and web together because older strict input validators reject `deviceId`; rollback
+requires a pre-upgrade backup.
+
+Successful completions notify the initiating subscription first, then other eligible devices after
+60 seconds if that completion remains unread. Missing or disabled initiating subscriptions and failed
+primary sends fall back to immediate delivery to other eligible devices. Failures and agent-initiated
+posts keep immediate broadcast behavior. Pending escalations are process-local: restarting Core during
+the delay drops them, and startup does not replay them.
+
 ## Native surface sends opt in to execution
 
 `surface.messages.send` replaces `suppressRun` with `triggerRun`, defaulting to false. Native sends

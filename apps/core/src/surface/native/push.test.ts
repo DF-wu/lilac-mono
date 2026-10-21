@@ -1,14 +1,16 @@
+import { createHash } from "node:crypto";
 import { expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Result } from "better-result";
 import { WebPushError, type sendNotification } from "web-push";
-import { NativePush, allowedPushEndpoint } from "./push";
+import { NativePush, allowedPushEndpoint, PUSH_ESCALATION_MS } from "./push";
 import { NativeStore } from "./store";
 import { NativeSurfaceAdapter } from "./adapter";
 import { NativeSurfaceStore } from "./store-surface";
 
 function fixture(
   send: typeof sendNotification = async () => ({ statusCode: 201, headers: {}, body: "" }),
+  deviceId?: string,
 ) {
   const db = new Database(":memory:");
   const store = new NativeStore(db);
@@ -38,6 +40,7 @@ function fixture(
     .acceptInput("alice", {
       threadId: thread.id,
       commandId: "input",
+      deviceId,
       historyGeneration: 0,
       text: "Hello",
       mode: "prompt",
@@ -304,5 +307,269 @@ test("an old socket cannot clear or restore presence after reconnect", async () 
   f.push.posted(f.thread.id);
   await f.push.stop();
   expect(sent).toBe(1);
+  f.db.close();
+});
+
+const primaryEndpoint = "https://fcm.googleapis.com/fcm/send/device";
+const primaryDeviceId = createHash("sha256").update(primaryEndpoint).digest("hex");
+const secondaryEndpoint = "https://fcm.googleapis.com/fcm/send/second";
+
+function escalationClock() {
+  const callbacks: Array<() => void> = [];
+  const original = globalThis.setTimeout;
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(
+    Object.assign((...args: Parameters<typeof setTimeout>) => {
+      const [callback, delay] = args;
+      if (delay === PUSH_ESCALATION_MS) callbacks.push(() => callback());
+      return original(...args);
+    }, original),
+  );
+  return {
+    callbacks,
+    [Symbol.dispose]() {
+      timer.mockRestore();
+    },
+  };
+}
+
+function stagedFixture(send?: typeof sendNotification, deviceId = primaryDeviceId) {
+  const sent: string[] = [];
+  const f = fixture(
+    send ??
+      (async (subscription) => {
+        sent.push(subscription.endpoint);
+        return { statusCode: 201, headers: {}, body: "" };
+      }),
+    deviceId,
+  );
+  f.push.subscribe("alice", { ...f.subscription, endpoint: secondaryEndpoint }).unwrap();
+  return { ...f, sent };
+}
+
+test("completion pushes the initiating device first and escalates once after 60 seconds", async () => {
+  using clock = escalationClock();
+  const f = stagedFixture();
+  await Promise.resolve();
+  f.finish();
+  await Promise.resolve();
+  expect(PUSH_ESCALATION_MS).toBe(60_000);
+  expect(f.sent).toEqual([primaryEndpoint]);
+  expect(clock.callbacks).toHaveLength(1);
+  clock.callbacks[0]!();
+  expect(f.sent).toEqual([primaryEndpoint, secondaryEndpoint]);
+  clock.callbacks[0]!();
+  expect(f.sent).toHaveLength(2);
+  await f.push.stop();
+  f.db.close();
+});
+
+for (const mode of [
+  "read",
+  "working",
+  "archived",
+  "revoked",
+  "reassigned",
+  "viewing",
+  "disabled",
+  "unsubscribed",
+  "generation",
+  "stopped",
+] as const) {
+  test(`delayed push rechecks ${mode} before delivery`, async () => {
+    using clock = escalationClock();
+    const f = stagedFixture();
+    await Promise.resolve();
+    f.finish();
+    await Promise.resolve();
+    expect(f.sent).toEqual([primaryEndpoint]);
+    const fire = clock.callbacks[0]!;
+    if (mode === "read") {
+      const surface = new NativeSurfaceStore(f.db, f.store);
+      surface.initialize().unwrap();
+      surface.markTurnRead("alice", f.thread.id, f.receipt.turnId!).unwrap();
+    }
+    if (mode === "working") f.store.setActiveRun(f.thread.id, 0, "next-run").unwrap();
+    if (mode === "archived" || mode === "generation") {
+      const field = mode === "archived" ? "archived" : "historyGeneration";
+      f.db
+        .query(
+          `UPDATE native_records SET data_json=json_set(data_json,'$.value.${field}',json(?)) WHERE kind='thread' AND id=?`,
+        )
+        .run(mode === "archived" ? "true" : "1", f.thread.id);
+    }
+    if (mode === "revoked")
+      f.db
+        .query(
+          "UPDATE native_records SET data_json=json_set(data_json,'$.value.starterId','bob') WHERE kind='thread' AND id=?",
+        )
+        .run(f.thread.id);
+    if (mode === "reassigned")
+      f.push.subscribe("bob", { ...f.subscription, endpoint: secondaryEndpoint }).unwrap();
+    if (mode === "viewing")
+      f.push.presence("alice", { threadId: f.thread.id, clientId: "reader" }).unwrap();
+    if (mode === "disabled")
+      f.push
+        .subscribe("alice", { ...f.subscription, endpoint: secondaryEndpoint, completion: false })
+        .unwrap();
+    if (mode === "unsubscribed") f.push.unsubscribe("alice", secondaryEndpoint).unwrap();
+    if (mode === "stopped") await f.push.stop();
+    fire();
+    expect(f.sent).toEqual([primaryEndpoint]);
+    await f.push.stop();
+    f.db.close();
+  });
+}
+
+for (const mode of ["unknown", "disabled", "missing", "failure"] as const) {
+  test(`completion fallback for ${mode} origin preserves immediate broadcast`, async () => {
+    using clock = escalationClock();
+    const f = stagedFixture(undefined, mode === "unknown" ? "0".repeat(64) : primaryDeviceId);
+    if (mode === "disabled")
+      f.push.subscribe("alice", { ...f.subscription, completion: false }).unwrap();
+    if (mode === "missing") f.push.unsubscribe("alice", primaryEndpoint).unwrap();
+    await Promise.resolve();
+    f.finish(mode === "failure" ? "failed" : "complete");
+    await Promise.resolve();
+    expect(f.sent.sort()).toEqual(
+      mode === "disabled" || mode === "missing"
+        ? [secondaryEndpoint]
+        : [primaryEndpoint, secondaryEndpoint].sort(),
+    );
+    expect(clock.callbacks).toHaveLength(0);
+    await f.push.stop();
+    f.db.close();
+  });
+}
+
+test("a rejected primary push falls back immediately without waiting for escalation", async () => {
+  using clock = escalationClock();
+  const sent: string[] = [];
+  const fallback = Promise.withResolvers<void>();
+  const f = stagedFixture(async (subscription) => {
+    sent.push(subscription.endpoint);
+    if (subscription.endpoint === primaryEndpoint)
+      throw new WebPushError("gone", 410, {}, "", primaryEndpoint);
+    fallback.resolve();
+    return { statusCode: 201, headers: {}, body: "" };
+  });
+  await Promise.resolve();
+  f.finish();
+  await fallback.promise;
+  expect(sent).toEqual([primaryEndpoint, secondaryEndpoint]);
+  clock.callbacks[0]!();
+  expect(sent).toHaveLength(2);
+  expect(
+    f.db
+      .query("SELECT endpoint FROM native_push_subscriptions WHERE endpoint=?")
+      .get(primaryEndpoint),
+  ).toBeNull();
+  await f.push.stop();
+  f.db.close();
+});
+
+test("origin survives a store reopen and schema 4 upgrades without rewriting inputs", async () => {
+  const f = stagedFixture();
+  const original = f.store.getInput(f.receipt.inputId).unwrap();
+  expect(original.deviceId).toBe(primaryDeviceId);
+  f.db.run("PRAGMA user_version = 4");
+  const reopened = new NativeStore(f.db);
+  reopened.initialize().unwrap();
+  expect(f.db.query("PRAGMA user_version").get()).toEqual({ user_version: 5 });
+  expect(reopened.getInput(f.receipt.inputId).unwrap()).toEqual(original);
+  expect(reopened.notificationOrigin("alice", f.thread.id).unwrap()).toMatchObject({
+    deviceId: primaryDeviceId,
+    turnId: f.receipt.turnId,
+    userId: "alice",
+  });
+  expect(reopened.notificationOrigin("bob", f.thread.id).isErr()).toBe(true);
+  await f.push.stop();
+  f.db.close();
+});
+
+test("an old timer cannot notify a newer completed turn or resend its primary push", async () => {
+  using clock = escalationClock();
+  const f = stagedFixture();
+  await Promise.resolve();
+  f.finish();
+  await Promise.resolve();
+  const first = clock.callbacks[0]!;
+  f.store.settleInput(f.receipt.inputId, "admitted").unwrap();
+  f.store.markInputCompleted(f.receipt.inputId).unwrap();
+  const next = f.store
+    .acceptInput("alice", {
+      threadId: f.thread.id,
+      commandId: "next",
+      historyGeneration: 0,
+      text: "Next",
+      mode: "prompt",
+      attachmentIds: [],
+      skillIds: [],
+      deviceId: primaryDeviceId,
+    })
+    .unwrap();
+  f.store.setActiveRun(f.thread.id, 0, "next").unwrap();
+  await Promise.resolve();
+  f.store
+    .projectTurn(f.thread.id, 0, "next-complete", next.turnId!, (slot) =>
+      Result.ok({
+        slot: {
+          ...slot,
+          state: "complete",
+          messages: [
+            ...slot.messages,
+            { id: "next-reply", role: "assistant", parts: [{ type: "text", text: "Next done" }] },
+          ],
+        },
+        changes: [],
+      }),
+    )
+    .unwrap();
+  f.store.setActiveRun(f.thread.id, 0).unwrap();
+  await Promise.resolve();
+  expect(f.sent).toEqual([primaryEndpoint, primaryEndpoint]);
+  expect(clock.callbacks).toHaveLength(2);
+  first();
+  expect(f.sent).toHaveLength(2);
+  clock.callbacks[1]!();
+  expect(f.sent).toEqual([primaryEndpoint, primaryEndpoint, secondaryEndpoint]);
+  await f.push.stop();
+  f.db.close();
+});
+
+test("steering from another device does not replace the turn's originating device", async () => {
+  using clock = escalationClock();
+  const f = stagedFixture();
+  f.store
+    .setActiveRun(f.thread.id, 0, f.store.getInput(f.receipt.inputId).unwrap().requestId)
+    .unwrap();
+  f.store
+    .acceptInput("alice", {
+      threadId: f.thread.id,
+      commandId: "steer",
+      historyGeneration: 0,
+      text: "Also check this",
+      mode: "steer",
+      attachmentIds: [],
+      skillIds: [],
+      deviceId: createHash("sha256").update(secondaryEndpoint).digest("hex"),
+    })
+    .unwrap();
+  await Promise.resolve();
+  f.finish();
+  await Promise.resolve();
+  expect(f.sent).toEqual([primaryEndpoint]);
+  await f.push.stop();
+  f.db.close();
+});
+
+test("schema 4 inputs without device identity remain readable after upgrade", async () => {
+  const f = fixture();
+  const original = f.store.getInput(f.receipt.inputId).unwrap();
+  expect(original.deviceId).toBeUndefined();
+  f.db.run("PRAGMA user_version = 4");
+  const reopened = new NativeStore(f.db);
+  reopened.initialize().unwrap();
+  expect(reopened.getInput(f.receipt.inputId).unwrap()).toEqual(original);
+  await f.push.stop();
   f.db.close();
 });

@@ -166,7 +166,7 @@ export class NativeStore {
     return nativeStoreTransaction(this.db, () => {
       const version =
         this.db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
-      if (version > 4)
+      if (version > 5)
         return Result.err(
           nativeFailure("invalid", "Native store version is newer than this build"),
         );
@@ -192,7 +192,7 @@ export class NativeStore {
         CREATE INDEX IF NOT EXISTS native_thread_preferences_order ON native_thread_preferences(user_id,section,position,thread_id);
         CREATE TABLE IF NOT EXISTS native_push_keys (id INTEGER PRIMARY KEY CHECK(id=1),public_key TEXT NOT NULL,private_key TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS native_push_subscriptions (endpoint TEXT PRIMARY KEY,user_id TEXT NOT NULL,p256dh TEXT NOT NULL,auth TEXT NOT NULL,completion INTEGER NOT NULL,failure INTEGER NOT NULL);
-        PRAGMA user_version = 4;`);
+        PRAGMA user_version = 5;`);
       return Result.ok(undefined);
     });
   }
@@ -731,6 +731,31 @@ export class NativeStore {
         return this.summary(user, thread);
       }, this),
     );
+  }
+
+  notificationOrigin(actorId: string, threadId: string) {
+    return Result.gen(function* () {
+      const thread = yield* this.authorizeThread(actorId, threadId);
+      const row = this.db
+        .query<{ turn_id: string; input_id: string | null }, [string]>(
+          "SELECT id AS turn_id,json_extract(data_json,'$.value.messages[0].metadata.inputId') AS input_id FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 1",
+        )
+        .get(threadId);
+      if (!row?.input_id) return Result.ok(undefined);
+      const input = yield* this.getInput(row.input_id);
+      if (
+        input.threadId !== threadId ||
+        input.turnId !== row.turn_id ||
+        input.historyGeneration !== thread.historyGeneration
+      )
+        return Result.ok(undefined);
+      return Result.ok({
+        turnId: row.turn_id,
+        generation: thread.historyGeneration,
+        userId: input.initiatingUserId,
+        deviceId: input.deviceId,
+      });
+    }, this);
   }
 
   notificationContent(actorId: string, threadId: string) {
@@ -1666,6 +1691,7 @@ export class NativeStore {
                 threadId: input.threadId,
                 authorId: options.authorId ?? actorId,
                 initiatingUserId: actorId,
+                deviceId: input.deviceId,
                 requestId: `native:${thread.id}:${messageId}`,
                 deliveryId: randomUUID(),
                 messageId,
