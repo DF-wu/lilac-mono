@@ -2766,7 +2766,7 @@ describe("SqliteTranscriptStore", () => {
     `);
     fence.close();
     expect(resultError(store.publishCoreNamedClaudeSuccess(publicationInput)).message).toContain(
-      "lost its unmarked fence",
+      "lost its active attempt fence",
     );
     expect(getRequestTranscript(store, { requestId })?.providerState).toBeNull();
     expect(
@@ -4573,7 +4573,7 @@ describe("SqliteTranscriptStore", () => {
     `);
     fence.close();
     expect(resultError(store.publishCorePrimaryClaudeSuccess(publicationInput)).message).toContain(
-      "lost its unmarked fence",
+      "lost its active attempt fence",
     );
     expect(getRequestTranscript(store, { requestId: "atomic-primary" })?.providerState).toBeNull();
     expect(
