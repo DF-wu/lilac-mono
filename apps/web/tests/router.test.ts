@@ -11,6 +11,23 @@ function setup(path: string) {
 }
 
 describe("web routes", () => {
+  test("DM routes share the chat layout and survive reload and back navigation", async () => {
+    const { router, history } = setup("/dm?settings=account");
+    await router.load();
+    expect(router.state.matches.at(-1)?.routeId).toBe("/chat/dm");
+    const layoutId = router.state.matches[1]!.id;
+    await router.navigate({ to: "/threads/$threadId", params: { threadId: "normal" } });
+    expect(router.state.matches[1]!.id).toBe(layoutId);
+    history.back();
+    await router.load();
+    expect(history.location.pathname).toBe("/dm");
+    expect(router.state.location.search).toEqual({ settings: "account" });
+    const reload = setup(history.location.href);
+    await reload.router.load();
+    expect(reload.router.state.matches.at(-1)?.routeId).toBe("/chat/dm");
+    expect(threadIdFromUrl(new URL("https://example.test/dm"))).toBeUndefined();
+  });
+
   test("invalid workspace parameters fall back to chat", async () => {
     const { router } = setup("/?view=invalid&settings=invalid");
     await router.load();

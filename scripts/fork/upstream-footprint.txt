@@ -39,6 +39,8 @@ README.md  # fork entry point; describes fork features and maintenance
 PROJECT.md  # documents the Telegram surface and the OpenAI-compatible image script provider
 MIGRATIONS.md  # documents fork v2 config keys (surface.telegram) and the removed tools.generate block
 docs/core-config-migrations.md  # documents fork v2 config keys
+docs/heartbeat.md  # clarifies that the fork's Telegram surface is not a heartbeat default destination
+packages/utils/builtin-skills/heartbeat/references/setup.md  # keeps heartbeat setup aligned with the default destination schema in the Telegram fork
 docs/docker-deployment.md  # documents the container identity variants
 packages/utils/config-templates/core-config.example.yaml  # example keys for surface.telegram
 packages/utils/builtin-skills/image-generation/SKILL.md  # catalog row for the openaiCompatible provider recipe

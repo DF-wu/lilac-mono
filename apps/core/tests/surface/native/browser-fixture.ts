@@ -60,7 +60,25 @@ const HTML_PREVIEW_PAGE = `<!doctype html>
 </html>
 `;
 
-export async function startNativeBrowserFixture(mcpRegistry?: NativeRuntimeOptions["mcpRegistry"]) {
+export const browserFixtureParticipant = {
+  username: "participant",
+  password: "native-participant-password",
+};
+
+export type BrowserFixtureClerkAuth = {
+  secretKey: string;
+  publishableKey: string;
+  issuer: string;
+  ownerProviderUserId: string;
+  oauthClientId?: string;
+};
+
+export async function startNativeBrowserFixture(
+  mcpRegistry?: NativeRuntimeOptions["mcpRegistry"],
+  options: { port?: number; webOrigins?: string[]; clerk?: BrowserFixtureClerkAuth } = {},
+) {
+  const port = options.port ?? Number(process.env.TEST_NATIVE_PORT ?? 8789);
+  const clerk = options.clerk;
   let threads: ReturnType<typeof seedNativeBrowserFixture> | undefined;
   const fixture = await createNativeIntegrationFixture({
     mcpRegistry,
@@ -74,26 +92,45 @@ export async function startNativeBrowserFixture(mcpRegistry?: NativeRuntimeOptio
             : "Fixture response.\n\nReady for the next message.",
         ),
     }),
-    port: Number(process.env.TEST_NATIVE_PORT ?? 8789),
-    password: process.env.TEST_NATIVE_PASSWORD ?? "native-fixture-password",
+    port,
     allowedOrigins: [
-      `http://127.0.0.1:${process.env.TEST_NATIVE_PORT ?? 8789}`,
-      "http://localhost:8789",
-      "http://127.0.0.1:5173",
-      "http://localhost:5173",
+      `http://127.0.0.1:${port}`,
+      `http://localhost:${port}`,
+      ...(options.webOrigins ?? ["http://127.0.0.1:5173", "http://localhost:5173"]),
     ],
-    additionalLocalUsers: [
-      {
-        userId: "participant",
-        username: "participant",
-        password: "native-participant-password",
-        sessionLifetimeSeconds: 60,
-      },
-    ],
-    seed(store, transcript) {
-      threads = seedNativeBrowserFixture(store, { transcript });
+    ...(clerk
+      ? {
+          installationSecrets: {
+            clerkSecretKey: clerk.secretKey,
+            clerkPublishableKey: clerk.publishableKey,
+          },
+          publishableKey: clerk.publishableKey,
+        }
+      : {
+          password: process.env.TEST_NATIVE_PASSWORD ?? "native-fixture-password",
+          additionalLocalUsers: [
+            {
+              userId: "participant",
+              ...browserFixtureParticipant,
+              sessionLifetimeSeconds: 60,
+            },
+          ],
+        }),
+    seed(store, transcript, database) {
+      threads = seedNativeBrowserFixture(store, { transcript, database });
     },
     async prepare({ workspaceRoot, dataDir, config }) {
+      if (clerk) {
+        config.surface.native.installationId = "native-clerk-browser-fixture";
+        config.surface.native.publicUrl = `http://localhost:${port}`;
+        config.surface.native.auth = {
+          provider: "clerk",
+          ownerId: "owner",
+          ownerProviderUserId: clerk.ownerProviderUserId,
+          clerkIssuer: clerk.issuer,
+          ...(clerk.oauthClientId ? { clerkOAuthClientId: clerk.oauthClientId } : {}),
+        };
+      }
       await mkdir(path.join(workspaceRoot, "html-preview"), { recursive: true });
       await writeFile(path.join(workspaceRoot, "html-preview", "runner.svg"), HTML_PREVIEW_ICON);
       await writeFile(

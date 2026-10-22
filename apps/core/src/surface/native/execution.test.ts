@@ -38,6 +38,7 @@ function value<T, E>(result: ResultType<T, E>): T {
 function fixture(blobStore?: BlobStore, direct = false) {
   let now = 1_000;
   let maxAgeMs: number | undefined;
+  let dmGapMs: number | undefined;
   const store = new NativeStore(new Database(":memory:"), () => now);
   value(store.initialize());
   value(
@@ -55,6 +56,15 @@ function fixture(blobStore?: BlobStore, direct = false) {
       providerId: "guest",
       displayName: "Guest",
       role: "participant",
+      toolMode: "full",
+    }),
+  );
+  value(
+    store.upsertUser({
+      id: "lilac",
+      providerId: "lilac",
+      displayName: "Lilac",
+      role: "service",
       toolMode: "full",
     }),
   );
@@ -88,6 +98,7 @@ function fixture(blobStore?: BlobStore, direct = false) {
     bus,
     now: () => now,
     getOldMessageSelectionMaxAgeMs: () => maxAgeMs,
+    getDmContextGapMs: () => dmGapMs ?? 7_200_000,
     runner: () => ({
       cancelNativeSession: async () => {
         cancellations += 1;
@@ -148,6 +159,9 @@ function fixture(blobStore?: BlobStore, direct = false) {
     },
     setMaxAge: (value: number | undefined) => {
       maxAgeMs = value;
+    },
+    setDmGap: (value: number) => {
+      dmGapMs = value;
     },
     failPublication: (error: EventPublishContractInvalid | EventPublishTransportFailed) => {
       publicationFailure = error;
@@ -715,6 +729,61 @@ describe("native execution admission", () => {
     }
   });
 
+  test("keeps a DM session start fixed until a pause exceeds the context gap", async () => {
+    const f = fixture(undefined, true);
+    const finish = async () => {
+      const request = f.request();
+      value(
+        f.transcripts.saveRequestTranscript({
+          ...request,
+          requestClient: "native",
+          messages: [
+            ...storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages),
+            { role: "assistant", content: "same" },
+          ],
+        }),
+      );
+      value(await f.execution.runnerLifecycle.settled(request, "completed"));
+    };
+    const send = async (at: number) => {
+      f.setNow(at);
+      const receipt = f.submit("continue");
+      value(await f.execution.kick(f.thread.id));
+      return value(f.store.getInput(receipt.inputId));
+    };
+    try {
+      f.setDmGap(1_000);
+      const first = await send(1_000);
+      await finish();
+      for (const [index, at] of [1_900, 2_800, 3_700, 4_600].entries()) {
+        const input = await send(at);
+        expect(f.published.at(-1)!.data.messages).toHaveLength(3 + index * 2);
+        expect(input.canonicalHistoryStartRequestId).toBe(first.requestId);
+        await finish();
+      }
+      f.setNow(5_500);
+      expect(value(f.execution.context("owner", f.thread.id))).toMatchObject({
+        firstTurnPosition: 0,
+        expiresAt: 4_600 + 1_000 + 1,
+      });
+      f.setNow(5_601);
+      expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBeNull();
+      const fresh = await send(5_601);
+      expect(f.published.at(-1)!.data.messages).toHaveLength(1);
+      expect(value(f.execution.context("owner", f.thread.id))).toMatchObject({
+        active: true,
+        firstTurnPosition: 5,
+      });
+      expect(fresh.canonicalHistoryStartRequestId).toBe(fresh.requestId);
+      await finish();
+      const next = await send(5_700);
+      expect(f.published.at(-1)!.data.messages).toHaveLength(3);
+      expect(next.canonicalHistoryStartRequestId).toBe(fresh.requestId);
+    } finally {
+      f.close();
+    }
+  });
+
   test("rejects forged native input identities before model admission", async () => {
     const f = fixture();
     try {
@@ -777,7 +846,7 @@ test("DM uses its own three-hour cutoff and freezes the selected context during 
   }
 });
 
-test("DM keeps a recent direct suffix when the compacted summary ages out", async () => {
+test("DM keeps a recent direct suffix when a shorter context gap excludes the compacted summary", async () => {
   const f = fixture(undefined, true);
   try {
     for (let turn = 1; turn <= 3; turn++) {
@@ -811,13 +880,236 @@ test("DM keeps a recent direct suffix when the compacted summary ages out", asyn
       );
       value(await f.execution.runnerLifecycle.settled(request, "completed"));
     }
-    f.setNow(10_802_500);
+    f.setDmGap(500);
+    f.setNow(3_100);
     const context = value(f.execution.context("owner", f.thread.id));
     expect(context.firstTurnPosition).toBe(2);
     expect(context.hasSummary).toBe(false);
     f.submit("next topic");
     value(await f.execution.kick(f.thread.id));
     expect(f.published.at(-1)!.data.messages).toHaveLength(3);
+  } finally {
+    f.close();
+  }
+});
+
+test("DM groups delivered posts with subsequent inputs and replays each post once", async () => {
+  const f = fixture(undefined, true);
+  const post = (id: string, at: number) => {
+    f.setNow(at);
+    value(
+      f.store.postMessage("owner", f.thread.id, {
+        id,
+        role: "assistant",
+        metadata: { authorId: "lilac", createdAt: at, phase: "final" },
+        parts: [{ type: "text", text: id }],
+      }),
+    );
+  };
+  const finish = async () => {
+    const request = f.request();
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...request,
+        requestClient: "native",
+        messages: [
+          ...storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages),
+          { role: "assistant", content: "answer" },
+        ],
+      }),
+    );
+    value(await f.execution.runnerLifecycle.settled(request, "completed"));
+  };
+  const texts = () =>
+    storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages).map((message) => {
+      const text =
+        typeof message.content === "string"
+          ? message.content
+          : message.content.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("\n");
+      return stripLeadingSurfaceMetadataLine(text);
+    });
+  try {
+    f.setDmGap(1_000);
+    f.submit("last normal chat");
+    value(await f.execution.kick(f.thread.id));
+    await finish();
+    post("heartbeat-1-1", 5_000);
+    post("heartbeat-1-2", 5_100);
+    expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBe(1);
+    f.setNow(5_200);
+    f.submit("notification test");
+    value(await f.execution.kick(f.thread.id));
+    expect(texts().slice(0, 2)).toEqual(["heartbeat-1-1", "heartbeat-1-2"]);
+    expect(texts().join("\n")).not.toContain("last normal chat");
+    expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBe(1);
+    await finish();
+    post("heartbeat-2", 6_000);
+    f.setNow(6_800);
+    f.submit("follow up");
+    value(await f.execution.kick(f.thread.id));
+    expect(texts().filter((t) => t.startsWith("heartbeat"))).toEqual([
+      "heartbeat-1-1",
+      "heartbeat-1-2",
+      "heartbeat-2",
+    ]);
+    expect(texts().findIndex((t) => t === "heartbeat-2")).toBeGreaterThan(
+      texts().findIndex((t) => t.includes("notification test")),
+    );
+    expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBe(1);
+    await finish();
+    f.setNow(8_000);
+    f.submit("fresh topic");
+    value(await f.execution.kick(f.thread.id));
+    expect(texts()).toHaveLength(1);
+    expect(texts()[0]).toContain("fresh topic");
+  } finally {
+    f.close();
+  }
+});
+
+test("DM includes delivered posts before its first primary run", async () => {
+  const f = fixture(undefined, true);
+  try {
+    value(
+      f.store.postMessage("owner", f.thread.id, {
+        id: "first-post",
+        role: "assistant",
+        metadata: { authorId: "lilac", createdAt: 1_000 },
+        parts: [{ type: "text", text: "Proactive update" }],
+      }),
+    );
+    expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBe(0);
+    f.setNow(1_100);
+    f.submit("Tell me more");
+    value(await f.execution.kick(f.thread.id));
+    const messages = storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages);
+    expect(messages).toHaveLength(2);
+    expect(JSON.stringify(messages[0])).toContain("Proactive update");
+    expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("DM backfills legacy delivered posts and does not replay posts already compacted", async () => {
+  const f = fixture(undefined, true);
+  try {
+    value(
+      f.store.postMessage("owner", f.thread.id, {
+        id: "legacy-post",
+        role: "assistant",
+        metadata: { authorId: "lilac", createdAt: 1_000 },
+        parts: [{ type: "text", text: "Legacy update" }],
+      }),
+    );
+    f.setNow(1_100);
+    f.submit("notification");
+    value(await f.execution.kick(f.thread.id));
+    const request = f.request();
+    const input = storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages).at(-1)!;
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...request,
+        requestClient: "native",
+        messages: [input, { role: "assistant", content: "skipped" }],
+      }),
+    );
+    value(await f.execution.runnerLifecycle.settled(request, "completed"));
+    f.setNow(1_200);
+    f.submit("next");
+    value(await f.execution.kick(f.thread.id));
+    const backfilled = storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages);
+    expect(JSON.stringify(backfilled[0])).toContain("Legacy update");
+    const compacted = f.request();
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...compacted,
+        requestClient: "native",
+        messages: [
+          {
+            role: "user",
+            content: "<context-compaction>Update and notification summarized</context-compaction>",
+          },
+          backfilled.at(-1)!,
+          { role: "assistant", content: "acknowledged" },
+        ],
+      }),
+    );
+    value(await f.execution.runnerLifecycle.settled(compacted, "completed"));
+    f.setNow(1_300);
+    f.submit("continue");
+    value(await f.execution.kick(f.thread.id));
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).toContain(
+      "Update and notification summarized",
+    );
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).not.toContain("Legacy update");
+    expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("shortening the DM gap excludes delivered posts outside the selected group", async () => {
+  const f = fixture(undefined, true);
+  try {
+    value(
+      f.store.postMessage("owner", f.thread.id, {
+        id: "older-post",
+        role: "assistant",
+        metadata: { authorId: "lilac", createdAt: 1_000 },
+        parts: [{ type: "text", text: "Outside the new group" }],
+      }),
+    );
+    f.setNow(3_000);
+    f.submit("recent topic");
+    value(await f.execution.kick(f.thread.id));
+    const request = f.request();
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...request,
+        requestClient: "native",
+        messages: [
+          ...storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages),
+          { role: "assistant", content: "answer" },
+        ],
+      }),
+    );
+    value(await f.execution.runnerLifecycle.settled(request, "completed"));
+    f.setDmGap(500);
+    f.setNow(3_100);
+    f.submit("continue recent topic");
+    value(await f.execution.kick(f.thread.id));
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).not.toContain(
+      "Outside the new group",
+    );
+    expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBe(1);
+  } finally {
+    f.close();
+  }
+});
+
+test("DM context includes a deferred notification after delivery", async () => {
+  const f = fixture(undefined, true);
+  try {
+    value(
+      f.store.queueSurfaceSend(
+        "owner",
+        f.thread.id,
+        "heartbeat:deferred",
+        {
+          id: "deferred-notice",
+          role: "assistant",
+          metadata: { authorId: "lilac", createdAt: 1000, phase: "final" },
+          parts: [{ type: "text", text: "Forecast changed" }],
+        },
+        false,
+      ),
+    );
+    value(f.store.settleSurfaceSends("heartbeat:deferred"));
+    value(f.store.deliverSurfaceSends());
+    f.submit("Tell me about the forecast");
+    value(await f.execution.kick(f.thread.id));
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).toContain("Forecast changed");
   } finally {
     f.close();
   }

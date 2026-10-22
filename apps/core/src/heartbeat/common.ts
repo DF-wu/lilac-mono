@@ -84,7 +84,8 @@ export function buildOrdinaryHeartbeatOverlay(params: {
 }): string {
   return [
     "## Heartbeat Context",
-    `If you write a handoff note for heartbeat in this run, use sourceSessionId='${params.sessionId}' and sourceRequestId='${params.requestId}'.`,
+    "For replies to proactive updates, resolutions, corrections, or changed commitments, use the heartbeat skill to reconcile shared working notes before finishing. Consult those notes when the relevant ongoing matter is missing from context.",
+    `For monitoring or later follow-up, use the heartbeat skill. Record sourceSessionId='${params.sessionId}' and sourceRequestId='${params.requestId}' with the watch. Capture the concrete current thread when the user says 'keep me posted here'.`,
   ].join("\n");
 }
 
@@ -105,7 +106,7 @@ export function buildHeartbeatSessionOverlay(params: {
   if (quietState.inside) {
     lines.push("If inside quiet hours, do not proactively message for low-priority findings.");
     lines.push(
-      "You may still update heartbeat files, process inbox notes, and surface urgent items.",
+      "You may still update working notes, check ongoing watches, and surface urgent items.",
     );
   } else {
     lines.push("Outside quiet hours, you may proactively surface findings when warranted.");
@@ -135,18 +136,13 @@ export function buildHeartbeatRequestMessages(params: {
     formatDefaultOutputSessionLine(params.heartbeat.defaultOutputSession),
     "",
     "Workspace:",
-    `- Canonical state file: ${paths.heartbeatFilePath}`,
-    `- Inbox: ${paths.inboxDir}`,
-    `- Archive: ${paths.archiveDir}`,
+    `- Workflow: ${paths.heartbeatFilePath}`,
+    `- Working notes: ${paths.workFilePath}`,
     "",
-    "Follow the ownership, inbox handling, and durable-state structure in HEARTBEAT.md.",
-    "",
-    "Tasks:",
-    `- Read ${paths.heartbeatFilePath}`,
-    `- Ingest notes from ${paths.inboxDir}`,
-    `- Update ${paths.heartbeatFilePath}`,
-    `- Archive processed inbox files into ${paths.archiveDir}`,
-    "- Perform due checks and follow-up actions.",
+    "Read the heartbeat skill, then follow the active HEARTBEAT.md workflow and its linked working notes.",
+    "If the active files still use the legacy inbox protocol, follow the skill's migration reference and preserve unfinished work.",
+    "Check due watches, discover useful follow-ups as the workflow directs, and maintain ongoing notes.",
+    "A watch's explicit output target overrides the default. Keep findings pending if that target is unavailable; do not redirect them.",
     "- Normal assistant output is discarded.",
     "- Use tools if you want to tell a human something.",
     `- Current local quiet-hours state: ${quietState.label}${quietState.localTime ? ` (${quietState.localTime})` : ""}${quietState.timezone ? ` tz=${quietState.timezone}` : ""}.`,

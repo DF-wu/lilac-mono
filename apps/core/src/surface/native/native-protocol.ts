@@ -137,13 +137,39 @@ export const nativeSurfaceProtocol = {
       sessionIdFormats: {
         client: "native",
         accepted: [
+          {
+            format: "dm",
+            meaning:
+              "The native requesting user’s DM, or the owner’s DM for trusted cross-surface agent runs",
+          },
           { format: "native:<threadId>", meaning: "Native chat thread (canonical)" },
           { format: "<threadId>", meaning: "Native thread ID returned by surface tools" },
         ],
-        notes: ["Both forms identify the same native thread."],
+        notes: [
+          "Thread ID forms identify the same native thread. The dm alias requires native request authority or a trusted agent capability. Save the resolved thread ID for deferred deliveries.",
+        ],
       },
     }),
-    resolveSession: async ({ selector }) => {
+    resolveSession: async ({ selector, adapter }) => {
+      if (selector === "dm") {
+        if (!adapter.resolveSessionAlias)
+          return Result.err(
+            new SurfaceToolTargetInvalid({
+              message: "Native DM resolution requires a scoped native adapter",
+            }),
+          );
+        return (await adapter.resolveSessionAlias("dm"))
+          .mapError((error) => new SurfaceToolTargetInvalid({ message: error.message }))
+          .andThen((sessionRef) =>
+            sessionRef.platform === "native"
+              ? Result.ok({ sessionRef })
+              : Result.err(
+                  new SurfaceToolTargetInvalid({
+                    message: "Native DM resolved to a different surface",
+                  }),
+                ),
+          );
+      }
       if (!/^(?:native:)?[^:\s]+$/u.test(selector))
         return Result.err(new SurfaceToolTargetInvalid({ message: "Expected native:<threadId>" }));
       return Result.ok({ sessionRef: { platform: "native", channelId: nativeThreadId(selector) } });

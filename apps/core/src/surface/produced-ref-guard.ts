@@ -2,6 +2,7 @@ import { Panic, Result } from "better-result";
 
 import type {
   SurfaceAdapter,
+  SurfaceToolSendResult,
   SurfaceAdapterEventSource,
   SurfaceCacheBurstProvider,
   SurfaceOperationError,
@@ -12,6 +13,7 @@ import type {
   StartOutputOpts,
 } from "./adapter";
 import {
+  SurfaceOperationUnsupported,
   hasCacheBurstProvider,
   hasRequestReadScopeProvider,
   hasSurfaceGuildIdResolver,
@@ -279,6 +281,28 @@ class DescriptorBoundSurfaceAdapter implements SurfaceAdapter {
     return self;
   }
 
+  async resolveSessionAlias(alias: string): Promise<SurfaceOperationResult<SessionRef>> {
+    if (!this.adapter.resolveSessionAlias)
+      return Result.err(
+        new SurfaceOperationUnsupported({
+          platform: this.descriptorPlatform,
+          operation: "resolve-session-alias",
+          message: "This surface does not support session aliases",
+        }),
+      );
+    const resolved = await this.adapter.resolveSessionAlias(alias);
+    requireOperationResult(
+      this.descriptorPlatform,
+      resolved,
+      "resolveSessionAlias",
+      undefined,
+      (ref) => {
+        requireProducedSessionRef(this.descriptorPlatform, ref, "resolveSessionAlias");
+      },
+    );
+    return resolved;
+  }
+
   async listSessions(opts?: Parameters<SurfaceAdapter["listSessions"]>[0]) {
     const listed = await this.adapter.listSessions(opts);
     requireOperationResult(this.descriptorPlatform, listed, "listSessions", undefined, (value) => {
@@ -366,6 +390,35 @@ class DescriptorBoundSurfaceAdapter implements SurfaceAdapter {
       sessionRef.channelId,
     );
     return prepared;
+  }
+
+  async sendToolMsg(
+    sessionRef: SessionRef,
+    content: Parameters<SurfaceAdapter["sendMsg"]>[1],
+    opts?: Parameters<SurfaceAdapter["sendMsg"]>[2],
+  ): Promise<SurfaceOperationResult<SurfaceToolSendResult>> {
+    if (!this.adapter.sendToolMsg)
+      return (await this.sendMsg(sessionRef, content, opts)).map((ref) => ({
+        status: "sent",
+        ref,
+      }));
+    const sent = await this.adapter.sendToolMsg(sessionRef, content, opts);
+    requireOperationResult(
+      this.descriptorPlatform,
+      sent,
+      "sendToolMsg",
+      sessionRef.channelId,
+      (value) => {
+        if (value.status === "sent")
+          requireProducedMsgRef(
+            this.descriptorPlatform,
+            value.ref,
+            "sendToolMsg.result",
+            sessionRef.channelId,
+          );
+      },
+    );
+    return sent;
   }
 
   async sendMsg(

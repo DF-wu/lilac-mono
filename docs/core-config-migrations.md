@@ -153,10 +153,12 @@ cycle. Inherited partial patches can parse and still fail resolution when their 
 Use `inherit` for partial patches and verify the inheritance target. Costs
 are USD per million tokens. See [`model-capability.ts`](../packages/utils/model-capability.ts).
 
-Heartbeat's default output accepts only `discord/<channel ID or alias>` or
-`github/OWNER/REPO#NUMBER`, for example `github/DF-wu/lilac-mono#123`. Native/Telegram destinations are
-not accepted by this field. The GitHub thread and adapter access must exist; parsing the prefix alone
-is not an access check. See [heartbeat schema](../packages/utils/core-config/v1.ts) and
+Heartbeat's default output accepts `discord/<channel ID or alias>`, `github/OWNER/REPO#NUMBER`
+(for example `github/DF-wu/lilac-mono#123`), or `native/<threadId>`. Telegram destinations are not
+accepted by this field. The destination and adapter access must exist; parsing the prefix alone
+is not an access check. Use the heartbeat skill to resolve a concrete destination, including a native
+DM, and verify delivery. See [heartbeat setup](heartbeat.md),
+[heartbeat schema](../packages/utils/core-config/v1.ts), and
 [`github-ids.ts`](../apps/core/src/github/github-ids.ts).
 
 ## Shared working indicators
@@ -350,7 +352,9 @@ New v2 fields:
   auto-injected metadata; defaults to `0.1`.
 - `conversation.thread.autoInject.expansionMinConfidence`: minimum ranking confidence for optional
   auto-injected results after the single recall-floor result; accepts `0` through `1` and defaults to
-  `0.57`. Frozen v1 configs receive the same universal default but cannot override it.
+  `0.65`. Frozen v1 configs receive the same universal default but cannot override it.
+  The default increased from `0.57` after production recall auditing. Explicit v2 overrides
+  retain their configured value; remove the override or set it to `0.65` to adopt the new cutoff.
 - `conversation.thread.autoInject.mode`: search mode (`hybrid`, `semantic`, or `lexical`); defaults to
   `hybrid`.
 - `conversation.thread.autoInject.filterCurrentParticipants`: defaults to `false`; applies to both

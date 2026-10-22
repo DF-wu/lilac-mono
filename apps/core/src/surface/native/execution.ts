@@ -4,6 +4,7 @@ import {
   expandAssistantCitations,
   collectCitations,
   CITATION_INPUT_LIMIT,
+  DEFAULT_DM_CONTEXT_GAP_MS,
 } from "@stanley2058/lilac-client-protocol";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import {
@@ -25,7 +26,7 @@ import {
   parseSurfaceMetadataLine,
 } from "../bridge/surface-metadata";
 import type { NativeRunnerLifecycle, NativeRunnerRequest } from "../bridge/bus-agent-runner";
-import type { NativeInputRecord } from "./codec";
+import type { NativeInputRecord, NativeThreadRecord } from "./codec";
 import { nativeFailure, NativeStoreFailure } from "./errors";
 import { nativeSessionId } from "./native-protocol";
 import type { NativeStore } from "./store";
@@ -49,7 +50,7 @@ export function createNativeExecution(options: {
   ) => Promise<ResultType<string, Error>> | ResultType<string, Error>;
   validateSkill?: (skillId: string, starterId: string) => boolean;
   getOldMessageSelectionMaxAgeMs?: () => number | undefined;
-  getDmContextMaxAgeMs?: () => number;
+  getDmContextGapMs?: () => number;
   now?: () => number;
   deliveryState?: (
     deliveryId: string,
@@ -130,24 +131,34 @@ export function createNativeExecution(options: {
     });
   }
 
+  function selectFirstInput(
+    thread: NativeThreadRecord,
+    sessionAt: number,
+  ): ResultType<NativeInputRecord | null, Error> {
+    if (thread.kind === "dm")
+      return store.selectSessionStartInput(thread.id, {
+        gapMs: options.getDmContextGapMs?.() ?? DEFAULT_DM_CONTEXT_GAP_MS,
+        at: sessionAt,
+      });
+    const maxAgeMs = options.getOldMessageSelectionMaxAgeMs?.();
+    const cutoff =
+      maxAgeMs === undefined ? 0 : Math.max(0, (options.now?.() ?? Date.now()) - maxAgeMs);
+    return store.selectCanonicalInput(thread.id, { since: cutoff });
+  }
+
   function selectedHistory(
     input: NativeInputRecord,
     latestRequestId: string,
     canonical: readonly StoredMessageV1[],
+    sessionAt: number,
   ): ResultType<{ messages: readonly StoredMessageV1[]; firstRequestId?: string }, Error> {
     return Result.gen(function* () {
       const empty = { messages: [] as readonly StoredMessageV1[] };
       if (input.canonicalHistoryStartRequestId === input.requestId) return Result.ok(empty);
       const thread = yield* store.getThreadRecord(input.threadId);
-      const maxAgeMs =
-        thread.kind === "dm"
-          ? (options.getDmContextMaxAgeMs?.() ?? 10_800_000)
-          : options.getOldMessageSelectionMaxAgeMs?.();
-      const cutoff =
-        maxAgeMs === undefined ? 0 : Math.max(0, (options.now?.() ?? Date.now()) - maxAgeMs);
       const first = input.canonicalHistoryStartRequestId
         ? yield* store.getInputByRequestId(input.canonicalHistoryStartRequestId)
-        : yield* store.selectCanonicalInput(input.threadId, { since: cutoff });
+        : yield* selectFirstInput(thread, sessionAt);
       if (!first) return Result.ok(empty);
       const latest = yield* store.getInputByRequestId(latestRequestId);
       if (!latest)
@@ -200,6 +211,120 @@ export function createNativeExecution(options: {
         };
       }
       return Result.ok(selected);
+    });
+  }
+
+  function messageHeader(message: StoredMessageV1) {
+    const text =
+      typeof message.content === "string"
+        ? message.content
+        : (message.content.find((part) => part.type === "text")?.text ?? "");
+    return parseSurfaceMetadataLine(text.split("\n")[0] ?? "");
+  }
+
+  function includeDeliveredPosts(input: NativeInputRecord, canonical: readonly StoredMessageV1[]) {
+    return Result.gen(function* () {
+      const thread = yield* store.getThreadRecord(input.threadId);
+      if (thread.kind !== "dm") return Result.ok([...canonical]);
+      const session = yield* store.selectSessionWindow(input.threadId, {
+        gapMs: options.getDmContextGapMs?.() ?? DEFAULT_DM_CONTEXT_GAP_MS,
+        at: input.createdAt,
+        beforePosition: input.position,
+        includePosts: true,
+      });
+      const history = canonical.filter((message) => {
+        if (message.role !== "assistant" || session.firstAt === null) return true;
+        const header = messageHeader(message);
+        if (
+          header?.meta.platform !== "native" ||
+          header.meta.thread_id !== input.threadId ||
+          typeof header.meta.message_time !== "string"
+        )
+          return true;
+        return !(Date.parse(header.meta.message_time) < session.firstAt);
+      });
+      const knownIds = new Set(
+        history.flatMap((message) => {
+          const header = messageHeader(message);
+          return header?.meta.thread_id === input.threadId &&
+            typeof header.meta.message_id === "string"
+            ? [header.meta.message_id]
+            : [];
+        }),
+      );
+      const anchors: { index: number; position: number }[] = [];
+      for (const [index, message] of history.entries()) {
+        if (message.role !== "user") continue;
+        const header = messageHeader(message);
+        if (header?.meta.platform !== "native" || header.meta.thread_id !== input.threadId)
+          continue;
+        const source = yield* store.getInputByRequestId(
+          `native:${input.threadId}:${header.meta.message_id}`,
+        );
+        if (source) anchors.push({ index, position: source.position });
+      }
+      const hasSummary = history.some((message) => {
+        const text =
+          typeof message.content === "string"
+            ? message.content
+            : message.content
+                .flatMap((part) => (part.type === "text" ? [part.text] : []))
+                .join("\n");
+        return text.startsWith("<context-compaction>");
+      });
+      const insertions = new Map<number, StoredMessageV1[]>();
+      for (const turn of session.postedTurns) {
+        if (hasSummary && turn.position < (anchors[0]?.position ?? input.position)) continue;
+        for (const posted of turn.messages) {
+          if (
+            posted.role !== "assistant" ||
+            posted.metadata?.inputId ||
+            posted.id !== turn.turnId ||
+            knownIds.has(posted.id)
+          )
+            continue;
+          const content: Extract<StoredMessageV1, { role: "assistant" }>["content"] = [];
+          const author = yield* store.getUser(posted.metadata?.authorId ?? "lilac");
+          const text = posted.parts
+            .flatMap((part) => (part.type === "text" ? [part.text] : []))
+            .join("");
+          content.push({
+            type: "text",
+            text: `${formatSurfaceMetadataLine({
+              platform: "native",
+              thread_id: input.threadId,
+              user_id: author.id,
+              user_name: author.displayName,
+              message_id: posted.id,
+              message_time: new Date(posted.metadata?.createdAt ?? session.latestAt).toISOString(),
+            })}\n${escapeSurfaceMetadataTags(text)}`,
+          });
+          for (const part of posted.parts) {
+            if (part.type !== "data-resource") continue;
+            const upload = yield* store.getUpload(part.data.resourceId);
+            if (upload.state !== "ready" || !upload.resourceUri) continue;
+            yield* store.authorizeThread(thread.starterId, upload.threadId);
+            content.push({
+              type: "resource",
+              uri: upload.resourceUri,
+              filename: upload.filename,
+              mediaType: upload.mediaType,
+              size: upload.size,
+            });
+          }
+          const index =
+            anchors.find((anchor) => anchor.position > turn.position)?.index ?? history.length;
+          const messages = insertions.get(index) ?? [];
+          messages.push({ role: "assistant", content });
+          insertions.set(index, messages);
+        }
+      }
+      const messages = history.flatMap((message, index) => [
+        ...(insertions.get(index) ?? []),
+        message,
+      ]);
+      messages.push(...(insertions.get(history.length) ?? []));
+      return Result.ok(messages);
     });
   }
 
@@ -261,7 +386,8 @@ export function createNativeExecution(options: {
       const previousRequestId = yield* store.getLatestCanonicalRequestId(input.threadId);
       if (!previousRequestId) {
         yield* store.setInputCanonicalHistoryStart(input.id, input.requestId);
-        return Result.ok([message]);
+        const posts = yield* includeDeliveredPosts(input, []);
+        return Result.ok([...posts, message]);
       }
       const previous = yield* (
         options.transcriptStore.getRequestTranscript?.({ requestId: previousRequestId }) ??
@@ -271,12 +397,18 @@ export function createNativeExecution(options: {
         return Result.err(
           nativeFailure("conflict", "The retained canonical transcript is unavailable"),
         );
-      const history = yield* selectedHistory(input, previousRequestId, previous.messages);
+      const history = yield* selectedHistory(
+        input,
+        previousRequestId,
+        previous.messages,
+        input.createdAt,
+      );
       yield* store.setInputCanonicalHistoryStart(
         input.id,
         history.messages.length > 0 ? (history.firstRequestId ?? input.requestId) : input.requestId,
       );
-      return Result.ok([...history.messages, message]);
+      const messages = yield* includeDeliveredPosts(input, history.messages);
+      return Result.ok([...messages, message]);
     });
   }
 
@@ -588,15 +720,11 @@ export function createNativeExecution(options: {
     return Result.all(await Promise.all(publications.values())).map(() => undefined);
   }
 
-  function context(actorId: string, threadId: string) {
+  function canonicalContext(actorId: string, threadId: string) {
     return Result.gen(function* () {
       const thread = yield* store.authorizeThread(actorId, threadId);
       const evaluatedAt = options.now?.() ?? Date.now();
       const latestId = yield* store.getLatestCanonicalRequestId(threadId);
-      const maxAgeMs =
-        thread.kind === "dm"
-          ? (options.getDmContextMaxAgeMs?.() ?? 10_800_000)
-          : options.getOldMessageSelectionMaxAgeMs?.();
       const empty = {
         historyGeneration: thread.historyGeneration,
         evaluatedAt,
@@ -619,7 +747,17 @@ export function createNativeExecution(options: {
         requestId: "preview",
         canonicalHistoryStartRequestId: undefined,
       };
-      const history = yield* selectedHistory(selector, latestId, snapshot.messages);
+      const history = yield* selectedHistory(
+        selector,
+        latestId,
+        snapshot.messages,
+        active?.createdAt ?? evaluatedAt,
+      );
+      if (active?.turnId && active.canonicalHistoryStartRequestId === active.requestId)
+        return Result.ok({
+          ...empty,
+          firstTurnPosition: yield* store.getTurnPosition(active.turnId),
+        });
       if (!history.firstRequestId) return Result.ok(empty);
       const first = yield* store.getInputByRequestId(history.firstRequestId);
       if (!first?.turnId) return Result.ok(empty);
@@ -649,12 +787,49 @@ export function createNativeExecution(options: {
         firstTurnPosition,
         hasSummary,
         summarizedBeforePosition,
-        expiresAt:
-          !active && maxAgeMs !== undefined
-            ? Math.max(evaluatedAt + 1, first.createdAt + maxAgeMs + 1)
-            : undefined,
+        expiresAt: active ? undefined : contextExpiry(thread, first, latest, evaluatedAt),
       });
     });
+  }
+
+  function context(actorId: string, threadId: string) {
+    return Result.gen(function* () {
+      const result = yield* canonicalContext(actorId, threadId);
+      const thread = yield* store.authorizeThread(actorId, threadId);
+      if (thread.kind !== "dm") return Result.ok(result);
+      const active = thread.activeRunId
+        ? yield* store.getInputByRequestId(thread.activeRunId)
+        : null;
+      const gapMs = options.getDmContextGapMs?.() ?? DEFAULT_DM_CONTEXT_GAP_MS;
+      const session = yield* store.selectSessionWindow(threadId, {
+        gapMs,
+        at: active?.createdAt ?? result.evaluatedAt,
+        beforePosition: active ? active.position + 1 : undefined,
+      });
+      return Result.ok({
+        ...result,
+        firstTurnPosition: session.firstPosition,
+        expiresAt:
+          active || session.firstPosition === null ? undefined : session.latestAt + gapMs + 1,
+      });
+    });
+  }
+
+  function dmContextExpiry(latest: NativeInputRecord, evaluatedAt: number): number {
+    const gapMs = options.getDmContextGapMs?.() ?? DEFAULT_DM_CONTEXT_GAP_MS;
+    return Math.max(evaluatedAt + 1, (latest.completedAt ?? evaluatedAt) + gapMs + 1);
+  }
+
+  function contextExpiry(
+    thread: NativeThreadRecord,
+    first: NativeInputRecord,
+    latest: NativeInputRecord,
+    evaluatedAt: number,
+  ): number | undefined {
+    if (thread.kind === "dm") return dmContextExpiry(latest, evaluatedAt);
+    const maxAgeMs = options.getOldMessageSelectionMaxAgeMs?.();
+    if (maxAgeMs === undefined) return undefined;
+    return Math.max(evaluatedAt + 1, first.createdAt + maxAgeMs + 1);
   }
 
   function validateCommand(input: Pick<NativeInputRecord, "command">): ResultType<void, Error> {

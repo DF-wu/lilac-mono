@@ -1,4 +1,4 @@
-import { ContextMessage } from "./components/RecentContext";
+import { ContextMessage, NextContextStart, TimestampSeparator } from "./components/RecentContext";
 import { DirectThreadCard } from "./components/DirectThreadCard";
 import { ComputerViewer } from "./components/ComputerViewer";
 import computerDemoUrl from "./assets/computer-demo.html?url";
@@ -11,7 +11,7 @@ import { ConversationContext, CopyReferenceButton } from "./components/Conversat
 import { Switch } from "./components/ui/switch";
 import { NotificationSettings } from "./components/NotificationSettings";
 import { AppearanceSettings } from "./components/AppearanceSettings";
-import { createNotificationPreferences } from "./notifications";
+import { createNotificationPreferences, sendTestNotification } from "./notifications";
 import { SPINNERS } from "loading-dev";
 import { LoadingSpinner } from "./components/ui/loading-spinner";
 import { ConnectionLoading } from "./components/ui/connection-loading";
@@ -1393,12 +1393,13 @@ function Controls() {
                 onSelect={() => {}}
               />
             ))}
-            <ContextMessage outside>
-              <p className="px-6 text-sm">Earlier conversation, outside context.</p>
-            </ContextMessage>
+            <TimestampSeparator at={now - 7_200_000} />
+            <p className="px-6 text-sm">Earlier conversation.</p>
+            <TimestampSeparator at={now - 1_800_000} contextStart />
             <ContextMessage summarized>
               <p className="px-6 text-sm">Earlier conversation, represented in the summary.</p>
             </ContextMessage>
+            <NextContextStart />
             <span className="ds-muted" role="status">
               {search ? `Search: ${search}` : ""}
             </span>
@@ -1827,7 +1828,8 @@ export default function DesignSystem() {
                   value={{
                     titleModel: "fast",
                     outputStreaming: "complete",
-                    dmContextMaxAgeMs: 10_800_000,
+                    dmContextGapMs: 7_200_000,
+                    dmTimestampGapMs: 1_800_000,
                     oldMessageSelectionMaxAgeMs: null,
                     storageRetentionMaxAgeMs: null,
                     crossThreadSend: { triggerRun: true },
@@ -1938,12 +1940,26 @@ function KeybindingsDemo() {
 }
 
 function NotificationSettingsDemo() {
+  const threadId = useLocation({ select: (location) => location.state.chatThreadId });
+  const [sending, setSending] = useState(false);
+  async function testNotification() {
+    setSending(true);
+    const result = await sendTestNotification(threadId);
+    result.match({
+      ok: () => toast.add({ title: "Test notification sent", type: "success" }),
+      err: (message) => toast.add({ title: message, type: "error" }),
+    });
+    setSending(false);
+  }
   const [preferences] = useState(() =>
     createNotificationPreferences({ installationId: "design-system", principalId: "preview" }),
   );
   return (
     <div className="max-w-xl">
-      <NotificationSettings preferences={preferences} />
+      <NotificationSettings preferences={preferences} preview />
+      <Button variant="outline" disabled={sending} onClick={() => void testNotification()}>
+        <Bell /> Test notification
+      </Button>
     </div>
   );
 }

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { replayReplySchema } from "@stanley2058/lilac-client-protocol";
+import { DEFAULT_DM_CONTEXT_GAP_MS, replayReplySchema } from "@stanley2058/lilac-client-protocol";
 import { SqliteTranscriptStore } from "../../../src/transcript/transcript-store";
 import { NativeStore } from "../../../src/surface/native/store";
 import { seedNativeBrowserFixture } from "./browser-seed";
@@ -24,6 +24,7 @@ describe("native browser fixture seeding", () => {
       historyTurns: 12,
       sidebarThreads: 2,
       transcript,
+      database: db,
     });
     const canonicalId = store.getLatestCanonicalRequestId(threads.history).unwrap();
     expect(canonicalId).toBeDefined();
@@ -54,5 +55,34 @@ describe("native browser fixture seeding", () => {
       share: false,
     });
     transcript.close();
+  });
+
+  test("seeds an idle DM whose latest session is past the default context gap", () => {
+    using db = new Database(":memory:");
+    const store = new NativeStore(db);
+    store.initialize().unwrap();
+    store
+      .upsertUser({
+        id: "owner",
+        providerId: "owner",
+        displayName: "Owner",
+        role: "owner",
+        toolMode: "full",
+      })
+      .unwrap();
+    const threads = seedNativeBrowserFixture(store, {
+      historyTurns: 1,
+      sidebarThreads: 0,
+      database: db,
+    });
+    expect(store.ensureDirectThread("owner").unwrap().id).toBe(threads.dm);
+    const now = Date.now();
+    const options = { gapMs: DEFAULT_DM_CONTEXT_GAP_MS, at: now };
+    expect(store.selectSessionWindow(threads.dm, options).unwrap().firstPosition).toBeNull();
+    const latest = store.selectSessionWindow(threads.dm, {
+      ...options,
+      at: now - 3 * 3_600_000 + 60_000,
+    });
+    expect(latest.unwrap().firstPosition).toBe(2);
   });
 });

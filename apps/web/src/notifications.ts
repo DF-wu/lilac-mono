@@ -3,9 +3,15 @@ import type { NativeClient, CacheScope } from "@stanley2058/lilac-client";
 import type { NativeThread } from "@stanley2058/lilac-client-protocol";
 import { createStore } from "zustand/vanilla";
 
-export type NotificationPreferences = { enabled: boolean; completion: boolean; failure: boolean };
+export type NotificationPreferences = {
+  enabled: boolean;
+  background: boolean;
+  completion: boolean;
+  failure: boolean;
+};
 export const defaultNotifications: NotificationPreferences = {
   enabled: false,
+  background: false,
   completion: true,
   failure: true,
 };
@@ -22,9 +28,10 @@ export function createNotificationPreferences(
       catch: () => "Storage unavailable",
     }).match({
       ok: (value) =>
-        /^[01]{3}$/.test(value ?? "")
+        /^[01]{3,4}$/.test(value ?? "")
           ? {
               enabled: value?.[0] === "1",
+              background: value?.[3] === "1",
               completion: value?.[1] === "1",
               failure: value?.[2] === "1",
             }
@@ -42,7 +49,7 @@ export function createNotificationPreferences(
         try: () =>
           localStorage.setItem(
             key,
-            [state.enabled, state.completion, state.failure].map(Number).join(""),
+            [state.enabled, state.completion, state.failure, state.background].map(Number).join(""),
           ),
         catch: () => "Storage unavailable",
       }).match({ ok: () => {}, err: () => {} });
@@ -98,7 +105,7 @@ export function holdNotificationLock(name: string): () => void {
 }
 
 export function watchNotifications(options: {
-  client: Pick<NativeClient, "subscribe" | "connectionState">;
+  client: Pick<NativeClient, "subscribe" | "connectionState"> & Partial<Pick<NativeClient, "rpc">>;
   initial: NativeThread[];
   scope: Pick<CacheScope, "installationId" | "principalId">;
   preferences: ReturnType<typeof createNotificationPreferences>;
@@ -172,6 +179,7 @@ export function watchNotifications(options: {
       disposed ||
       !leader ||
       !prefs.enabled ||
+      prefs.background ||
       !prefs[kind] ||
       notificationPermission() !== "granted"
     )
@@ -185,12 +193,35 @@ export function watchNotifications(options: {
       current.displayStatus !== thread.displayStatus
     )
       return;
-    const tag = `${scope}:${thread.id}:${thread.revision}:${kind}`;
+    const content = await Result.tryPromise({
+      try: async () => client.rpc?.notifications.read({ threadId: thread.id }),
+      catch: () => "Notification unavailable",
+    }).then((result) => result.match({ ok: (value) => value, err: () => undefined }));
+    const latestPreferences = preferences.store.getState();
+    if (
+      disposed ||
+      epoch !== startedEpoch ||
+      !latestPreferences.enabled ||
+      latestPreferences.background ||
+      !latestPreferences[kind] ||
+      (client.rpc && !content)
+    )
+      return;
+    const latest = threads.get(thread.id);
+    if (
+      !latest?.capabilities.read ||
+      latest.archived ||
+      latest.displayStatus !== thread.displayStatus
+    )
+      return;
+    const tag = content?.tag ?? `lilac:${thread.id}:${thread.revision}`;
+    const title = content?.title ?? `Lilac · ${current.title || "Untitled thread"}`;
+    const body = content?.body ?? (kind === "completion" ? "Response finished" : "Run failed");
     if (registration?.active) {
       await Result.tryPromise({
         try: () =>
-          registration.showNotification(current.title || "Untitled conversation", {
-            body: kind === "completion" ? "Response finished" : "Run failed",
+          registration.showNotification(title, {
+            body,
             tag,
             data: { threadId: thread.id },
           }),
@@ -200,8 +231,8 @@ export function watchNotifications(options: {
     }
     Result.try({
       try: () => {
-        const notification = new Notification(current.title || "Untitled conversation", {
-          body: kind === "completion" ? "Response finished" : "Run failed",
+        const notification = new Notification(title, {
+          body,
           tag,
         });
         shown.add(notification);
@@ -246,7 +277,7 @@ export function watchNotifications(options: {
     const kind = notificationTransition(trackWorkingThread(event.thread), event.thread);
     if (!kind || !leader || client.connectionState !== "online") return;
     const prefs = preferences.store.getState();
-    if (prefs.enabled && prefs[kind] && notificationPermission() === "granted")
+    if (prefs.enabled && !prefs.background && prefs[kind] && notificationPermission() === "granted")
       return notify(event.thread, kind);
   });
   return () => {
@@ -256,4 +287,36 @@ export function watchNotifications(options: {
     releaseLeadership();
     for (const notification of shown) notification.close();
   };
+}
+
+export async function sendTestNotification(threadId?: string) {
+  const permission = await requestNotificationPermission();
+  if (permission === "unsupported")
+    return Result.err("Notifications are unavailable in this browser.");
+  if (permission !== "granted")
+    return Result.err("Allow notifications in your browser's site settings.");
+  return Result.tryPromise({
+    try: async () => {
+      const title = "Lilac · Notification test";
+      const options: NotificationOptions = {
+        body: "Your response is ready. This is a preview of the completed response.",
+        tag: "lilac-notification-test",
+        data: threadId ? { threadId } : { designSystem: true },
+      };
+      const registration = await navigator.serviceWorker?.getRegistration();
+      if (registration?.active) {
+        await registration.showNotification(title, options);
+        return;
+      }
+      const notification = new Notification(title, options);
+      notification.onclick = () => {
+        window.focus();
+        window.location.assign(
+          threadId ? `/threads/${encodeURIComponent(threadId)}` : "/design-system#notifications",
+        );
+        notification.close();
+      };
+    },
+    catch: () => "Could not show the test notification.",
+  });
 }

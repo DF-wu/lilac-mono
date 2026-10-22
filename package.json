@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build:web": "bun --cwd=apps/web run build",
-    "dev:web": "bun --cwd=apps/web run dev",
+    "dev:web": "bun --env-file=apps/web/.env.local apps/core/tests/surface/native/web-dev.ts",
     "test:web": "bun run --filter=@stanley2058/lilac-web test",
     "build:info": "bun scripts/write-build-info.ts",
     "build:remote-fs": "bun --cwd=apps/core run build:remote-runner && bun --cwd=packages/remote-fs-runner run build",

@@ -465,9 +465,11 @@ function truncateWithEllipsis(raw: string, maxChars: number): string {
 export function skillAvailableOn(
   skill: Pick<DiscoveredSkill, "surfaces">,
   requestClient: string | undefined,
+  authenticatedOriginPlatform?: string,
 ): boolean {
   if (!skill.surfaces) return true;
-  return requestClient !== undefined && skill.surfaces.includes(requestClient);
+  const surface = requestClient === "unknown" ? authenticatedOriginPlatform : requestClient;
+  return surface !== undefined && skill.surfaces.includes(surface);
 }
 
 /**

@@ -1,4 +1,5 @@
 import { DirectThreadCard, DirectThreadTitle } from "./components/DirectThreadCard";
+import { currentPushDeviceId } from "./push-device";
 import { NativeComputerViewer } from "./components/ComputerViewer";
 import { FloatingChatMenu } from "./components/FloatingChatMenu";
 import { useWorkspaceViewport } from "./use-workspace-viewport";
@@ -123,14 +124,22 @@ function Workspace(props: AppProps) {
   const navigate = useNavigate();
   const router = useRouter();
   const active = useMatch({ from: "/chat", shouldThrow: false, select: () => true }) ?? false;
-  const routeThreadId = useMatch({
+  const isDmRoute = useMatch({ from: "/chat/dm", shouldThrow: false, select: () => true }) ?? false;
+  const explicitThreadId = useMatch({
     from: "/chat/threads/$threadId",
     shouldThrow: false,
     select: (match) => match.params.threadId,
   });
   const routePathname = useLocation({ select: (location) => location.pathname });
   const routeDraftId = useLocation({ select: (location) => location.state.draftThreadId });
-  const { pool, drafts: draftStore, panels, notifications } = useWorkspace();
+  const {
+    pool,
+    drafts: draftStore,
+    panels,
+    notifications,
+    backgroundPush,
+    presence,
+  } = useWorkspace();
   const draftIds = useStore(draftStore, (state) => state.ids);
   const setLocalDrafts = draftStore.getState().setLocalDrafts;
   const { client, initial } = props;
@@ -138,6 +147,8 @@ function Workspace(props: AppProps) {
   const profile = useQuery({ ...profileOptions(client), enabled: online });
   const viewer = profile.data ?? initial.viewer;
   const [threads, setThreads] = useState(initial.threads.items);
+  const directThread = threads.find((thread) => thread.kind === "dm");
+  const routeThreadId = isDmRoute ? directThread?.id : explicitThreadId;
   const [workingIndicators, setWorkingIndicators] = useState(
     initial.workingIndicators ?? FALLBACK_WORKING_INDICATORS,
   );
@@ -166,6 +177,10 @@ function Workspace(props: AppProps) {
       });
       return;
     }
+    if (selectedId === directThread?.id) {
+      void navigate({ to: "/dm", search: true, hash: true, replace: true });
+      return;
+    }
     void navigate({
       to: "/threads/$threadId",
       params: { threadId: selectedId },
@@ -173,7 +188,7 @@ function Workspace(props: AppProps) {
       hash: true,
       replace: true,
     });
-  }, [active, routePathname, routeThreadId, routeDraftId, selectedId, navigate]);
+  }, [active, routePathname, routeThreadId, routeDraftId, selectedId, directThread?.id, navigate]);
   const [catalog, setCatalog] = useState<DisplayCatalog | undefined>(() =>
     initial.catalog.kind === "catalog" ? initial.catalog.catalog : client.catalogs.get(props.scope),
   );
@@ -210,6 +225,11 @@ function Workspace(props: AppProps) {
     const update = () => {
       release?.();
       release = undefined;
+      presence.view(
+        active && !settings && document.visibilityState === "visible" && document.hasFocus()
+          ? viewedNotificationThread
+          : undefined,
+      );
       if (
         active &&
         !settings &&
@@ -222,17 +242,27 @@ function Workspace(props: AppProps) {
           `${notificationScope(props.scope)}:view:${viewedNotificationThread}`,
         );
     };
+    const hide = () => {
+      presence.view();
+      release?.();
+      release = undefined;
+    };
     update();
+    window.addEventListener("pagehide", hide);
+    window.addEventListener("pageshow", update);
     window.addEventListener("focus", update);
     window.addEventListener("blur", update);
     document.addEventListener("visibilitychange", update);
     return () => {
+      presence.view();
       release?.();
+      window.removeEventListener("pagehide", hide);
+      window.removeEventListener("pageshow", update);
       window.removeEventListener("focus", update);
       window.removeEventListener("blur", update);
       document.removeEventListener("visibilitychange", update);
     };
-  }, [active, settings, viewedNotificationThread, notifications]);
+  }, [active, settings, viewedNotificationThread, notifications, presence]);
 
   const archived = search.view === "archived";
   const external = search.view === "others" && viewer.role === "owner";
@@ -517,6 +547,10 @@ function Workspace(props: AppProps) {
       void navigate({ to: "/", state: { draftThreadId: id }, search });
       return;
     }
+    if (id === directThread?.id) {
+      void navigate({ to: "/dm", search });
+      return;
+    }
     void navigate({ to: "/threads/$threadId", params: { threadId: id }, search });
   });
 
@@ -661,6 +695,7 @@ function Workspace(props: AppProps) {
           threadId: created.id,
           commandId: entry.commandId,
           historyGeneration: replay.checkpoint.historyGeneration,
+          deviceId: await currentPushDeviceId(),
           text: entry.submission.attachmentText
             ? resolveComposerAttachments(
                 entry.submission.attachmentText,
@@ -782,7 +817,6 @@ function Workspace(props: AppProps) {
     setConfirmDelete(undefined);
     if (activeRef.current && selectedRef.current === id) createThread();
   }
-  const directThread = threads.find((thread) => thread.kind === "dm");
   const sidebarThreads = [
     ...(!archived ? draftIds.map((id) => ({ id, source: undefined })) : []),
     ...threads
@@ -827,7 +861,22 @@ function Workspace(props: AppProps) {
           : { chatThreadId: selectedId },
       }),
   );
-  const logout = useEventCallback(() => void attempt(props.onLogout, setError));
+  const logout = useEventCallback(
+    () =>
+      void attempt(async () => {
+        if (
+          notifications.store.getState().background &&
+          !(await backgroundPush.apply({ background: false }))
+        ) {
+          setError(
+            backgroundPush.store.getState().error ??
+              "Could not disable background push before signing out.",
+          );
+          return;
+        }
+        await props.onLogout();
+      }, setError),
+  );
   const newThreadKeys = useShortcut("newThread");
   const settingsKeys = useShortcut("settings");
   useAppShortcuts({
@@ -933,7 +982,7 @@ function Workspace(props: AppProps) {
               <Tooltip.Provider delay={350}>
                 <main
                   ref={viewport}
-                  className={`app-shell group/workspace relative flex h-dvh overflow-hidden ${sidebar ? "" : "sidebar-hidden"} ${rightOpen ? "" : "right-panel-hidden"}`}
+                  className={`app-shell group/workspace fixed inset-x-0 top-0 flex h-dvh overflow-hidden ${sidebar ? "" : "sidebar-hidden"} ${rightOpen ? "" : "right-panel-hidden"}`}
                   aria-label="Chat workspace"
                 >
                   <div className="sidebar-toggle fixed top-0 left-3 h-8 flex items-center z-40 [&_.icon-button]:size-[var(--ui-control-compact)]">

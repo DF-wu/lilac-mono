@@ -1,7 +1,8 @@
+import type { Database } from "bun:sqlite";
 import { Result } from "better-result";
 import type { DisplayMessage } from "@stanley2058/lilac-client-protocol";
 import type { SqliteTranscriptStore } from "../../../src/transcript/transcript-store";
-import type { NativeStore } from "../../../src/surface/native/store";
+import { NativeStore } from "../../../src/surface/native/store";
 
 const richMarkdown = `# Native surface check
 
@@ -77,6 +78,7 @@ function completedTurn(
   text: string,
   answer: string,
   rich = false,
+  createdAt = Date.now() - (1000 - index) * 60_000,
 ) {
   const receipt = store
     .acceptInput("owner", {
@@ -92,7 +94,6 @@ function completedTurn(
   const input = store.getInput(receipt.inputId).unwrap();
   if (!input.turnId) throw new Error("Fixture full turn was not created");
   store.settleInput(input.id, "admitted").unwrap();
-  const createdAt = Date.now() - (1000 - index) * 60_000;
   const messages: DisplayMessage[] = [];
   if (rich) {
     messages.push({
@@ -197,13 +198,59 @@ function completedTurn(
   return input;
 }
 
+const HOUR_MS = 3_600_000;
+
+// The DM context window reads stored timestamps, so these turns go through a store whose clock is set
+// to each turn's time. The latest session is older than the default two-hour context gap.
+function seedDirectMessages(
+  database: Database,
+  transcript: SqliteTranscriptStore | undefined,
+): string {
+  let now = Date.now();
+  const store = new NativeStore(database, () => now);
+  const dm = store.ensureDirectThread("owner").unwrap();
+  const sessions: { startedAt: number; turns: [string, string][] }[] = [
+    {
+      startedAt: Date.now() - 26 * HOUR_MS,
+      turns: [
+        [
+          "What should I pack for Kyoto next week?",
+          "Layers, a light rain jacket, and comfortable walking shoes.",
+        ],
+        [
+          "Anything I should book ahead?",
+          "Book kaiseki dinners and the Katsura Imperial Villa now. Most temples need no reservation.",
+        ],
+      ],
+    },
+    {
+      startedAt: Date.now() - 3 * HOUR_MS,
+      turns: [
+        [
+          "Remind me what the release checklist says about migrations.",
+          "Run the migration dry run, then record the result in the release notes.",
+        ],
+        ["Thanks, that's all for now.", "Anytime."],
+      ],
+    },
+  ];
+  let index = 0;
+  for (const session of sessions)
+    for (const [offset, [text, answer]] of session.turns.entries()) {
+      now = session.startedAt + offset * 5 * 60_000;
+      completedTurn(store, transcript, dm.id, index++, text, answer, false, now);
+    }
+  return dm.id;
+}
+
 export function seedNativeBrowserFixture(
   store: NativeStore,
   options: {
     historyTurns?: number;
     sidebarThreads?: number;
     transcript?: SqliteTranscriptStore;
-  } = {},
+    database: Database;
+  },
 ) {
   const historyTurns = options.historyTurns ?? 600;
   const sidebarThreads = options.sidebarThreads ?? 60;
@@ -329,7 +376,9 @@ export function seedNativeBrowserFixture(
     })
     .unwrap();
   store.shareThread("owner", { threadId: rich.id, userId: "participant", grant: "read" }).unwrap();
+  const dm = seedDirectMessages(options.database, options.transcript);
   return {
+    dm,
     rich: rich.id,
     history: long.id,
     largeTurn: largeTurn.id,

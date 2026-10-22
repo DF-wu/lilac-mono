@@ -66,6 +66,7 @@ type SurfaceOperationEntrypoint =
   | {
       readonly target: "adapter";
       readonly method:
+        | "resolveSessionAlias"
         | "listSessions"
         | "listSessionParticipants"
         | "startOutput"
@@ -118,6 +119,7 @@ const DISCORD_ADAPTER_OPERATION_CONTRACT = {
   sessionRef: SESSION_REF_FIXTURES.discord,
   messageRef: MESSAGE_REF_FIXTURES.discord,
   operations: {
+    "resolve-session-alias": { target: "adapter", method: "resolveSessionAlias" },
     "list-sessions": { target: "adapter", method: "listSessions" },
     "list-session-participants": { target: "adapter", method: "listSessionParticipants" },
     "start-output": { target: "adapter", method: "startOutput" },
@@ -154,6 +156,7 @@ const GITHUB_ADAPTER_OPERATION_CONTRACT = {
   sessionRef: SESSION_REF_FIXTURES.github,
   messageRef: MESSAGE_REF_FIXTURES.github,
   operations: {
+    "resolve-session-alias": { target: "adapter", method: "resolveSessionAlias" },
     "list-sessions": { target: "adapter", method: "listSessions" },
     "list-session-participants": { target: "adapter", method: "listSessionParticipants" },
     "start-output": { target: "adapter", method: "startOutput" },
@@ -185,6 +188,7 @@ interface SurfaceAdapterSignatureFixture {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   getSelf(): Promise<SurfaceSelf>;
+  resolveSessionAlias?(alias: string): Promise<SurfaceOperationResult<SessionRef>>;
   listSessions(opts?: {
     limit?: number;
     archived?: boolean;
@@ -206,6 +210,7 @@ interface SurfaceAdapterSignatureFixture {
     input: SurfaceSendPreparationInput,
     opts?: SendOpts,
   ): Promise<SurfaceOperationResult<void>>;
+  sendToolMsg?: SurfaceAdapter["sendToolMsg"];
   sendMsg(
     sessionRef: SessionRef,
     content: ContentOpts,
@@ -300,6 +305,7 @@ describe("surface operation contract", () => {
       "read-message",
       "remove-reaction",
       "resolve-attachment",
+      "resolve-session-alias",
       "send-message",
       "start-output",
       "start-typing",

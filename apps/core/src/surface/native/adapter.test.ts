@@ -1,3 +1,6 @@
+import type { RequestContext } from "../../tool-server/types";
+import { HEARTBEAT_LEVEL2_CALLABLES } from "../../tool-server/request-control-authority";
+import { createToolServer } from "../../tool-server/create-tool-server";
 import { SqliteTranscriptStore } from "../../transcript/transcript-store";
 import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
 import { projectNativeOutput } from "./output-projection";
@@ -702,7 +705,13 @@ test("native sends appear in recent writes and deletion removes their links", as
         finalText: "Old final text",
       })
       .unwrap();
-    (await tool.call("surface.messages.send", { text: "Sent by tool" }, { context })).unwrap();
+    (
+      await tool.call(
+        "surface.messages.send",
+        { text: "Sent by tool", triggerRun: true },
+        { context },
+      )
+    ).unwrap();
     expect(
       (await tool.call("surface.activities.recentAgentWrites", {}, { context })).unwrap(),
     ).toMatchObject([{ preview: "Sent by tool", requestId: "request" }]);
@@ -716,6 +725,317 @@ test("native sends appear in recent writes and deletion removes their links", as
     ).toEqual([]);
     expect(transcript.listSurfaceMessagesForRequest({ requestId: "request" })).toEqual([]);
   } finally {
+    transcript.close();
+  }
+});
+
+test("DM aliases resolve per authenticated user and surface tools return concrete targets", async () => {
+  const f = fixture();
+  const registry = SurfaceRuntimeRegistry.create([
+    createNativeSurfaceRuntimeDescriptor({
+      adapter: f.adapter,
+      resolveWorkflowAdapter: () => Result.ok(f.scoped),
+    }),
+  ]).unwrap();
+  const tool = new Surface({
+    config: parseCoreConfigV2ToUniversal({}),
+    adapterResolver: registry.adapterResolver(),
+    nativeAdapterForContext: () => Result.ok(f.scoped),
+  });
+  const context = {
+    requestClient: "native",
+    requestId: "request",
+    sessionId: `native:${f.source.id}`,
+    requestInitiator: { platform: "native" as const, userId: "owner" },
+    requestInitiatorSessionId: f.source.id,
+    serverOwnedRequest: true,
+  };
+  const listed = (
+    await tool.call("surface.messages.list", { client: "native", sessionId: "dm" }, { context })
+  ).unwrap();
+  const ownerDm = f.store.ensureDirectThread("owner").unwrap();
+  expect(listed).toMatchObject({
+    meta: { session: { platform: "native", channelId: ownerDm.id } },
+  });
+  (
+    await tool.call(
+      "surface.messages.send",
+      { client: "native", sessionId: "dm", text: "Notification only" },
+      { context },
+    )
+  ).unwrap();
+  expect(f.store.listPendingInputs().unwrap()).toHaveLength(0);
+  expect(f.kicks).toEqual([]);
+  f.store.settleSurfaceSends("request").unwrap();
+  f.store.deliverSurfaceSends().unwrap();
+  const notification = (
+    await f.scoped.listMsg({ platform: "native", channelId: ownerDm.id })
+  ).unwrap()[0]!;
+  expect(notification.text).toBe("Notification only");
+  expect(
+    f.surface.readMessage("owner", ownerDm.id, notification.ref.messageId).unwrap()?.message
+      .metadata?.phase,
+  ).toBe("final");
+  (
+    await tool.call(
+      "surface.messages.send",
+      { client: "native", sessionId: "dm", text: "For my DM", triggerRun: true },
+      { context },
+    )
+  ).unwrap();
+  expect(
+    (await f.scoped.listMsg({ platform: "native", channelId: ownerDm.id }))
+      .unwrap()
+      .map((message) => message.text),
+  ).toContain("For my DM");
+  expect(f.store.listPendingInputs().unwrap()).toHaveLength(1);
+  expect(f.kicks).toEqual([ownerDm.id]);
+  const other = f.adapter.forRequest({
+    principalId: "other",
+    sourceThreadId: f.destination.id,
+    requestId: "other-request",
+  });
+  const otherDm = (await other.resolveSessionAlias("dm")).unwrap();
+  expect(otherDm.channelId).not.toBe(ownerDm.id);
+  expect(otherDm.channelId).toBe(f.store.ensureDirectThread("other").unwrap().id);
+  expect((await f.adapter.resolveSessionAlias("dm")).isErr()).toBe(true);
+  expect((await f.scoped.resolveSessionAlias("unknown")).isErr()).toBe(true);
+  const forged = f.adapter.forRequest({
+    principalId: "other",
+    sourceThreadId: f.source.id,
+    requestId: "forged",
+  });
+  expect((await forged.resolveSessionAlias("dm")).isErr()).toBe(true);
+  expect(
+    (
+      await tool.call("surface.messages.send", {
+        client: "native",
+        sessionId: "dm",
+        text: "Denied",
+      })
+    ).isErr(),
+  ).toBe(true);
+  expect(
+    (
+      await tool.call(
+        "surface.messages.send",
+        { client: "native", sessionId: "dm", text: "Denied" },
+        {
+          context: {
+            ...context,
+            requestClient: "discord",
+            requestInitiator: { platform: "discord", userId: "owner" },
+          },
+        },
+      )
+    ).isErr(),
+  ).toBe(true);
+  const help = (await tool.call("surface.help", { client: "native" }, { context })).unwrap();
+  expect(JSON.stringify(help)).toContain('"format":"dm"');
+  expect(JSON.stringify(help)).toContain("triggerRun");
+  expect(JSON.stringify(help)).toContain("Defaults to false");
+  expect(JSON.stringify(help)).not.toContain("suppressRun");
+  expect(
+    (
+      await tool.call(
+        "surface.messages.send",
+        { client: "native", sessionId: "dm", text: "Old flag", suppressRun: true },
+        { context },
+      )
+    ).isErr(),
+  ).toBe(true);
+});
+
+test("trusted cross-surface capabilities use owner access without exposing other private DMs", async () => {
+  const f = fixture();
+  const ownerDm = f.store.ensureDirectThread("owner").unwrap();
+  const otherDm = f.store.ensureDirectThread("other").unwrap();
+  const context: RequestContext = {
+    serverOwnedRequest: true,
+    safetyMode: "trusted",
+    requestClient: "discord",
+    requestInitiator: { platform: "discord", userId: "discord-user" },
+    controlPolicy: { kind: "primary", allowedCallables: null },
+  };
+  const adapter = f.adapter.forToolContext(context, "owner").unwrap();
+  expect((await adapter.resolveSessionAlias("dm")).unwrap().channelId).toBe(ownerDm.id);
+  expect((await adapter.listSessions()).unwrap().map((s) => s.ref.channelId)).not.toContain(
+    otherDm.id,
+  );
+  expect(
+    (
+      await adapter.sendMsg({ platform: "native", channelId: otherDm.id }, { text: "private" })
+    ).isErr(),
+  ).toBe(true);
+  const sent = (
+    await adapter.sendMsg({ platform: "native", channelId: f.source.id }, { text: "cross-surface" })
+  ).unwrap();
+  expect((await adapter.readMsg(sent)).unwrap()?.text).toBe("cross-surface");
+  for (const denied of [
+    { ...context, serverOwnedRequest: false },
+    { ...context, safetyMode: "restricted" as const },
+    { ...context, controlPolicy: undefined },
+  ])
+    expect(f.adapter.forToolContext(denied, "owner").isErr()).toBe(true);
+  expect(f.adapter.forToolContext(context, "other").isErr()).toBe(true);
+});
+
+test("native participant authority stays scoped even with a trusted capability", async () => {
+  const f = fixture();
+  const otherDm = f.store.ensureDirectThread("other").unwrap();
+  const ownerDm = f.store.ensureDirectThread("owner").unwrap();
+  const adapter = f.adapter
+    .forToolContext(
+      {
+        serverOwnedRequest: true,
+        safetyMode: "trusted",
+        requestInitiator: { platform: "native", userId: "other" },
+        requestInitiatorSessionId: otherDm.id,
+        controlPolicy: { kind: "primary", allowedCallables: null },
+      },
+      "owner",
+    )
+    .unwrap();
+  expect((await adapter.resolveSessionAlias("dm")).unwrap().channelId).toBe(otherDm.id);
+  expect((await adapter.listMsg({ platform: "native", channelId: ownerDm.id })).isErr()).toBe(true);
+});
+
+test("authenticated heartbeat discovers native history and delivers to a chosen thread without waking it", async () => {
+  const f = fixture();
+  const transcript = new SqliteTranscriptStore(":memory:");
+  const registry = SurfaceRuntimeRegistry.create([
+    createNativeSurfaceRuntimeDescriptor({
+      adapter: f.adapter,
+      resolveWorkflowAdapter: () => Result.ok(f.scoped),
+    }),
+  ]).unwrap();
+  const surface = new Surface({
+    config: parseCoreConfigV2ToUniversal({}),
+    transcriptStore: transcript,
+    adapterResolver: registry.adapterResolver(),
+    nativeAdapterForContext: (ctx) => f.adapter.forToolContext(ctx, "owner"),
+  });
+  const server = createToolServer({
+    tools: [surface],
+    authorizeControlRequest: ({ token }) =>
+      token === "heartbeat-test"
+        ? {
+            kind: "heartbeat",
+            principal: null,
+            authenticatedOrigin: null,
+            allowedCallables: HEARTBEAT_LEVEL2_CALLABLES,
+            profile: "primary",
+            canonicalCwd: "/tmp",
+            safetyMode: "trusted",
+          }
+        : null,
+  });
+  await server.init();
+  const headers = {
+    "content-type": "application/json",
+    "x-lilac-request-id": "heartbeat:test",
+    "x-lilac-session-id": "__heartbeat__",
+    "x-lilac-request-client": "unknown",
+    "x-lilac-control-capability": "heartbeat-test",
+    "x-lilac-cwd": "/tmp",
+  };
+  async function call(callableId: string, input: object, requestHeaders = headers) {
+    const response = await server.app.handle(
+      new Request("http://localhost/call", {
+        method: "POST",
+        headers: requestHeaders,
+        body: JSON.stringify({ callableId, input }),
+      }),
+    );
+    return response.json();
+  }
+  try {
+    transcript
+      .saveRequestTranscript({
+        requestId: "heartbeat:test",
+        sessionId: "__heartbeat__",
+        requestClient: "unknown",
+        messages: [],
+        finalText: "HEARTBEAT_OK",
+      })
+      .unwrap();
+    transcript
+      .saveRequestTranscript({
+        requestId: "heartbeat:test:heartbeat-handoff:deferred",
+        sessionId: "__heartbeat__:handoff",
+        requestClient: "unknown",
+        messages: [{ role: "assistant", content: "Forecast changed" }],
+        finalText: "Forecast changed",
+      })
+      .unwrap();
+    const sent = await call("surface.messages.send", {
+      client: "native",
+      sessionId: f.source.id,
+      text: "Forecast changed",
+    });
+    expect(sent).toMatchObject({ status: "ok", value: { status: "queued" } });
+    expect((await f.scoped.listMsg(f.ref)).unwrap()).toHaveLength(0);
+    f.store.settleSurfaceSends("heartbeat:test").unwrap();
+    f.store.deliverSurfaceSends().unwrap();
+    for (const link of f.store.listProjectedMessageLinks("heartbeat:test").unwrap()) {
+      const refs = link.messageIds.map((messageId) => ({
+        platform: "native" as const,
+        channelId: link.threadId,
+        messageId,
+      }));
+      transcript.linkSurfaceMessagesToRequest({
+        requestId: link.requestId,
+        created: refs,
+        last: refs.at(-1)!,
+      });
+    }
+
+    expect(f.store.listPendingInputs().unwrap()).toHaveLength(0);
+    expect(f.kicks).toEqual([]);
+    const messages = (await f.scoped.listMsg(f.ref)).unwrap();
+    const delivered = messages.find((m) => m.text === "Forecast changed");
+    expect(delivered).toBeDefined();
+    const displayed = f.surface
+      .readMessage("owner", f.source.id, delivered!.ref.messageId)
+      .unwrap()!.message;
+    expect(displayed).toMatchObject({
+      role: "assistant",
+      metadata: { authorId: "lilac", phase: "final" },
+      parts: [{ type: "text", text: "Forecast changed" }],
+    });
+    expect(
+      JSON.stringify(await call("surface.activities.recentAgentWrites", { client: "native" })),
+    ).toContain("Forecast changed");
+    expect(
+      (await call("surface.messages.list", { client: "native", sessionId: f.source.id })).status,
+    ).toBe("ok");
+    expect(
+      (
+        await call("surface.messages.send", {
+          client: "native",
+          sessionId: "dm",
+          text: "Default DM",
+        })
+      ).status,
+    ).toBe("ok");
+    const otherDm = f.store.ensureDirectThread("other").unwrap();
+    expect(
+      (
+        await call("surface.messages.send", {
+          client: "native",
+          sessionId: otherDm.id,
+          text: "Denied",
+        })
+      ).status,
+    ).toBe("error");
+    const forged = await call(
+      "surface.messages.send",
+      { client: "native", sessionId: f.source.id, text: "Forged" },
+      { ...headers, "x-lilac-control-capability": "invalid" },
+    );
+    expect(forged.status).toBe("error");
+  } finally {
+    await server.stop();
     transcript.close();
   }
 });

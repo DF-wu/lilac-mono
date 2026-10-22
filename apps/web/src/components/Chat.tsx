@@ -1,4 +1,6 @@
 import { RecentContextProvider } from "./RecentContext";
+import { currentPushDeviceId } from "../push-device";
+import { watchReadLifecycle } from "../read-lifecycle";
 import { rewindDraft } from "../rewind-draft";
 import type { OptimisticTurn } from "../optimistic-turns";
 import { useEventCallback } from "../use-event-callback";
@@ -313,28 +315,25 @@ export function Chat(props: ChatProps) {
   useEffect(() => {
     if (local || !props.foreground || !readableTurnId || !latestVisible || active) return;
     const turnId = readableTurnId;
-    let pending = false;
-    function markVisibleTurnRead() {
+    return watchReadLifecycle(client, async () => {
+      if (props.readTurns.get(threadId) === turnId) return true;
       const rpc = client.rpc;
-      if (
-        document.visibilityState !== "visible" ||
-        !rpc ||
-        pending ||
-        props.readTurns.get(threadId) === turnId
-      )
-        return;
-      pending = true;
-      void attempt(() => rpc.threads.markRead({ threadId: threadId, turnId }), setError).then(
-        (result) => {
-          pending = false;
-          if (result) props.readTurns.set(threadId, turnId);
-        },
-      );
-    }
-    markVisibleTurnRead();
-    document.addEventListener("visibilitychange", markVisibleTurnRead);
-    return () => document.removeEventListener("visibilitychange", markVisibleTurnRead);
-  }, [client, threadId, active, latestVisible, readableTurnId, props.readTurns, props.foreground]);
+      if (!rpc) return false;
+      const result = await attempt(() => rpc.threads.markRead({ threadId, turnId }), setError);
+      if (!result) return false;
+      props.readTurns.set(threadId, turnId);
+      return true;
+    });
+  }, [
+    client,
+    threadId,
+    local,
+    active,
+    latestVisible,
+    readableTurnId,
+    props.readTurns,
+    props.foreground,
+  ]);
 
   const setPending = (commandId: string, patch: Partial<PendingInput> | null) => {
     commitPending((entries) =>
@@ -377,6 +376,7 @@ export function Chat(props: ChatProps) {
       threadId: threadId,
       commandId: entry.commandId,
       historyGeneration: checkpoint.historyGeneration,
+      deviceId: await currentPushDeviceId(),
       text: entry.submission.attachmentText
         ? resolveComposerAttachments(
             entry.submission.attachmentText,
@@ -809,6 +809,7 @@ export function Chat(props: ChatProps) {
               upload={recoveryUpload}
               onRewind={setRewindTarget}
               rewindDisabled={active || thread?.kind === "dm"}
+              timestamps={thread?.kind === "dm"}
               onAction={onAction}
               onReaction={onReaction}
             />

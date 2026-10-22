@@ -265,6 +265,10 @@ export function buildDiscordOutputOverlay(): string {
 
 export function buildNativeOutputOverlay(): string {
   return [
+    "Native DM delivery:",
+    "- When the user asks to send something to their DM, use surface.messages.send with client=native and sessionId=dm.",
+    "- The dm alias resolves to the authenticated requesting user's permanent DM. For deferred deliveries, call surface.messages.list with client=native and sessionId=dm now, then save the returned meta.session.channelId as the delivery target.",
+    "",
     "Native web file presentation:",
     "",
     "- Show an image inline with `![Description](/absolute/path/image.png)`.",

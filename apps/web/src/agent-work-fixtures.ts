@@ -526,6 +526,77 @@ const foldedActivityMessages = [
 
 export const agentWorkStages: AgentWorkStage[] = [
   {
+    id: "grouped-messages",
+    label: "Grouped messages",
+    description:
+      "A deferred post shares the completed reply’s avatar, including older queued timestamps.",
+    frames: [
+      {
+        ...turn([], "complete"),
+        messages: [
+          message("grouped_work", [forecast]),
+          message(
+            "grouped_first",
+            [{ type: "text", text: "The forecast is ready. The morning looks clear." }],
+            "final",
+          ),
+        ],
+        following: {
+          kind: "ready",
+          slotId: "grouped_post",
+          turnId: "grouped_post",
+          position: 1,
+          state: "complete",
+          messages: [
+            {
+              ...message(
+                "grouped_post",
+                [{ type: "text", text: "Bring a light jacket for the riverside walk." }],
+                "final",
+              ),
+              metadata: { authorId: "demo_agent", createdAt: demoTime - 30_000, phase: "final" },
+            },
+          ],
+        },
+      },
+    ],
+  },
+  {
+    id: "surface-message",
+    label: "Cross-thread message",
+    description: "An incoming agent message stays visible above the destination run's work.",
+    frames: [
+      {
+        ...turn([], "complete"),
+        messages: [
+          {
+            ...message(
+              "demo_surface_message",
+              [{ type: "text", text: "Notification test. Did your phone blink?" }],
+              "final",
+            ),
+            metadata: {
+              authorId: "demo_agent",
+              createdAt: demoTime,
+              phase: "final",
+              inputId: "demo_surface_input",
+              inputMode: "prompt",
+            },
+          },
+          message("demo_surface_recall", [
+            activity(
+              "demo_surface_recall",
+              "tool",
+              "conversation_thread_search auto-injected metadata",
+              "complete",
+              "Related conversation context was added to the destination run.",
+            ),
+          ]),
+        ],
+      },
+    ],
+  },
+  {
     id: "sent",
     label: "Message sent",
     description: "The agent shows Thinking immediately after sending.",

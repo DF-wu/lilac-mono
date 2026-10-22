@@ -43,7 +43,12 @@ export function settleSurfaceFallback<T, E>(
   });
 }
 
+export type SurfaceToolSendResult =
+  | { readonly status: "queued" }
+  | { readonly status: "sent"; readonly ref: MsgRef };
+
 export type SurfaceOperation =
+  | "resolve-session-alias"
   | "list-sessions"
   | "list-session-participants"
   | "resolve-attachment"
@@ -249,6 +254,8 @@ export interface SurfaceAdapter {
   disconnect(): Promise<void>;
   getSelf(): Promise<SurfaceSelf>;
 
+  resolveSessionAlias?(alias: string): Promise<SurfaceOperationResult<SessionRef>>;
+
   listSessions(opts?: {
     limit?: number;
     archived?: boolean;
@@ -272,6 +279,12 @@ export interface SurfaceAdapter {
     input: SurfaceSendPreparationInput,
     opts?: SendOpts,
   ): Promise<SurfaceOperationResult<void>>;
+  sendToolMsg?(
+    sessionRef: SessionRef,
+    content: ContentOpts,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<SurfaceToolSendResult>>;
+
   sendMsg(
     sessionRef: SessionRef,
     content: ContentOpts,

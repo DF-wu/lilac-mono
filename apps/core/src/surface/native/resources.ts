@@ -50,6 +50,7 @@ type HttpResourceRead = {
 };
 
 export interface NativeUploadStore {
+  hasDeferredUpload(uploadId: string): NativeStateResult<boolean>;
   setUserProfile?(
     actorId: string,
     input: { avatar?: NativeUser["avatar"] | null; providerAvatarUrl?: string | null },
@@ -932,6 +933,7 @@ export class NativeResourceService {
         .mapError(() => nativeFailure("sqlite", "File ownership could not be read"));
       let released = 0;
       for (const reference of references) {
+        if (yield* this.dependencies.native.hasDeferredUpload(reference.uploadId)) continue;
         const upload = yield* this.dependencies.native
           .getUpload(reference.uploadId)
           .map<NativeUploadRecord | null>((value) => value)

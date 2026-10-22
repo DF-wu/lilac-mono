@@ -139,7 +139,38 @@ export const turnPageSchema = z
       message: "Turn page exceeds the batch byte budget",
     },
   );
+export const pushSubscriptionSchema = z.strictObject({
+  endpoint: z.url().max(2048),
+  keys: z.strictObject({
+    p256dh: z.string().regex(/^[A-Za-z0-9_-]{87}$/),
+    auth: z.string().regex(/^[A-Za-z0-9_-]{22}$/),
+  }),
+  completion: z.boolean(),
+  failure: z.boolean(),
+});
+export const notificationContentSchema = z.strictObject({
+  threadId: identitySchema,
+  title: z.string().max(600),
+  body: z.string().max(240),
+  tag: z.string().max(1024),
+});
 export const nativeContract = {
+  notifications: {
+    presence: procedure
+      .input(
+        z.strictObject({
+          threadId: identitySchema.optional(),
+          clientId: identitySchema,
+        }),
+      )
+      .output(successSchema),
+    key: procedure.input(z.strictObject({})).output(z.strictObject({ publicKey: z.string() })),
+    subscribe: procedure.input(pushSubscriptionSchema).output(successSchema),
+    unsubscribe: procedure
+      .input(z.strictObject({ endpoint: z.string().max(2048) }))
+      .output(successSchema),
+    read: procedure.input(threadIdInput).output(notificationContentSchema),
+  },
   streams: {
     sync: procedure.input(displayStreamSyncSchema).output(replayReplySchema),
     watch: procedure.input(displayStreamSyncSchema).output(eventIterator(threadEventSchema)),
@@ -231,6 +262,7 @@ export const nativeContract = {
         summarizedBeforePosition: revisionSchema.optional(),
         active: z.boolean(),
         expiresAt: revisionSchema.optional(),
+        timestampGapMs: z.number().int().positive(),
       }),
     ),
     get: procedure.input(threadIdInput).output(nativeThreadSchema),

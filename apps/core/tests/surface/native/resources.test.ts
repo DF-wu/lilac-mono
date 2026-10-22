@@ -97,10 +97,68 @@ async function fixture() {
     bytes,
     publish,
     progress,
+    advanceClock: (milliseconds: number) => {
+      clock += milliseconds;
+    },
   };
 }
 
 describe("native resources", () => {
+  for (const deliverFirst of [false, true]) {
+    test(`deferred attachments survive staging expiry and release on deletion, delivered=${deliverFirst}`, async () => {
+      const f = await fixture();
+      const ready = value(await f.service.upload("alice", f.reserve().id, f.source()));
+      value(
+        f.native.queueSurfaceSend(
+          "alice",
+          f.thread.id,
+          "heartbeat:attachment",
+          {
+            id: "deferred-file",
+            role: "assistant",
+            parts: [
+              {
+                type: "data-resource",
+                id: ready.id,
+                data: {
+                  resourceId: ready.id,
+                  name: ready.filename,
+                  mediaType: ready.mediaType,
+                  size: ready.size,
+                  state: "ready",
+                },
+              },
+            ],
+          },
+          true,
+        ),
+      );
+      f.advanceClock(48 * 60 * 60_000);
+      expect(value(f.native.hasDeferredUpload(ready.id))).toBe(true);
+      expect(value(f.service.reconcileReferences())).toBe(0);
+      expect(value(f.resources.listNativeResourceReferences())).toHaveLength(1);
+      expect(value(await f.access.maintain({ limit: 10 })).deleted).toBe(0);
+      expect(value(f.native.getUpload(ready.id)).published).toBe(false);
+      if (deliverFirst) {
+        value(f.native.settleSurfaceSends("heartbeat:attachment"));
+        const delivered = value(f.native.deliverSurfaceSends());
+        expect(delivered.requestIds).toEqual(["heartbeat:attachment"]);
+        expect(delivered.notifications).toEqual([]);
+        expect(value(f.native.hasDeferredUpload(ready.id))).toBe(false);
+        expect(value(f.native.getUpload(ready.id)).published).toBe(true);
+        expect(value(f.service.reconcileReferences())).toBe(0);
+      }
+      const deletion = value(
+        f.native.deleteThread("alice", { threadId: f.thread.id, commandId: "delete-deferred" }),
+      );
+      value(f.native.finishMutation(f.thread.id, deletion.historyGeneration!));
+      expect(value(f.native.hasDeferredUpload(ready.id))).toBe(false);
+      expect(value(f.service.reconcileReferences())).toBe(1);
+      expect(value(f.resources.listNativeResourceReferences())).toEqual([]);
+      expect(value(await f.access.maintain({ limit: 10 })).deleted).toBe(1);
+    });
+  }
+
   test("physical thread cleanup releases orphaned native resource ownership", async () => {
     const f = await fixture();
     const ready = value(await f.service.upload("alice", f.reserve().id, f.source()));

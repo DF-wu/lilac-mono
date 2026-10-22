@@ -117,6 +117,7 @@ export async function createNativeIntegrationFixture(
     seed?: (
       store: import("../../../src/surface/native/store").NativeStore,
       transcript: SqliteTranscriptStore,
+      database: import("bun:sqlite").Database,
     ) => void | Promise<void>;
     additionalLocalUsers?: readonly {
       userId: string;
@@ -387,7 +388,7 @@ export async function createNativeIntegrationFixture(
           }),
       }),
   });
-  await options.seed?.(store, transcript);
+  await options.seed?.(store, transcript, installation.database);
   integrationValue(await runtime.recover());
   runner.activate();
   const address = integrationValue(runtime.startIngress());

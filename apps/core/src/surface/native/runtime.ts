@@ -1,3 +1,5 @@
+import { reconcileNativeDeferredSends, subscribeNativeDeferredSends } from "./deferred-sends";
+import { NativePush } from "./push";
 import { NativeComputer } from "./computer";
 import { NativeReferences } from "./references";
 import { nativeStoreTransaction, type NativeStoreError } from "./store";
@@ -10,6 +12,10 @@ import type { DurableWorkflowStore } from "../../workflow/durable-workflow-store
 import path from "node:path";
 import { Panic, Result, type Result as ResultType } from "better-result";
 import { FileSystem } from "@stanley2058/lilac-fs";
+import {
+  DEFAULT_DM_CONTEXT_GAP_MS,
+  DEFAULT_DM_TIMESTAMP_GAP_MS,
+} from "@stanley2058/lilac-client-protocol";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import {
   lilacEventTypes,
@@ -113,7 +119,8 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   const deploymentInitialized = store.initializeDeployment({
     titleModel: legacy.titleModel,
     outputStreaming: legacy.outputStreaming,
-    dmContextMaxAgeMs: 10_800_000,
+    dmContextGapMs: DEFAULT_DM_CONTEXT_GAP_MS,
+    dmTimestampGapMs: DEFAULT_DM_TIMESTAMP_GAP_MS,
     oldMessageSelectionMaxAgeMs: legacy.oldMessageSelectionMaxAgeMs,
     storageRetentionMaxAgeMs: legacy.storageRetentionMaxAgeMs,
     crossThreadSend: legacy.crossThreadSend,
@@ -179,7 +186,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     customCommands: options.customCommands,
     validateSkill: (id) => skills.some((skill) => skill.name === id),
     deliveryState: options.deliveryState,
-    getDmContextMaxAgeMs: () => deployment().dmContextMaxAgeMs,
+    getDmContextGapMs: () => deployment().dmContextGapMs,
     getOldMessageSelectionMaxAgeMs: () => deployment().oldMessageSelectionMaxAgeMs ?? undefined,
   });
   const operator = options.operatorTokenSha256
@@ -228,6 +235,10 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   const initializationError = initialized.match({ ok: () => null, err: (error) => error });
   if (initializationError) return Result.err(initializationError);
   const kick = (threadId: string) => {
+    flushSurfaceSends(threadId).match({
+      ok: () => undefined,
+      err: (error) => options.warn("Native deferred sends delayed", error),
+    });
     void execution.kick(threadId).then((result) =>
       result.match({
         ok: () => undefined,
@@ -243,6 +254,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       requestModelOverride: modelId,
     }).map((plan) => toDurableResolvedModelPlan(plan, cfg.agent.reasoningDisplay));
   };
+  const push = new NativePush(database, store);
   const adapter = new NativeSurfaceAdapter({
     store,
     surface,
@@ -251,6 +263,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     shouldTriggerRun: () => deployment().crossThreadSend.triggerRun,
     streamingMode: () => deployment().outputStreaming,
     kick,
+    notifyPostedMessage: (threadId) => push.posted(threadId),
   });
   const descriptor = createNativeSurfaceRuntimeDescriptor({
     adapter,
@@ -297,6 +310,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     streamingMode: () => deployment().outputStreaming,
   });
   const services = createNativeRpcServices({
+    push,
     computer: new NativeComputer(store, options.mcpRegistry),
     references,
     files: liveFiles,
@@ -397,27 +411,13 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   }
   let output: NativeOutputSubscription | undefined;
   let workflowOutput: NativeOutputSubscription | undefined;
+  let sendOutput: NativeOutputSubscription | undefined;
   let outputStopping = false;
   let unsubscribe: (() => void) | undefined;
   const nativeAdapterForContext: NonNullable<CoreToolPluginRuntime["nativeAdapterForContext"]> = (
     context,
   ) => {
-    const principal = context.requestInitiator;
-    const threadId = context.requestInitiatorSessionId ?? context.sessionId;
-    if (!context.serverOwnedRequest || principal?.platform !== "native" || !threadId)
-      return Result.err(
-        nativeSurfaceError(
-          "list-sessions",
-          nativeFailure("forbidden", "Native tools require starter authority"),
-        ),
-      );
-    return Result.ok(
-      adapter.forRequest({
-        principalId: principal.userId,
-        sourceThreadId: nativeThreadId(threadId),
-        requestId: context.requestId,
-      }),
-    );
+    return adapter.forToolContext(context, options.getConfig().surface.native.auth.ownerId);
   };
 
   const resourceAccessForContext: NonNullable<CoreToolPluginRuntime["resourceAccessForContext"]> = (
@@ -480,6 +480,16 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
             .mapError((error) => nativeFailure("sqlite", error.message));
         }
       }
+      return Result.ok(undefined);
+    });
+  }
+
+  function flushSurfaceSends(threadId?: string) {
+    return Result.gen(function* () {
+      yield* reconcileNativeDeferredSends(store, options.deliveryState);
+      const delivered = yield* store.deliverSurfaceSends(threadId);
+      for (const requestId of delivered.requestIds) yield* linkProjectedMessages(requestId);
+      for (const id of delivered.notifications) push.posted(id);
       return Result.ok(undefined);
     });
   }
@@ -587,6 +597,24 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       const workflowHandle = yield* workflowStarted;
       workflowOutput = workflowHandle;
       observeOutput(workflowHandle);
+      const sendStarted = await subscribeNativeDeferredSends({
+        bus: options.bus,
+        subscriptionPrefix: options.subscriptionPrefix,
+        store,
+        flush: flushSurfaceSends,
+      });
+      const sendError = sendStarted.match({ ok: () => undefined, err: (error) => error });
+      if (sendError) {
+        yield* Result.await(workflowHandle.stop());
+        yield* Result.await(handle.stop());
+        workflowOutput = undefined;
+        output = undefined;
+        return Result.err(sendError);
+      }
+      const sendHandle = yield* sendStarted;
+      sendOutput = sendHandle;
+      observeOutput(sendHandle);
+      yield* flushSurfaceSends();
       return Result.ok(undefined);
     });
   }
@@ -759,6 +787,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     return Result.gen(async function* () {
       yield* Result.await(execution.recoverMutations());
       yield* Result.await(execution.kick());
+      yield* flushSurfaceSends();
       return Result.ok(undefined);
     });
   }
@@ -769,6 +798,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       const operatorAddress = operatorGateway ? yield* operatorGateway.start() : undefined;
       const address = publicAddress ?? operatorAddress ?? { url: nativeConfig.publicUrl };
       unsubscribe = store.subscribeChanges(kick);
+      push.start();
       if (operator) operatorTimer = setInterval(tickOperator, 1000);
       return Result.ok(address);
     });
@@ -783,6 +813,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     await operatorMaintenance;
     await operatorGateway?.stop();
     await gateway.stop();
+    await push.stop();
     const uploads = await resources.stop();
     const publications = await execution.drainPublications();
     nativeRuntimeResultToHost(Result.all([uploads, publications]));
@@ -793,7 +824,9 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     output = undefined;
     const workflowActive = workflowOutput;
     workflowOutput = undefined;
-    const stopped = await Promise.all([active?.stop(), workflowActive?.stop()]);
+    const sendActive = sendOutput;
+    sendOutput = undefined;
+    const stopped = await Promise.all([active?.stop(), workflowActive?.stop(), sendActive?.stop()]);
     for (const result of stopped) if (result) nativeRuntimeResultToHost(result);
   }
   async function updateCatalog() {
@@ -820,6 +853,8 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
             }),
           );
       }
+      yield* flushSurfaceSends();
+      yield* linkProjectedMessages();
       yield* resources.reconcileReferences();
       yield* surface.pruneDeleted();
       yield* store.pruneReplay();
@@ -849,6 +884,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       ref: Parameters<typeof hydrateNativeConversationAttachments>[1],
       remainingBytes: number,
     ) => hydrateNativeConversationAttachments({ store, surface, resources }, ref, remainingBytes),
+    flushSurfaceSends,
     startOutput,
     startIngress,
     stopIngress,

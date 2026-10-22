@@ -1,5 +1,5 @@
 import {
-  nativeDeploymentDocumentSchema,
+  nativeDeploymentSettingsSchema,
   displayMessageSchema,
   displayPartSchema,
   readyTurnSlotSchema,
@@ -66,6 +66,10 @@ export const nativeInputRecordSchema = z.strictObject({
   threadId: id,
   authorId: id,
   initiatingUserId: id,
+  deviceId: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
   requestId: id,
   deliveryId: id,
   messageId: id,
@@ -142,8 +146,31 @@ export const nativeAgentStreamRecordSchema = z.strictObject({
   deleted: z.boolean(),
   mutationPending: z.boolean(),
 });
+// Records written before gap-based DM context carry `dmContextMaxAgeMs`. Its age semantics do not
+// map onto a session gap, so decoding drops it and the gap settings take their defaults.
+const storedDeploymentSettingsSchema = nativeDeploymentSettingsSchema
+  .extend({ dmContextMaxAgeMs: z.number().int().positive().optional() })
+  .transform(({ dmContextMaxAgeMs: _legacy, ...settings }) => settings);
+export const nativeSendGroupSchema = z.strictObject({
+  id,
+  requestId: id,
+  deliveryId: id.optional(),
+  transcriptRequestId: id.optional(),
+  actorId: id,
+  threadId: id,
+  historyGeneration: revision,
+  settled: z.boolean(),
+  delivered: z.boolean(),
+  messages: z.array(z.strictObject({ message: displayMessageSchema, silent: z.boolean() })),
+});
+export type NativeSendGroup = z.infer<typeof nativeSendGroupSchema>;
+
 export const nativeRecordSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("deployment"), value: nativeDeploymentDocumentSchema }),
+  z.strictObject({ kind: z.literal("send-group"), value: nativeSendGroupSchema }),
+  z.strictObject({
+    kind: z.literal("deployment"),
+    value: z.strictObject({ settings: storedDeploymentSettingsSchema, revision }),
+  }),
   z.strictObject({ kind: z.literal("user"), value: nativeUserSchema }),
   z.strictObject({ kind: z.literal("thread"), value: nativeThreadRecordSchema }),
   z.strictObject({ kind: z.literal("agent-stream"), value: nativeAgentStreamRecordSchema }),

@@ -372,11 +372,12 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
         "aria-autocomplete": "list",
         "aria-haspopup": "listbox",
       },
+      // ProseMirror filters IME confirmation keys before calling handleKeyDown.
+      handleKeyDown: (_view, event) => {
+        current.current.onKeyDown(event);
+        return event.defaultPrevented;
+      },
       handleDOMEvents: {
-        keydown: (_view, event) => {
-          current.current.onKeyDown(event);
-          return event.defaultPrevented;
-        },
         paste: (_view, event) => {
           current.current.onPaste(event);
           return event.defaultPrevented;

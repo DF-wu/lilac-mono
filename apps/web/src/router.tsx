@@ -67,6 +67,10 @@ export function createAppRouter(options: {
         });
     },
   });
+  const dmRoute = createRoute({
+    getParentRoute: () => chatRoute,
+    path: "/dm",
+  });
   const threadRoute = createRoute({
     getParentRoute: () => chatRoute,
     path: "/threads/$threadId",
@@ -78,7 +82,7 @@ export function createAppRouter(options: {
   });
   return createRouter({
     routeTree: rootRoute.addChildren([
-      chatRoute.addChildren([indexRoute, threadRoute]),
+      chatRoute.addChildren([indexRoute, dmRoute, threadRoute]),
       designSystemRoute,
     ]),
     history: options.history,

@@ -1,5 +1,66 @@
 # MIGRATIONS.md
 
+## Native schema 5: initiating notification device
+
+Native input submissions and persisted input records gain optional `deviceId`, the lowercase SHA-256
+hex digest of the initiating browser's push subscription endpoint. Core matches it only against the
+authenticated initiating user's subscriptions. Existing inputs without this field keep immediate
+broadcast delivery. The existing subscription table remains unchanged; no device registry is added.
+
+Initialization advances SQLite schema 4 to 5 without rewriting existing records. Older binaries reject
+schema 5. Deploy Core and web together because older strict input validators reject `deviceId`; rollback
+requires a pre-upgrade backup.
+
+Successful completions notify the initiating subscription first, then other eligible devices after
+60 seconds if that completion remains unread. Missing or disabled initiating subscriptions and failed
+primary sends fall back to immediate delivery to other eligible devices. Failures and agent-initiated
+posts keep immediate broadcast behavior. Pending escalations are process-local: restarting Core during
+the delay drops them, and startup does not replay them.
+
+## Native surface sends opt in to execution
+
+`surface.messages.send` replaces `suppressRun` with `triggerRun`, defaulting to false. Native sends
+now queue by default; pass `triggerRun: true` to request the existing cross-thread execution behavior.
+Heartbeat remains notification-only. The strict input schema rejects the removed flag. Update callers
+and deploy Core and tools together; there is no stored-data or configuration migration. Other surfaces
+retain their send behavior. Deferred native messages now receive their visible timestamp at delivery.
+
+## Native schema 4: deferred surface sends
+
+Native `surface.messages.send` calls with effective `suppressRun=true`, including heartbeat, now
+return `{ ok: true, status: "queued", message, session }` without a message reference. Other sends
+retain their existing result and run-triggering behavior. Deploy Core and its tools together.
+
+Schema 4 stores request-grouped sends in native records. Groups retain first-send order per destination
+and become visible only after the sender settles and the destination has no active or pending input.
+Lifecycle bus events wake delivery checks; the durable request outcome distinguishes settlement from
+recoverable failure. Startup and maintenance reconcile retained groups, and runner settlement wakes
+delivery immediately. Repeated delivery does not duplicate messages. Pending
+messages remain absent from history, search and transcript links. Attachments retain their bytes while
+pending. Deleting a destination removes its groups; a history-generation change or lost write access
+discards pending groups when delivery is checked. Completed groups retain delivery links for recovery. Heartbeat handoffs are prepared before settlement
+and linked only after delivery.
+There is no expiry, coalescing, operation-status API, or change to edits and deletes.
+
+Existing data needs no rewrite. Older binaries reject schema 4; rollback requires a pre-upgrade backup.
+Existing customized HEARTBEAT.md files remain unchanged. A queued acknowledgment means acceptance;
+heartbeat should continue and avoid resending the same finding while it waits for delivery.
+
+## File-based heartbeat workflow and native agent access
+
+No config version, wire schema, or database schema changes. Core seeds missing `prompts/HEARTBEAT.md`
+and `prompts/heartbeat/WORK.md` from the built-in heartbeat skill. Existing files and legacy inbox/archive
+notes remain unchanged. Ask the agent to use the heartbeat skill's migration reference to merge old
+responsibilities and active prompt instructions, preserve destinations, and verify delivery. Startup
+no longer creates empty legacy inbox/archive directories. The default destination remains optional in
+configuration and is selected through conversation during setup; native is not required.
+
+Trusted cross-surface agent capabilities now grant the configured native owner's existing thread access.
+Native-origin runs retain their original principal. Restricted or unverified requests receive no owner
+fallback, and other users' private DMs remain inaccessible. Heartbeat posts are notifications and do not
+admit another agent turn in their destination. This is a deliberate authority-policy change, not a change
+to human login or thread-sharing permissions. Deploy Core; web clients need no protocol upgrade.
+
 ## Permanent native DM
 
 Native thread records and summaries gain optional `kind: "dm"`. Absence retains ordinary-thread
@@ -1092,3 +1153,35 @@ resize policy version, dimensions, media type, and a separate expiring blob refe
 expire after 24 hours through existing blob maintenance, including abandoned or replaced previews.
 Missing or expired previews regenerate on demand. Original downloads remain unchanged.
 Older binaries reject schema 14; rollback requires a pre-upgrade backup.
+
+## Native schema 3: background notifications
+
+Schema 3 adds installation-owned Web Push signing keys and per-browser subscriptions to the native
+SQLite database. Existing accounts and conversation records are unchanged. Keys are generated on the
+first opt-in and retained across restarts. Subscriptions belong to the authenticated user, store the
+two event preferences, and are removed on opt-out, explicit logout, or a push service's 404/410 reply.
+Deploy Core and the web client together for the new `notifications.*` RPC methods. Older binaries
+reject schema 3; rollback requires a pre-upgrade backup.
+
+The browser's existing three-bit notification preference accepts an optional fourth background-push
+bit. Existing preferences retain their event choices and default background push to off. Push previews
+contain at most 200 characters of assistant text. Delivery is best effort and has no replay queue.
+
+## Native thread presence independent of push
+
+The native `notifications.presence` RPC now accepts only `clientId` and optional `threadId`.
+It no longer accepts or requires a push endpoint. Deploy Core and the web client together and reload
+open tabs. Presence is scoped to the authenticated user and tab, remains in memory, and expires after
+60 seconds without a heartbeat. A focused thread suppresses that user's completion and failure pushes
+on all devices, including when push is disabled or unsupported on the viewing device. There is no
+stored-data migration.
+
+## Gap-based native DM context
+
+Deployment settings replace `dmContextMaxAgeMs` with `dmContextGapMs` (default 7,200,000 ms) and add
+`dmTimestampGapMs` (default 1,800,000 ms). Decoding a stored deployment record drops
+`dmContextMaxAgeMs` and applies both defaults; the next save writes the new fields. A custom DM age
+is not carried over because an age limit does not translate to a pause length. `threads.context`
+gains required `timestampGapMs`, and its `expiresAt` for a DM is the latest completion plus the gap.
+Deploy Core and web together. Older strict validators reject the new fields, and older clients that
+send `dmContextMaxAgeMs` are rejected. There is no other stored-data migration.

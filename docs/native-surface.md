@@ -37,9 +37,15 @@ For a remote installation, put the native listener behind HTTPS and set `publicU
 `allowedOrigins` to the externally visible origin. Auth uses the configured public URL; arbitrary
 forwarded headers cannot change it.
 
-For frontend development, run `bun run dev:web`. Vite proxies `/api` and WebSocket upgrades to
-`http://127.0.0.1:8789`; `LILAC_WEB_BACKEND_URL` overrides that development target. Add the development
-origin, normally `http://localhost:5173`, to `allowedOrigins`.
+For frontend development, run `bun run dev:web`. It starts the deterministic browser fixture and Vite
+on free ports and prints the web URL, login and seeded thread links. `--replace` stops the dev servers on
+ports 5173 and 8789 and starts there instead. `--clerk` uses Clerk authentication with the keys in
+`apps/web/.env.local` and prints a single-use sign-in link; `--clerk-owner <user_id>` picks the owner
+when the Clerk instance has more than one user.
+
+To develop against a real Core installation, run `bun --cwd=apps/web run dev`. Vite proxies `/api` and
+WebSocket upgrades to `http://127.0.0.1:8789`; `LILAC_WEB_BACKEND_URL` overrides that development
+target. Add the development origin, normally `http://localhost:5173`, to `allowedOrigins`.
 
 ## Design system
 
@@ -143,6 +149,11 @@ values once without rewriting the YAML file. Later YAML edits do not override da
 Saves reject stale revisions. New title jobs, output attempts, selections, and retention passes use
 the latest settings; active output attempts keep their original streaming mode.
 
+Native `surface.messages.send` defaults to `triggerRun: false`. Core queues the message until the
+sender finishes and the destination is idle, without starting a destination run. Pass `triggerRun: true`
+only when the destination agent should respond, subject to the deployment's cross-thread execution
+setting. Heartbeat always queues. `silent` independently controls notifications.
+
 Core and MCP configuration editors are also owner-only. Save validates and atomically updates the
 selected file, using revisions to reject concurrent edits. Core keeps its existing reload behavior. MCP
 Save writes the document; Reload applies it through the existing MCP registry. The UI does not edit
@@ -194,6 +205,21 @@ text and strips terminal control sequences. It does not read the host clipboard.
 
 For source development, `bun run dev:tui` connects to the same local operator endpoint. It requires
 access to the operator token, just like the container command.
+
+## DM links and agent delivery
+
+Open `/dm` to return to your permanent DM. Its existing `/threads/<threadId>` URL remains valid
+for links to that specific conversation.
+
+Agents can use `surface.messages.send` with `client=native` and `sessionId=dm`. Native requests
+resolve `dm` using the authenticated requesting user. Trusted agent runs from another surface, and
+heartbeat runs, use the configured native owner's access after Core validates their control capability.
+Restricted and unverified requests cannot use this cross-surface access. Other users' private DMs stay
+inaccessible to the owner. The alias is documented in `surface.help` and native agent instructions.
+For deferred delivery, call `surface.messages.list` with the same target and save the concrete
+`meta.session.channelId` returned by Core. Heartbeat messages are visible assistant posts and do not
+start another agent run in the destination thread. Cross-thread agent messages trigger a run only with explicit
+`triggerRun: true` and the deployment setting enabled. Native is optional for heartbeat; see [heartbeat](heartbeat.md).
 
 ## Diagnostics and compatibility
 
@@ -285,14 +311,54 @@ while a reply runs.
 Bootstrap creates it on first use. Its history stays available indefinitely. Sharing, renaming,
 archiving, deletion, rewind, and storage-retention cleanup do not apply to this conversation.
 
-Deployment settings expose "DM context max age (ms)", initially 10,800,000 ms. The age window is
-selected when a request starts and stays fixed for that reply. New requests select a fresh window.
-Older messages remain searchable by their owner. An owner account cannot browse another user's DM.
+Deployment settings expose "DM context gap (ms)", initially 7,200,000 ms. A request's context starts
+at the first visible turn after the most recent pause longer than the gap. Delivered heartbeat and
+surface messages participate in the same time group as human messages and primary replies. The gap
+runs from a reply's completion or a delivered post's timestamp to the next message. The start stays
+fixed while the conversation continues, so the model sees a
+stable prefix. A request sent after a longer pause starts with no earlier history. Automatic or manual
+compaction bounds a long session. Older messages remain searchable by their owner. An owner account cannot browse another user's DM.
 The agent receives a brief instruction to follow the current topic in a mixed-topic conversation.
+Delivered posts in that group enter the next primary request in timeline order without starting a run
+themselves. Existing posts are included from retained display history; no database migration is needed.
 
-Message dimming reflects the next request when idle and the current request while running.
-Messages outside selected history use 0.8 opacity. Messages represented by a summary have a tooltip.
+The DM shows a timestamp above the first turn and above any turn sent at least "DM timestamp gap (ms)"
+after the previous one, initially 1,800,000 ms, or on a new day. The turn where the selected context
+starts adds a list-start icon to its timestamp, with a "Context starts here" tooltip. The marker reflects the next request when idle and the
+current request while running. Messages represented by a summary have a tooltip.
 During a reply the context refreshes once per second to reflect compaction. `/compact` summarizes
 current model context through the existing compaction engine, even when automatic compaction is off.
 It preserves the displayed messages and queues behind a running reply. It accepts no arguments,
-skills, or attachments. Recent direct messages survive age expiry of an older summary.
+skills, or attachments. Recent direct messages survive a shortened gap that excludes an older summary.
+
+### Background notifications
+
+Settings → Notifications has separate event choices and a Background push toggle. Enabling background
+push registers this browser with Core, which sends encrypted Web Push when a response finishes or a
+run fails. A surface post that does not start a run also sends a push under the completion preference,
+unless the send uses `silent: true`. Notifications show Lilac, the thread title, and a short
+assistant-response preview. Clicking
+opens the thread. Viewing a visible, focused thread suppresses that user's background pushes on all
+devices, even when push is disabled or unsupported on the viewing device. Focus clears when the tab
+is hidden or blurred; disconnected tabs expire after 60 seconds without a presence heartbeat.
+
+Successful responses notify the browser that submitted the turn first. If the response remains unread
+60 seconds later, Core notifies the user's other eligible devices. Reading the response on any device
+cancels that escalation. The read acknowledgment requires the selected conversation's latest completed
+turn to be visible in a focused window; returning focus or reconnecting retries it.
+
+If the initiating browser has no eligible push subscription, or its push request fails, Core sends to
+other eligible devices immediately. Run failures and agent-initiated posts retain immediate broadcast
+delivery. The initiating browser is identified by a hash of its push endpoint on the accepted input;
+steering does not replace the turn's initiating device. Existing inputs without an identifier retain
+broadcast behavior. Each user's subscriptions and read state remain separate in shared threads.
+
+Delayed notifications are held only in memory. A Core restart during the 60-second delay drops the
+pending escalation; startup does not replay it. Before sending, Core rechecks the same turn and history
+generation, read status, access, archive state, viewing presence and current notification preferences.
+Newer work cancels the earlier escalation.
+
+Use HTTPS. On iOS/iPadOS 16.4 or newer, add Lilac to the Home Screen and enable notifications from the
+installed web app. Core generates and retains signing keys automatically. No Firebase project or Apple
+developer account is required. Core needs outbound HTTPS access to the browser's push service. Delivery
+is best effort; failed transient sends are not queued. Explicit logout removes this browser's subscription.

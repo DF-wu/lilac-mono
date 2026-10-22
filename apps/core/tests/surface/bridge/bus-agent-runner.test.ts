@@ -1,3 +1,8 @@
+import { DurableWorkflowStore } from "../../../src/workflow/durable-workflow-store";
+import { WorkflowLiveParentBridge } from "../../../src/workflow/workflow-live-parent-bridge";
+import { WorkflowSubagentDispatcher } from "../../../src/workflow/workflow-subagent-dispatcher";
+import { WorkflowEngine } from "../../../src/workflow/workflow-engine";
+import { subagentTools } from "../../../src/tools/subagent";
 import { generatedMessageMetadata } from "@stanley2058/lilac-agent";
 import {
   createNativeOutputPublisher,
@@ -96,6 +101,7 @@ import {
   planDeferredSubagentBoundary,
   maybeBuildAutoInjectedThreadSearchMessages,
   buildPersistedHeartbeatMessages,
+  persistHeartbeatSurfaceHandoffs,
   buildSurfaceMetadataOverlay,
   corePrimaryLineageHasCompactionCheckpoint,
   isActiveRuntimeModelCompatible,
@@ -5571,6 +5577,161 @@ describe("bus agent runner terminal cleanup", () => {
 });
 
 describe("startBusAgentRunner production path", () => {
+  it.each([
+    ["explore", "deferred"],
+    ["general", "sync"],
+    ["self", "deferred"],
+  ] as const)(
+    "delegates heartbeat work with inherited %s authority in %s mode",
+    async (profile, mode) => {
+      const root = await mkdtemp(path.join(tmpdir(), "heartbeat-delegation-"));
+      const config = parseCoreConfigV2ToUniversal({});
+      config.models.main = { model: "openai/heartbeat-test" };
+      const bus = createLilacBus(createInMemoryRawBus());
+      const store = new DurableWorkflowStore(path.join(root, "workflow.db"));
+      const bridge = new WorkflowLiveParentBridge({
+        bus,
+        blobStore: TEST_BLOB_STORE,
+        store,
+        subscriptionId: "heartbeat-parent",
+      });
+      await bridge.start();
+      const dispatcher = WorkflowSubagentDispatcher.create({
+        store,
+        blobStore: TEST_BLOB_STORE,
+        dataDir: root,
+      });
+      const issuedProfiles: string[] = [];
+      let currentContext: Parameters<
+        CoreToolPluginManager["buildLevel1ToolsetResult"]
+      >[0]["requestContext"];
+      const pluginManager = corePrimaryTestPluginManager((context) => {
+        currentContext = context;
+      });
+      let delegated = false;
+      let resumed = false;
+      const runner = await startBusAgentRunner({
+        bus,
+        config,
+        pluginManager,
+        cwd: root,
+        subscriptionId: "heartbeat-delegation",
+        reportFatalPanic: (panic) => {
+          throw panic;
+        },
+        durableWorkflowStore: store,
+        workflowLiveParentBridge: bridge,
+        workflowSubagentDispatcher: dispatcher,
+        issueHeartbeatCapability: ({ profile }) => {
+          issuedProfiles.push(profile);
+          return `heartbeat-${profile}`;
+        },
+        issueControlCapability: () => {
+          throw new Error("Heartbeat child requested primary authority");
+        },
+        createAgent: (options) => {
+          const context = currentContext!;
+          return new AiSdkPiAgent({
+            ...options,
+            model: new MockLanguageModelV4({
+              modelId: "heartbeat-test",
+              doStream: async ({ prompt }) => {
+                expect(context.requestInitiator).toBeUndefined();
+                if (context.sessionId !== "__heartbeat__") {
+                  expect(context.metadata?.controlCapability).toBe(`heartbeat-${profile}`);
+                  return level1TextStep("child research complete");
+                }
+                if (delegated) {
+                  expect(JSON.stringify(prompt)).toContain("child research complete");
+                  resumed = true;
+                  return level1TextStep("HEARTBEAT_OK");
+                }
+                delegated = true;
+                const onDelegate = context.metadata?.onSubagentDelegate as NonNullable<
+                  Parameters<typeof subagentTools>[0]["onDelegate"]
+                >;
+                expect(onDelegate).toBeFunction();
+                const tool = subagentTools({
+                  idleTimeoutMs: 10_000,
+                  maxDepth: 2,
+                  onDelegate,
+                }).subagent_delegate;
+                const result = await tool.execute!(
+                  { task: "Research the watch", profile, mode },
+                  {
+                    toolCallId: "heartbeat-delegate",
+                    messages: [],
+                    context,
+                  },
+                );
+                if (mode === "sync") {
+                  expect(result).toMatchObject({
+                    status: "resolved",
+                    finalText: "child research complete",
+                  });
+                  resumed = true;
+                  return level1TextStep("HEARTBEAT_OK");
+                }
+                return level1TextStep("NO_REPLY");
+              },
+            }),
+          });
+        },
+      });
+      const engine = new WorkflowEngine({
+        bus,
+        blobStore: TEST_BLOB_STORE,
+        store,
+        dataDir: root,
+        subscriptionId: "heartbeat-engine",
+        pollMs: 5,
+        validateAgentSelection: () => ({
+          model: "openai/heartbeat-test",
+          reasoning: null,
+          request: {
+            spec: "openai/heartbeat-test",
+            provider: "openai",
+            modelId: "heartbeat-test",
+            reasoningDisplay: "simple",
+          },
+        }),
+      });
+      await engine.start();
+      const lifecycle = await observeRequestLifecycle(bus, "heartbeat:delegation-test");
+      try {
+        await bus.publish(
+          lilacEventTypes.CmdRequestMessage,
+          {
+            requestDeliveryId: crypto.randomUUID(),
+            queue: "prompt",
+            runPolicy: "idle_only_global",
+            origin: { kind: "heartbeat", reason: "interval" },
+            messages: [{ role: "user", content: "Check the watch" }],
+          },
+          {
+            headers: {
+              request_id: "heartbeat:delegation-test",
+              session_id: "__heartbeat__",
+              request_client: "unknown",
+            },
+          },
+        );
+        expect(await lifecycle.terminal, JSON.stringify(lifecycle.details)).toBe("resolved");
+        expect(resumed).toBe(true);
+        expect(issuedProfiles).toEqual(["primary", profile]);
+      } finally {
+        await lifecycle.stop();
+        await runner.stop();
+        await engine.stop();
+        await bridge.stop();
+        await pluginManager.destroy();
+        await bus.close();
+        store.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it.each(["discord", "github"] as const)(
     "normalizes native links in %s model input",
     async (requestClient) => {
@@ -14060,3 +14221,54 @@ function readGeneratedPayload(messages: readonly ModelMessage[]) {
   if (body?.type !== "text") throw new Error("expected generated payload");
   return JSON.parse(body.text);
 }
+
+it("persists heartbeat handoff before deferred messages have surface references", () => {
+  const store = new SqliteTranscriptStore(":memory:");
+  try {
+    persistHeartbeatSurfaceHandoffs({
+      logger: createLogger({}),
+      transcriptStore: store,
+      requestId: "heartbeat:deferred",
+      requestClient: "unknown",
+      sessionId: "__heartbeat__",
+      modelLabel: "test",
+      responseMessages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "send",
+              toolName: "surface.messages.send",
+              input: { client: "native", sessionId: "dm", text: "Forecast changed" },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "send",
+              toolName: "surface.messages.send",
+              output: { type: "json", value: { status: "queued" } },
+            },
+          ],
+        },
+        { role: "assistant", content: "HEARTBEAT_OK" },
+      ],
+    });
+    const transcript = store
+      .getRequestTranscript({ requestId: "heartbeat:deferred:heartbeat-handoff:deferred" })
+      .unwrap();
+    expect(transcript?.finalText).toBe("Forecast changed");
+    expect(JSON.stringify(transcript?.messages)).toContain("Forecast changed");
+    expect(
+      store.listSurfaceMessagesForRequest({
+        requestId: "heartbeat:deferred:heartbeat-handoff:deferred",
+      }),
+    ).toEqual([]);
+  } finally {
+    store.close();
+  }
+});

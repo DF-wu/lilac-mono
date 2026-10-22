@@ -1141,7 +1141,7 @@ export function createToolServer(options: ToolServerOptions) {
           kind: authorized.kind,
           allowedCallables: authorized.allowedCallables,
         };
-        context.subagentProfile = undefined;
+        context.subagentProfile = authorized.profile === "primary" ? undefined : authorized.profile;
         delete context.requestInitiator;
         delete context.requestInitiatorSessionId;
         delete context.currentTurnUserId;

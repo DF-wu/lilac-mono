@@ -1,8 +1,20 @@
-import { ContextMessage, useRecentContext } from "./RecentContext";
+import { joinMessageTurns, lastTurnMessageTime, sameMessageAuthor } from "../message-grouping";
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+} from "./ui/context-menu";
+import {
+  ContextMessage,
+  NextContextStart,
+  TimestampSeparator,
+  useRecentContext,
+} from "./RecentContext";
 import { LoadingSpinner } from "./ui/loading-spinner";
 import { AddReaction, MessageReactions } from "./MessageReactions";
 import { OptimisticTurns, type OptimisticTurn } from "../optimistic-turns";
-import { CopyReferenceButton, useConversation } from "./ConversationReference";
+import { CopyReferenceButton, copyReferenceLink, useConversation } from "./ConversationReference";
 import {
   Activity,
   ActivityTimesContext,
@@ -37,12 +49,14 @@ import {
   type ComponentProps,
 } from "react";
 import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
-import { ChevronDown, ChevronRight, RotateCcw, Copy, CopyCheck } from "lucide-react";
+import { ChevronDown, ChevronRight, RotateCcw, Copy, CopyCheck, Link2 } from "lucide-react";
 import type { NativeClient, NativeThreadStore } from "@stanley2058/lilac-client";
-import type {
-  DisplayMessage,
-  ReadyTurnSlot,
-  DisplayPart,
+import {
+  DEFAULT_DM_TIMESTAMP_GAP_MS,
+  type DisplayMessage,
+  type ReadyTurnSlot,
+  type DisplayPart,
+  type TurnSlot,
 } from "@stanley2058/lilac-client-protocol";
 import { IconButton, attempt } from "./ui";
 import { WorkingText } from "./ui/working-text";
@@ -76,6 +90,58 @@ export function useSlot(store: NativeThreadStore, slotId: string | undefined) {
   const snapshot = useCallback(() => (slotId ? store.get(slotId) : undefined), [store, slotId]);
   return useSyncExternalStore(subscribe, snapshot, snapshot);
 }
+function turnTime(slot: TurnSlot | undefined): number | undefined {
+  if (slot?.kind !== "ready") return undefined;
+  return (
+    slot.messages.find((message) => message.role === "user")?.metadata?.createdAt ??
+    slot.messages[0]?.metadata?.createdAt ??
+    slot.startedAt
+  );
+}
+function useSlotTime(store: NativeThreadStore, slotId: string | undefined) {
+  const subscribe = useCallback(
+    (listener: () => void) => (slotId ? store.subscribeSlot(slotId, listener) : () => {}),
+    [store, slotId],
+  );
+  const snapshot = useCallback(
+    () => (slotId ? lastTurnMessageTime(store.get(slotId)) : undefined),
+    [store, slotId],
+  );
+  return useSyncExternalStore(subscribe, snapshot, snapshot);
+}
+function useJoinedTurns(
+  store: NativeThreadStore,
+  leftId: string | undefined,
+  rightId: string | undefined,
+  contextStart: number | null | undefined,
+  gapMs: number | undefined,
+) {
+  const subscribe = useCallback(
+    (listener: () => void) => {
+      const left = leftId ? store.subscribeSlot(leftId, listener) : () => {};
+      const right = rightId ? store.subscribeSlot(rightId, listener) : () => {};
+      return () => {
+        left();
+        right();
+      };
+    },
+    [store, leftId, rightId],
+  );
+  const snapshot = useCallback(
+    () =>
+      joinMessageTurns(
+        leftId ? store.get(leftId) : undefined,
+        rightId ? store.get(rightId) : undefined,
+        contextStart,
+        gapMs,
+      ),
+    [store, leftId, rightId, contextStart, gapMs],
+  );
+  return useSyncExternalStore(subscribe, snapshot, snapshot);
+}
+function startsNewDay(previous: number, next: number): boolean {
+  return new Date(previous).toDateString() !== new Date(next).toDateString();
+}
 export function useSlotIds(store: NativeThreadStore) {
   const subscribe = useCallback(
     (listener: () => void) =>
@@ -99,8 +165,9 @@ export type TimelineProps = MessageServices & {
   emptyContent?: ReactNode;
   optimisticTurn?: OptimisticTurn;
   onOptimisticResolved?: () => void;
+  timestamps?: boolean;
 };
-type TimelineServices = Pick<TimelineProps, "client" | "threadId" | "onRewind"> & {
+type TimelineServices = Pick<TimelineProps, "client" | "threadId" | "onRewind" | "timestamps"> & {
   measureTurn: (content: HTMLElement) => void;
 };
 const TimelineContext = createContext<TimelineServices | undefined>(undefined);
@@ -250,9 +317,10 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       client: props.client,
       threadId: props.threadId,
       onRewind: props.onRewind,
+      timestamps: props.timestamps,
       measureTurn,
     }),
-    [props.client, props.threadId, props.onRewind, measureTurn],
+    [props.client, props.threadId, props.onRewind, props.timestamps, measureTurn],
   );
   const measureHeader = useCallback(
     (element: HTMLDivElement | null) => {
@@ -319,7 +387,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       <TimelineContext value={timeline}>
         <MessageServicesContext value={services}>
           <div
-            className="timeline overflow-auto min-h-0 flex-1 [overflow-anchor:none] chat-scroll relative overflow-y-auto overflow-x-hidden"
+            className="timeline overflow-auto overscroll-none min-h-0 flex-1 [overflow-anchor:none] chat-scroll relative overflow-y-auto overflow-x-hidden"
             ref={bindViewport}
             onScroll={(event) => {
               setReadingDisclosure(undefined);
@@ -372,6 +440,8 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
                 >
                   <SlotRow
                     slotId={ids[row.index - 1]!}
+                    previousSlotId={ids[row.index - 2]}
+                    nextSlotId={ids[row.index]}
                     store={store}
                     renderKey={identities.key(ids[row.index - 1]!)}
                     fallback={
@@ -428,12 +498,33 @@ export function ThinkingIndicator({ spinner }: { spinner?: ReactNode } = {}) {
 const SlotRow = memo(function SlotRow(props: {
   store: NativeThreadStore;
   slotId: string;
+  previousSlotId?: string;
+  nextSlotId?: string;
   renderKey: string;
   fallback?: ReadyTurnSlot;
 }) {
-  const { client, threadId, onRewind } = useContext(TimelineContext)!;
+  const { client, threadId, onRewind, timestamps } = useContext(TimelineContext)!;
   const recentContext = useRecentContext();
+  const groupingContext =
+    recentContext?.historyGeneration === props.store.checkpoint?.historyGeneration
+      ? recentContext
+      : undefined;
+  const joinedBefore = useJoinedTurns(
+    props.store,
+    props.previousSlotId,
+    props.slotId,
+    groupingContext?.firstTurnPosition,
+    groupingContext?.timestampGapMs,
+  );
+  const joinedAfter = useJoinedTurns(
+    props.store,
+    props.slotId,
+    props.nextSlotId,
+    groupingContext?.firstTurnPosition,
+    groupingContext?.timestampGapMs,
+  );
   const stored = useSlot(props.store, props.slotId);
+  const previousTime = useSlotTime(props.store, timestamps ? props.previousSlotId : undefined);
   const slot = stored?.kind === "ready" ? stored : (props.fallback ?? stored);
   useEffect(() => {
     if (stored?.kind === "deferred") void client.hydrate(threadId, props.slotId);
@@ -454,25 +545,42 @@ const SlotRow = memo(function SlotRow(props: {
         )}
       </div>
     );
-  const outside =
-    recentContext &&
-    recentContext.historyGeneration === props.store.checkpoint?.historyGeneration &&
+  const currentContext =
+    recentContext?.historyGeneration === props.store.checkpoint?.historyGeneration
+      ? recentContext
+      : undefined;
+  const contextStart = currentContext?.firstTurnPosition === slot.position && slot.position > 0;
+  const firstTurnPosition = currentContext?.firstTurnPosition ?? null;
+  const summarized =
+    firstTurnPosition !== null &&
+    slot.position >= firstTurnPosition &&
+    slot.position < (currentContext?.summarizedBeforePosition ?? 0);
+  const time = turnTime(slot);
+  const gapMs = recentContext?.timestampGapMs ?? DEFAULT_DM_TIMESTAMP_GAP_MS;
+  const separated =
+    timestamps &&
+    time !== undefined &&
+    (contextStart ||
+      props.previousSlotId === undefined ||
+      (previousTime !== undefined &&
+        (time - previousTime >= gapMs || startsNewDay(previousTime, time))));
+  // An idle DM without a current window means the server will open a new context on the next send.
+  const nextContextStart =
+    timestamps &&
+    props.nextSlotId === undefined &&
+    !props.fallback &&
     slot.state !== "pending" &&
     slot.state !== "running" &&
-    (recentContext.firstTurnPosition === null || slot.position < recentContext.firstTurnPosition);
-  const summarized =
-    !outside &&
-    recentContext?.summarizedBeforePosition !== undefined &&
-    slot.position < recentContext.summarizedBeforePosition;
+    currentContext !== undefined &&
+    !currentContext.active &&
+    currentContext.firstTurnPosition === null;
   return (
-    <ContextMessage outside={!!outside} summarized={summarized}>
-      {recentContext?.firstTurnPosition === slot.position && slot.position > 0 ? (
-        <p className="px-6 pt-3 text-xs text-muted-foreground">
-          Earlier messages outside recent context
-        </p>
-      ) : null}
+    <ContextMessage summarized={summarized}>
+      {separated ? <TimestampSeparator at={time} contextStart={contextStart} /> : null}
       <Turn
         slot={slot}
+        joinedBefore={joinedBefore && !separated}
+        joinedAfter={joinedAfter}
         optimistic={!!props.fallback && stored?.kind !== "ready"}
         userRenderKey={
           props.renderKey !== props.slotId || props.fallback ? props.renderKey : undefined
@@ -481,11 +589,14 @@ const SlotRow = memo(function SlotRow(props: {
         onRewind={onRewind}
         onLoadMore={() => void client.loadTurnPage(threadId, slot.slotId)}
       />
+      {nextContextStart ? <NextContextStart /> : null}
     </ContextMessage>
   );
 });
 
 type TurnProps = {
+  joinedBefore?: boolean;
+  joinedAfter?: boolean;
   slot: ReadyTurnSlot;
   animateArrivals?: boolean;
   optimistic?: boolean;
@@ -540,10 +651,21 @@ function AgentTurn(props: TurnProps) {
   const firstUser = slot.messages.find(
     (message) => message.role === "user" && message.metadata?.inputMode !== "steer",
   );
+  const incomingMessage = slot.messages.find(
+    (message) =>
+      message.role === "assistant" &&
+      message.metadata?.inputId &&
+      message.metadata.inputMode !== "steer",
+  );
   const settled = slot.state === "complete" || slot.state === "failed" || slot.state === "canceled";
   const remaining = useMemo(
-    () => groupActivityMessages(slot.messages.filter((message) => message.id !== firstUser?.id)),
-    [slot.messages, firstUser?.id],
+    () =>
+      groupActivityMessages(
+        slot.messages.filter(
+          (message) => message.id !== firstUser?.id && message.id !== incomingMessage?.id,
+        ),
+      ),
+    [slot.messages, firstUser?.id, incomingMessage?.id],
   );
   // Start times never change, so one stable map keeps streaming updates from rerendering every row.
   const [times] = useState(() => new Map<string, number>());
@@ -554,7 +676,8 @@ function AgentTurn(props: TurnProps) {
   const intermediate = remaining.slice(0, lastIntermediate + 1);
   const finals = remaining.slice(lastIntermediate + 1);
   const identities = useContext(MessageIdentityContext);
-  const startedAt = slot.startedAt ?? firstUser?.metadata?.createdAt;
+  const startedAt =
+    slot.startedAt ?? firstUser?.metadata?.createdAt ?? incomingMessage?.metadata?.createdAt;
   const duration =
     startedAt !== undefined && slot.settledAt !== undefined
       ? Math.max(0, slot.settledAt - startedAt)
@@ -566,17 +689,31 @@ function AgentTurn(props: TurnProps) {
   const tail = waiting ? undefined : liveTailActivity(remaining);
   const thinkingAfter =
     active && !waiting && !tail && !finals.length && !remaining.at(-1)?.metadata?.incomplete;
+  const incomingContinues = sameMessageAuthor(incomingMessage, remaining[0]);
+  const incomingSpacing = incomingContinues ? "mb-2" : "mb-6";
   const folded = slot.state === "complete" && intermediate.length > 0;
   return (
     <article
-      className="turn pt-4 px-6 pb-8 max-workspace:pt-3 max-workspace:px-4 max-workspace:pb-6"
+      className={`turn px-6 max-workspace:px-4 ${props.joinedBefore ? "pt-0" : "pt-4 max-workspace:pt-3"} ${props.joinedAfter ? "pb-0" : "pb-8 max-workspace:pb-6"}`}
+      data-joined-before={props.joinedBefore || undefined}
+      data-joined-after={props.joinedAfter || undefined}
       data-turn-id={slot.turnId}
     >
       {firstUser ? (
-        <div className="user-turn ml-12 mb-6 max-workspace:ml-6">
+        <div className={`user-turn ml-12 max-workspace:ml-6 ${remaining.length ? "mb-6" : ""}`}>
           <MessageBody
             live={props.animateArrivals ?? true}
             message={firstUser}
+            showAvatar={!props.joinedBefore}
+            showControls={!(props.joinedAfter && !remaining.length)}
+            rewind={
+              canEdit && firstUser.metadata?.authorId === identities.viewerId
+                ? {
+                    disabled: !!props.optimistic || !!rewindDisabled || slot.state === "pending",
+                    run: () => onRewind(slot.turnId),
+                  }
+                : undefined
+            }
             renderKey={props.userRenderKey}
             optimistic={props.optimistic}
             controls={
@@ -595,14 +732,27 @@ function AgentTurn(props: TurnProps) {
           />
         </div>
       ) : null}
+      {incomingMessage ? (
+        <div className={props.joinedAfter && !remaining.length ? "mb-0" : incomingSpacing}>
+          <MessageBody
+            message={incomingMessage}
+            live={props.animateArrivals ?? true}
+            showAvatar={!props.joinedBefore}
+            showControls={!incomingContinues && !(props.joinedAfter && !remaining.length)}
+          />
+        </div>
+      ) : null}
       <RequestActiveContext value={!settled}>
         <LiveTailContext value={tail}>
           <ActivityTimesContext value={times}>
             <div className="agent-response flex flex-col gap-2">
-              {waiting ||
-              (remaining.length > 0 &&
-                (settled ||
-                  remaining.find((message) => message.role !== "system")?.role === "assistant")) ? (
+              {!incomingContinues &&
+              (!props.joinedBefore || !!firstUser || !!incomingMessage) &&
+              (waiting ||
+                (remaining.length > 0 &&
+                  (settled ||
+                    remaining.find((message) => message.role !== "system")?.role ===
+                      "assistant"))) ? (
                 <AuthorAvatar author={identities.agent} role="Agent" />
               ) : null}
               {active ? (
@@ -660,7 +810,7 @@ function AgentTurn(props: TurnProps) {
                 messages={finals}
                 live={props.animateArrivals ?? true}
                 showFirstAvatar={!settled && intermediate.at(-1)?.role === "user"}
-                finalMessageId={settled ? finals.at(-1)?.id : undefined}
+                finalMessageId={settled && !props.joinedAfter ? finals.at(-1)?.id : undefined}
                 finalText={finals.map(messageText).filter(Boolean).join("\n\n")}
               />
             </div>
@@ -765,9 +915,11 @@ function TurnMessages({
   finalText?: string;
 }) {
   let nextAssistantAvatar = showFirstAvatar;
-  return messages.map((message) => {
+  return messages.map((message, index) => {
     const showAvatar =
-      message.role === "user" || (message.role === "assistant" && nextAssistantAvatar);
+      (message.role === "user" && !sameMessageAuthor(messages[index - 1], message)) ||
+      (message.role === "assistant" &&
+        (nextAssistantAvatar || (index > 0 && !sameMessageAuthor(messages[index - 1], message))));
     if (message.role === "user") nextAssistantAvatar = true;
     if (message.role === "assistant") nextAssistantAvatar = false;
     return (
@@ -776,7 +928,10 @@ function TurnMessages({
         message={message}
         live={live}
         showAvatar={showAvatar}
-        showControls={message.role === "user" || message.id === finalMessageId}
+        showControls={
+          (message.role === "user" && !sameMessageAuthor(message, messages[index + 1])) ||
+          message.id === finalMessageId
+        }
         copyText={message.id === finalMessageId ? finalText : undefined}
         copyParts={
           message.id === finalMessageId ? messages.flatMap((item) => item.parts) : undefined
@@ -1119,6 +1274,7 @@ const MessageBody = memo(function MessageBody(
     copyParts?: readonly DisplayPart[];
     renderKey?: string;
     optimistic?: boolean;
+    rewind?: { disabled: boolean; run: () => void };
   },
 ) {
   const { resourceUrl, canEdit, onAction } = useMessageServices();
@@ -1211,21 +1367,21 @@ const MessageBody = memo(function MessageBody(
         })}
       </time>
     ) : null;
+  const copyCurrentMessage = () =>
+    void attempt(
+      async () => {
+        setCopyError(undefined);
+        await copyMessage(messageClipboard(copyText, props.copyParts ?? message.parts));
+        setCopiedAt(Date.now());
+      },
+      () => setCopyError("Copy unavailable"),
+    );
   const copyButton =
     copyText || attachments.length ? (
       <IconButton
         label="Copy message"
         tooltip={copiedAt ? "Copied!" : "Copy message"}
-        onClick={() =>
-          void attempt(
-            async () => {
-              setCopyError(undefined);
-              await copyMessage(messageClipboard(copyText, props.copyParts ?? message.parts));
-              setCopiedAt(Date.now());
-            },
-            () => setCopyError("Copy unavailable"),
-          )
-        }
+        onClick={copyCurrentMessage}
       >
         {copiedAt ? <CopyCheck /> : <Copy />}
       </IconButton>
@@ -1239,119 +1395,172 @@ const MessageBody = memo(function MessageBody(
   ) : null;
   return (
     <LiveMessageContext value={props.live ?? false}>
-      <ChatMessage
-        align={self ? "end" : "start"}
-        className={`message leading-normal ${conversational ? "py-1" : "py-0"} px-0 wrap-anywhere message-${message.role} native-message text-base`}
-        data-message-id={message.id}
-        data-citation-source={
-          message.role === "assistant" &&
-          reference?.surface === "native" &&
-          displayStream?.kind !== "subagent"
-            ? message.id
-            : undefined
-        }
-        data-citation-thread={reference?.surface === "native" ? reference.sessionId : undefined}
+      <ContextMenu
+        onOpenChange={(open, details) => {
+          if (open && window.getSelection()?.toString()) details.cancel();
+        }}
       >
-        {(props.showAvatar ?? conversational) ? (
-          <AuthorAvatar author={author} role={authorRole} self={self} message={message} />
-        ) : null}
-        <MessageResourcesContext value={resources}>
-          <HtmlPreviewMessageContext value={previewMessage}>
-            <MessageContent>
-              {cards.map((group, index) => {
-                if (group.kind === "content")
-                  return (
-                    <MessageCard
-                      key={index}
-                      arrivalId={`${props.renderKey ?? message.id}:content:${index}`}
-                      content={group}
-                      self={self}
-                      collapsible={message.role === "user"}
-                      streaming={message.role === "assistant" && !!props.live}
-                      reactions={
-                        index === lastContent ? (
-                          <MessageReactions messageId={message.id} items={reactions} />
-                        ) : null
-                      }
-                    />
-                  );
-                if (group.kind === "activity") return <Activity key={index} parts={group.parts} />;
-                const part = group.part;
-                switch (part.type) {
-                  case "data-compaction":
+        <ContextMenuTrigger
+          data-slot="message"
+          className="select-text"
+          style={{ WebkitTouchCallout: "default" }}
+          onContextMenu={(event) => {
+            if (window.getSelection()?.toString()) {
+              event.preventBaseUIHandler();
+              event.stopPropagation();
+            }
+          }}
+          onTouchStart={(event) => {
+            if (window.getSelection()?.toString()) event.preventBaseUIHandler();
+          }}
+          render={
+            <ChatMessage
+              align={self ? "end" : "start"}
+              className={`message leading-normal ${conversational ? "py-1" : "py-0"} px-0 wrap-anywhere message-${message.role} native-message text-base`}
+              data-message-id={message.id}
+              data-citation-source={
+                message.role === "assistant" &&
+                reference?.surface === "native" &&
+                displayStream?.kind !== "subagent"
+                  ? message.id
+                  : undefined
+              }
+              data-citation-thread={
+                reference?.surface === "native" ? reference.sessionId : undefined
+              }
+            />
+          }
+        >
+          {(props.showAvatar ?? conversational) ? (
+            <AuthorAvatar author={author} role={authorRole} self={self} message={message} />
+          ) : null}
+          <MessageResourcesContext value={resources}>
+            <HtmlPreviewMessageContext value={previewMessage}>
+              <MessageContent>
+                {cards.map((group, index) => {
+                  if (group.kind === "content")
                     return (
-                      <Marker variant="separator" className="compaction" key={part.id}>
-                        <MarkerContent>
-                          Context compaction {part.data.state}
-                          {part.data.beforeCount !== undefined && part.data.afterCount !== undefined
-                            ? ` · ${part.data.beforeCount} → ${part.data.afterCount}`
-                            : ""}
-                        </MarkerContent>
-                      </Marker>
-                    );
-                  case "data-input-state":
-                    return part.data.state === "admitted" || part.data.state === "queued" ? null : (
-                      <Marker className="input-state" key={part.id}>
-                        <MarkerContent>{part.data.reason ?? part.data.state}</MarkerContent>
-                      </Marker>
-                    );
-                  case "data-actions":
-                    return (
-                      <div className="action-list" key={part.id}>
-                        {part.data.actions.map((action) => (
-                          <Button
-                            key={action.actionId}
-                            type="button"
-                            disabled={!canEdit || action.disabled}
-                            variant={action.style === "danger" ? "destructive" : "secondary"}
-                            onClick={() => onAction(message.id, part, action.actionId)}
-                          >
-                            {action.label}
-                          </Button>
-                        ))}
-                      </div>
-                    );
-                  case "data-workflow":
-                    return (
-                      <WorkflowCard
-                        key={part.id}
-                        messageId={message.id}
-                        card={part.data}
-                        actions={message.parts.find((item) => item.type === "data-actions")}
+                      <MessageCard
+                        key={index}
+                        arrivalId={`${props.renderKey ?? message.id}:content:${index}`}
+                        content={group}
+                        self={self}
+                        collapsible={message.role === "user"}
+                        streaming={message.role === "assistant" && !!props.live}
+                        reactions={
+                          index === lastContent ? (
+                            <MessageReactions messageId={message.id} items={reactions} />
+                          ) : null
+                        }
                       />
                     );
-                  case "data-reactions":
-                    return lastContent < 0 ? (
-                      <Bubble
-                        key={part.id}
-                        variant={self ? "tinted" : "muted"}
-                        className="message-bubble"
-                      >
-                        <BubbleContent>
-                          <MessageReactions messageId={message.id} items={part.data.items} />
-                        </BubbleContent>
-                      </Bubble>
-                    ) : null;
-                }
-              })}
-            </MessageContent>
-          </HtmlPreviewMessageContext>
-        </MessageResourcesContext>
-        {conversational &&
-        (props.showControls ??
-          (message.metadata?.phase !== "commentary" && !message.metadata?.incomplete)) ? (
-          <div
-            data-ui="message-controls"
-            className="message-controls flex items-center justify-end gap-1 text-muted-foreground text-xs mt-1"
+                  if (group.kind === "activity")
+                    return <Activity key={index} parts={group.parts} />;
+                  const part = group.part;
+                  switch (part.type) {
+                    case "data-compaction":
+                      return (
+                        <Marker variant="separator" className="compaction" key={part.id}>
+                          <MarkerContent>
+                            Context compaction {part.data.state}
+                            {part.data.beforeCount !== undefined &&
+                            part.data.afterCount !== undefined
+                              ? ` · ${part.data.beforeCount} → ${part.data.afterCount}`
+                              : ""}
+                          </MarkerContent>
+                        </Marker>
+                      );
+                    case "data-input-state":
+                      return part.data.state === "admitted" ||
+                        part.data.state === "queued" ? null : (
+                        <Marker className="input-state" key={part.id}>
+                          <MarkerContent>{part.data.reason ?? part.data.state}</MarkerContent>
+                        </Marker>
+                      );
+                    case "data-actions":
+                      return (
+                        <div className="action-list" key={part.id}>
+                          {part.data.actions.map((action) => (
+                            <Button
+                              key={action.actionId}
+                              type="button"
+                              disabled={!canEdit || action.disabled}
+                              variant={action.style === "danger" ? "destructive" : "secondary"}
+                              onClick={() => onAction(message.id, part, action.actionId)}
+                            >
+                              {action.label}
+                            </Button>
+                          ))}
+                        </div>
+                      );
+                    case "data-workflow":
+                      return (
+                        <WorkflowCard
+                          key={part.id}
+                          messageId={message.id}
+                          card={part.data}
+                          actions={message.parts.find((item) => item.type === "data-actions")}
+                        />
+                      );
+                    case "data-reactions":
+                      return lastContent < 0 ? (
+                        <Bubble
+                          key={part.id}
+                          variant={self ? "tinted" : "muted"}
+                          className="message-bubble"
+                        >
+                          <BubbleContent>
+                            <MessageReactions messageId={message.id} items={part.data.items} />
+                          </BubbleContent>
+                        </Bubble>
+                      ) : null;
+                  }
+                })}
+              </MessageContent>
+            </HtmlPreviewMessageContext>
+          </MessageResourcesContext>
+          {conversational &&
+          (props.showControls ??
+            (message.metadata?.phase !== "commentary" && !message.metadata?.incomplete)) ? (
+            <div
+              data-ui="message-controls"
+              className="message-controls flex items-center justify-end gap-1 text-muted-foreground text-xs mt-1"
+            >
+              {self ? time : copy}
+              <AddReaction messageId={message.id} items={reactions} disabled={props.optimistic} />
+              {self ? props.controls : null}
+              {self ? copy : time}
+              {copyError ? <span role="status">{copyError}</span> : null}
+            </div>
+          ) : null}
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuItem
+            disabled={!messageText(message) && !attachments.length}
+            onClick={copyCurrentMessage}
           >
-            {self ? time : copy}
-            <AddReaction messageId={message.id} items={reactions} disabled={props.optimistic} />
-            {self ? props.controls : null}
-            {self ? copy : time}
-            {copyError ? <span role="status">{copyError}</span> : null}
-          </div>
-        ) : null}
-      </ChatMessage>
+            <Copy />
+            Copy message
+          </ContextMenuItem>
+          <ContextMenuItem
+            disabled={!!props.optimistic || !copyReference}
+            onClick={() => {
+              if (copyReference) copyReferenceLink(copyReference);
+            }}
+          >
+            <Link2 />
+            Copy link
+          </ContextMenuItem>
+          <AddReaction messageId={message.id} items={reactions} disabled={props.optimistic} menu />
+          {props.rewind ? (
+            <ContextMenuItem disabled={props.rewind.disabled} onClick={props.rewind.run}>
+              <RotateCcw />
+              Rewind to this turn
+            </ContextMenuItem>
+          ) : null}
+          {copyError ? <span role="status">{copyError}</span> : null}
+        </ContextMenuContent>
+      </ContextMenu>
     </LiveMessageContext>
   );
 });

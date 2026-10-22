@@ -174,7 +174,7 @@ conversation:
       # candidate is kept when search returns one. 0.45-0.55 favors recall;
       # 0.65-0.75 favors precision. Tune this before minScore, which removes
       # candidates before confidence ranking.
-      expansionMinConfidence: 0.57
+      expansionMinConfidence: 0.65
       # Search mode for auto-injected metadata: hybrid, semantic, or lexical.
       mode: hybrid
       # Both llm and decision lanes: Discord/Telegram origins with recovered
@@ -452,11 +452,13 @@ surface:
     # Optional heartbeat model override lives under:
     # surface.router.sessionModes."__heartbeat__".model
     # The alias key "heartbeat" is also accepted.
-    # Optional default output destination for proactive heartbeat messages.
-    # Only discord or github is accepted (not native or telegram).
-    # Discord: channel ID or configured entity.sessions.discord alias.
+    # Set through conversation with the heartbeat skill: ask where default updates should go.
+    # Native is optional. Per-watch concrete thread destinations override this default.
+    # Format: <client>/<sessionIdOrAlias>. Supports discord, github, and native; not telegram.
+    # Discord: channel ID or configured entity.sessions.discord alias, e.g. "discord/ops".
     # GitHub: github/OWNER/REPO#NUMBER, e.g. "github/DF-wu/lilac-mono#123".
-    # Destination must exist and be accessible to the configured adapter.
+    # Native: native/<threadId>, including a concrete DM thread resolved during setup.
+    # Destination must exist and be accessible to the configured adapter. Prefer concrete IDs.
     # defaultOutputSession: "discord/ops"
     # When heartbeat gets a chance to think (5-field minute-precision cron).
     cron: "*/30 * * * *"

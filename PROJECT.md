@@ -91,9 +91,14 @@ uses the shared client and a principal-scoped IndexedDB cache. See [native setup
 
 Native input receipts and upload readiness commit before the existing request-delivery coordinator
 admits execution. Stable delivery identities bridge these stores; the native surface does not own a
-second model-execution queue. Each human user also has one permanent native DM, with a separate
-three-hour context window and manual compaction through the shared agent engine. DM display history
+second model-execution queue. Each human user also has one permanent native DM, with gap-based
+context sessions and manual compaction through the shared agent engine. DM display history
 is retained, and search/read authority remains restricted to its starter. Starter authority and history generation are rechecked at admission.
+Native surface-tool sends default to `triggerRun=false` and are persisted in request groups. The request
+lifecycle bus closes groups; native thread activity gates atomic delivery in first-group order. The tool
+returns a queued acknowledgment while messages remain absent from history. Explicit `triggerRun=true` sends retain their
+existing cross-thread execution behavior. See [native deferred-send migration](MIGRATIONS.md#native-schema-4-deferred-surface-sends).
+
 Semantic output uses the nonexpiring `evt.native.output` topic. Projection and deduplication receipts
 commit before bus acknowledgement; WAL checkpoints wait for the output publication frontier they
 cover. Rewind fences the discarded generation, waits for runner cancellation, reconciles canonical
@@ -399,6 +404,20 @@ Persisted formats are trust boundaries. Their codecs distinguish current, migrat
 - Plugins, native tools, workflow agent processes, and other same-user processes are trusted code with service-user authority unless an explicit restricted or OS-isolated boundary says otherwise.
 
 Run `bun run lint:architecture` for the semantic and production-syntax architecture gate. The root `bun run check` overlaps generated-code, lint, tests, typecheck, architecture, and format gates; `bun run ci` runs the conservative serial sequence.
+
+## Proactive heartbeat
+
+The existing idle-only heartbeat lane runs an editable workflow in `prompts/HEARTBEAT.md` and maintains
+Markdown watches in `prompts/heartbeat/WORK.md`. The built-in `heartbeat` skill owns setup, verification,
+and progressive migration guidance. Core seeds missing files from its assets without overwriting
+customized files or migrating legacy notes automatically. Watch due times, discovery progress, lessons,
+and delivery overrides are agent-maintained prose, not scheduler or database contracts.
+
+Setup asks for a default surface destination; native is optional. Explicit watch targets retain their
+concrete thread IDs. Heartbeat capabilities allow skill reads and recent-agent-write discovery. Native
+surface tools accept verified native authority or trusted cross-surface agent capabilities; the latter
+use the configured owner's existing thread access, while other users' DMs remain private. Heartbeat
+posts do not trigger destination runs. See `docs/heartbeat.md` for deployment tests and limitations.
 
 ## Runtime Lifecycle Invariants
 

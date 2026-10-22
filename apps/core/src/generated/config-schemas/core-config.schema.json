@@ -444,7 +444,10 @@
                   "exclusiveMinimum": 0,
                   "maximum": 9007199254740991
                 },
-                "defaultOutputSession": { "type": "string", "pattern": "^(discord|github)\\/.+$" },
+                "defaultOutputSession": {
+                  "type": "string",
+                  "pattern": "^(discord|github|native)\\/.+$"
+                },
                 "softQuietHours": {
                   "type": "object",
                   "properties": {
@@ -1146,7 +1149,7 @@
                     },
                     "minScore": { "default": 0.1, "type": "number", "minimum": 0 },
                     "expansionMinConfidence": {
-                      "default": 0.57,
+                      "default": 0.65,
                       "type": "number",
                       "minimum": 0,
                       "maximum": 1
@@ -1862,7 +1865,10 @@
                   "exclusiveMinimum": 0,
                   "maximum": 9007199254740991
                 },
-                "defaultOutputSession": { "type": "string", "pattern": "^(discord|github)\\/.+$" },
+                "defaultOutputSession": {
+                  "type": "string",
+                  "pattern": "^(discord|github|native)\\/.+$"
+                },
                 "softQuietHours": {
                   "type": "object",
                   "properties": {

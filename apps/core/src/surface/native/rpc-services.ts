@@ -1,3 +1,4 @@
+import type { NativePush } from "./push";
 import type { NativeComputer } from "./computer";
 import type { NativeReferences } from "./references";
 import { resolveLinkPreview } from "./link-preview";
@@ -35,6 +36,7 @@ import type { NativeSearchStore } from "./store-search";
 import type { NativeSurfaceStore } from "./store-surface";
 
 export type NativeRpcServiceOptions = {
+  push?: NativePush;
   computer?: Pick<NativeComputer, "read">;
   references?: Pick<NativeReferences, "resolve" | "read" | "range">;
   files?: Pick<NativeLiveFileService, "resolve">;
@@ -574,6 +576,20 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
 
   const success = () => ({ ok: true as const });
   return {
+    notifications: {
+      presence: (principal, input, signal) =>
+        options.push?.presence(principal.userId, input, signal) ?? Result.ok({ ok: true as const }),
+      key: () =>
+        options.push?.key() ??
+        Result.err(nativeFailure("invalid", "Background push is unavailable")),
+      subscribe: (principal, input) =>
+        options.push?.subscribe(principal.userId, input) ??
+        Result.err(nativeFailure("invalid", "Background push is unavailable")),
+      unsubscribe: (principal, input) =>
+        options.push?.unsubscribe(principal.userId, input.endpoint) ??
+        Result.ok({ ok: true as const }),
+      read: (principal, input) => store.notificationContent(principal.userId, input.threadId),
+    },
     streams: {
       sync: syncStream,
       watch(principal, input, signal) {
@@ -682,7 +698,12 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
     },
     threads: {
       context(principal, input) {
-        return execution.context(principal.userId, input.threadId);
+        return execution.context(principal.userId, input.threadId).andThen((context) =>
+          store.getDeployment().map((deployment) => ({
+            ...context,
+            timestampGapMs: deployment.settings.dmTimestampGapMs,
+          })),
+        );
       },
       get(principal, input) {
         return auth

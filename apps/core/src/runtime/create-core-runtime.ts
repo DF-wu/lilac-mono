@@ -4041,7 +4041,14 @@ export async function createCoreRuntime(
                   nativeConversationThreads: nativeRuntime.scopedThreads,
                 }
               : {}),
-            onRequestSettled: (id) => adapter.presence.requestSettled(id),
+            onRequestSettled: (id) => {
+              adapter.presence.requestSettled(id);
+              nativeRuntime?.flushSurfaceSends().match({
+                ok: () => undefined,
+                err: (error) =>
+                  logger.warn("Native deferred sends delayed", formatTaggedErrorForLog(error)),
+              });
+            },
             ...(agentRunJournal ? { agentRunJournal } : {}),
             subscriptionId: subId(subscriptionPrefix, "agent-runner"),
             reportFatalPanic: reportFatalError,
@@ -4099,7 +4106,7 @@ export async function createCoreRuntime(
                 principal: null,
                 authenticatedOrigin: null,
                 allowedCallables: HEARTBEAT_LEVEL2_CALLABLES,
-                profile: "primary",
+                profile: input.profile,
                 canonicalCwd: input.canonicalCwd,
                 safetyMode: "trusted",
                 expiresAt: input.expiresAt,

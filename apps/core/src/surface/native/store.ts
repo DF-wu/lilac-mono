@@ -33,6 +33,7 @@ import { configureSqliteConnection } from "../../shared/sqlite";
 import { nativeThreadCapabilities, type NativeThreadGrant } from "./authority";
 import {
   decodeNativeRecord,
+  type NativeSendGroup,
   type NativeHtmlPreviewRecord,
   type NativeInputRecord,
   type NativeMutationResult,
@@ -122,6 +123,9 @@ function nullableAuthority<T>(result: NativeStoreResult<T>): NativeStoreResult<T
   });
 }
 
+const CANONICAL_INPUT_FILTER =
+  "json_extract(i.data_json,'$.value.completedAt') IS NOT NULL AND json_extract(i.data_json,'$.value.mode')!='steer' AND json_extract(i.data_json,'$.value.state') IN ('admitted','canceled') AND EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.id=json_extract(i.data_json,'$.value.turnId'))";
+
 export class NativeStore {
   private readonly listeners = new Set<(threadId: string) => void>();
   private readonly pendingNotifications = new Set<string>();
@@ -162,7 +166,7 @@ export class NativeStore {
     return nativeStoreTransaction(this.db, () => {
       const version =
         this.db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
-      if (version > 2)
+      if (version > 5)
         return Result.err(
           nativeFailure("invalid", "Native store version is newer than this build"),
         );
@@ -186,7 +190,9 @@ export class NativeStore {
         CREATE TABLE IF NOT EXISTS native_user_preferences (user_id TEXT PRIMARY KEY,auto_settle_days INTEGER NOT NULL DEFAULT 3 CHECK(auto_settle_days IN (1,3,5,7,30)));
         CREATE TABLE IF NOT EXISTS native_thread_preferences (user_id TEXT NOT NULL,thread_id TEXT NOT NULL,section TEXT NOT NULL CHECK(section IN ('pinned','active','settled')),position INTEGER NOT NULL,last_activity INTEGER NOT NULL,touched_at INTEGER NOT NULL,PRIMARY KEY(user_id,thread_id));
         CREATE INDEX IF NOT EXISTS native_thread_preferences_order ON native_thread_preferences(user_id,section,position,thread_id);
-        PRAGMA user_version = 2;`);
+        CREATE TABLE IF NOT EXISTS native_push_keys (id INTEGER PRIMARY KEY CHECK(id=1),public_key TEXT NOT NULL,private_key TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS native_push_subscriptions (endpoint TEXT PRIMARY KEY,user_id TEXT NOT NULL,p256dh TEXT NOT NULL,auth TEXT NOT NULL,completion INTEGER NOT NULL,failure INTEGER NOT NULL);
+        PRAGMA user_version = 5;`);
       return Result.ok(undefined);
     });
   }
@@ -266,8 +272,8 @@ export class NativeStore {
         const value = {
           settings: {
             ...input.settings,
-            dmContextMaxAgeMs:
-              input.settings.dmContextMaxAgeMs ?? current.settings.dmContextMaxAgeMs,
+            dmContextGapMs: input.settings.dmContextGapMs ?? current.settings.dmContextGapMs,
+            dmTimestampGapMs: input.settings.dmTimestampGapMs ?? current.settings.dmTimestampGapMs,
           },
           revision: current.revision + 1,
         };
@@ -725,6 +731,55 @@ export class NativeStore {
         return this.summary(user, thread);
       }, this),
     );
+  }
+
+  notificationOrigin(actorId: string, threadId: string) {
+    return Result.gen(function* () {
+      const thread = yield* this.authorizeThread(actorId, threadId);
+      const row = this.db
+        .query<{ turn_id: string; input_id: string | null }, [string]>(
+          "SELECT id AS turn_id,json_extract(data_json,'$.value.messages[0].metadata.inputId') AS input_id FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 1",
+        )
+        .get(threadId);
+      if (!row?.input_id) return Result.ok(undefined);
+      const input = yield* this.getInput(row.input_id);
+      if (
+        input.threadId !== threadId ||
+        input.turnId !== row.turn_id ||
+        input.historyGeneration !== thread.historyGeneration
+      )
+        return Result.ok(undefined);
+      return Result.ok({
+        turnId: row.turn_id,
+        generation: thread.historyGeneration,
+        userId: input.initiatingUserId,
+        deviceId: input.deviceId,
+      });
+    }, this);
+  }
+
+  notificationContent(actorId: string, threadId: string) {
+    return Result.gen(function* () {
+      const thread = yield* this.getThread(actorId, threadId);
+      const row = this.db
+        .query<{ text: string | null }, [string]>(
+          `SELECT (SELECT group_concat(json_extract(p.value,'$.text'),' ' ORDER BY p.key) FROM json_each(m.value,'$.parts') p WHERE json_extract(p.value,'$.type')='text') AS text FROM (SELECT data_json FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 1) r,json_each(r.data_json,'$.value.messages') m WHERE json_extract(m.value,'$.role')='assistant' AND COALESCE(json_extract(m.value,'$.metadata.phase'),'final')='final' ORDER BY m.key DESC LIMIT 1`,
+        )
+        .get(threadId);
+      const preview = (row?.text ?? "")
+        .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+        .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+        .replace(/[`*_#~]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      const body = thread.displayStatus === "error" ? "Run failed" : preview || "Response finished";
+      return Result.ok({
+        threadId,
+        title: `Lilac · ${thread.title || "Untitled thread"}`,
+        body: body.slice(0, 200).replace(/[\uD800-\uDBFF]$/, ""),
+        tag: `lilac:${threadId}:${thread.revision}`,
+      });
+    }, this);
   }
 
   listThreads(
@@ -1206,6 +1261,8 @@ export class NativeStore {
     assistant?: string;
   } | null> {
     return Result.gen(function* () {
+      const agentStream = yield* this.readRecord("agent-stream", threadId);
+      if (agentStream?.kind === "agent-stream") return Result.ok(null);
       const thread = yield* this.getThreadRecord(threadId);
       const state = thread.titleGeneration;
       if (
@@ -1634,6 +1691,7 @@ export class NativeStore {
                 threadId: input.threadId,
                 authorId: options.authorId ?? actorId,
                 initiatingUserId: actorId,
+                deviceId: input.deviceId,
                 requestId: `native:${thread.id}:${messageId}`,
                 deliveryId: randomUUID(),
                 messageId,
@@ -1905,13 +1963,88 @@ export class NativeStore {
         : "i.position DESC";
     return nativeStoreTransaction(this.db, () =>
       this.readRows(
-        `SELECT i.* FROM native_records i INDEXED BY ${index} WHERE i.kind='input' AND i.thread_id=? AND json_extract(i.data_json,'$.value.createdAt')>=? AND i.position<? AND json_extract(i.data_json,'$.value.completedAt') IS NOT NULL AND json_extract(i.data_json,'$.value.mode')!='steer' AND json_extract(i.data_json,'$.value.state') IN ('admitted','canceled') AND EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.id=json_extract(i.data_json,'$.value.turnId')) ORDER BY ${order} LIMIT 1`,
+        `SELECT i.* FROM native_records i INDEXED BY ${index} WHERE i.kind='input' AND i.thread_id=? AND json_extract(i.data_json,'$.value.createdAt')>=? AND i.position<? AND ${CANONICAL_INPUT_FILTER} ORDER BY ${order} LIMIT 1`,
         [threadId, options.since ?? 0, options.before ?? Number.MAX_SAFE_INTEGER],
       ).map((records) => {
         const record = records[0];
         return record?.kind === "input" ? record.value : null;
       }),
     );
+  }
+
+  selectSessionStartInput(
+    threadId: string,
+    options: { gapMs: number; at: number },
+  ): NativeStoreResult<NativeInputRecord | null> {
+    return this.selectSessionWindow(threadId, options).andThen((session) => {
+      const firstPosition = session.firstPosition;
+      if (firstPosition === null) return Result.ok(null);
+      return this.readRows(
+        `SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND i.position>=? AND ${CANONICAL_INPUT_FILTER} ORDER BY i.position LIMIT 1`,
+        [threadId, firstPosition],
+      ).map((records) => {
+        const record = records[0];
+        return record?.kind === "input" ? record.value : null;
+      });
+    });
+  }
+
+  selectSessionWindow(
+    threadId: string,
+    options: { gapMs: number; at: number; beforePosition?: number; includePosts?: boolean },
+  ): NativeStoreResult<{
+    firstPosition: number | null;
+    firstAt: number | null;
+    postedTurns: ReadyTurnSlot[];
+    latestAt: number;
+  }> {
+    return nativeStoreTransaction(this.db, () => {
+      const statement = this.db.prepare<
+        {
+          id: string;
+          position: number;
+          posted: number;
+          created_at: number | null;
+          completed_at: number | null;
+        },
+        [string, number]
+      >(
+        `SELECT t.id,t.position,json_extract(t.data_json,'$.value.messages[0].id')=t.id AS posted,
+          COALESCE((SELECT MIN(json_extract(m.value,'$.metadata.createdAt')) FROM json_each(t.data_json,'$.value.messages') m),json_extract(t.data_json,'$.value.startedAt')) created_at,
+          MAX(COALESCE(json_extract(t.data_json,'$.value.settledAt'),0),
+            COALESCE((SELECT MAX(json_extract(i.data_json,'$.value.completedAt')) FROM native_records i WHERE i.kind='input' AND i.thread_id=t.thread_id AND i.position=t.position),0),
+            COALESCE((SELECT MAX(json_extract(m.value,'$.metadata.createdAt')) FROM json_each(t.data_json,'$.value.messages') m),0)) completed_at
+        FROM native_records t INDEXED BY native_records_thread_position
+        WHERE t.kind='turn' AND t.thread_id=? AND t.position<? ORDER BY t.position DESC`,
+      );
+      const ids: string[] = [];
+      let firstPosition: number | null = null;
+      let firstAt: number | null = null;
+      let nextAt = options.at;
+      let latestAt = 0;
+      for (const row of statement.iterate(
+        threadId,
+        options.beforePosition ?? Number.MAX_SAFE_INTEGER,
+      )) {
+        if (row.created_at === null || row.completed_at === null || row.created_at > options.at)
+          continue;
+        if (nextAt - row.completed_at > options.gapMs) break;
+        latestAt = Math.max(latestAt, row.completed_at);
+        firstPosition = row.position;
+        firstAt = row.created_at;
+        if (row.posted && options.includePosts) ids.push(row.id);
+        nextAt = row.created_at;
+      }
+      statement.finalize();
+      return Result.all(ids.toReversed().map((id) => this.readRecord("turn", id))).map(
+        (records) => ({
+          firstPosition,
+          firstAt,
+          postedTurns: records.flatMap((record) => (record?.kind === "turn" ? [record.value] : [])),
+          latestAt,
+        }),
+      );
+    });
   }
 
   getTurnPosition(turnId: string): NativeStoreResult<number> {
@@ -1925,7 +2058,7 @@ export class NativeStore {
   getLatestCanonicalRequestId(threadId: string): NativeStoreResult<string | null> {
     return nativeStoreTransaction(this.db, () =>
       this.readRows(
-        "SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND json_extract(i.data_json,'$.value.completedAt') IS NOT NULL AND json_extract(i.data_json,'$.value.mode')!='steer' AND json_extract(i.data_json,'$.value.state') IN ('admitted','canceled') AND EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.id=json_extract(i.data_json,'$.value.turnId')) ORDER BY i.position DESC LIMIT 1",
+        `SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND ${CANONICAL_INPUT_FILTER} ORDER BY i.position DESC LIMIT 1`,
         [threadId],
       ).map((records) => {
         const record = records[0];
@@ -2318,6 +2451,9 @@ export class NativeStore {
           return Result.err(nativeFailure("forbidden", "Thread access is denied"));
         return this.command(actorId, input.commandId, { operation: "delete", ...input }, () =>
           Result.gen(function* () {
+            this.db
+              .query("DELETE FROM native_records WHERE kind='send-group' AND thread_id=?")
+              .run(thread.id);
             const pending = yield* this.listPendingInputs(thread.id);
             for (const item of pending)
               this.writeRecord(
@@ -2577,6 +2713,164 @@ export class NativeStore {
           )
           .run(eventId, threadId, historyGeneration);
         return Result.ok(undefined);
+      }, this),
+    );
+  }
+
+  queueSurfaceSend(
+    actorId: string,
+    threadId: string,
+    requestId: string,
+    message: DisplayMessage,
+    silent: boolean,
+    origin: { deliveryId?: string; transcriptRequestId?: string } = {},
+  ): NativeStoreResult<void> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const thread = yield* this.authorizeThread(actorId, threadId, true);
+        if (thread.mutationPending)
+          return Result.err(nativeFailure("stale", "Thread history is changing"));
+        const id = fingerprint({ kind: "send-group", threadId, requestId });
+        const existing = yield* this.readRecord("send-group", id);
+        if (existing?.kind === "send-group" && existing.value.settled)
+          return Result.err(nativeFailure("conflict", "Originating request has already settled"));
+        const value: NativeSendGroup =
+          existing?.kind === "send-group"
+            ? existing.value
+            : {
+                id,
+                requestId,
+                ...origin,
+                actorId,
+                threadId,
+                historyGeneration: thread.historyGeneration,
+                settled: false,
+                delivered: false,
+                messages: [],
+              };
+        const position =
+          this.db
+            .query<{ position: number }, [string]>(
+              "SELECT COALESCE(MAX(position)+1,0) AS position FROM native_records WHERE kind='send-group' AND thread_id=?",
+            )
+            .get(threadId)?.position ?? 0;
+        const oldPosition = this.db
+          .query<{ position: number }, [string]>(
+            "SELECT position FROM native_records WHERE kind='send-group' AND id=?",
+          )
+          .get(id)?.position;
+        this.writeRecord(
+          id,
+          {
+            kind: "send-group",
+            value: { ...value, messages: [...value.messages, { message, silent }] },
+          },
+          threadId,
+          oldPosition ?? position,
+        );
+        return Result.ok(undefined);
+      }, this),
+    );
+  }
+
+  hasDeferredUpload(uploadId: string): NativeStoreResult<boolean> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.ok(
+        !!this.db
+          .query<{ id: string }, [string]>(
+            "SELECT r.id FROM native_records r, json_each(r.data_json,'$.value.messages') m, json_each(m.value,'$.message.parts') p WHERE r.kind='send-group' AND json_extract(r.data_json,'$.value.delivered')=0 AND json_extract(p.value,'$.type')='data-resource' AND json_extract(p.value,'$.data.resourceId')=? LIMIT 1",
+          )
+          .get(uploadId),
+      ),
+    );
+  }
+
+  listUnsettledSurfaceSends(): NativeStoreResult<Array<{ requestId: string; deliveryId: string }>> {
+    return nativeStoreTransaction(this.db, () =>
+      this.readRows(
+        "SELECT * FROM native_records WHERE kind='send-group' AND json_extract(data_json,'$.value.settled')=0",
+        [],
+      ).map((groups) =>
+        groups.flatMap((group) =>
+          group.kind === "send-group" && group.value.deliveryId
+            ? [{ requestId: group.value.requestId, deliveryId: group.value.deliveryId }]
+            : [],
+        ),
+      ),
+    );
+  }
+
+  settleSurfaceSends(requestId: string, untrackedOnly = false): NativeStoreResult<void> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const groups = yield* this.readRows(
+          "SELECT * FROM native_records WHERE kind='send-group' AND json_extract(data_json,'$.value.requestId')=?",
+          [requestId],
+        );
+        for (const group of groups) {
+          if (group.kind !== "send-group" || group.value.settled) continue;
+          if (untrackedOnly && group.value.deliveryId) continue;
+          this.db
+            .query(
+              "UPDATE native_records SET data_json=json_set(data_json,'$.value.settled',json('true')) WHERE kind='send-group' AND id=?",
+            )
+            .run(group.value.id);
+        }
+        return Result.ok(undefined);
+      }, this),
+    );
+  }
+
+  deliverSurfaceSends(
+    threadId?: string,
+  ): NativeStoreResult<{ requestIds: string[]; notifications: string[] }> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const groups = yield* this.readRows(
+          "SELECT * FROM native_records WHERE kind='send-group' AND json_extract(data_json,'$.value.delivered')=0 AND (?='' OR thread_id=?) ORDER BY thread_id,position",
+          [threadId ?? "", threadId ?? ""],
+        );
+        const blocked = new Set<string>();
+        const notify = new Set<string>();
+        const requestIds = new Set<string>();
+        for (const record of groups) {
+          if (record.kind !== "send-group") continue;
+          const group = record.value;
+          if (blocked.has(group.threadId)) continue;
+          const thread = yield* nullableAuthority(
+            this.authorizeThread(group.actorId, group.threadId, true),
+          );
+          if (!thread || thread.historyGeneration !== group.historyGeneration) {
+            this.db
+              .query("DELETE FROM native_records WHERE kind='send-group' AND id=?")
+              .run(group.id);
+            continue;
+          }
+          const pending = yield* this.listPendingInputs(thread.id);
+          if (
+            !group.settled ||
+            thread.activeRunId ||
+            thread.mutationPending ||
+            pending.length > 0
+          ) {
+            blocked.add(thread.id);
+            continue;
+          }
+          for (const entry of group.messages) {
+            yield* this.postMessage(group.actorId, thread.id, {
+              ...entry.message,
+              metadata: { ...entry.message.metadata, createdAt: this.now() },
+            });
+            if (!entry.silent) notify.add(thread.id);
+          }
+          requestIds.add(group.transcriptRequestId ?? group.requestId);
+          this.db
+            .query(
+              "UPDATE native_records SET data_json=json_set(data_json,'$.value.delivered',json('true')) WHERE kind='send-group' AND id=?",
+            )
+            .run(group.id);
+        }
+        return Result.ok({ requestIds: [...requestIds], notifications: [...notify] });
       }, this),
     );
   }
@@ -3019,6 +3313,18 @@ export class NativeStore {
             requestId: input.value.requestId,
             threadId: input.value.threadId,
             messageIds,
+          });
+        }
+        const groups = yield* this.readRows(
+          "SELECT * FROM native_records WHERE kind='send-group' AND json_extract(data_json,'$.value.delivered')=1 AND (?='' OR json_extract(data_json,'$.value.requestId')=? OR json_extract(data_json,'$.value.transcriptRequestId')=?)",
+          [requestId ?? "", requestId ?? "", requestId ?? ""],
+        );
+        for (const group of groups) {
+          if (group.kind !== "send-group") continue;
+          links.push({
+            requestId: group.value.transcriptRequestId ?? group.value.requestId,
+            threadId: group.value.threadId,
+            messageIds: group.value.messages.map((entry) => entry.message.id),
           });
         }
         return Result.ok(links);

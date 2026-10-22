@@ -119,7 +119,9 @@ async function loadSkillsForToolHost(
     const requestClient = opts?.context?.requestClient;
     return Result.ok({
       ...discovered,
-      skills: discovered.skills.filter((skill) => skillAvailableOn(skill, requestClient)),
+      skills: discovered.skills.filter((skill) =>
+        skillAvailableOn(skill, requestClient, opts?.context?.requestInitiator?.platform),
+      ),
     });
   });
 }

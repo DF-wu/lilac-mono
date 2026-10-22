@@ -1,3 +1,4 @@
+import { heartbeatDeferredHandoffRequestId } from "../../transcript/heartbeat-handoff";
 import { isNativeServiceMessage } from "./message-ownership";
 import { randomUUID } from "node:crypto";
 import {
@@ -6,6 +7,8 @@ import {
   type WorkflowCard,
 } from "@stanley2058/lilac-client-protocol";
 import { Result } from "better-result";
+import type { RequestContext } from "../../tool-server/types";
+import { nativeThreadId } from "./native-protocol";
 import type { DurableResolvedModelRequest } from "@stanley2058/lilac-utils";
 import {
   SurfaceInvalidInput,
@@ -14,6 +17,7 @@ import {
   SurfacePlatformMismatch,
   SurfaceSessionMismatch,
   SurfaceUnavailable,
+  type SurfaceToolSendResult,
   type StartOutputOpts,
   type StartTypingOpts,
   type SurfaceAdapter,
@@ -51,6 +55,9 @@ export type NativeAdapterRequest = {
   readonly principalId: string;
   readonly sourceThreadId: string;
   readonly requestId?: string;
+  readonly requestDeliveryId?: string;
+  readonly heartbeat?: boolean;
+  readonly suppressRun?: boolean;
 };
 export type NativeAdapterDependencies = {
   readonly store: NativeStore;
@@ -61,6 +68,7 @@ export type NativeAdapterDependencies = {
   readonly resolveModel?: (modelId?: string) => Result<DurableResolvedModelRequest, Error>;
   readonly streamingMode?: () => "paragraph" | "complete";
   readonly kick: (threadId: string) => void;
+  readonly notifyPostedMessage?: (threadId: string) => void;
   readonly now?: () => number;
 };
 
@@ -171,6 +179,69 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
   forRequest(request: NativeAdapterRequest): NativeSurfaceAdapter {
     return new NativeSurfaceAdapter(this.dependencies, request);
   }
+  forToolContext(
+    context: RequestContext,
+    ownerId: string,
+  ): SurfaceOperationResult<NativeSurfaceAdapter> {
+    return Result.gen(function* () {
+      if (!context.serverOwnedRequest)
+        return Result.err(
+          new SurfacePermissionDenied({
+            platform: "native",
+            operation: "list-sessions",
+            message: "Native tools require server-owned request authority",
+          }),
+        );
+      const principal = context.requestInitiator;
+      const sourceThread = context.requestInitiatorSessionId ?? context.sessionId;
+      if (principal?.platform === "native" && sourceThread) {
+        return Result.ok(
+          this.forRequest({
+            principalId: principal.userId,
+            sourceThreadId: nativeThreadId(sourceThread),
+            requestId: context.requestId,
+            requestDeliveryId: context.requestDeliveryId,
+          }),
+        );
+      }
+      if (
+        principal?.platform === "native" ||
+        context.safetyMode !== "trusted" ||
+        !context.controlPolicy
+      )
+        return Result.err(
+          new SurfacePermissionDenied({
+            platform: "native",
+            operation: "list-sessions",
+            message: "Cross-surface native tools require a trusted agent capability",
+          }),
+        );
+      const owner = yield* this.dependencies.store
+        .getUser(ownerId)
+        .mapError((error) => nativeSurfaceError("list-sessions", error));
+      if (owner.role !== "owner")
+        return Result.err(
+          new SurfacePermissionDenied({
+            platform: "native",
+            operation: "list-sessions",
+            message: "Configured native owner is unavailable",
+          }),
+        );
+      const dm = yield* this.dependencies.store
+        .ensureDirectThread(owner.id)
+        .mapError((error) => nativeSurfaceError("list-sessions", error));
+      return Result.ok(
+        this.forRequest({
+          principalId: owner.id,
+          sourceThreadId: dm.id,
+          requestId: context.requestId,
+          requestDeliveryId: context.requestDeliveryId,
+          heartbeat: context.controlPolicy.kind === "heartbeat",
+          suppressRun: context.controlPolicy.kind === "heartbeat",
+        }),
+      );
+    }, this);
+  }
   async connect(): Promise<void> {}
   async disconnect(): Promise<void> {}
   async getSelf(): Promise<SurfaceSelf> {
@@ -238,6 +309,25 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         messageId: row.message.metadata.replyToMessageId,
       };
     return message;
+  }
+
+  async resolveSessionAlias(alias: string): Promise<SurfaceOperationResult<SessionRef>> {
+    return Result.gen(function* () {
+      const request = yield* this.principal("resolve-session-alias");
+      if (alias !== "dm")
+        return Result.err(
+          new SurfaceInvalidInput({
+            platform: "native",
+            operation: "resolve-session-alias",
+            field: "alias",
+            message: "Unknown native session alias",
+          }),
+        );
+      const thread = yield* this.dependencies.store
+        .ensureDirectThread(request.principalId)
+        .mapError((error) => nativeSurfaceError("resolve-session-alias", error));
+      return Result.ok({ platform: "native" as const, channelId: thread.id });
+    }, this);
   }
 
   async listSessions(opts?: {
@@ -334,6 +424,26 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
       return Result.ok(undefined);
     }, this);
   }
+  async sendToolMsg(
+    sessionRef: SessionRef,
+    content: ContentOpts,
+    opts?: SendOpts,
+  ): Promise<SurfaceOperationResult<SurfaceToolSendResult>> {
+    const deferred = this.request?.suppressRun === true || opts?.suppressRun === true;
+    if (!deferred)
+      return (await this.sendMsg(sessionRef, content, opts)).map((ref) => ({
+        status: "sent",
+        ref,
+      }));
+    if (!this.request?.requestId)
+      return Result.err(
+        invalid("send-message", "requestId", "Deferred sends require an originating request"),
+      );
+    return (await this.post(sessionRef, content, opts, true, true)).map(() => ({
+      status: "queued",
+    }));
+  }
+
   async sendMsg(
     sessionRef: SessionRef,
     content: NativeContentOpts,
@@ -346,6 +456,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
     content: NativeContentOpts,
     opts: SendOpts | undefined,
     trigger: boolean,
+    deferred = false,
   ): Promise<SurfaceOperationResult<MsgRef>> {
     return Result.gen(async function* () {
       yield* Result.await(
@@ -411,6 +522,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         id,
         role: "assistant",
         metadata: {
+          phase: "final",
           authorId: this.serviceUserId,
           createdAt: (this.dependencies.now ?? Date.now)(),
           ...(opts?.replyTo ? { replyToMessageId: opts.replyTo.messageId } : {}),
@@ -421,8 +533,28 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         return Result.err(
           invalid("send-message", "content", "Message exceeds native display limits"),
         );
+      if (deferred && request.requestId) {
+        yield* this.dependencies.store
+          .queueSurfaceSend(
+            request.principalId,
+            ref.channelId,
+            request.requestId,
+            message,
+            opts?.silent === true,
+            {
+              deliveryId: request.requestDeliveryId,
+              transcriptRequestId: request.heartbeat
+                ? heartbeatDeferredHandoffRequestId(request.requestId)
+                : undefined,
+            },
+          )
+          .mapError((error) => nativeSurfaceError("send-message", error));
+        return Result.ok({ platform: "native" as const, channelId: ref.channelId, messageId: id });
+      }
       if (
         trigger &&
+        !request.suppressRun &&
+        !opts?.suppressRun &&
         ref.channelId !== request.sourceThreadId &&
         this.dependencies.shouldTriggerRun()
       ) {
@@ -461,6 +593,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
       yield* this.dependencies.store
         .postMessage(request.principalId, ref.channelId, message)
         .mapError((error) => nativeSurfaceError("send-message", error));
+      if (!opts?.silent) this.dependencies.notifyPostedMessage?.(ref.channelId);
       return Result.ok({ platform: "native" as const, channelId: ref.channelId, messageId: id });
     }, this);
   }
