@@ -20,6 +20,7 @@ Language: [`English (primary / canonical)`](../README.md) · [`Traditional Chine
 | --- | --- |
 | [`docker-deployment.md`](./docker-deployment.md) | Docker/Compose, operator tokens, persistence, UID, security boundaries, and diagnostics |
 | [`native-surface.md`](./native-surface.md) | Native Web surface: authentication, configuration, operation, and the temporary operator console |
+| [`heartbeat.md`](./heartbeat.md) | Proactive follow-ups: setup, legacy inbox migration, supported destinations, delivery verification, and scheduling limits |
 | [`native-surface-verification.md`](./native-surface-verification.md) | Historical verification record for the former standalone native client; current console setup is in `native-surface.md` |
 | [`telegram-surface.md`](./telegram-surface.md) | BotFather, allowlists, groups, forum topics, workflows, conversation memory, verification, and limitations |
 | [`telegram-feature-parity.md`](./telegram-feature-parity.md) | Telegram versus Discord capability matrix: what the router rewrite aligned, every remaining gap with its reason and the change needed, and Telegram-only strengths |

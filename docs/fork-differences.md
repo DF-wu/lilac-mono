@@ -4,10 +4,22 @@ Language: [`English (primary / canonical)`](./fork-differences.md) · [`Traditio
 
 This document describes the current differences between [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) and [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono).
 
-The comparison baseline is upstream commit [`0c906d23`](https://github.com/stanley2058/lilac-mono/commit/0c906d23), integrated through fork PR [#85](https://github.com/DF-wu/lilac-mono/pull/85) on 2026-10-07. The fork retains the following feature and operational changes on top of it.
+The comparison baseline is upstream commit [`4f7eedb8`](https://github.com/stanley2058/lilac-mono/commit/4f7eedb80dece58c79369b62210574ea869bbae6), integrated through fork PR [#92](https://github.com/DF-wu/lilac-mono/pull/92). The fork retains the following feature and operational changes on top of it.
 
 > [!IMPORTANT]
 > This is a maintenance document, not a permanent compatibility commitment. After an upstream sync, differences that have been accepted upstream or no longer exist must be removed from this table or reclassified.
+
+## Inherited Native Chat and Heartbeat Updates
+
+PR #92 brings upstream native permanent DMs, background push and device-aware notifications,
+gap-based DM context, and file-based proactive heartbeat into this fork. These are inherited upstream
+capabilities. See [native operation](./native-surface.md) and [heartbeat setup and verification](./heartbeat.md).
+
+Heartbeat's default destination supports Discord, GitHub, and native; this configuration field does
+not accept Telegram. Existing customized workflow files and legacy inbox/archive notes are preserved,
+but unfinished work must be migrated through the heartbeat skill before relying on the new workflow.
+Native tool sends queue without starting a destination run by default; heartbeat remains
+notification-only. Deploy Core and web together and review [migration and rollback requirements](../MIGRATIONS.md).
 
 ## Current Fork-only Features
 

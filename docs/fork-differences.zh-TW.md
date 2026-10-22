@@ -4,10 +4,21 @@
 
 本文件描述 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) 相對於 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的現行差異。
 
-比較基準為 upstream commit [`0c906d23`](https://github.com/stanley2058/lilac-mono/commit/0c906d23)，於 2026-10-07 透過 fork PR [#85](https://github.com/DF-wu/lilac-mono/pull/85) 整合。本 fork 在其上保留下列功能與維運修改。
+比較基準為 upstream commit [`4f7eedb8`](https://github.com/stanley2058/lilac-mono/commit/4f7eedb80dece58c79369b62210574ea869bbae6)，透過 fork PR [#92](https://github.com/DF-wu/lilac-mono/pull/92) 整合。本 fork 在其上保留下列功能與維運修改。
 
 > [!IMPORTANT]
 > 這是維護文件，不是永久相容性承諾。Upstream sync 後，已被上游接收或不再存在的差異必須從本表移除或重新分類。
+
+## 繼承的 Native 聊天與 Heartbeat 更新
+
+PR #92 將上游的 native 永久私訊、背景推播與依裝置投遞的通知、依對話間隔切分的私訊上下文，
+以及以檔案維護的主動 heartbeat 整合進本 fork。這些功能屬於繼承的上游能力。
+操作方式見 [native 文件](./native-surface.md) 與 [heartbeat 設定及驗證](./heartbeat.md)。
+
+Heartbeat 的預設目的地支援 Discord、GitHub 與 native；此設定欄位不接受 Telegram。
+現有的客製工作流程檔與舊 inbox/archive 筆記會保留，但依賴新工作流程前，須先透過 heartbeat
+skill 遷移未完成事項。Native 工具送訊息預設排隊投遞，不啟動目標對話的執行；heartbeat
+維持純通知。Core 與網頁須一起部署，並先閱讀[遷移及回滾要求](../MIGRATIONS.md)。
 
 ## 現行 Fork-only 功能
 
