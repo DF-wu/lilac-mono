@@ -1,11 +1,14 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { Panic } from "better-result";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { customMediaConfigSchema } from "../src/config";
 import { createCustomMediaServerTool } from "../src/index";
+import { generateCustomImage } from "../src/image";
 import { IMAGE_MODEL_REGISTRY } from "../src/models";
 import { restrictedSessionRoot, restrictedSessionToken } from "../src/paths";
+import { imageOutputSchema } from "../src/schemas";
 
 const PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
@@ -78,7 +81,121 @@ describe("custom-media configuration and registration", () => {
   });
 });
 
+describe("custom-media call defects", () => {
+  it.each([
+    { callableId: "custom-media.image", cause: new Error("unexpected image transport defect") },
+    {
+      callableId: "custom-media.image",
+      cause: new Panic({ message: "image transport invariant" }),
+    },
+    {
+      callableId: "custom-media.image",
+      cause: new DOMException("unexpected image transport state", "InvalidStateError"),
+    },
+    { callableId: "custom-media.video", cause: new Error("unexpected video transport defect") },
+    {
+      callableId: "custom-media.video",
+      cause: new Panic({ message: "video transport invariant" }),
+    },
+    {
+      callableId: "custom-media.video",
+      cause: new DOMException("unexpected video transport state", "InvalidStateError"),
+    },
+  ])(
+    "preserves transport defect identity: $callableId $cause.name",
+    async ({ callableId, cause }) => {
+      startServer(() => Response.json({ data: [] }));
+      const transport = spyOn(globalThis, "fetch").mockRejectedValue(cause);
+      try {
+        await expect(
+          createCustomMediaServerTool(config).call(callableId, {
+            prompt: "defect",
+            ...(callableId === "custom-media.video" ? { path: "defect.mp4" } : {}),
+          }),
+        ).rejects.toBe(cause);
+      } finally {
+        transport.mockRestore();
+      }
+    },
+  );
+
+  it.each(["custom-media.image", "custom-media.video"])(
+    "keeps real %s connection failures recoverable",
+    async (callableId) => {
+      const server = startServer(() => new Response("unused"));
+      await server.stop(true);
+      const result = await createCustomMediaServerTool(config).call(callableId, {
+        prompt: "offline",
+        ...(callableId === "custom-media.video" ? { path: "offline.mp4" } : {}),
+      });
+      expect(result).toMatchObject({
+        status: "error",
+        error: { kind: "unavailable", code: "PROVIDER_ERROR", retryable: true },
+      });
+    },
+  );
+});
+
 describe("custom-media.image", () => {
+  it("returns malformed provider base64 as a retryable failure", async () => {
+    startServer(() => Response.json({ data: [{ b64_json: "not valid base64!" }] }));
+
+    await expect(
+      createCustomMediaServerTool(config).call("custom-media.image", { prompt: "invalid payload" }),
+    ).resolves.toMatchObject({
+      status: "error",
+      error: { kind: "unavailable", code: "PROVIDER_ERROR", retryable: true },
+    });
+  });
+
+  it.each([1, 2])(
+    "uploads %i validated images and a mask with nonempty multipart filenames",
+    async (imageCount) => {
+      const output = await tempDirectory("custom-media-edit-filenames-");
+      const inputPath = path.join(output, "input.png");
+      const maskPath = path.join(output, "mask.png");
+      await fs.writeFile(inputPath, PNG);
+      await fs.writeFile(maskPath, PNG);
+      let captured: FormData | undefined;
+      let multipart = "";
+      let requests = 0;
+      startServer(async (request) => {
+        requests += 1;
+        expect(new URL(request.url).pathname).toBe("/v1/images/edits");
+        multipart = await request.clone().text();
+        captured = await request.formData();
+        return Response.json({ data: [{ b64_json: PNG.toString("base64") }] });
+      });
+
+      await generateCustomImage(
+        {
+          prompt: "edit with mask",
+          inputImages: Array(imageCount).fill(inputPath),
+          maskImage: maskPath,
+          outputDir: output,
+        },
+        config,
+      );
+      expect(requests).toBe(1);
+      expect(captured?.get("model")).toBe("gpt-image-2");
+      expect(captured?.get("prompt")).toBe("edit with mask");
+      const filenames = [
+        ...multipart.matchAll(/name="(?:image(?:\[\])?|mask)"; filename="([^"]*)"/gu),
+      ].map((match) => match[1]);
+      expect(filenames).toHaveLength(imageCount + 1);
+      expect(filenames).not.toContain("");
+      const images = captured?.getAll(imageCount === 1 ? "image" : "image[]") ?? [];
+      expect(images).toHaveLength(imageCount);
+      for (const file of [...images, captured?.get("mask")]) {
+        expect(file).toBeInstanceOf(File);
+        if (!(file instanceof File)) throw new Error("Expected a multipart file");
+        expect(file.name).not.toBe("");
+        expect(file.type).toBe("image/png");
+        expect(Buffer.from(await file.arrayBuffer())).toEqual(PNG);
+      }
+    },
+  );
+
   it("generates through createOpenAICompatible without retries or model fallback", async () => {
     const output = await tempDirectory("custom-media-image-");
     let requests = 0;
@@ -93,16 +210,18 @@ describe("custom-media.image", () => {
       return Response.json({ data: [{ b64_json: PNG.toString("base64") }] });
     });
 
-    const result = await createCustomMediaServerTool(config).call(
-      "custom-media.image",
-      {
-        prompt: "paint a quiet harbor",
-        model: "gpt-5-image",
-        aspectRatio: "3:2",
-        outputDir: output,
-      },
-      { context: { cwd: output } },
-    );
+    const result = (
+      await createCustomMediaServerTool(config).call(
+        "custom-media.image",
+        {
+          prompt: "paint a quiet harbor",
+          model: "gpt-5-image",
+          aspectRatio: "3:2",
+          outputDir: output,
+        },
+        { context: { cwd: output } },
+      )
+    ).unwrap();
 
     expect(requests).toBe(1);
     expect(result).toMatchObject({
@@ -111,7 +230,7 @@ describe("custom-media.image", () => {
       route: "gpt-image-1.5",
       mimeType: "image/png",
     });
-    expect(await fs.readFile((result as { path: string }).path)).toEqual(PNG);
+    expect(await fs.readFile(imageOutputSchema.parse(result).path)).toEqual(PNG);
   });
 
   it("uses multipart /images/edits with validated local images", async () => {
@@ -127,16 +246,18 @@ describe("custom-media.image", () => {
       return Response.json({ data: [{ b64_json: PNG.toString("base64") }] });
     });
 
-    const result = await createCustomMediaServerTool(config).call(
-      "custom-media.image",
-      {
-        prompt: "add morning light",
-        model: "grok-imagine-image",
-        inputImages: inputPath,
-        outputDir: output,
-      },
-      { context: { cwd: output } },
-    );
+    const result = (
+      await createCustomMediaServerTool(config).call(
+        "custom-media.image",
+        {
+          prompt: "add morning light",
+          model: "grok-imagine-image",
+          inputImages: inputPath,
+          outputDir: output,
+        },
+        { context: { cwd: output } },
+      )
+    ).unwrap();
     expect(result).toMatchObject({ ok: true, route: "grok-imagine-image" });
   });
 
@@ -152,7 +273,10 @@ describe("custom-media.image", () => {
         model: "grok-imagine-image",
         size: "1024x1024",
       }),
-    ).rejects.toThrow("UNSUPPORTED_CAPABILITY");
+    ).resolves.toMatchObject({
+      status: "error",
+      error: { code: "UNSUPPORTED_CAPABILITY", kind: "usage", retryable: false },
+    });
     expect(requests).toBe(0);
   });
 
@@ -167,16 +291,18 @@ describe("custom-media.image", () => {
       return Response.json({ data: [{ b64_json: PNG.toString("base64") }] });
     });
 
-    const result = await createCustomMediaServerTool(config).call(
-      "custom-media.image",
-      {
-        prompt: "edit safely",
-        inputImages: "/tmp/input.png",
-        outputDir: "/tmp/out",
-      },
-      { context: { cwd: "/tmp", safetyMode: "restricted", sessionId } },
-    );
-    const returnedPath = (result as { path: string }).path;
+    const result = (
+      await createCustomMediaServerTool(config).call(
+        "custom-media.image",
+        {
+          prompt: "edit safely",
+          inputImages: "/tmp/input.png",
+          outputDir: "/tmp/out",
+        },
+        { context: { cwd: "/tmp", safetyMode: "restricted", sessionId } },
+      )
+    ).unwrap();
+    const returnedPath = imageOutputSchema.parse(result).path;
     expect(returnedPath).toStartWith("/tmp/out/custom-media-image");
     expect(await fs.readFile(path.join(restrictedRoot, returnedPath.slice(5)))).toEqual(PNG);
   });
@@ -188,15 +314,12 @@ describe("custom-media.image", () => {
         { status: 401 },
       ),
     );
-    try {
-      await createCustomMediaServerTool(config).call("custom-media.image", {
-        prompt: "fail",
-      });
-      throw new Error("expected image call to fail");
-    } catch (error) {
-      expect(String(error)).not.toContain(API_KEY);
-      expect(String(error)).toContain("REDACTED");
-    }
+    const result = await createCustomMediaServerTool(config).call("custom-media.image", {
+      prompt: "fail",
+    });
+    expect(result).toMatchObject({ status: "error", error: { code: "PROVIDER_ERROR" } });
+    expect(JSON.stringify(result)).not.toContain(API_KEY);
+    expect(JSON.stringify(result)).toContain("REDACTED");
   });
 });
 
@@ -234,18 +357,20 @@ describe("custom-media.video", () => {
       return new Response("not found", { status: 404 });
     });
 
-    const result = await createCustomMediaServerTool(config).call(
-      "custom-media.video",
-      {
-        prompt: "slow camera move",
-        path: "clip.mp4",
-        inputImage: "frame.png",
-        seconds: 5,
-        size: "1280x720",
-        pollIntervalMs: 10,
-      },
-      { context: { cwd: output } },
-    );
+    const result = (
+      await createCustomMediaServerTool(config).call(
+        "custom-media.video",
+        {
+          prompt: "slow camera move",
+          path: "clip.mp4",
+          inputImage: "frame.png",
+          seconds: 5,
+          size: "1280x720",
+          pollIntervalMs: 10,
+        },
+        { context: { cwd: output } },
+      )
+    ).unwrap();
     expect(polls).toBe(1);
     expect(result).toMatchObject({
       ok: true,
@@ -289,7 +414,10 @@ describe("custom-media.video", () => {
         },
         { context: { cwd: output } },
       ),
-    ).rejects.toThrow("DOWNLOAD_TOO_LARGE");
+    ).resolves.toMatchObject({
+      status: "error",
+      error: { code: "DOWNLOAD_TOO_LARGE", kind: "usage", retryable: false },
+    });
     expect(await fs.readdir(output)).toEqual([]);
   });
 
@@ -303,16 +431,13 @@ describe("custom-media.video", () => {
       }),
     );
 
-    try {
-      await createCustomMediaServerTool(config).call(
-        "custom-media.video",
-        { prompt: "fail", path: "failed.mp4" },
-        { context: { cwd: output } },
-      );
-      throw new Error("expected video call to fail");
-    } catch (error) {
-      expect(String(error)).not.toContain(API_KEY);
-      expect(String(error)).toContain("REDACTED");
-    }
+    const result = await createCustomMediaServerTool(config).call(
+      "custom-media.video",
+      { prompt: "fail", path: "failed.mp4" },
+      { context: { cwd: output } },
+    );
+    expect(result).toMatchObject({ status: "error", error: { code: "VIDEO_FAILED" } });
+    expect(JSON.stringify(result)).not.toContain(API_KEY);
+    expect(JSON.stringify(result)).toContain("REDACTED");
   });
 });

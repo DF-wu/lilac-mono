@@ -333,6 +333,15 @@ function decodeOpenAIWebSearchOutcome(
     );
   }
   if (envelope.kind === "completed") {
+    const searches = envelope.payload.output.filter((item) => item.type === "web_search_call");
+    if (searches.every((item) => item.status === "failed")) {
+      return Result.err(
+        new OpenAIWebSearchFailure({
+          message: `OpenAI web search failed (${response.status}): hosted search service unavailable; all web_search calls failed.`,
+          status: response.status,
+        }),
+      );
+    }
     return Result.ok(collectOpenAIWebSearchResults(envelope.payload, maxResults));
   }
   return Result.err(

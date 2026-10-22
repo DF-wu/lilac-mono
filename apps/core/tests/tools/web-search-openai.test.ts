@@ -294,6 +294,35 @@ describe("web-search (openai)", () => {
     );
   });
 
+  it("rejects completed responses when every hosted search explicitly failed", async () => {
+    const server = startResponsesServer(() =>
+      json(completedResponse({ output: [{ type: "web_search_call", status: "failed" }] })),
+    );
+    const provider = new OpenAIWebSearchProvider({ apiKey: "sk-test", baseUrl: server.url });
+
+    await expect(provider.search(webSearchInputSchema.parse({ query: "x" }))).rejects.toThrow(
+      "hosted search service unavailable",
+    );
+  });
+
+  it("accepts a successful or legacy search alongside failed hosted searches", async () => {
+    for (const status of ["completed", undefined]) {
+      const server = startResponsesServer(() =>
+        json(
+          completedResponse({
+            output: [
+              { type: "web_search_call", status: "failed" },
+              { type: "web_search_call", ...(status ? { status } : {}), action: { sources: [] } },
+            ],
+          }),
+        ),
+      );
+      const provider = new OpenAIWebSearchProvider({ apiKey: "sk-test", baseUrl: server.url });
+
+      expect(await provider.search(webSearchInputSchema.parse({ query: "x" }))).toEqual([]);
+    }
+  });
+
   it("rejects failed, incomplete, and malformed responses", async () => {
     const payloads: unknown[] = [
       { status: "failed", error: { message: "server_error: boom", code: "server_error" } },

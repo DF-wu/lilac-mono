@@ -1,11 +1,11 @@
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
-import type { LilacBus } from "@stanley2058/lilac-event-bus";
+import type { EventDeliveryDoneError, LilacBus } from "@stanley2058/lilac-event-bus";
 import {
   isTelegramSurfaceUsable,
   resolveTelegramDbPath,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
-import { Result, type Result as ResultType } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
 
 import { ConversationThreadOperationFailed } from "../../conversation/thread-service";
 import type { CustomCommandManager } from "../../custom-commands/manager";
@@ -17,7 +17,10 @@ import { shouldSuppressRouterForWorkflowReply } from "../../workflow/workflow-ro
 import type { SurfaceAdapter, SurfaceAdapterEventSource } from "../adapter";
 import { bridgeAdapterToBus } from "../bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../bridge/subscribe-from-bus";
-import { createDescriptorBoundSurfaceEventSource } from "../produced-ref-guard";
+import {
+  createDescriptorBoundSurfaceAdapter,
+  createDescriptorBoundSurfaceEventSource,
+} from "../produced-ref-guard";
 import type { SurfaceRuntimeDescriptor } from "../runtime-descriptor";
 import { TelegramAdapter } from "./telegram-adapter";
 import { isTelegramChatAllowed } from "./telegram-guards";
@@ -46,7 +49,10 @@ type TelegramSurfaceRuntimeLogger = {
 };
 
 export type TelegramSurfaceRuntimeInput = {
-  readonly adapter: SurfaceAdapter & { stopIngress(): Promise<void> };
+  readonly adapter: SurfaceAdapter & {
+    initialize(): Promise<void>;
+    stopIngress(): Promise<void>;
+  };
   readonly eventSource: SurfaceAdapterEventSource;
   readonly healthProvider: TelegramRuntimeHealthProvider;
   readonly customCommands?: CustomCommandManager;
@@ -60,6 +66,7 @@ export type TelegramSurfaceRuntimeDeps = {
   readonly subscriptionId: (name: string) => string;
   readonly getTranscriptStore: () => TranscriptStore | undefined;
   readonly logger: TelegramSurfaceRuntimeLogger;
+  readonly reportFatalError: (error: Error) => void;
 };
 
 /**
@@ -215,9 +222,14 @@ export function createTelegramSurfaceRuntimeEntry(
   telegram: TelegramSurfaceRuntimeInput,
   deps: TelegramSurfaceRuntimeDeps,
 ): SurfaceRuntimeDescriptor<"telegram"> {
+  let requestRouterHealthy = true;
   return createTelegramSurfaceRuntimeDescriptor({
-    adapter: telegram.adapter,
-    health: createTelegramRuntimeHealthPort(telegram.healthProvider),
+    // Shared connection owns initialization and rollback. Polling/outbox replay
+    // starts separately after the paused runner and all surface consumers exist.
+    adapter: Object.assign(createDescriptorBoundSurfaceAdapter("telegram", telegram.adapter), {
+      connect: () => telegram.adapter.initialize(),
+    }),
+    health: createTelegramRuntimeHealthPort(telegram.healthProvider, () => requestRouterHealthy),
     requestIngress: {
       start: async () => {
         const id = deps.subscriptionId("telegram-request-router");
@@ -239,8 +251,23 @@ export function createTelegramSurfaceRuntimeEntry(
               }
             : {}),
         });
+        let stopping = false;
+        const supervision = superviseTelegramRouterDone({
+          done: router.done,
+          isStopping: () => stopping,
+          markUnhealthy: () => {
+            requestRouterHealthy = false;
+          },
+          reportFatalError: deps.reportFatalError,
+        });
         deps.logger.debug("Telegram request router started", { subscriptionId: id });
-        return router;
+        return {
+          stop: async () => {
+            stopping = true;
+            await router.stop();
+            await supervision;
+          },
+        };
       },
     },
     adapterIngress: {
@@ -253,7 +280,6 @@ export function createTelegramSurfaceRuntimeEntry(
           subscriptionId: id,
           transcriptStore: deps.getTranscriptStore(),
         });
-        await telegram.adapter.connect();
         deps.logger.debug("Telegram adapter ingress started", { subscriptionId: id });
         return {
           platform: "telegram" as const,
@@ -288,4 +314,29 @@ export function createTelegramSurfaceRuntimeEntry(
       };
     },
   });
+}
+
+async function superviseTelegramRouterDone(input: {
+  readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
+  readonly isStopping: () => boolean;
+  readonly markUnhealthy: () => void;
+  readonly reportFatalError: (error: Error) => void;
+}): Promise<void> {
+  const [settled] = await Promise.allSettled([input.done]);
+  if (input.isStopping()) return;
+  input.markUnhealthy();
+  if (settled.status === "rejected") {
+    input.reportFatalError(
+      settled.reason instanceof Error
+        ? settled.reason
+        : new Panic({ message: "Telegram request router subscription rejected" }),
+    );
+    return;
+  }
+  const failure = settled.value.match<Error>({
+    err: (error) => error,
+    ok: () =>
+      new Panic({ message: "Telegram request router subscriptions completed unexpectedly" }),
+  });
+  input.reportFatalError(failure);
 }

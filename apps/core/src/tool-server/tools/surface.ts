@@ -415,20 +415,30 @@ const sessionsListLimitSchema = z
   })
   .describe("Max sessions to return (default: all).");
 
-function withDefaultSessionId<TInput extends { readonly sessionId?: string }>(
-  input: TInput,
-  ctx: RequestContext | undefined,
-): ResultType<TInput, ServerToolFailure> {
+function withDefaultSessionId<
+  TInput extends {
+    readonly sessionId?: string;
+    readonly client?: SurfaceClient;
+  },
+>(input: TInput, ctx: RequestContext | undefined): ResultType<TInput, ServerToolFailure> {
   const initiatorSessionId =
     typeof ctx?.requestInitiatorSessionId === "string" && ctx.requestInitiatorSessionId.length > 0
       ? ctx.requestInitiatorSessionId
       : undefined;
 
   if (input.sessionId !== undefined) {
+    const nativeRefs = getBuiltinSurfaceProtocol("native").refs;
+    const matchesNativeSession =
+      ctx?.requestInitiator?.platform === "native" &&
+      (input.client === undefined || input.client === "native") &&
+      initiatorSessionId !== undefined &&
+      nativeRefs.createSessionRef(input.sessionId).channelId ===
+        nativeRefs.createSessionRef(initiatorSessionId).channelId;
     if (
       ctx?.safetyMode === "restricted" &&
       initiatorSessionId &&
-      input.sessionId !== initiatorSessionId
+      input.sessionId !== initiatorSessionId &&
+      !matchesNativeSession
     ) {
       return Result.err(
         surfaceFailure(

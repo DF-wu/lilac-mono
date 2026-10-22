@@ -71,11 +71,14 @@ Durable workflow engine 使用相同 request bus，並以 SQLite journal 保存 
 ```mermaid
 flowchart LR
     Upstream[stanley2058/lilac-mono main] -->|scheduled check every 6 hours| Sync[Sync Upstream workflow]
-    Sync -->|clean merge| Fork[DF-wu/lilac-mono main]
+    Sync -->|clean candidate| CI[CI]
+    CI -->|pass and unchanged main| Fork[DF-wu/lilac-mono main]
     Features[Fork features and fixes] --> Fork
-    Fork --> CI[CI]
     Fork --> Images[GHCR image workflow]
 ```
+
+Git conflict 仍由 fork review PR 交由人工解決。這次對齊 upstream 的取捨與修正見
+[維護審查紀錄](./docs/fork-review-2026-10-22.md)。
 
 ## 快速開始
 

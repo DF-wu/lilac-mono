@@ -102,6 +102,19 @@ test("Core editor diagnostics reject wrong versions, fields, types, and units", 
     expect(validateCore(input), JSON.stringify(input)).toBe(false);
 });
 
+test("Core editor web provider aliases use the selected config version's provider enum", () => {
+  for (const section of ["extract", "search"]) {
+    for (const selection of [{ provider: "openai" }, { providers: ["openai"] }]) {
+      for (const configVersion of [1, 2]) {
+        const input = { configVersion, tools: { web: { [section]: selection } } };
+        const accepted = configVersion === 2;
+        expect(parseCoreConfigResult(input).isOk()).toBe(accepted);
+        expect(validateCore(input), JSON.stringify(validateCore.errors)).toBe(accepted);
+      }
+    }
+  }
+});
+
 test("MCP schema validates transport-specific fields and credential source shapes", () => {
   const input = {
     configVersion: 1,

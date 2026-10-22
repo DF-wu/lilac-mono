@@ -65,8 +65,8 @@ apps/core/src/surface/bridge/subscribe-from-bus.ts  # platform-generic relay ref
 apps/core/src/transcript/transcript-store.ts  # Telegram platform filters
 apps/core/src/migration/frozen-graceful-restart-store.ts  # frozen restart snapshot accepts Telegram refs
 apps/core/scripts/legacy-graceful-restart-blob-migration.ts  # legacy snapshot decoder accepts Telegram refs
-apps/core/scripts/legacy-transcript-blob-migration.ts  # startup legacy blob migration
-apps/core/src/runtime/main.ts  # startup legacy blob migration via startCoreRuntime
+apps/core/scripts/legacy-transcript-blob-migration.ts  # explicitly closes the legacy migration database with close(false)
+apps/core/src/runtime/main.ts  # settles Core creation/start Results through the fork-owned startCoreRuntime helper
 apps/core/src/runtime/create-core-runtime.ts  # constructs and registers the Telegram surface module
 apps/core/src/runtime/compose-builtin-surface-runtimes.ts  # includes the Telegram runtime descriptor entry
 apps/core/package.json  # grammY dependency
@@ -113,7 +113,7 @@ packages/utils/core-config.ts  # re-exports fork config modules
 packages/utils/core-config/types.ts  # UniversalCoreConfig gains surface.telegram
 packages/utils/core-config/v1.ts  # v1 fallbacks for fork config keys
 packages/utils/core-config/v2.ts  # v2 schema includes fork config modules
-apps/core/scripts/generate-config-schemas.ts  # preserves the existing fail-closed editor-schema conversion for unsupported Zod inputs
+apps/core/scripts/generate-config-schemas.ts  # fail-closed Zod conversion and version-correct legacy web provider aliases
 apps/core/src/generated/config-schemas/core-config.schema.json  # generated from fork input schemas including Telegram and OpenAI search
 apps/core/tests/runtime/config-schemas.test.ts  # verifies fork editor schema acceptance and removed image config diagnostics
 apps/web/src/generated/tool-activities.ts  # generated from fork tool definitions and workflow progress content
@@ -123,7 +123,6 @@ packages/utils/index.ts  # re-exports the custom-command menu module
 # --- Agent and event bus fixes carried by the fork
 packages/agent/auto-compaction.ts  # applies the existing current-input boundary in compaction preflight; selection policy is owned by this upstream module
 packages/agent/adapters/ai-sdk/adapter.ts  # executes parsed local tool calls on nonstandard finish reasons
-packages/agent/agent-run-idle-watchdog.ts  # idle watchdog restart gap fix
 packages/event-bus/redis-streams-bus.ts  # single-flight subscription cleanup
 
 # --- Upstream tests extended for fork behavior

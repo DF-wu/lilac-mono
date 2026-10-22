@@ -1,6 +1,7 @@
 import path from "node:path";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateImage } from "ai";
+import { Panic } from "better-result";
 import type { CustomMediaConfig } from "./config";
 import { resolveCredentials } from "./config";
 import type { ToolCallOptions } from "./contracts";
@@ -13,6 +14,31 @@ import { createCallSignal } from "./signal";
 import { parseWithSchema } from "./errors";
 
 type GenerateImagePrompt = Parameters<typeof generateImage>[0]["prompt"];
+type ImageFetch = NonNullable<Parameters<typeof createOpenAICompatible>[0]["fetch"]>;
+
+const IMAGE_UPLOAD_EXTENSIONS: Readonly<Record<string, string>> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+};
+
+// The SDK creates unnamed Blobs; Bun sends filename="" unless append receives a name.
+function fetchImageRequest(...[url, init]: Parameters<ImageFetch>): Promise<Response> {
+  if (!(init?.body instanceof FormData)) return fetch(url, init);
+  const body = new FormData();
+  init.body.forEach((value, key) => {
+    if (typeof value === "string") return body.append(key, value);
+    const extension = IMAGE_UPLOAD_EXTENSIONS[value.type] ?? "bin";
+    const filename = value.name || `${key.replace(/\[\]$/u, "")}.${extension}`;
+    body.append(key, value, filename);
+  });
+  return fetch(url, { ...init, body });
+}
+
+const fetchWithImageFilenames: ImageFetch = Object.assign(fetchImageRequest, {
+  preconnect: (...args: Parameters<ImageFetch["preconnect"]>) => fetch.preconnect(...args),
+});
 
 async function buildPrompt(
   input: ReturnType<typeof imageInputSchema.parse>,
@@ -57,6 +83,7 @@ export async function generateCustomImage(
       name: "customMedia",
       baseURL: credentials.baseURL,
       apiKey: credentials.apiKey,
+      fetch: fetchWithImageFilenames,
     });
     const result = await generateImage({
       model: provider.imageModel(registration.route),
@@ -91,6 +118,7 @@ export async function generateCustomImage(
       warnings: result.warnings,
     });
   } catch (error) {
+    if (Panic.is(error)) throw error;
     if (callSignal.signal.aborted) callSignal.mapAbort(error);
     if (error instanceof CustomMediaError) throw error;
     throw asCustomMediaError(error, "PROVIDER_ERROR", "Image generation failed", [

@@ -1,3 +1,4 @@
+import type { OpenAIWebSearchConfig } from "./openai-web-search";
 import type { TelegramSurfaceConfig } from "./telegram-surface";
 
 export type JSONValue = null | string | number | boolean | Readonly<JSONObject> | JSONArray;
@@ -196,15 +197,7 @@ export type UniversalCoreConfig = {
         queueTtlMs: number;
       };
       /** Only meaningful when `extract.providers` includes `openai` (web.search only). */
-      openai?: {
-        /**
-         * `provider/model` that runs the hosted `web_search` call. Only `openai`
-         * and `openai-compatible` providers are accepted; a bare model id means
-         * `openai/<id>`.
-         */
-        model: string;
-        searchContextSize: "low" | "medium" | "high";
-      };
+      openai?: OpenAIWebSearchConfig;
     };
     inspect: {
       model: string;

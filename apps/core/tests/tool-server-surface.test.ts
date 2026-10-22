@@ -268,6 +268,88 @@ class FakeAdapter extends SurfaceAdapterTestBase {
 }
 
 describe("tool-server surface", () => {
+  it.each([
+    ["thread", "thread", "native", true],
+    ["thread", "native:thread", "native", true],
+    ["native:thread", "thread", "native", true],
+    ["native:thread", "native:thread", "native", true],
+    ["thread", "other", "native", false],
+    ["thread", "native:other", "native", false],
+    ["thread", "native:thread", "discord", false],
+  ] as const)(
+    "restricted native session %s scopes explicit target %s on %s",
+    async (originSessionId, sessionId, client, allowed) => {
+      const sessionRef = { platform: "native" as const, channelId: "thread" };
+      const adapter = new FakeAdapter([], {
+        thread: [
+          {
+            ref: { ...sessionRef, messageId: "message" },
+            session: sessionRef,
+            userId: "native-user",
+            text: "hello",
+            ts: 0,
+          },
+        ],
+      });
+      const tool = new ProductionSurface({
+        adapterResolver: createTestAdapterResolver([
+          { protocol: BUILTIN_SURFACE_PROTOCOLS.native, adapter },
+          { protocol: BUILTIN_SURFACE_PROTOCOLS.discord, adapter },
+        ]),
+        nativeAdapterForContext: () => Result.ok(adapter),
+        config: testConfig({}),
+      });
+      const result = await tool.callResult(
+        "surface.messages.read",
+        { client, sessionId, messageId: "message" },
+        {
+          context: {
+            sessionId: "native:thread",
+            requestClient: "native",
+            requestInitiator: { platform: "native", userId: "native-user" },
+            requestInitiatorSessionId: originSessionId,
+            safetyMode: "restricted",
+            serverOwnedRequest: true,
+          },
+        },
+      );
+      if (!allowed) {
+        expect(result).toMatchObject({ status: "error", error: { kind: "denied" } });
+        expect(adapter.readCalls).toEqual([]);
+        return;
+      }
+      expect(result).toMatchObject({
+        status: "ok",
+        value: {
+          meta: { session: { platform: "native", channelId: "thread" } },
+          message: { richText: "hello" },
+        },
+      });
+      expect(adapter.readCalls).toEqual([
+        { platform: "native", channelId: "thread", messageId: "message" },
+      ]);
+    },
+  );
+
+  it("keeps restricted non-native session IDs literal", async () => {
+    const adapter = new FakeAdapter([], {});
+    const tool = new Surface({ adapter, config: testConfig({}) });
+    const result = await tool.callResult(
+      "surface.messages.read",
+      { client: "discord", sessionId: "native:123", messageId: "message" },
+      {
+        context: {
+          requestClient: "discord",
+          requestInitiator: { platform: "discord", userId: "discord-user" },
+          requestInitiatorSessionId: "123",
+          safetyMode: "restricted",
+        },
+      },
+    );
+    expect(result).toMatchObject({ status: "error", error: { kind: "denied" } });
+    expect(adapter.readCalls).toEqual([]);
+  });
+
   it("marks surface.messages.search as deprecated and hidden", async () => {
     const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
 

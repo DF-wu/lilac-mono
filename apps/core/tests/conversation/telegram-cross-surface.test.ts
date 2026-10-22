@@ -191,6 +191,7 @@ describe("telegram conversation source", () => {
       text: "with files",
       offsetMs: 2_000,
       rawJson: documentRaw("3"),
+      editedTs: now + 6_000,
     });
     upsert({ sessionId: CHAT, messageId: "4", text: "gone", offsetMs: 3_000 });
     telegram.markDeleted({ sessionId: CHAT, messageId: "4" });
@@ -206,7 +207,7 @@ describe("telegram conversation source", () => {
       expect(threads.map((thread) => thread.id).sort()).toEqual([CHAT, TOPIC]);
       expect(threads.find((thread) => thread.id === CHAT)).toMatchObject({
         chat_id: CHAT,
-        updated_at: now + 3_000,
+        updated_at: now + 6_000,
       });
 
       const messages = readTelegramConversationMessages(db, CHAT).unwrap();
@@ -255,6 +256,61 @@ describe("telegram conversation source", () => {
     for (const id of ["1", "2", "3"]) telegram.markDeleted({ sessionId: CHAT, messageId: id });
     index.refreshTelegramThreads();
     expect(index.getThread(ref)).toBeNull();
+  });
+
+  test("same-second content edits rebuild the thread with a bounded retained revision", () => {
+    const ref = seedChat();
+    const editedTs = Math.floor((now + 5_000) / 1_000) * 1_000;
+    upsert({ sessionId: CHAT, messageId: "1", text: "first edit", editedTs });
+    index.refreshTelegramThreads();
+    const first = index.getThread(ref)!;
+    const text = "deployment replacement ".repeat(40);
+    upsert({ sessionId: CHAT, messageId: "1", text, editedTs });
+    index.refreshTelegramThreads();
+    const second = index.getThread(ref)!;
+    expect(second.summary_input_hash).not.toBe(first.summary_input_hash);
+    expect(second.summary_input_hash!.length).toBeLessThan(128);
+    expect(index.listMessages(ref)[0]?.text).toBe(text);
+
+    upsert({ sessionId: CHAT, messageId: "1", text, editedTs });
+    index.refreshTelegramThreads();
+    expect(index.getThread(ref)?.summary_input_hash).toBe(second.summary_input_hash);
+  });
+
+  test("attachment metadata changes rebuild the thread without changed text or timestamps", () => {
+    const ref = seedChat();
+    upsert({ sessionId: CHAT, messageId: "3", text: "with files", rawJson: documentRaw("3") });
+    index.refreshTelegramThreads();
+    const originalRevision = index.getThread(ref)?.summary_input_hash;
+
+    upsert({
+      sessionId: CHAT,
+      messageId: "3",
+      text: "with files",
+      rawJson: documentRaw("3").replace("doc-file", "replacement-file"),
+    });
+    index.refreshTelegramThreads();
+    expect(index.getThread(ref)?.summary_input_hash).not.toBe(originalRevision);
+    expect(
+      index.listMessages(ref).find((message) => message.messageId === "3")?.attachments,
+    ).toContainEqual({
+      id: "replacement-file",
+      filename: "plan.pdf",
+      mimeType: "application/pdf",
+      size: 1234,
+    });
+  });
+
+  test("edits delay summarization until the quiet period has elapsed", async () => {
+    const ref = seedChat();
+    expect((await service.runSummarization({ now: Date.now() })).summarized).toBe(1);
+    const editedTs = Math.floor(Date.now() / 1_000) * 1_000;
+    upsert({ sessionId: CHAT, messageId: "1", text: "recent deployment edit", editedTs });
+
+    expect((await service.runSummarization({ now: editedTs + 3_600_000 - 1 })).eligible).toBe(0);
+    expect(index.getThread(ref)).toMatchObject({ updated_at: editedTs, end_ts: editedTs });
+    expect((await service.runSummarization({ now: editedTs + 3_600_000 })).summarized).toBe(1);
+    expect(index.getSummary(ref).unwrap()?.brief).toContain("recent deployment edit");
   });
 
   test("search, read, and metadata follow the chat allowlist and label the surface", async () => {
@@ -553,8 +609,14 @@ describe("Telegram search through the actual worker pool", () => {
     const edited = (await pool.hits({ type: "lexical", query: "replacement", allowlist })).unwrap();
     expect(edited).toHaveLength(1);
     expect(edited[0]?.sourceRevision).not.toBe(original[0]?.sourceRevision);
-    telegram.markDeleted({ sessionId: CHAT, messageId: "1" });
+    upsert({ sessionId: CHAT, messageId: "1", text: "second replacement", editedTs: now + 5_000 });
     expect(await current(edited)).toEqual([]);
+    await service.runSummarization({ now: Date.now() });
+    const secondEdit = (await pool.hits({ type: "lexical", query: "second", allowlist })).unwrap();
+    expect(secondEdit).toHaveLength(1);
+    expect(secondEdit[0]?.sourceRevision).not.toBe(edited[0]?.sourceRevision);
+    telegram.markDeleted({ sessionId: CHAT, messageId: "1" });
+    expect(await current(secondEdit)).toEqual([]);
     expect(
       (await service.search({ query: "replacement", mode: "lexical" })).unwrap().results,
     ).toEqual([]);

@@ -1,4 +1,5 @@
 import { ZodError, type ZodType } from "zod";
+import { APICallError, NoImageGeneratedError } from "ai";
 
 export const CUSTOM_MEDIA_ERROR_CODES = [
   "INVALID_CONFIG",
@@ -61,6 +62,31 @@ export function asCustomMediaError(
   if (error instanceof CustomMediaError) return error;
   if (error instanceof ZodError) {
     return new CustomMediaError("INVALID_INPUT", `${fallbackMessage}: invalid structured data`);
+  }
+  const systemFailure =
+    error instanceof Error &&
+    (("syscall" in error && typeof error.syscall === "string") ||
+      ("code" in error &&
+        typeof error.code === "string" &&
+        [
+          "ConnectionRefused",
+          "ConnectionClosed",
+          "FailedToOpenSocket",
+          "ECONNRESET",
+          "ECONNREFUSED",
+          "ETIMEDOUT",
+          "EPIPE",
+        ].includes(error.code)));
+  // The image SDK's base64 decoder can escape its APICallError boundary.
+  const imageDecodingFailure =
+    error instanceof DOMException && error.name === "InvalidCharacterError";
+  if (
+    !APICallError.isInstance(error) &&
+    !NoImageGeneratedError.isInstance(error) &&
+    !systemFailure &&
+    !imageDecodingFailure
+  ) {
+    throw error;
   }
   return new CustomMediaError(
     fallbackCode,

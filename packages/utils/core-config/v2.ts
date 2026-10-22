@@ -14,12 +14,12 @@ import {
   modelCapabilityLimitPatchSchema,
   modelCapabilityModalitiesPatchSchema,
   migrateWebConfigValue,
-  migrateWebExtractConfigValue,
   routerSchema,
   statsForNerdsSchema,
   webFetchModeSchema,
 } from "./v1";
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
+import { openaiWebSearchSchema, webExtractConfigValueSchemaV2 } from "./openai-web-search";
 import { cloneDefaultTelegramSurface, telegramSurfaceSchema } from "./telegram-surface";
 import { defaultNativeSurfaceConfig, MODEL_REASONING_EFFORTS } from "./types";
 
@@ -397,20 +397,6 @@ const discordSurfaceSchema = z
 const byteSizeSchema = z.preprocess(parseFriendlyByteSize, z.number().int().positive());
 const durationMsSchema = z.preprocess(parseFriendlyDurationMs, z.number().int().positive());
 
-// v2 accepts `openai` (OpenAI Responses `web_search`) as a search-only provider;
-// the frozen v1 enum stays unchanged.
-const webExtractProviderSchemaV2 = z.enum(["tavily", "exa", "firecrawl", "openai"]);
-const webExtractConfigValueSchemaV2 = z.preprocess(
-  migrateWebExtractConfigValue,
-  z.object({
-    providers: z
-      .array(webExtractProviderSchemaV2)
-      .min(1)
-      .transform((providers) => [...new Set(providers)])
-      .default(["tavily"]),
-  }),
-);
-
 const webConfigSchemaV2 = z
   .preprocess(
     migrateWebConfigValue,
@@ -431,12 +417,7 @@ const webConfigSchemaV2 = z
           queueTtl: durationMsSchema.default(3_000),
         })
         .optional(),
-      openai: z
-        .object({
-          model: z.string().trim().min(1).default("openai/gpt-5-mini"),
-          searchContextSize: z.enum(["low", "medium", "high"]).default("medium"),
-        })
-        .optional(),
+      openai: openaiWebSearchSchema.optional(),
     }),
   )
   .default({

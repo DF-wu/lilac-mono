@@ -9,6 +9,7 @@
 | 文件 | 內容 |
 | --- | --- |
 | [`fork-differences.zh-TW.md`](./fork-differences.zh-TW.md) | 本 fork 與 upstream 的現行差異、限制、同步政策與已 upstreamed 貢獻 |
+| [`fork-review-2026-10-22.md`](./fork-review-2026-10-22.md) | 對照 upstream `4f7eedb8` 的 fork 維護審查：保留的擴充、移除的補丁、修正與驗證限制 |
 | [`../PROJECT.md`](../PROJECT.md) | Core 的持久架構、名詞、workspace 擁有權、信任邊界與持久化指南 |
 | [`../MIGRATIONS.md`](../MIGRATIONS.md) | Core config 與儲存格式的 migration contract |
 | [`core-config-migrations.md`](./core-config-migrations.md) | 跨 config 版本的手動 `core-config.yaml` 升級，含本 fork 的 v2 keys |

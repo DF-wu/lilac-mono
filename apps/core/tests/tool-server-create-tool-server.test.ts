@@ -24,6 +24,12 @@ import { RequestControlAuthority } from "../src/tool-server/request-control-auth
 import { requestInvocationCwd } from "../src/tool-server/request-invocation-cwd";
 import { decodeToolInput } from "../src/tool-server/validation-error-message";
 import type { AuthenticatedRequestProjection } from "../src/surface/authenticated-request";
+import type { SurfaceAdapter } from "../src/surface/adapter";
+import { BUILTIN_SURFACE_PROTOCOLS } from "../src/surface/builtin-surface-protocols";
+import { SurfaceRuntimeRegistry } from "../src/surface/runtime-descriptor";
+import type { MsgRef } from "../src/surface/types";
+import { Surface } from "../src/tool-server/tools/surface";
+import { SurfaceAdapterTestBase } from "./helpers/surface-adapter-test-base";
 
 const originalMemoryUsage = process.memoryUsage;
 const TEST_OPERATOR_TOKEN = "tool-server-test-operator";
@@ -4167,3 +4173,152 @@ it("restricted native calls accept bare and canonical current-thread IDs only", 
     await server.stop();
   }
 });
+
+it.each([
+  ["raw current thread", { sessionId: "thread" }, "native", null],
+  ["canonical current thread", { sessionId: "native:thread" }, "native", null],
+  ["explicit native client", { client: "native", sessionId: "native:thread" }, "native", null],
+  ["default current thread", {}, "native", null],
+  ["other raw thread", { sessionId: "other" }, "native", "restricted_mode_denied"],
+  ["other canonical thread", { sessionId: "native:other" }, "native", "restricted_mode_denied"],
+  [
+    "canonical target on another client",
+    { client: "discord", sessionId: "native:thread" },
+    "native",
+    "restricted_mode_denied",
+  ],
+  ["mismatched request client", { sessionId: "thread" }, "discord", "authentication_failed"],
+] as const)(
+  "authenticated restricted native surface call: %s",
+  async (_name, input, requestClient, expectedErrorCode) => {
+    const requestId = "native:thread:message";
+    const sessionId = "native:thread";
+    const principal = { platform: "native" as const, userId: "native-user" };
+    const sessionRef = { platform: "native" as const, channelId: "thread" };
+    const messageRef = { ...sessionRef, messageId: "message" };
+    const authenticatedOrigin = { ...principal, sessionRef, messageRef };
+    const projection: AuthenticatedRequestProjection = {
+      requestId,
+      sessionId,
+      requestClient: "native",
+      source: "external",
+      platform: "native",
+      sessionRef,
+      messageRef,
+      authenticatedActor: principal,
+      authenticatedOrigin,
+      authenticationMetadataKind: "actor-origin",
+      verifiedIngress: true,
+      native: {
+        threadId: "thread",
+        authorUserId: principal.userId,
+        starterUserId: principal.userId,
+        turnId: "turn",
+        historyGeneration: 0,
+        inputId: "input",
+        requestId,
+        requestDeliveryId: "00000000-0000-4000-8000-000000000001",
+      },
+    };
+    const authority = new RequestControlAuthority();
+    const capability = authority.issue({
+      kind: "primary",
+      requestId,
+      sessionId,
+      platform: "native",
+      principal,
+      authenticatedOrigin,
+      allowedCallables: null,
+      profile: "primary",
+      canonicalCwd: "/workspace",
+      safetyMode: "restricted",
+      expiresAt: Date.now() + 60_000,
+    });
+    const reads: MsgRef[] = [];
+    const unexpectedOperation = async () => {
+      throw new Error("Unexpected native adapter operation");
+    };
+    const adapter: SurfaceAdapter = Object.assign(new SurfaceAdapterTestBase(), {
+      connect: unexpectedOperation,
+      disconnect: unexpectedOperation,
+      getSelf: unexpectedOperation,
+      listSessions: unexpectedOperation,
+      startOutput: unexpectedOperation,
+      sendMsg: unexpectedOperation,
+      readMsg: async (ref: MsgRef) => {
+        reads.push(ref);
+        return Result.ok({
+          ref,
+          session: sessionRef,
+          userId: principal.userId,
+          text: "hello",
+          ts: 0,
+        });
+      },
+      listMsg: unexpectedOperation,
+      editMsg: unexpectedOperation,
+      deleteMsg: unexpectedOperation,
+      getReplyContext: unexpectedOperation,
+      addReaction: unexpectedOperation,
+      removeReaction: unexpectedOperation,
+      listReactions: unexpectedOperation,
+      getUnRead: unexpectedOperation,
+      markRead: unexpectedOperation,
+    });
+    const registry = SurfaceRuntimeRegistry.create([
+      { protocol: BUILTIN_SURFACE_PROTOCOLS.native, adapter },
+    ]).unwrap();
+    const tool = new Surface({
+      adapterResolver: registry.adapterResolver(),
+      nativeAdapterForContext: () => Result.ok(adapter),
+      config: parseCoreConfigV2ToUniversal({ configVersion: 2 }),
+    });
+    const server = createToolServer({
+      tools: [tool],
+      requestMessageCache: {
+        get: (id) => (id === requestId ? [{ role: "user", content: "hello" }] : undefined),
+        getOrigin: (id) => (id === requestId ? projection : undefined),
+      },
+      authorizeControlRequest: (request) => authority.authorize(request),
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-lilac-request-id": requestId,
+            "x-lilac-session-id": sessionId,
+            "x-lilac-request-client": requestClient,
+            "x-lilac-control-capability": capability,
+            "x-lilac-cwd": "/workspace",
+          },
+          body: JSON.stringify({
+            callableId: "surface.messages.read",
+            input: { ...input, messageId: "message" },
+          }),
+        }),
+      );
+      const body = await response.json();
+      if (expectedErrorCode) {
+        expect(body).toMatchObject({
+          status: "error",
+          error: { kind: "denied", code: expectedErrorCode },
+        });
+        expect(reads).toEqual([]);
+        return;
+      }
+      expect(body).toMatchObject({
+        status: "ok",
+        value: {
+          meta: { session: { platform: "native", channelId: "thread" } },
+          message: { richText: "hello" },
+        },
+      });
+      expect(reads).toEqual([{ platform: "native", channelId: "thread", messageId: "message" }]);
+    } finally {
+      await server.stop();
+    }
+  },
+);

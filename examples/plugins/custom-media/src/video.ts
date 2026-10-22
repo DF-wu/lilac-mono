@@ -1,6 +1,7 @@
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import { Panic } from "better-result";
 import type { CustomMediaConfig } from "./config";
 import { resolveCredentials } from "./config";
 import type { ToolCallOptions } from "./contracts";
@@ -62,7 +63,7 @@ async function createVideoTask(params: {
   if (params.inputImage) {
     form.set(
       "input_reference",
-      new File([params.inputImage.bytes], params.inputImage.filename, {
+      new File([new Uint8Array(params.inputImage.bytes)], params.inputImage.filename, {
         type: params.inputImage.mimeType,
       }),
     );
@@ -244,6 +245,7 @@ export async function generateCustomVideo(
       videoId: completed.id,
     });
   } catch (error) {
+    if (Panic.is(error)) throw error;
     if (callSignal.signal.aborted) callSignal.mapAbort(error);
     if (error instanceof CustomMediaError) throw error;
     throw asCustomMediaError(error, "PROVIDER_ERROR", "Video generation failed", [

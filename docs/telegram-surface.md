@@ -427,7 +427,11 @@ summarization worker receives the same path.
   segmentation of a long chat into several threads yet; a busy group is one
   thread whose summary is rebuilt as it grows. Deleted messages leave the
   projection immediately, and any edit or deletion changes the thread revision
-  so the next summarization pass rebuilds it from current text.
+  so the next summarization pass rebuilds it from current text. Revisions hash
+  ordered content and metadata, so edits sharing the same second-resolution
+  Telegram timestamp still invalidate stale summaries and search hits. Edit
+  activity also restarts the existing summary quiet period. Existing derived
+  Telegram summaries refresh normally after this update; no manual migration is needed.
 - **Allowlist gating.** Search, read, metadata, and automatic recall admit a
   Telegram thread only when its chat id is in the live `allowedChatIds`; a
   topic follows its chat. The list fails closed, so an empty allowlist hides

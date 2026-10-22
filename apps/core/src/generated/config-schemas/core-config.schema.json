@@ -20,11 +20,7 @@
                       "type": "array",
                       "items": { "type": "string", "enum": ["tavily", "exa", "firecrawl"] }
                     },
-                    "provider": {
-                      "$schema": "http://json-schema.org/draft-07/schema#",
-                      "type": "string",
-                      "enum": ["tavily", "exa", "firecrawl"]
-                    }
+                    "provider": { "type": "string", "enum": ["tavily", "exa", "firecrawl"] }
                   },
                   "additionalProperties": false
                 },
@@ -48,11 +44,7 @@
                       "type": "array",
                       "items": { "type": "string", "enum": ["tavily", "exa", "firecrawl"] }
                     },
-                    "provider": {
-                      "$schema": "http://json-schema.org/draft-07/schema#",
-                      "type": "string",
-                      "enum": ["tavily", "exa", "firecrawl"]
-                    }
+                    "provider": { "type": "string", "enum": ["tavily", "exa", "firecrawl"] }
                   },
                   "additionalProperties": false
                 }
@@ -854,9 +846,8 @@
                       }
                     },
                     "provider": {
-                      "$schema": "http://json-schema.org/draft-07/schema#",
                       "type": "string",
-                      "enum": ["tavily", "exa", "firecrawl"]
+                      "enum": ["tavily", "exa", "firecrawl", "openai"]
                     }
                   },
                   "additionalProperties": false
@@ -918,9 +909,8 @@
                       }
                     },
                     "provider": {
-                      "$schema": "http://json-schema.org/draft-07/schema#",
                       "type": "string",
-                      "enum": ["tavily", "exa", "firecrawl"]
+                      "enum": ["tavily", "exa", "firecrawl", "openai"]
                     }
                   },
                   "additionalProperties": false

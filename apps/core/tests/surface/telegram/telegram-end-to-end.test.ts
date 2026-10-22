@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { createLilacBus, lilacEventTypes, type Message } from "@stanley2058/lilac-event-bus";
-import { Result } from "better-result";
+import { Result, type Result as ResultType } from "better-result";
 import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils/core-config/v2";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 import type { Message as TelegramMessage, Update } from "grammy/types";
@@ -16,7 +16,13 @@ import { startTelegramRequestRouter } from "../../../src/surface/telegram/telegr
 import { createInMemoryDeliveryBus } from "../../helpers/in-memory-delivery-bus";
 import { getTestBlobStore } from "../../helpers/blob-store";
 import { FakeBotApiServer } from "./fake-bot-api-server";
-import { BOT_USER_ID, BOT_USERNAME, makeMessage, makeSupergroupChat } from "./telegram-fixtures";
+import {
+  BOT_USER_ID,
+  BOT_USERNAME,
+  makeMessage,
+  makeReplyTo,
+  makeSupergroupChat,
+} from "./telegram-fixtures";
 
 /**
  * The whole inbound chain, with only the Bot API faked:
@@ -146,16 +152,24 @@ async function startChain(cfg: CoreConfig = testConfig(), customCommands?: Custo
   await created.whenReady();
   adapter = created;
 
-  return { requests };
+  return { requests, adapter: created, bus };
 }
 
-async function waitForRequest(requests: Array<Message<unknown>>): Promise<Message<unknown>> {
+async function waitForRequest(
+  requests: Array<Message<unknown>>,
+  count = 1,
+): Promise<Message<unknown>> {
   const deadline = Date.now() + 10_000;
-  while (requests.length === 0) {
+  while (requests.length < count) {
     if (Date.now() > deadline) throw new Error("no cmd.request.message was published");
     await new Promise((resolve) => setImmediate(resolve));
   }
-  return requests[0] as Message<unknown>;
+  return requests[count - 1] as Message<unknown>;
+}
+
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
 }
 
 function privateMessage(overrides: Partial<TelegramMessage> = {}): NonNullable<Update["message"]> {
@@ -206,6 +220,32 @@ describe("a telegram message reaches the router as a telegram message", () => {
     const data = msg.data as { messages: Array<{ content: unknown }> };
     expect(JSON.stringify(data.messages)).toContain("what is 2 plus 2?");
   });
+
+  it.each([
+    ["discovered", undefined, BOT_USERNAME],
+    ["configured", "Configured_bot", "Configured_bot"],
+  ] as const)(
+    "uses the %s username for mention-prefixed model directives",
+    async (_label, botUsername, username) => {
+      const { requests } = await startChain(testConfig({ botUsername }));
+      const mention = `@${username}`;
+      server.enqueueMessage(
+        privateMessage({
+          message_id: 39,
+          text: `${mention} !model:fast hello`,
+          entities: [{ type: "mention", offset: 0, length: mention.length }],
+        }),
+      );
+
+      const msg = await waitForRequest(requests);
+      const data = msg.data as { modelOverride?: string; messages: Array<{ content: unknown }> };
+      expect(data.modelOverride).toBe("fast");
+      const content = JSON.stringify(data.messages);
+      expect(content).toContain("hello");
+      expect(content).not.toContain(mention);
+      expect(content).not.toContain("!model:");
+    },
+  );
 
   it("attributes the request to telegram, not discord", async () => {
     const { requests } = await startChain();
@@ -265,6 +305,97 @@ describe("a telegram message reaches the router as a telegram message", () => {
   });
 });
 
+describe("reply context through the adapter's streamed output", () => {
+  it.each([
+    ["fresh", false],
+    ["resumed", true],
+    ["reanchored", false],
+  ] as const)(
+    "keeps the original user message behind a %s streamed reply",
+    async (lane, resume) => {
+      const { requests, adapter: connected, bus } = await startChain();
+      const original = privateMessage({
+        message_id: 1,
+        date: Math.floor(Date.now() / 1000) - 10,
+        text: "the original question",
+      });
+      server.enqueueMessage(original);
+      const first = await waitForRequest(requests);
+      const session = { platform: "telegram" as const, channelId: String(CHAT) };
+      if (lane === "reanchored") {
+        const previous = resultValue(
+          await connected.startOutput(session, {
+            replyTo: { ...session, messageId: "999" },
+          }),
+        );
+        resultValue(await previous.push({ type: "text.set", text: "the previous lane" }));
+        await server.waitForCall("sendMessage");
+        resultValue(await previous.abort("reanchor"));
+      }
+      const stream = resultValue(
+        await connected.startOutput(session, {
+          replyTo: { ...session, messageId: "1" },
+        }),
+      );
+      resultValue(await stream.push({ type: "text.set", text: "draft answer" }));
+      await server.waitForCall("sendMessage", lane === "reanchored" ? 2 : 1);
+      resultValue(await stream.push({ type: "text.set", text: "the streamed answer" }));
+      const output = resultValue(await stream.finish());
+
+      if (resume) {
+        // Editing cannot change Telegram's original reply target, even when
+        // the recovered request supplies a newer anchor.
+        const resumed = resultValue(
+          await connected.startOutput(session, {
+            resumeAt: output.last,
+            replyTo: { ...session, messageId: "999" },
+          }),
+        );
+        resultValue(await resumed.push({ type: "text.set", text: "the resumed answer" }));
+        resultValue(await resumed.finish());
+      }
+
+      await bus.publish(
+        lilacEventTypes.EvtRequestLifecycleChanged,
+        { state: "resolved" },
+        {
+          headers: {
+            request_id: String(first.headers?.request_id),
+            session_id: String(CHAT),
+            request_client: "telegram",
+          },
+        },
+      );
+      server.enqueueMessage(
+        privateMessage({
+          message_id: 2000,
+          date: Math.ceil(Date.now() / 1000) + 1,
+          text: "expand on that answer",
+          reply_to_message: makeReplyTo({
+            message_id: Number(output.last.messageId),
+            from: { id: BOT_USER_ID, is_bot: true, first_name: "Catalina" },
+            text: resume ? "the resumed answer" : "the streamed answer",
+          }),
+        }),
+      );
+
+      const next = await waitForRequest(requests, 2);
+      const data = next.data as {
+        raw: { chainMessageIds: string[] };
+        messages: Array<{ role: string; content: unknown }>;
+      };
+      expect(data.raw.chainMessageIds).toEqual([
+        "1",
+        lane === "reanchored" ? "1001" : "1000",
+        "2000",
+      ]);
+      expect(data.messages.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
+      expect(JSON.stringify(data.messages[0]?.content)).toContain("the original question");
+      expect(data.messages[1]?.content).toBe(resume ? "the resumed answer" : "the streamed answer");
+    },
+  );
+});
+
 /**
  * A menu tap sends ordinary message text, so the alias has to survive the same
  * adapter -> bridge -> router path as anything the user types. Asserting only
@@ -315,9 +446,12 @@ describe("a command menu tap invokes the same command as the typed form", () => 
     });
   });
 
-  it("accepts the alias with the @botusername suffix a group tap produces", async () => {
+  it.each([
+    ["configured", BOT_USERNAME],
+    ["discovered", undefined],
+  ] as const)("accepts a targeted alias with the %s username", async (_label, botUsername) => {
     const registry = await loadRegistry([{ name: "tarot", description: "Draw a tarot spread" }]);
-    const cfg = testConfig({ allowedChatIds: ["-1001234567890"] });
+    const cfg = testConfig({ allowedChatIds: ["-1001234567890"], botUsername });
     const { requests } = await startChain(cfg, registry);
 
     server.enqueueMessage(
@@ -340,38 +474,44 @@ describe("a command menu tap invokes the same command as the typed form", () => 
    * explicitly addressed to another bot ran ours. Mention gating does not save
    * us — the router's custom-command branch is ahead of it.
    */
-  it("does not run a command addressed to a different bot in the same group", async () => {
-    const registry = await loadRegistry([{ name: "tarot", description: "Draw a tarot spread" }]);
-    const cfg = testConfig({ allowedChatIds: ["-1001234567890"] });
-    const { requests } = await startChain(cfg, registry);
+  it.each([
+    ["configured", BOT_USERNAME],
+    ["discovered", undefined],
+  ] as const)(
+    "rejects a foreign targeted command with the %s username",
+    async (_label, botUsername) => {
+      const registry = await loadRegistry([{ name: "tarot", description: "Draw a tarot spread" }]);
+      const cfg = testConfig({ allowedChatIds: ["-1001234567890"], botUsername });
+      const { requests } = await startChain(cfg, registry);
 
-    const foreign = "/lilac_tarot@SomeOtherBot";
-    server.enqueueMessage(
-      makeMessage({
-        message_id: 45,
-        chat: makeSupergroupChat(),
-        text: foreign,
-        entities: [{ type: "bot_command", offset: 0, length: foreign.length }],
-      }) as NonNullable<Update["message"]>,
-    );
+      const foreign = "/lilac_tarot@SomeOtherBot";
+      server.enqueueMessage(
+        makeMessage({
+          message_id: 45,
+          chat: makeSupergroupChat(),
+          text: foreign,
+          entities: [{ type: "bot_command", offset: 0, length: foreign.length }],
+        }) as NonNullable<Update["message"]>,
+      );
 
-    // Send an addressed command afterwards: it proves the first was seen and
-    // rejected rather than merely still in flight.
-    const mine = `/lilac_tarot@${BOT_USERNAME}`;
-    server.enqueueMessage(
-      makeMessage({
-        message_id: 46,
-        chat: makeSupergroupChat(),
-        text: mine,
-        entities: [{ type: "bot_command", offset: 0, length: mine.length }],
-      }) as NonNullable<Update["message"]>,
-    );
+      // Send an addressed command afterwards: it proves the first was seen and
+      // rejected rather than merely still in flight.
+      const mine = `/lilac_tarot@${BOT_USERNAME}`;
+      server.enqueueMessage(
+        makeMessage({
+          message_id: 46,
+          chat: makeSupergroupChat(),
+          text: mine,
+          entities: [{ type: "bot_command", offset: 0, length: mine.length }],
+        }) as NonNullable<Update["message"]>,
+      );
 
-    const msg = await waitForRequest(requests);
-    expect(requests).toHaveLength(1);
-    expect(customCommandOf(msg)).toMatchObject({ name: "tarot" });
-    expect(String(msg.headers?.request_id ?? "")).toContain("46");
-  });
+      const msg = await waitForRequest(requests);
+      expect(requests).toHaveLength(1);
+      expect(customCommandOf(msg)).toMatchObject({ name: "tarot" });
+      expect(String(msg.headers?.request_id ?? "")).toContain("46");
+    },
+  );
 
   it("reports an unknown alias instead of silently treating it as chat", async () => {
     const registry = await loadRegistry([{ name: "tarot", description: "Draw a tarot spread" }]);

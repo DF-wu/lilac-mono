@@ -9,6 +9,7 @@ Language: [`English (primary / canonical)`](../README.md) · [`Traditional Chine
 | Document | Contents |
 | --- | --- |
 | [`fork-differences.md`](./fork-differences.md) | Current differences from upstream, limitations, sync policy, and upstreamed contributions |
+| [`fork-review-2026-10-22.md`](./fork-review-2026-10-22.md) | Fork maintenance review against upstream `4f7eedb8`: retained extensions, retired patches, fixes, and verification limits |
 | [`../PROJECT.md`](../PROJECT.md) | Durable Core architecture, terminology, workspace ownership, trust boundaries, and persistence guide |
 | [`../MIGRATIONS.md`](../MIGRATIONS.md) | Core configuration and storage-format migration contract |
 | [`core-config-migrations.md`](./core-config-migrations.md) | Manual `core-config.yaml` upgrades between config versions, including the fork's v2 keys |

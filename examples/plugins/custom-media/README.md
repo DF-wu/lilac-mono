@@ -10,6 +10,14 @@ second provider or model. Image calls use AI SDK `createOpenAICompatible` and `g
 `maxRetries: 0`. Video calls use QuantumNous/new-api's OpenAI-compatible `POST /v1/videos`,
 `GET /v1/videos/:id`, and `GET /v1/videos/:id/content` flow.
 
+Both callables return `better-result` Results for the current Level 2 contract. Successful payloads
+are wrapped in `Result.ok`; expected failures use `Result.err` with a `ServerToolFailure` containing
+the existing custom-media error code, a redacted message, failure kind, and retryability. Core owns
+the wire response envelope. Unexpected defects and Panics propagate to Core's defect handling.
+Malformed provider image payloads, including invalid base64, return a retryable `PROVIDER_ERROR`.
+Image edit requests retain the SDK's routing and explicitly name image and mask multipart uploads
+for Bun compatibility.
+
 ## Install
 
 Build from source when changing the example:

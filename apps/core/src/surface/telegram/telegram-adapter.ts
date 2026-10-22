@@ -258,8 +258,13 @@ export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolve
 
   constructor(private readonly opts?: TelegramAdapterOptions) {}
 
-  async connect(): Promise<void> {
-    if (this.bot) return;
+  /** Open history and resolve identity before durable consumers can deliver retained events. */
+  async initialize(): Promise<void> {
+    await this.connect(false);
+  }
+
+  async connect(startIngress = true): Promise<void> {
+    if (this.bot) return startIngress ? this.startIngress() : undefined;
 
     this.healthState = { connectionState: "connecting", isReady: false };
     this.ready = createDeferred();
@@ -298,10 +303,20 @@ export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolve
       userId: String(bot.botInfo.id),
       userName: bot.botInfo.username,
     };
+    if (!startIngress) return;
+    await this.startIngress();
+  }
+
+  /** Shared runtime startup calls this only after all event and request consumers exist. */
+  async startIngress(): Promise<void> {
+    const bot = this.mustBot();
+    await this.getSelf();
+    const cfg = this.cfg ?? (await this.resolveCoreConfig());
+    if (this.pollingStopped || this.ingressStopped) return;
 
     // Drain anything a previous run committed but never published, before new
-    // updates start arriving, so a backlog keeps its arrival order. Subscribers
-    // are registered before connect(), so they are in place by now.
+    // updates start arriving, so a backlog keeps its arrival order. Runtime
+    // consumers are all registered before this ingress phase starts.
     const replayed = await Result.tryPromise({
       try: () => this.replayPendingIngress(),
       catch: (cause) => captureError(cause, "Telegram ingress replay failed"),
@@ -427,12 +442,12 @@ export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolve
     this.ingressStopped = true;
     // Tell the supervisor this settlement is deliberate.
     this.stopping = true;
-    const stopped = await Result.tryPromise({
-      try: () => bot.stop(),
-      catch: (cause) => captureError(cause, "Telegram bot stop failed"),
-    });
-    if (stopped.isErr()) projectTelegramError(stopped.error.cause, "Telegram bot stop failed");
     if (this.pollingStopped) {
+      const stopped = await Result.tryPromise({
+        try: () => bot.stop(),
+        catch: (cause) => captureError(cause, "Telegram bot stop failed"),
+      });
+      if (stopped.isErr()) projectTelegramError(stopped.error.cause, "Telegram bot stop failed");
       const settled = await Result.tryPromise({
         try: () => this.pollingStopped ?? Promise.resolve(),
         catch: (cause) => captureError(cause, "Telegram polling settlement failed"),
@@ -451,13 +466,12 @@ export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolve
 
   async disconnect(): Promise<void> {
     const bot = this.bot;
-    if (!bot) return;
 
     // Set before stopping so the supervisor treats the resulting settlement as
     // a deliberate shutdown rather than a failure.
     this.stopping = true;
     this.bot = null;
-    if (!this.ingressStopped) {
+    if (bot && this.pollingStopped && !this.ingressStopped) {
       // Stopping aborts the in-flight getUpdates, which surfaces as a transport
       // error. That is the expected shape of a clean shutdown, not a failure.
       const stopped = await Result.tryPromise({
@@ -483,6 +497,8 @@ export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolve
     this.ready = null;
     this.store?.close();
     this.store = null;
+    this.me = null;
+    this.self = null;
     this.healthState = {
       ...this.healthState,
       connectionState: "disconnected",
@@ -1502,7 +1518,7 @@ export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolve
    */
   private recordOwnOutput(
     sessionRef: TelegramSessionRef,
-    messages: readonly { messageId: number; text: string }[],
+    messages: readonly { messageId: number; text: string; replyToMessageId?: number }[],
   ): void {
     const store = this.store;
     if (!store || messages.length === 0) return;
@@ -1512,6 +1528,14 @@ export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolve
     const now = Date.now();
 
     for (const message of messages) {
+      const existing = store.getMessage({
+        sessionId: sessionRef.channelId,
+        messageId: String(message.messageId),
+      });
+      // A resumed edit cannot change the original message's reply target.
+      const replyToMessageId =
+        existing?.replyToMessageId ??
+        (message.replyToMessageId === undefined ? undefined : String(message.replyToMessageId));
       store.upsertMessage({
         sessionId: sessionRef.channelId,
         messageId: String(message.messageId),
@@ -1520,8 +1544,20 @@ export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolve
         userId: self?.userId ?? "bot",
         ...(self?.userName === undefined ? {} : { userName: self.userName }),
         text: message.text,
-        ts: now,
+        ts: existing?.ts ?? now,
+        ...(existing ? { editedTs: now } : {}),
+        ...(replyToMessageId === undefined ? {} : { replyToMessageId }),
         fromBot: true,
+        rawJson: JSON.stringify(
+          existing?.raw ?? {
+            telegram: {
+              chatId: String(chatId),
+              ...(threadId === undefined ? {} : { threadId: String(threadId) }),
+              messageId: String(message.messageId),
+              ...(replyToMessageId === undefined ? {} : { replyToMessageId }),
+            },
+          },
+        ),
       });
     }
   }
