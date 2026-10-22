@@ -1,7 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { createLilacBus } from "@stanley2058/lilac-event-bus";
+import {
+  createLilacBus,
+  EventDeliveryTransportFailed,
+  lilacEventTypes,
+  type EventDeliveryDoneError,
+  type RawBus,
+} from "@stanley2058/lilac-event-bus";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
-import { Panic } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
 
 import { composeBuiltinSurfaceRuntimes } from "../../src/runtime/compose-builtin-surface-runtimes";
 import type {
@@ -23,6 +29,8 @@ function createComposition(input: {
   readonly telegramEnabled?: boolean;
   readonly discordEnabled?: boolean;
   readonly nativeDescriptor?: SurfaceRuntimeDescriptor<"native">;
+  readonly rawBus?: RawBus;
+  readonly telegramOnConnect?: (handler: AdapterEventHandler) => Promise<void>;
 }) {
   const logs: Array<{
     readonly level: "debug" | "info" | "warn";
@@ -31,12 +39,30 @@ function createComposition(input: {
   }> = [];
   let adapterEventHandler: AdapterEventHandler | undefined;
   let transcriptStoreLookups = 0;
+  let telegramConnections = 0;
+  let telegramInitialized = false;
+  const fatalErrors: Error[] = [];
   const discordAdapter = {} as SurfaceAdapter;
   const githubAdapter = {} as SurfaceAdapter;
   const telegramAdapter = Object.assign({} as SurfaceAdapter, {
-    connect: async () => undefined,
+    initialize: async () => {
+      telegramInitialized = true;
+    },
+    connect: async () => {
+      telegramConnections += 1;
+      if (!input.telegramOnConnect) return;
+      if (!adapterEventHandler) throw new Error("Telegram ingress was not subscribed");
+      await input.telegramOnConnect(adapterEventHandler);
+    },
     stopIngress: async () => undefined,
-    getSelf: async () => ({ platform: "telegram", userId: "1", userName: "lilac" }) as const,
+    getSelf: async () => {
+      if (!telegramInitialized) throw new Error("telegram adapter: not connected");
+      return { platform: "telegram", userId: "1", userName: "lilac" } as const;
+    },
+    readMsg: async () => Result.ok(null),
+    listMsg: async () => Result.ok([]),
+    getReplyContext: async () => Result.ok([]),
+    planReplyChain: async () => Result.ok([]),
   });
   const eventSource: SurfaceAdapterEventSource = {
     subscribe: async (handler) => {
@@ -44,6 +70,7 @@ function createComposition(input: {
       return { stop: async () => undefined };
     },
   };
+  const bus = createLilacBus(input.rawBus ?? createInMemoryDeliveryBus());
   const created = composeBuiltinSurfaceRuntimes({
     discordAdapter,
     discordEnabled: input.discordEnabled,
@@ -84,7 +111,7 @@ function createComposition(input: {
           },
         }
       : {}),
-    bus: createLilacBus(createInMemoryDeliveryBus()),
+    bus,
     blobStore: {} as BlobStore,
     subscriptionPrefix: "focused",
     webhookSecret: input.webhookSecret,
@@ -98,7 +125,7 @@ function createComposition(input: {
       info: (message, context) => logs.push({ level: "info", message, context }),
       warn: (message, context) => logs.push({ level: "warn", message, context }),
     },
-    reportFatalError: () => undefined,
+    reportFatalError: (error) => fatalErrors.push(error),
   });
   if (created.status === "error") throw created.error;
   return {
@@ -106,6 +133,9 @@ function createComposition(input: {
     discordAdapter,
     githubAdapter,
     telegramAdapter,
+    bus,
+    fatalErrors,
+    getTelegramConnections: () => telegramConnections,
     logs,
     getAdapterEventHandler: () => adapterEventHandler,
     getTranscriptStoreLookups: () => transcriptStoreLookups,
@@ -148,6 +178,8 @@ describe("built-in surface runtime composition", () => {
     }
 
     const adapterIngress = await telegram.adapterIngress.start();
+    expect(composition.getTelegramConnections()).toBe(0);
+    await telegram.adapter.connect();
     const requestIngress = await telegram.requestIngress.start();
     const relay = await telegram.relay.lifecycle.start();
 
@@ -174,7 +206,120 @@ describe("built-in surface runtime composition", () => {
     await relay.stop();
     await requestIngress.stop();
     await adapterIngress.stop();
+    expect(composition.fatalErrors).toEqual([]);
   });
+
+  it("routes an update emitted when ingress starts after shared initialization exactly once", async () => {
+    const composition = createComposition({
+      githubAppCredentialsAvailable: false,
+      telegramEnabled: true,
+      telegramOnConnect: async (handler) => {
+        await handler({
+          type: "adapter.message.created",
+          platform: "telegram",
+          ts: 1,
+          message: {
+            ref: { platform: "telegram", channelId: "1001", messageId: "10" },
+            session: { platform: "telegram", channelId: "1001" },
+            ts: 1,
+            userId: "7",
+            userName: "Ada",
+            text: "lilac hello",
+            raw: { telegram: { mentionsBot: true, isDMBased: false, botUserId: "1" } },
+          },
+        });
+      },
+    });
+    const telegram = composition.registry.entries().find((entry) => entry.platform === "telegram")!;
+    const requests: string[] = [];
+    await composition.bus.subscribeTopic(
+      "cmd.request",
+      { mode: "fanout", subscriptionId: "request-sink", consumerId: "request-sink" },
+      async (message) => {
+        if (message.type === lilacEventTypes.CmdRequestMessage)
+          requests.push(message.headers!.request_id!);
+        return Result.ok(undefined);
+      },
+      () => "park-pending",
+    );
+    const adapterIngress = await telegram.adapterIngress!.start();
+    await telegram.adapter.connect();
+    const requestIngress = await telegram.requestIngress!.start();
+    try {
+      await composition.telegramAdapter.connect();
+      expect(requests).toEqual(["telegram:1001:10"]);
+      expect(composition.getTelegramConnections()).toBe(1);
+    } finally {
+      await requestIngress.stop();
+      await adapterIngress.stop();
+      await composition.bus.close();
+    }
+  });
+
+  for (const topic of ["evt.adapter", "evt.surface", "evt.request"] as const) {
+    it.each(["rejected", "failed", "completed"] as const)(
+      `reports an unexpectedly %s Telegram ${topic} router subscription and fails readiness`,
+      async (termination) => {
+        const raw = createInMemoryDeliveryBus();
+        const done = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
+        const rawBus: RawBus = {
+          ...raw,
+          subscribe: async (subscribedTopic, options, handler) => {
+            const started = await raw.subscribe(subscribedTopic, options, handler);
+            if (
+              subscribedTopic !== topic ||
+              options.mode === "tail" ||
+              !options.subscriptionId.startsWith("focused:telegram-request-router:")
+            )
+              return started;
+            return started.map((subscription) => ({
+              done: done.promise,
+              stop: async () => {
+                done.resolve(Result.ok(undefined));
+                return subscription.stop();
+              },
+            }));
+          },
+        };
+        const composition = createComposition({
+          githubAppCredentialsAvailable: false,
+          telegramEnabled: true,
+          rawBus,
+        });
+        const telegram = composition.registry
+          .entries()
+          .find((entry) => entry.platform === "telegram")!;
+        const ingress = await telegram.requestIngress!.start();
+        const failure = new EventDeliveryTransportFailed({
+          operation: "read",
+          topic,
+          message: "Telegram router subscription lost",
+          cause: new Error("read failed"),
+        });
+        const defect = new Panic({ message: "Telegram subscription defect" });
+        try {
+          if (termination === "rejected") done.reject(defect);
+          if (termination === "failed") done.resolve(Result.err(failure));
+          if (termination === "completed") done.resolve(Result.ok(undefined));
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          for (const runtimeFullyStarted of [false, true]) {
+            const health = await telegram.health!.getContribution({
+              now: 1,
+              runtimeFullyStarted,
+              includeMemoryDiagnostics: false,
+            });
+            expect(health.checks.some((check) => !check.ok && check.impact === "ready")).toBe(true);
+          }
+          expect(composition.fatalErrors).toHaveLength(1);
+          if (termination === "rejected") expect(composition.fatalErrors[0]).toBe(defect);
+          if (termination === "failed") expect(composition.fatalErrors[0]).toBe(failure);
+        } finally {
+          await ingress.stop();
+          await composition.bus.close();
+        }
+      },
+    );
+  }
 
   it("runs native without registering Discord ingress, relay or questions", () => {
     const composition = createComposition({

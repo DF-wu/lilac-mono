@@ -154,6 +154,7 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
             subscriptionId,
             getTranscriptStore: input.getTranscriptStore,
             logger: input.logger,
+            reportFatalError: input.reportFatalError,
           }),
         ]
       : []),

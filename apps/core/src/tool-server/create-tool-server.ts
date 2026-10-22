@@ -58,7 +58,10 @@ import {
 import type { RequestContext, ServerTool } from "./types";
 import { bindRequestInvocationCwd } from "./request-invocation-cwd";
 import type { AuthenticatedSurfaceOrigin, SurfacePrincipal } from "../surface/types";
-import { resolveAuthenticatedRequestSafetyMode } from "../surface/builtin-surface-protocols";
+import {
+  getBuiltinSurfaceProtocol,
+  resolveAuthenticatedRequestSafetyMode,
+} from "../surface/builtin-surface-protocols";
 import { resolveSessionSafetyMode } from "../surface/session-policy";
 import type { AuthenticatedRequestOrigin } from "./request-message-cache";
 
@@ -404,8 +407,16 @@ function isCurrentSessionScopedSurfaceCall(params: {
   const inputSessionId = Reflect.get(params.input, "sessionId");
   if (inputSessionId === undefined || inputSessionId === null || inputSessionId === "") return true;
   if (typeof inputSessionId !== "string") return false;
-  if (params.requestClient === "native" && params.sessionId.startsWith("native:")) {
-    return inputSessionId === params.sessionId || inputSessionId === params.sessionId.slice(7);
+  const inputClient = Reflect.get(params.input, "client");
+  if (
+    params.requestClient === "native" &&
+    (inputClient === undefined || inputClient === "native")
+  ) {
+    const refs = getBuiltinSurfaceProtocol("native").refs;
+    return (
+      refs.createSessionRef(inputSessionId).channelId ===
+      refs.createSessionRef(params.sessionId).channelId
+    );
   }
   return inputSessionId === params.sessionId;
 }

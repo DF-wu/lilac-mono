@@ -1,6 +1,12 @@
-import type { LilacToolPlugin, ServerTool } from "@stanley2058/lilac-plugin-runtime";
+import type {
+  LilacToolPlugin,
+  ServerTool,
+  ServerToolFailure,
+} from "@stanley2058/lilac-plugin-runtime";
+import { Result } from "better-result";
 import { customMediaConfigSchema, type CustomMediaConfig } from "./config";
-import { CustomMediaError, redactDiagnostic } from "./errors";
+import type { ToolCallOptions } from "./contracts";
+import { CustomMediaError, redactDiagnostic, type CustomMediaErrorCode } from "./errors";
 import { generateCustomImage } from "./image";
 import { IMAGE_MODEL_ALIASES, VIDEO_MODEL_ALIASES } from "./models";
 import { generateCustomVideo } from "./video";
@@ -10,6 +16,47 @@ export * from "./errors";
 export * from "./models";
 export * from "./paths";
 export * from "./schemas";
+
+const FAILURE_POLICIES = {
+  INVALID_CONFIG: { kind: "unavailable", retryable: false },
+  MISSING_ENV: { kind: "unavailable", retryable: false },
+  INVALID_INPUT: { kind: "usage", retryable: false },
+  UNSUPPORTED_MODEL: { kind: "usage", retryable: false },
+  UNSUPPORTED_CAPABILITY: { kind: "usage", retryable: false },
+  UNSAFE_PATH: { kind: "denied", retryable: false },
+  INVALID_MEDIA: { kind: "usage", retryable: false },
+  MEDIA_TOO_LARGE: { kind: "usage", retryable: false },
+  PROVIDER_ERROR: { kind: "unavailable", retryable: true },
+  VIDEO_FAILED: { kind: "unavailable", retryable: true },
+  DOWNLOAD_TOO_LARGE: { kind: "usage", retryable: false },
+  TIMEOUT: { kind: "timeout", retryable: true },
+  ABORTED: { kind: "cancelled", retryable: false },
+  IO_ERROR: { kind: "internal", retryable: false },
+} satisfies Record<CustomMediaErrorCode, Pick<ServerToolFailure, "kind" | "retryable">>;
+
+function customMediaFailure(cause: unknown): ServerToolFailure {
+  if (!(cause instanceof CustomMediaError)) throw cause;
+  return {
+    ...FAILURE_POLICIES[cause.code],
+    code: cause.code,
+    message: redactDiagnostic(cause),
+  };
+}
+
+async function callCustomMedia(
+  callableId: string,
+  input: Record<string, unknown>,
+  config: CustomMediaConfig,
+  options?: ToolCallOptions,
+) {
+  if (callableId === "custom-media.image") {
+    return generateCustomImage(input, config, options);
+  }
+  if (callableId === "custom-media.video") {
+    return generateCustomVideo(input, config, options);
+  }
+  throw new CustomMediaError("INVALID_INPUT", `Unknown callable '${callableId}'.`);
+}
 
 export function createCustomMediaServerTool(config: CustomMediaConfig): ServerTool {
   return {
@@ -59,13 +106,14 @@ export function createCustomMediaServerTool(config: CustomMediaConfig): ServerTo
       ];
     },
     async call(callableId, input, options) {
-      if (callableId === "custom-media.image") {
-        return await generateCustomImage(input, config, options);
+      const captured = await Result.tryPromise({
+        try: () => callCustomMedia(callableId, input, config, options),
+        catch: (cause) => ({ restoreCause: () => cause }),
+      });
+      if (captured.isErr()) {
+        return Result.err(customMediaFailure(captured.error.restoreCause()));
       }
-      if (callableId === "custom-media.video") {
-        return await generateCustomVideo(input, config, options);
-      }
-      throw new CustomMediaError("INVALID_INPUT", `Unknown callable '${callableId}'.`);
+      return captured;
     },
   };
 }

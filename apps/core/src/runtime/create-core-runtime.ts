@@ -3875,12 +3875,6 @@ export async function createCoreRuntime(
           await toolServer.init();
           await toolServer.start(toolServerPort);
 
-          await startSurfaceOutputs({
-            registry,
-            requestIngress: surfaceRequestIngressHandles,
-            relays: surfaceRelayHandles,
-          });
-
           let loadedJournalHeads: readonly AgentRunRecoveryHead[] = [];
           if (agentRunJournal) {
             const loadedJournal = agentRunJournal.loadRecoveryHeads();
@@ -4028,7 +4022,7 @@ export async function createCoreRuntime(
             }
           }
 
-          // Start agent runner last so it can't publish replies before relay is online.
+          // Subscribe while paused before surface routers can replay retained adapter events.
           const startedAgentRunner = await startBusAgentRunner({
             bus: durableBus,
             blobStore: activeBlobStore,
@@ -4122,6 +4116,12 @@ export async function createCoreRuntime(
             },
           });
           stopAgentRunner = startedAgentRunner;
+          await startSurfaceOutputs({
+            registry,
+            requestIngress: surfaceRequestIngressHandles,
+            relays: surfaceRelayHandles,
+          });
+          await telegramAdapter?.startIngress();
           if (nativeRuntime) {
             nativeRuntimeResultToHost(await nativeRuntime.recoverOperator());
             nativeRuntimeResultToHost(await nativeRuntime.execution.recoverMutations());

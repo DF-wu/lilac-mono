@@ -88,6 +88,10 @@ Responses whose status is `failed`, `cancelled`, or `incomplete`, API error
 envelopes, non-JSON bodies, and completed responses without a `web_search_call`
 item are all rejected with an error that keeps the HTTP status (see
 [Errors](#errors-and-fallback)).
+If every hosted search call explicitly reports `failed`, the provider reports
+service unavailability and uses the existing fallback chain, even when the envelope
+itself is `completed`. Successful searches with no sources still return an empty
+list; older gateways that omit call status remain supported.
 
 ## What the conversation model receives
 
@@ -144,6 +148,12 @@ makes that visible to the conversation model. Tavily, Exa, and Firecrawl fill
 `content` with page excerpts instead.
 
 ## Configuration
+
+The fork-owned `packages/utils/core-config/openai-web-search.ts` defines the v2
+provider extension and tuning schema. The runtime parser and generated editor
+schema accept the same provider enum, including the legacy singular
+`extract.provider` and `search.provider` aliases. V1 retains its original enum
+without `openai`; existing v2 defaults and configuration need no migration.
 
 Requires `configVersion: 2`. Frozen v1 configurations cannot select this
 provider.

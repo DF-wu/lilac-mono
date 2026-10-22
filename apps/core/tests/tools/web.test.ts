@@ -811,6 +811,29 @@ describe("web provider extraction", () => {
 });
 
 describe("web search and permits", () => {
+  it("falls back when the OpenAI HTTP response completed but all hosted searches failed", async () => {
+    const server = startServer(() =>
+      Response.json({
+        status: "completed",
+        output: [{ type: "web_search_call", status: "failed" }],
+      }),
+    );
+    const recovered = [
+      { url: "https://example.com", title: "Recovered", content: "Found by fallback", score: null },
+    ];
+    const tool = createTool({
+      providers: [
+        new OpenAIWebSearchProvider({
+          apiKey: "test-key",
+          baseUrl: `http://127.0.0.1:${server.port}/v1`,
+        }),
+        configuredProvider("tavily", async () => recovered),
+      ],
+    });
+
+    await expect(toolValue(tool.call("search", { query: "fallback" }))).resolves.toEqual(recovered);
+  });
+
   it("preserves the terminal status category in an aggregated fallback failure", async () => {
     const tool = createTool({
       providers: [

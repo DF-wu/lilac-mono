@@ -581,16 +581,21 @@ remove the field and include the prefix in the referenced value before downgradi
 The production Docker entrypoint coordinates the one-way Core transcript schema 5 and workflow
 schema 25 migration before starting the default Core command. When both databases are at those exact
 legacy versions, startup first writes an immutable backup to
-`/data/migration-backups/blob-storage-v2/<timestamp>/`, then runs the blob-storage migration.
+`${DATA_DIR}/.migration-backups/blob-storage-v5-v25` (normally
+`/data/.migration-backups/blob-storage-v5-v25` in Docker), then runs the blob-storage migration.
 
-If either database is already newer, startup skips this compatibility migration. If either database is
-older or only one database is at the expected legacy version, startup fails closed and requires an
-operator to inspect and migrate the deployment explicitly. Rollback after a successful migration
+Startup skips this compatibility migration when each database is either absent or within its supported
+post-migration version range. If either database is unsupported or only one database is at the expected
+legacy version, startup fails closed and requires an operator to inspect and migrate the deployment
+explicitly. Rollback after a successful migration
 requires restoring the generated backup and running a pre-migration image that expects schema 5/25.
 
 Set `LILAC_AUTO_MIGRATE_BLOB_STORAGE=0` only as an operator-controlled temporary opt-out when the
 migration will be run manually with `bun run migrate:blob-storage`. The Docker gate applies only to the
 image's exact default Core command; maintenance and diagnostic commands do not trigger it.
+The fork-owned `apps/core/scripts/startup-blob-storage-migration.ts` and
+`startup-blob-storage-backup.ts` implement this gate and backup. Running
+`apps/core/src/runtime/main.ts` directly, including through `startCoreRuntime`, does not run it.
 
 ## Agent tool approval removal
 

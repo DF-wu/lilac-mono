@@ -132,6 +132,12 @@ The registry binds one produced-ref-guarded adapter facade and passes that facad
 
 Discord owns its gateway ingress, allowlists, mention/active router, local message cache/search, and Discord rendering. Telegram owns long-polling ingress, chat/user admission, command targeting and menus, its local history index, and Telegram rendering. `apps/core/src/conversation` owns shared Discord/native/Telegram conversation-memory indexing, summarization, embeddings, search, and automatic recall; the Telegram source projection lives in `apps/core/src/surface/telegram/telegram-conversation-source.ts`. Agent memory reads include all retained native threads, allowlisted Discord threads, and Telegram threads whose chat is in `allowedChatIds`; native UI permissions and modification authority remain surface-owned. GitHub owns webhook verification, trigger parsing, API authentication, acknowledgement state, pagination, and GitHub rendering. Shared code must not infer that a wire-valid platform has those capabilities.
 
+Telegram's shared adapter connection initializes its history store and bot identity before request
+and relay consumers can replay retained events. The agent runner subscribes while paused; these
+consumers are installed before Telegram starts polling or replaying its ingress outbox. Unexpected
+router subscription termination withdraws readiness and reports a fatal runtime failure; normal
+shutdown stops supervision with the router.
+
 With table rendering enabled and style `image`, Discord's preview/plain/flat final output renders top-level Markdown tables
 as 2× PNG attachments and starts a new message after each table. When image table rendering is enabled,
 the Discord adapter starts and warms one Chromium browser and page, serializes table renders on that
@@ -315,6 +321,11 @@ Runtime startup does not open `graceful-restart.db`. Existing files are inert. T
 migration keeps a frozen graceful-snapshot decoder only so it can classify and discard supported legacy
 blob-bearing snapshots; runtime code has no graceful-snapshot import path.
 
+The fork's default Docker entrypoint runs `apps/core/scripts/startup-blob-storage-migration.ts`
+before Core to coordinate the supported legacy transcript/workflow migration and immutable backup.
+`startup-blob-storage-backup.ts` owns that backup; `runtime/main.ts` and `startCoreRuntime` own
+Core startup settlement and do not invoke the migration. See [migration and rollback rules](MIGRATIONS.md#automatic-transcript-and-workflow-blob-migration).
+
 Redis Streams is separate durable bus state. Project workflow source lives in each project's `.lilac/workflows`, outside `DATA_DIR`. The workspace operated on by tools is user data, not Lilac metadata.
 
 ### Computer use
@@ -438,7 +449,7 @@ These invariants matter more than a fragile numbered list. Update this section o
 - Core process composition or lifecycle: `apps/core/src/runtime/create-core-runtime.ts`, `compose-builtin-surface-runtimes.ts`, and `surface-runtime-lifecycle.ts`.
 - Surface ref semantics versus executable participation: `apps/core/src/surface/builtin-surface-protocols.ts`, protocol modules, `runtime-descriptor.ts`, and the platform's runtime descriptor.
 - Discord request admission and queue selection: `apps/core/src/surface/discord/discord-request-router.ts`.
-- Telegram ingress, admission, command menus, history, and rendering: `apps/core/src/surface/telegram` and `docs/telegram-surface.md`. Core wires the surface only through `telegram-surface-runtime.ts`; its configuration lives in `packages/utils/core-config/telegram-surface.ts` and `telegram-runtime.ts`. See `docs/fork-differences.md#fork-code-layout` for the fork/upstream ownership map.
+- Telegram ingress, admission, command menus, history, and rendering: `apps/core/src/surface/telegram` and `docs/telegram-surface.md`. Core builds its runtime descriptor through `telegram-surface-runtime.ts` and starts ingress after the shared consumers; its configuration lives in `packages/utils/core-config/telegram-surface.ts` and `telegram-runtime.ts`. See `docs/fork-differences.md#fork-code-layout` for the fork/upstream ownership map.
 - Core resource URI, origin, cache, classification, access, and materialization behavior:
   `apps/core/src/resource`; Discord origin refresh belongs in
   `apps/core/src/surface/discord/discord-resource-origin.ts`.

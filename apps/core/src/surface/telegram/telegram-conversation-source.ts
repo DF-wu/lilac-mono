@@ -54,13 +54,15 @@ export function installTelegramConversationSource(
   const userName = botName
     ? `CASE WHEN m.from_bot=1 THEN ${sqlString(botName)} ELSE m.user_name END`
     : "m.user_name";
-  // The revision changes whenever a message is added, edited, or deleted, so
-  // a stale summary is rebuilt from the current text rather than patched.
+  // Like native, the ordered snapshot feeds the thread store's bounded SHA-256
+  // revision. Counts and edit timestamps alone miss edits within the same second.
   db.run(`CREATE TEMP VIEW telegram_conversation_threads AS SELECT
     s.session_id AS id, s.chat_id,
-    COALESCE((SELECT COUNT(1) || ':' || MAX(m.ts) || ':' || MAX(COALESCE(m.edited_ts,0)) || ':' || SUM(m.deleted)
-      FROM telegram_conversation.telegram_messages m WHERE m.session_id=s.session_id), '0') AS revision,
-    COALESCE((SELECT MAX(m.ts) FROM telegram_conversation.telegram_messages m
+    COALESCE((SELECT group_concat(message,char(0)) FROM
+      (SELECT json_array(m.message_id,m.user_id,${userName},m.text,m.ts,m.edited_ts,m.deleted,m.raw_json) AS message
+        FROM telegram_conversation.telegram_messages m WHERE m.session_id=s.session_id
+        ORDER BY m.ts,CAST(m.message_id AS INTEGER))), '') AS revision,
+    COALESCE((SELECT MAX(MAX(m.ts,COALESCE(m.edited_ts,0))) FROM telegram_conversation.telegram_messages m
       WHERE m.session_id=s.session_id), s.updated_ts) AS updated_at,
     0 AS active
     FROM telegram_conversation.telegram_sessions s`);

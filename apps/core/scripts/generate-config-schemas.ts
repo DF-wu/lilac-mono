@@ -4,7 +4,6 @@ import {
   coreConfigInputSchemaV1,
   migrateWebConfigValue,
   migrateWebExtractConfigValue,
-  webExtractProviderSchema,
 } from "@stanley2058/lilac-utils/core-config/v1";
 import { coreConfigInputSchemaV2 } from "@stanley2058/lilac-utils/core-config/v2";
 import {
@@ -54,7 +53,10 @@ function applyPreprocessorSchema(
     jsonSchema.properties.search = jsonSchema.properties.extract;
   }
   if (transform === migrateWebExtractConfigValue && jsonSchema.properties) {
-    jsonSchema.properties.provider = toEditorSchema(webExtractProviderSchema);
+    const providers = jsonSchema.properties.providers;
+    if (typeof providers !== "object") return;
+    const items = providers.items;
+    if (items && !Array.isArray(items)) jsonSchema.properties.provider = items;
   }
 }
 

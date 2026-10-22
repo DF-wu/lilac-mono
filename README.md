@@ -85,11 +85,14 @@ The durable workflow engine uses the same request bus and stores trigger, wait, 
 ```mermaid
 flowchart LR
     Upstream[stanley2058/lilac-mono main] -->|scheduled check every 6 hours| Sync[Sync Upstream workflow]
-    Sync -->|clean merge| Fork[DF-wu/lilac-mono main]
+    Sync -->|clean candidate| CI[CI]
+    CI -->|pass and unchanged main| Fork[DF-wu/lilac-mono main]
     Features[Fork features and fixes] --> Fork
-    Fork --> CI[CI]
     Fork --> Images[GHCR image workflow]
 ```
+
+Git conflicts remain fork review PRs for human resolution. See the
+[maintenance review](./docs/fork-review-2026-10-22.md) for the current upstream alignment work.
 
 ## Quick Start
 

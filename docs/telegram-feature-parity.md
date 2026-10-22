@@ -9,6 +9,11 @@ The baseline is the Telegram request router rewrite merged as fork PR [#75](http
 > [!IMPORTANT]
 > This is a maintenance document, not a roadmap. When a row's capability is implemented, lands upstream in a platform-neutral form, or is dropped as a non-goal, update or remove the row. "Not yet implemented" means feasible, not approved: it is not a work item until a plan says so.
 
+The [2026-10-22 maintenance review](./fork-review-2026-10-22.md), based on fork `728658f9`
+and upstream `4f7eedb8`, corrects lifecycle supervision, discovered-username routing,
+streamed reply links, and memory revision invalidation within the implemented capabilities.
+It does not change the remaining parity classifications below.
+
 ## How gaps are classified
 
 | Class                 | Meaning                                                                                                                                                                   |

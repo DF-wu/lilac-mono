@@ -268,6 +268,8 @@ export function pickWorkingIndicator(input: {
 
 type OutputMessage = {
   messageId: number;
+  /** The immutable reply target used when this stream created the message. */
+  replyToMessageId?: number;
   /** Last payload successfully handed to the API, for edit deduplication. */
   sentText: string;
   sentMarkup: string;
@@ -351,12 +353,15 @@ export class TelegramOutputStream implements SurfaceOutputStream {
    * updates, so the adapter has to record them into its local index from here
    * or the agent would never see its own prior replies as reply context.
    */
-  getDeliveredMessages(): { messageId: number; text: string }[] {
+  getDeliveredMessages(): { messageId: number; text: string; replyToMessageId?: number }[] {
     return this.messages
       .filter((message) => message.deliveredTextKnown)
       .map((message) => ({
         messageId: message.messageId,
         text: stripTelegramHtml(message.sentText),
+        ...(message.replyToMessageId === undefined
+          ? {}
+          : { replyToMessageId: message.replyToMessageId }),
       }));
   }
 
@@ -745,6 +750,7 @@ export class TelegramOutputStream implements SurfaceOutputStream {
 
     this.messages.push({
       messageId: sent.message_id,
+      ...(replyToMessageId === null ? {} : { replyToMessageId }),
       sentText: html,
       sentMarkup: markupKey(markup),
       deliveredTextKnown: true,

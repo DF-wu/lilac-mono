@@ -197,6 +197,7 @@ type RoutedMessage = {
   readonly replyToMessageId?: string;
   readonly parentChannelId?: string;
   readonly botUserId: string;
+  readonly botUsername?: string;
   readonly botNames: readonly string[];
   readonly requestModelOverride?: string;
   readonly continueCount?: number;
@@ -929,9 +930,10 @@ async function describeRouting(
   const sessionId = event.channelId;
   const isDm = flags.isDMBased === true;
   const parentChannelId = flags.parentChannelId;
+  const botUsername = cfg.surface.telegram.botUsername ?? self.userName;
   const botNames = resolveTelegramBotMentionNames({
     botName: cfg.surface.telegram.botName,
-    botUsername: cfg.surface.telegram.botUsername,
+    botUsername,
   });
   const requestModelOverride = parseLeadingModelOverride({ text: event.text, botNames });
   const continueCount = parseLeadingContinueDirective({ text: event.text, botNames });
@@ -946,6 +948,7 @@ async function describeRouting(
     replyToMessageId: flags.replyToMessageId,
     parentChannelId,
     botUserId: flags.botUserId ?? self.userId,
+    botUsername,
     botNames,
     requestModelOverride,
     continueCount,
@@ -1070,7 +1073,7 @@ async function routeAdapterMessage(
 
   const routed = await describeRouting(ctx, event);
   const command = ctx.customCommands
-    ? commandMetadata(ctx.customCommands, event.text, routed.cfg.surface.telegram.botUsername)
+    ? commandMetadata(ctx.customCommands, event.text, routed.botUsername)
     : null;
   if (command) return handleCustomCommand(ctx, routed, command);
 
