@@ -77,10 +77,14 @@ export function asCustomMediaError(
           "ETIMEDOUT",
           "EPIPE",
         ].includes(error.code)));
+  // The image SDK's base64 decoder can escape its APICallError boundary.
+  const imageDecodingFailure =
+    error instanceof DOMException && error.name === "InvalidCharacterError";
   if (
     !APICallError.isInstance(error) &&
     !NoImageGeneratedError.isInstance(error) &&
-    !systemFailure
+    !systemFailure &&
+    !imageDecodingFailure
   ) {
     throw error;
   }

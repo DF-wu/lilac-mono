@@ -210,6 +210,19 @@ describe("bundled custom-media through Core's Level 2 hook", () => {
     expect(serialized).toContain("REDACTED");
   });
 
+  it("returns malformed provider base64 without a hook defect", async () => {
+    startServer(() => Response.json({ data: [{ b64_json: "not valid base64!" }] }));
+    const invoked = await callBundledTool("custom-media.image", { prompt: "invalid payload" });
+
+    expect(invoked).toMatchObject({
+      status: "ok",
+      value: {
+        status: "error",
+        error: { kind: "unavailable", code: "PROVIDER_ERROR", retryable: true },
+      },
+    });
+  });
+
   it("returns caller cancellation as a semantic failure", async () => {
     startServer(() => Response.json({ data: [] }));
     const invoked = await callBundledTool(

@@ -14,6 +14,7 @@ Both callables return `better-result` Results for the current Level 2 contract. 
 are wrapped in `Result.ok`; expected failures use `Result.err` with a `ServerToolFailure` containing
 the existing custom-media error code, a redacted message, failure kind, and retryability. Core owns
 the wire response envelope. Unexpected defects and Panics propagate to Core's defect handling.
+Malformed provider image payloads, including invalid base64, return a retryable `PROVIDER_ERROR`.
 Image edit requests retain the SDK's routing and explicitly name image and mask multipart uploads
 for Bun compatibility.
 

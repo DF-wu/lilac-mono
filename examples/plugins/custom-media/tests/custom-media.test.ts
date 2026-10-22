@@ -88,10 +88,18 @@ describe("custom-media call defects", () => {
       callableId: "custom-media.image",
       cause: new Panic({ message: "image transport invariant" }),
     },
+    {
+      callableId: "custom-media.image",
+      cause: new DOMException("unexpected image transport state", "InvalidStateError"),
+    },
     { callableId: "custom-media.video", cause: new Error("unexpected video transport defect") },
     {
       callableId: "custom-media.video",
       cause: new Panic({ message: "video transport invariant" }),
+    },
+    {
+      callableId: "custom-media.video",
+      cause: new DOMException("unexpected video transport state", "InvalidStateError"),
     },
   ])(
     "preserves transport defect identity: $callableId $cause.name",
@@ -129,6 +137,17 @@ describe("custom-media call defects", () => {
 });
 
 describe("custom-media.image", () => {
+  it("returns malformed provider base64 as a retryable failure", async () => {
+    startServer(() => Response.json({ data: [{ b64_json: "not valid base64!" }] }));
+
+    await expect(
+      createCustomMediaServerTool(config).call("custom-media.image", { prompt: "invalid payload" }),
+    ).resolves.toMatchObject({
+      status: "error",
+      error: { kind: "unavailable", code: "PROVIDER_ERROR", retryable: true },
+    });
+  });
+
   it.each([1, 2])(
     "uploads %i validated images and a mask with nonempty multipart filenames",
     async (imageCount) => {

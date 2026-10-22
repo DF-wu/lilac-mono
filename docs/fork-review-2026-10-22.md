@@ -30,6 +30,7 @@ review does not restore the old tool or introduce another image abstraction.
 | Authenticated restricted native tool calls treated `thread` and `native:thread` as different destinations. | Normalize with existing native session helpers at both authorization gates; test actual Surface calls and continued rejection of other threads. |
 | The custom-media example returned raw values and threw expected failures after upstream adopted real Level 2 Results. | Return `Result.ok` / `Result.err` with the current failure contract; exercise the built plugin through Core's hook. The only added dependency is the approved `better-result@3.0.1`. |
 | Custom-media edit uploads had unnamed image and mask parts. | Supply multipart filenames while retaining existing validation and routing; inspect requests at a local provider fixture. |
+| Malformed provider base64 escaped the image SDK as `InvalidCharacterError` and was treated as a plugin defect. | Return the existing retryable `PROVIDER_ERROR` Result for that decoding failure; test source and bundled callables while preserving unrelated DOM exceptions and Panic identity. |
 | A completed Responses envelope with only failed hosted searches was accepted as an empty success. | Reject the failed search as unavailable so the existing fallback chain runs; retain successful empty searches and legacy calls without a status. |
 | V2 runtime accepted singular OpenAI provider aliases that the generated editor schema rejected. | Derive each version's alias enum from its own provider items; keep v1 frozen and test runtime/editor agreement. Move fork search schemas and their inferred tuning type to `core-config/openai-web-search.ts`. |
 | The watchdog restart behavior was already upstream; the surviving fork patch only added unused timer injection. | Restore the exact upstream implementation and remove its footprint entry; retain the existing runtime-control tests. |
@@ -66,7 +67,7 @@ The final `bun run check` ran without source changes during the run:
 
 - Generated-schema freshness, typechecks, lint, formatting, and architecture checks passed;
   the architecture suite passed all 113 tests. Lint retains four pre-existing unused-variable warnings.
-- Root tests passed all 24 cases. Core passed 4,186 tests, including the new regressions, with
+- Root tests passed all 24 cases. Core passed 4,187 tests, including the new regressions, with
   two failures also present before this review: native `operator-integration.test.ts` could not
   bind its required port while the host was already listening on `8788`, and the fuzzy-search
   assertion in `tool-server-skills.test.ts` was affected by the host's global skills.
@@ -76,7 +77,7 @@ The final `bun run check` ran without source changes during the run:
   passed another focused 120-test run and found no introduced P1/P2 issue. Retained Redis delivery
   is simulated in the real-adapter/local Bot API fixture; native Core startup also passed against
   isolated Redis.
-- The standalone custom-media example passed 20 tests, typecheck, build, and formatting. Core's
+- The standalone custom-media example passed 23 tests, typecheck, build, and formatting. Core's
   full suite exercised the rebuilt bundle through the actual Level 2 plugin hook.
 - Strict footprint validation against `4f7eedb8` passed: 115 allowed upstream-file differences,
   zero unlisted, and zero stale. The retired watchdog file matches upstream exactly.
