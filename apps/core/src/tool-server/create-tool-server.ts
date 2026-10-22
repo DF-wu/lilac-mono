@@ -152,6 +152,7 @@ type ToolRequestHeaders = {
   readonly requestId?: string;
   readonly requestDeliveryId?: string;
   readonly sessionId?: string;
+  readonly originSessionId?: string;
   readonly requestClient?: string;
   readonly cwd?: string;
   readonly toolCallId?: string;
@@ -182,6 +183,7 @@ const toolRequestHeadersSchema = z.object({
   "x-lilac-request-id": z.string().optional(),
   "x-lilac-request-delivery-id": z.string().optional(),
   "x-lilac-session-id": z.string().optional(),
+  "x-lilac-origin-session-id": z.string().optional(),
   "x-lilac-request-client": z.string().optional(),
   "x-lilac-cwd": z.string().optional(),
   "x-lilac-tool-call-id": z.string().optional(),
@@ -303,6 +305,7 @@ function decodeToolRequestHeaders(
     requestId: headerStr(decoded.data["x-lilac-request-id"]),
     requestDeliveryId: headerStr(decoded.data["x-lilac-request-delivery-id"]),
     sessionId: headerStr(decoded.data["x-lilac-session-id"]),
+    originSessionId: headerStr(decoded.data["x-lilac-origin-session-id"]),
     requestClient: headerStr(decoded.data["x-lilac-request-client"]),
     cwd: headerStr(decoded.data["x-lilac-cwd"]),
     toolCallId: headerStr(decoded.data["x-lilac-tool-call-id"]),
@@ -326,6 +329,7 @@ function parseRequestContext(headers: ToolRequestHeaders): RequestContext {
     requestId: headers.requestId,
     requestDeliveryId: headers.requestDeliveryId,
     sessionId: headers.sessionId,
+    originSessionId: headers.originSessionId,
     requestClient: headers.requestClient,
     cwd: headers.cwd,
     toolCallId: headers.toolCallId,
@@ -415,8 +419,10 @@ function isRestrictedCallableAllowed(params: {
   return isCurrentSessionScopedSurfaceCall({
     callableId: params.callableId,
     input: params.input,
-    sessionId: params.ctx.sessionId,
-    requestClient: params.ctx.requestClient,
+    sessionId: params.ctx.requestInitiator
+      ? params.ctx.requestInitiatorSessionId
+      : params.ctx.sessionId,
+    requestClient: params.ctx.requestInitiator?.platform ?? params.ctx.requestClient,
   });
 }
 
@@ -452,6 +458,7 @@ export type ToolServerOptions = {
     now: number;
   }) => {
     kind: "primary" | "heartbeat";
+    originSessionId?: string;
     principal: SurfacePrincipal | null;
     authenticatedOrigin: AuthenticatedSurfaceOrigin | null;
     allowedCallables: readonly string[] | null;
@@ -1117,6 +1124,7 @@ export function createToolServer(options: ToolServerOptions) {
           }),
         );
       }
+      context.originSessionId = authorized.originSessionId;
       const cachedOrigin = options.requestMessageCache?.getOrigin?.(requestId);
       if (authorized.kind === "heartbeat") {
         if (authorized.authenticatedOrigin !== null || authorized.principal !== null) {

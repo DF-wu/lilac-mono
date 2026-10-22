@@ -7,6 +7,7 @@ Resolve the actual `DATA_DIR`; preserve unrelated configuration and customized p
 ## Establish the destination
 
 If no default is configured, ask: “Where should the default heartbeat output go?” Native is optional.
+The default supports `discord`, `github`, and `native`; `telegram` is not accepted by this setting.
 Resolve the answer through `surface.help`, `surface.sessions.list`, and `surface.messages.list` as
 needed. Save a concrete target as `surface.heartbeat.defaultOutputSession: <client>/<sessionId>`.
 For native `dm`, resolve it and save the concrete thread ID returned in `meta.session.channelId`.

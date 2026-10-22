@@ -15,7 +15,7 @@ import {
 const PNG =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7+9n0AAAAASUVORK5CYII=";
 const JPEG = "/9j/4AAQSkZJRgABAQAAAQABAAD/2Q==";
-const names = ["openai", "openrouter", "xai"] as const;
+const names = ["openai", "openrouter", "xai", "openaiCompatible"] as const;
 const originalProviders = Object.fromEntries(
   names.map((name) => [name, { ...env.providers[name] }]),
 );

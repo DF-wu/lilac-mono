@@ -1075,6 +1075,19 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     category: "wire",
   },
   ...[
+    "decodeOpenAIWebSearchResponse",
+    "decodeOutputItems",
+    "decodeOutputTexts",
+    "decodeUrlCitations",
+    "decodeWebSearchSources",
+  ].map((exportName) => ({
+    identity: {
+      module: "src/tool-server/tools/web-search/openai-web-search-provider.ts",
+      exportName,
+    },
+    category: "wire" as const,
+  })),
+  ...[
     "captureWebConfigFailure",
     "getNumericField",
     "getErrorStatus",
@@ -3399,6 +3412,14 @@ const CORE_EVENT_DELIVERY_CONSUMERS = [
   },
   {
     identity: {
+      module: "src/surface/telegram/telegram-request-router.ts",
+      exportName: "startTelegramRequestRouter",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+  {
+    identity: {
       module: "src/surface/bridge/subscribe-from-bus.ts",
       exportName: "bridgeBusToAdapter",
     },
@@ -3905,7 +3926,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : []),
       ...(root === "apps/core"
-        ? [
+        ? ([
             ...[
               "decodeSentAttachmentMetadata",
               "decodeSentAttachmentStdout",
@@ -3930,6 +3951,17 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "decodeNativeAttachmentProjection",
             ].map((exportName) => ({
               identity: { module: "src/surface/native/conversation-source.ts", exportName },
+              category: "projection" as const,
+            })),
+            ...[
+              "decodeTelegramThreadProjection",
+              "decodeTelegramMessageProjection",
+              "decodeTelegramAttachmentProjection",
+            ].map((exportName) => ({
+              identity: {
+                module: "src/surface/telegram/telegram-conversation-source.ts",
+                exportName,
+              },
               category: "projection" as const,
             })),
             ...["decodeSearchRows", "decodeSearchCount"].map((exportName) => ({
@@ -4006,7 +4038,26 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               },
               category: "wire" as const,
             },
-          ]
+            ...["parseStoredAdapterEvent", "parseStoredTelegramRaw"].map((exportName) => ({
+              identity: {
+                module: "src/surface/telegram/telegram-ingress.ts",
+                exportName,
+              },
+              category: "persistence" as const,
+            })),
+            ...(
+              [
+                ["src/surface/telegram/telegram-raw.ts", "normalizeTelegramReplyReference"],
+                ["src/surface/telegram/telegram-error-projection.ts", "projectTelegramError"],
+                ["src/surface/telegram/telegram-error-projection.ts", "projectTelegramBotFailure"],
+                ["src/surface/telegram/telegram-request-router-composition.ts", "telegramFlags"],
+                ["src/surface/telegram/telegram-inbound-media.ts", "telegramInboundMediaFromRaw"],
+              ] as const
+            ).map(([module, exportName]) => ({
+              identity: { module, exportName },
+              category: "projection" as const,
+            })),
+          ] satisfies readonly BoundaryDecoder[])
         : []),
       ...(root === "apps/computer-use-gateway"
         ? [
@@ -4523,6 +4574,20 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
     ],
     exceptionAdapters: [
       ...(REVIEWED_EXCEPTION_ADAPTERS[root] ?? []),
+      ...(root === "apps/core"
+        ? ([
+            {
+              identity: {
+                module: "src/surface/telegram/telegram-error-projection.ts",
+                exportName: "projectTelegramError",
+              },
+              category: "defect-supervisor" as const,
+              externalApi: { package: "better-result", exportName: "Panic.is" },
+              direction: "observe-panic" as const,
+              reason: "Preserves exact Panic identity while projecting ordinary Telegram failures.",
+            },
+          ] satisfies readonly ExceptionAdapter[])
+        : []),
       ...(PRECISE_EXCEPTION_IDENTITIES[root] ?? []).map(([module, exportName]) => ({
         identity: { module, exportName },
         category: "compatibility" as const,
@@ -4613,6 +4678,17 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "readNativeConversationAttachments",
             ].map((exportName) => ({
               module: "src/surface/native/conversation-source.ts",
+              exportName,
+            })),
+            ...[
+              "decodeTelegramThreadProjection",
+              "decodeTelegramMessageProjection",
+              "decodeTelegramAttachmentProjection",
+              "readTelegramConversationThreads",
+              "readTelegramConversationMessages",
+              "readTelegramConversationAttachments",
+            ].map((exportName) => ({
+              module: "src/surface/telegram/telegram-conversation-source.ts",
               exportName,
             })),
             { module: "src/surface/native/gateway.ts", exportName: "validateNativeFrame" },
@@ -4996,6 +5072,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             {
               module: "src/tool-server/tools/web-search/firecrawl-web-search-provider.ts",
               exportName: "decodeFirecrawlSearchResponse",
+            },
+            {
+              module: "src/tool-server/tools/web-search/openai-web-search-provider.ts",
+              exportName: "decodeOpenAIWebSearchResponse",
             },
             {
               module: "src/tool-server/tools/web-search/firecrawl-permit-pool.ts",
@@ -5475,7 +5555,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "747afd090dba4ff74fe5df8bcc755b9e1e038bc4b4beaf65019f9b8074852e91";
+  "81bf00a7c0d571f6e3aa1fbe16f373d59f21f5144231fa72da752cc3eff5917b";
 
 export const architectureManifest = {
   version: 1,

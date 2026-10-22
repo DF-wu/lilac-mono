@@ -337,7 +337,7 @@ const legacyAgentRecoveryEntrySchema = z.strictObject({
   recovery: recoverySchema.optional(),
 });
 
-const registeredPlatformSchema = z.enum(["discord", "github"]);
+const registeredPlatformSchema = z.enum(["discord", "github", "telegram"]);
 const discordSessionRefSchema = z.strictObject({
   platform: z.literal("discord"),
   channelId: nonemptyStringSchema,
@@ -346,9 +346,14 @@ const githubSessionRefSchema = z.strictObject({
   platform: z.literal("github"),
   channelId: nonemptyStringSchema,
 });
+const telegramSessionRefSchema = z.strictObject({
+  platform: z.literal("telegram"),
+  channelId: nonemptyStringSchema,
+});
 const persistedSessionRefSchema = z.discriminatedUnion("platform", [
   discordSessionRefSchema,
   githubSessionRefSchema,
+  telegramSessionRefSchema,
 ]);
 const discordMsgRefSchema = z.strictObject({
   platform: z.literal("discord"),
@@ -360,9 +365,15 @@ const githubMsgRefSchema = z.strictObject({
   channelId: nonemptyStringSchema,
   messageId: nonemptyStringSchema,
 });
+const telegramMsgRefSchema = z.strictObject({
+  platform: z.literal("telegram"),
+  channelId: nonemptyStringSchema,
+  messageId: nonemptyStringSchema,
+});
 const persistedMsgRefSchema = z.discriminatedUnion("platform", [
   discordMsgRefSchema,
   githubMsgRefSchema,
+  telegramMsgRefSchema,
 ]);
 const authenticatedSurfaceOriginSchema = z.discriminatedUnion("platform", [
   z.strictObject({
@@ -376,6 +387,12 @@ const authenticatedSurfaceOriginSchema = z.discriminatedUnion("platform", [
     userId: nonemptyStringSchema,
     sessionRef: githubSessionRefSchema,
     messageRef: githubMsgRefSchema.optional(),
+  }),
+  z.strictObject({
+    platform: z.literal("telegram"),
+    userId: nonemptyStringSchema,
+    sessionRef: telegramSessionRefSchema,
+    messageRef: telegramMsgRefSchema.optional(),
   }),
 ]);
 const authenticatedRequestProjectionSchema = z.strictObject({
@@ -634,7 +651,7 @@ type GracefulRestartSnapshot = {
 };
 
 const relayMsgRefSchema = z.strictObject({
-  platform: z.enum(["discord", "github"]),
+  platform: z.enum(["discord", "github", "telegram"]),
   channelId: nonemptyStringSchema,
   messageId: nonemptyStringSchema,
 });
@@ -840,7 +857,10 @@ function validateSnapshotCorrelation(
   };
   const relayByRequestId = new Map<
     string,
-    { readonly platform: "discord" | "github"; readonly sessionId: string }
+    {
+      readonly platform: GracefulRestartSnapshot["relays"][number]["platform"];
+      readonly sessionId: string;
+    }
   >();
   const relayIdentities = new Set<string>();
   for (const relay of snapshot.relays) {

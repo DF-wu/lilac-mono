@@ -72,6 +72,18 @@ export {
   DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
   MODEL_REASONING_EFFORTS,
 } from "./core-config/types";
+export {
+  TELEGRAM_SURFACE_DEFAULTS,
+  cloneDefaultTelegramSurface,
+  type TelegramSurfaceConfig,
+} from "./core-config/telegram-surface";
+export {
+  TelegramTokenMissing,
+  isTelegramSurfaceUsable,
+  resolveTelegramDbPath,
+  resolveTelegramToken,
+  resolveTelegramTokenResult,
+} from "./core-config/telegram-runtime";
 export type {
   BlobStorageConfig,
   ConfiguredModelChainEntry,

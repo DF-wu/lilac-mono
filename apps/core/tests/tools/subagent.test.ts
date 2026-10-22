@@ -3,7 +3,7 @@ import { asSchema } from "ai";
 import { Panic } from "better-result";
 
 import { BUILTIN_SURFACE_PROTOCOLS } from "../../src/surface/builtin-surface-protocols";
-import { subagentTools } from "../../src/tools/subagent";
+import { subagentTools, type SubagentDelegationRegistration } from "../../src/tools/subagent";
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
@@ -207,15 +207,10 @@ describe("subagent_delegate tool", () => {
 
   it("passes selected model and reasoning to deferred registration", async () => {
     let selected:
-      | {
-          modelOverride?: string;
-          reasoningOverride?: string;
-          authenticatedOrigin?: {
-            platform: "discord" | "github" | "native";
-            userId: string;
-            sessionRef: { platform: "discord" | "github" | "native"; channelId: string };
-          };
-        }
+      | Pick<
+          SubagentDelegationRegistration,
+          "modelOverride" | "reasoningOverride" | "authenticatedOrigin"
+        >
       | undefined;
     const tools = subagentTools({
       idleTimeoutMs: 2_000,

@@ -37,6 +37,7 @@ export class WorkflowTriggerScheduler {
   private readonly workerId = `workflow-trigger-scheduler:${process.pid}:${crypto.randomUUID()}`;
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
+  private readonly unauthorizedTriggerIds = new Set<string>();
 
   constructor(
     private readonly input: {
@@ -122,6 +123,11 @@ export class WorkflowTriggerScheduler {
       });
     const dueTriggers = readDueTriggers();
     for (const trigger of dueTriggers) {
+      if (!(await this.isTargetAuthorized(trigger))) {
+        this.warnUnauthorizedTarget(trigger);
+        continue;
+      }
+      this.unauthorizedTriggerIds.delete(trigger.triggerId);
       const claimed = this.input.store.tryClaimDueTrigger({
         triggerId: trigger.triggerId,
         claimerId: this.workerId,
@@ -160,6 +166,22 @@ export class WorkflowTriggerScheduler {
         now,
       });
     }
+  }
+
+  private async isTargetAuthorized(trigger: WorkflowTrigger): Promise<boolean> {
+    return !trigger.progressTarget || !this.input.progressCards?.isTargetAuthorized
+      ? true
+      : await this.input.progressCards.isTargetAuthorized(trigger.progressTarget);
+  }
+
+  private warnUnauthorizedTarget(trigger: WorkflowTrigger): void {
+    if (!trigger.progressTarget || this.unauthorizedTriggerIds.has(trigger.triggerId)) return;
+    this.logger.warn("Workflow trigger progress target is no longer authorized", {
+      triggerId: trigger.triggerId,
+      platform: trigger.progressTarget.platform,
+      channelId: trigger.progressTarget.channelId,
+    });
+    this.unauthorizedTriggerIds.add(trigger.triggerId);
   }
 
   private logInitialCardCreationFailure(runId: string, error: Error): void {
@@ -213,6 +235,20 @@ export class WorkflowTriggerScheduler {
     };
     const maxActiveRuns =
       (await this.input.getMaxActiveRuns?.()) ?? DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS;
+    if (!(await this.isTargetAuthorized(trigger))) {
+      this.warnUnauthorizedTarget(trigger);
+      if (
+        !this.input.store.releaseTriggerClaim({
+          triggerId: trigger.triggerId,
+          claimerId: this.workerId,
+          now,
+        })
+      ) {
+        throw new Error(`Lost workflow trigger claim: ${trigger.triggerId}`);
+      }
+      return;
+    }
+    this.unauthorizedTriggerIds.delete(trigger.triggerId);
     const fired = this.input.store.fireClaimedTrigger({
       triggerId: trigger.triggerId,
       claimerId: this.workerId,

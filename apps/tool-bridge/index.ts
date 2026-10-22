@@ -1,4 +1,4 @@
-import { createLogger, env } from "@stanley2058/lilac-utils";
+import { createLogger, env, getCoreConfig } from "@stanley2058/lilac-utils";
 import {
   createCoreToolPluginManager,
   createProcessHandlers,
@@ -10,7 +10,7 @@ const logger = createLogger({
 });
 
 const pluginManager = createCoreToolPluginManager({
-  runtime: {},
+  runtime: { getConfig: () => getCoreConfig() },
   dataDir: env.dataDir,
 });
 

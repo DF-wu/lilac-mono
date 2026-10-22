@@ -1,7 +1,18 @@
 # yaml-language-server: $schema=./.schemas/core-config.schema.json
+# Explicit numeric version: omission uses frozen v1; strings are invalid.
+# null selects the v1 parser but fails its literal schema; omit it or use 1/2.
+# Startup never rewrites/upgrades YAML. See docs/core-config-migrations.md.
+# Most unknown keys warn and are ignored; invalid known values, removed fields,
+# and unknown blobStorage keys fail validation. Model option warnings are not
+# proof that an upstream supports an option.
+# Reload validates config and refreshes consumers, but does not rebuild startup
+# services. Restart boundaries and field-specific units are documented below.
 configVersion: 2
 
 # Managed opaque bytes use local storage below the runtime data directory by default.
+# Adapter/root/bucket/credential changes require a Core restart. This is not a
+# data migration: stop Core, copy all objects preserving IDs, verify references,
+# then cut over. See MIGRATIONS.md (Core unified blob storage clean break).
 # Set an absolute local root when the blob store lives elsewhere:
 # blobStorage:
 #   kind: local
@@ -25,34 +36,76 @@ configVersion: 2
 basePrompt: "You are Lilac."
 
 tools:
+  # Filesystem implementation: fff (default) or node-rg; read by new toolsets.
+  # fff provides indexed discovery/fuzzy_search; node-rg uses Node/ripgrep and
+  # does not expose fuzzy_search. Startup prewarming is not rerun on reload.
+  # fsBackend: fff
   web:
     extract:
+      # Ordered, nonempty search/extraction chain; duplicates are removed.
+      # Values: tavily, exa, firecrawl, openai (search only). Unconfigured providers
+      # are skipped; retryable failures try the next provider, not every failure.
+      # Credentials: TAVILY_API_KEY, EXA_API_KEY, FIRECRAWL_API_KEY, or OpenAI below.
       providers: [tavily]
     fetch:
+      # Default web.fetch mode; a call may override it:
+      # auto: HTTP -> browser -> providers on failure/weak content (not HTML),
+      #       retaining browser content as a last fallback.
+      # fetch: HTTP only; browser: browser only.
+      # extract: providers -> browser on failure (except cancellation).
+      # provider-only: providers only, with no HTTP/browser fallback.
+      # web.extract always uses the provider chain, without browser fallback.
       mode: auto
     # Optional independent process-local limits for Firecrawl fetch and search calls.
+    # queueTtl accepts positive milliseconds or ms/s/m/h/d/w/mo (mo = 30 days).
     # firecrawl:
     #   maxConcurrency: 2
     #   queueTtl: 3s
+    # `openai` in extract.providers runs web.search through the OpenAI Responses web_search tool
+    # (search-only, web.extract skips it). Dates are prompt guidance with this
+    # provider, not enforced publication-date filters. `model` is the provider/model
+    # that runs the hosted search: `openai/...` uses OPENAI_API_KEY / OPENAI_BASE_URL,
+    # `openai-compatible/...` uses OPENAI_COMPATIBLE_API_KEY / OPENAI_COMPATIBLE_BASE_URL.
+    # A bare model id means `openai/<id>`.
+    # openai:
+    #   model: openai/gpt-5-mini   # or openai-compatible/gpt-5.6-terra
+    #   searchContextSize: medium
   inspect:
     # Must start with google/.
     model: google/gemini-3.5-flash
   editFile:
     hashline: true
   output:
+    # Positive integer bytes or B/KB/MB/GB/KiB/MiB/GiB strings (case-sensitive).
+    # Oversized tool text becomes an overflow reference to a scoped resource://
+    # artifact; if storage fails, the full output cannot be recovered from it.
     maxPreviewBytes: 40KiB
+    # Positive milliseconds or ms/s/m/h/d/w/mo; mo = 30 days. No unlimited.
     artifactTtl: 7d
+    # Storage quota for transient tool-result artifacts, not all managed blobs.
     artifactMaxBytesPerSession: 50MiB
   historicalResultPruning:
+    # Rewrites the model view of older tool results; not transcript retention.
+    # Skips the latest human turn and protected tools. Thresholds are nonnegative
+    # estimated token counts; pruning occurs only above minimumTokens.
     enabled: false
+    # Keep this estimated recent eligible tool-output token budget.
     protectTokens: 40000
     minimumTokens: 20000
   media:
+    # Decoded binary bytes in the model view; same positive byte units as output.
+    # These limits do not govern uploads, text output, or artifact retention.
+    # Oversized/unsupported binary parts degrade to metadata/resource markers.
     maxInlineBytesPerPart: 10MiB
     maxInlineBytesTotal: 20MiB
 
+# External plugins are discovered under <DATA_DIR>/plugins; see PLUGIN_AUTHORING.md.
+# Policy/config changes reload with tools. Plugin-specific schemas and lifecycle
+# govern config payload validation; this is not a list of packages to install.
 plugins:
+  # Plugin IDs to disable (built-ins and external plugins).
   disabled: []
+  # Opaque payloads keyed by plugin ID; interpreted by that plugin.
   config: {}
 
 workflows:
@@ -124,9 +177,11 @@ conversation:
       expansionMinConfidence: 0.65
       # Search mode for auto-injected metadata: hybrid, semantic, or lexical.
       mode: hybrid
-      # Restricts Discord-origin recall of Discord threads to participants visible
-      # in the composed request/reply-chain context.
-      # Native candidates and native-origin cross-surface recall remain global.
+      # Both llm and decision lanes: Discord/Telegram origins with recovered
+      # participant IDs recall same-platform threads involving any of those IDs,
+      # plus Native threads. The other messaging platform is excluded.
+      # Native origins and requests without recovered IDs remain unfiltered by
+      # participant, subject to normal candidate eligibility.
       filterCurrentParticipants: false
 
 
@@ -137,6 +192,8 @@ surface:
   # workingIndicators: []
 
   native:
+    # Startup listener/auth/identity settings require restart: enabled, host, port,
+    # publicUrl, installationId, allowedOrigins, auth and auth environment secrets.
     enabled: false
     host: 127.0.0.1
     port: 8789
@@ -150,7 +207,16 @@ surface:
       # Clerk: set ownerProviderUserId and clerkIssuer; clerkOAuthClientId enables TUI login.
       # Local credentials: LILAC_NATIVE_LOCAL_USERNAME, LILAC_NATIVE_LOCAL_PASSWORD_HASH.
       # Session signing: LILAC_NATIVE_SESSION_SECRET (at least 32 bytes).
-    # Native runtime settings live in the database. Edit them in Settings > Deployment.
+    # Native deployment settings live in the database. Edit Settings > Deployment.
+    # Legacy YAML titleModel, outputStreaming, oldMessageSelectionMaxAgeMs,
+    # storageRetentionMaxAgeMs and crossThreadSend seed ONLY an absent deployment
+    # record; later YAML edits/restarts do not overwrite it. See migration guide.
+    # Initial import values (optional):
+    # titleModel: fast
+    # outputStreaming: paragraph  # paragraph | complete
+    # oldMessageSelectionMaxAgeMs: null  # null = no age limit; or positive duration
+    # storageRetentionMaxAgeMs: null    # same units; not agent transcript retention
+    # crossThreadSend: { triggerRun: true }
   # Router behavior is surface-wide (not per-adapter).
   router:
     # Routing modes:
@@ -187,7 +253,7 @@ surface:
     #   "234567890123456789": # Discord server/guild defaults
     #     mode: active
     #     gate: false
-    #     model: "haiku"
+    #     model: "gpt-5.5"
     #     safetyMode: restricted
     #     additionalPrompts:
     #       - "Default memo for channels in this server."
@@ -196,6 +262,7 @@ surface:
     #     # The convenience alias "heartbeat" is also accepted.
     #     model: "sonnet"
 
+    # Integer milliseconds only (no friendly duration suffixes).
     # Debounce window (ms) for active mode initial prompt batching.
     activeDebounceMs: 3000
 
@@ -208,8 +275,10 @@ surface:
   discord:
     tokenEnv: "DISCORD_TOKEN"
 
+    # Connection tokenEnv, dbPath and memberPresence changes require restart.
     # Reuse downloaded Discord ingress attachments for this long. Set ttl to
-    # "unlimited" to keep new cache objects without an expiry.
+    # "unlimited" to keep new cache objects without an expiry. Otherwise use positive
+    # milliseconds or ms/s/m/h/d/w/mo (mo = 30 days). Reload affects new cache writes.
     attachmentCache:
       ttl: 30d
 
@@ -282,6 +351,101 @@ surface:
       # - passthrough: pass the original content through unchanged
       fallbackMode: source
 
+  # Telegram surface (opt-in). Requires configVersion 2.
+  # See docs/telegram-surface.md for BotFather setup and group privacy notes.
+  telegram:
+    # enabled/token/apiRoot/dbPath/commandMenu changes require a Core restart.
+    # Allowlist/rendering settings can reload; botUsername is resolved at connect.
+    # The adapter is only constructed when this is true (and token is set).
+    enabled: false
+
+    # Keep this file private: the token is stored directly in core-config.yaml.
+    # token: "123456789:replace-with-your-bot-token"
+
+    # Fails closed: while allowedChatIds is empty the bot ignores every chat.
+    # Use numeric chat ids (negative for groups/supergroups), as strings.
+    allowedChatIds: []
+
+    # Optional second gate. Empty means "any user in an allowed chat".
+    allowedUserIds: []
+
+    # Display name used in attribution + mention stripping. Must not contain spaces.
+    botName: "lilac"
+
+    # Optional: the @username of the bot, without the leading "@".
+    # Resolved from getMe on connect when omitted.
+    # botUsername: "Catalina_agentbot"
+
+    # Optional: override surface DB location (default: <dataDir>/telegram-surface.db).
+    # Telegram has no history API, so the adapter keeps its own message index.
+    # dbPath: "/path/to/telegram-surface.db"
+
+    # Optional: Bot API endpoint. Telegram supports self-hosted Bot API servers,
+    # which raise the file-size limits and keep traffic on your own network.
+    # Must be a full URL. Changing it takes effect on restart.
+    # Default: https://api.telegram.org
+    # apiRoot: "http://127.0.0.1:8081"
+
+    # What happens to the streamed messages when a request is cancelled.
+    # Telegram edits in place, so a successful run looks identical either way.
+    # - inline: leave the partial answer visible
+    # - preview: delete the streamed messages on cancellation
+    outputMode: preview
+
+    # Message formatting sent to the Bot API:
+    # - html: convert markdown to Telegram HTML (recommended)
+    # - plain: send unformatted text
+    parseMode: html
+
+    # Integer milliseconds only, 500..60000 (no friendly duration suffixes).
+    # Minimum gap between streaming edits. Telegram throttles edits at roughly
+    # one per second per chat; lowering this trips 429 retry_after responses.
+    streamEditIntervalMs: 1500
+
+    # - true: allow messages to notify chat members
+    # - false: send with disable_notification
+    outputNotification: true
+
+    # Publish the custom-command menu via setMyCommands on connect.
+    #
+    # Each command in <dataDir>/cmds is advertised as /lilac_<name>, with
+    # hyphens mapped to underscores because Telegram only accepts
+    # [a-z0-9_]{1,32}. The typed /lilac:<name> form keeps working either way.
+    # An empty registry publishes an empty menu, so removing a command also
+    # removes it from the menu.
+    #
+    # false leaves the bot's existing menu untouched.
+    commandMenu: true
+
+    # Inbound photo/document delivery to the model.
+    #
+    # Media is resolved from Telegram at composition time via the permanent
+    # file_id (never a URL, so the bot token cannot reach composed content or
+    # transcripts). Images and PDFs become inline file parts, text documents
+    # are inlined as text, and audio/video/voice degrade to metadata markers.
+    # Budgets bound decoded bytes; oversized media degrades to a marker.
+    inboundMedia:
+      # false restores caption-only behavior: media is dropped and an
+      # uncaptioned photo does not start a run.
+      enabled: true
+      # Decoded-byte cap per attachment. Accepts friendly sizes ("5MiB").
+      maxBytesPerAttachment: 5MiB
+      # One decoded-byte budget across every attachment in a composed request,
+      # including reply-chain history. The trigger message wins the budget
+      # over older history.
+      maxBytesPerRequest: 10MiB
+
+    # Streaming title phrases for in-progress updates. At least one entry.
+    # Defaults live in packages/utils/working-indicators.ts.
+    # workingIndicators: [Composing, Distilling]
+
+    # Telegram renders fixed-width tables well inside <pre> blocks.
+    markdownTableRender:
+      enabled: true
+      # Style: unicode | ascii. The Discord-only image style is rejected here.
+      style: unicode
+      maxWidth: 50
+      fallbackMode: list
   heartbeat:
     # Enable the internal autonomous heartbeat lane.
     enabled: false
@@ -290,10 +454,15 @@ surface:
     # The alias key "heartbeat" is also accepted.
     # Set through conversation with the heartbeat skill: ask where default updates should go.
     # Native is optional. Per-watch concrete thread destinations override this default.
-    # Format: <client>/<sessionIdOrAlias>, for example: discord/ops. Prefer concrete IDs.
+    # Format: <client>/<sessionIdOrAlias>. Supports discord, github, and native; not telegram.
+    # Discord: channel ID or configured entity.sessions.discord alias, e.g. "discord/ops".
+    # GitHub: github/OWNER/REPO#NUMBER, e.g. "github/DF-wu/lilac-mono#123".
+    # Native: native/<threadId>, including a concrete DM thread resolved during setup.
+    # Destination must exist and be accessible to the configured adapter. Prefer concrete IDs.
     # defaultOutputSession: "discord/ops"
     # When heartbeat gets a chance to think (5-field minute-precision cron).
     cron: "*/30 * * * *"
+    # Integer milliseconds only: quietAfterActivityMs >= 0, retryBusyMs > 0.
     # Suppress heartbeat for this long after any non-heartbeat request activity.
     quietAfterActivityMs: 300000
     # Retry suppressed wakes after this delay.
@@ -305,8 +474,9 @@ surface:
     #   timezone: "Asia/Taipei"
 
 agent:
-  # Retain completed request transcripts by age and count. Each limit can be
-  # set independently to "unlimited".
+  # Retain completed request transcripts by age and count. maxAge accepts positive
+  # milliseconds or ms/s/m/h/d/w/mo (mo = 30 days); maxRequests is a positive
+  # integer count. Each independently accepts "unlimited". Reload applies on save.
   transcriptRetention:
     maxAge: 180d
     maxRequests: 10000
@@ -325,6 +495,7 @@ agent:
 
   # Stop a primary agent run after this long without model, tool, or subagent activity.
   # Active runs may continue indefinitely.
+  # Integer milliseconds only, >= 1500; retry delays below are nonnegative integers.
   idleTimeoutMs: 900000
 
   retry:
@@ -353,7 +524,7 @@ agent:
         modelSlot: main
         # Profile behavior applies identically to direct and workflow launches.
         level1:
-          tools: [bash, read, glob, grep, fuzzy_search, batch]
+          tools: [bash, read, glob, grep, fuzzy_search]
           plugins: [builtin-local-tools]
         level2:
           callables:
@@ -388,11 +559,12 @@ agent:
         # Optional ordered fallback chain. A profile chain takes precedence over
         # the selected model slot or models.def alias chain.
         # fallback:
-        #   - sonnet
+        #   - openrouter/openai/gpt-4o
         #   - model: openrouter/openai/gpt-4o-mini
         #     reasoning: none
         # options:
-        #   temperature: 0.0
+        #   openrouter:
+        #     temperature: 0.0
         # Optional extra prompt fragment appended in explore mode.
         # promptOverlay: |
         #   Focus on codebase mapping, cite concrete file paths, and avoid edits.
@@ -409,7 +581,8 @@ agent:
         # model: "openrouter/openai/gpt-4o"
         # reasoning: medium
         # options:
-        #   temperature: 0.1
+        #   openrouter:
+        #     temperature: 0.1
         # Optional extra prompt fragment appended in general mode.
         # promptOverlay: |
         #   Prioritize execution over discussion and report concrete outcomes.
@@ -425,15 +598,11 @@ agent:
         # model: "openrouter/openai/gpt-4o"
         # reasoning: high
         # options:
-        #   temperature: 0.2
+        #   openrouter:
+        #     temperature: 0.2
         # Optional extra prompt fragment appended in self mode.
         # promptOverlay: |
         #   Assume no prior conversation context; restate assumptions briefly.
-
-# Optional base instructions. Codex uses this for Responses instructions when
-# codex_instructions is absent; other providers prepend it to data/prompts/*.
-# basePrompt: |
-#   You are lilac.
 
 models:
   # Local Claude subscription models use claude-code/<model>, for example:
@@ -450,32 +619,31 @@ models:
   # prefix. First/missing/invalid/scope-mismatched state starts fresh persisted;
   # only an exact compatible continuation forks. Fork-heavy storage may grow
   # roughly quadratically and is not deleted by Core.
-  # Explicit cross-family selection uses lossy text replay. Automatic fallback
-  # never crosses provider families and is disabled for a Claude-headed run.
-  # Optional preset registry to make model selection ergonomic.
+  # Runtime history families are ai-sdk and claude-code, not upstream vendors.
+  # Explicit selection between these families uses lossy text replay. Automatic
+  # fallback can switch vendors within ai-sdk, skips claude-code candidates,
+  # and is disabled when the head uses claude-code.
+  # Named presets: alias keys cannot contain "/"; model values must be provider/model.
+  # Replace the empty registry with this ONE mapping when enabling the examples.
   def: {}
   # def:
   #   gpt-5.5:
   #     model: openai/gpt-5.5
-  #     # Optional guidance shown to agents selecting a subagent model.
+  #     # Guidance is shown for dynamic subagent model selection, not a system prompt.
   #     comment: "Strong default for bounded coding and mechanical work."
-  #     # Explicitly allow dynamic selection by subagent_delegate. Defaults to
-  #     # false; static profiles, model slots, and human overrides are unaffected.
+  #     # Opt into dynamic subagent_delegate selection (default false); static
+  #     # profiles, slots and human overrides are unaffected.
   #     agentCanSelect: true
-  #     # Portable AI SDK reasoning effort:
-  #     # provider-default | none | minimal | low | medium | high | xhigh
+  #     # Portable reasoning: provider-default | none | minimal | low | medium |
+  #     # high | xhigh. Provider-native controls take precedence where supported.
   #     reasoning: high
-  #     # Provider-specific options are still supported and take precedence for
-  #     # exact provider-native reasoning controls.
   #     options:
-  #       reasoningEffort: high
-  #     # Ordered fallback entries can be aliases, provider/model refs, or objects
-  #     # with per-candidate reasoning/options overrides.
+  #       openai:
+  #         reasoningEffort: high
+  #     # All AI SDK vendors share a family. Retry budgets are exhausted per candidate.
+  #     # [] explicitly suppresses inherited fallback; chains are flat, not recursive.
   #     fallback:
-  #       - sonnet
-  #       - model: openrouter/openai/gpt-4o
-  #         reasoning: medium
-  # def:
+  #       - openai/gpt-5-mini
   #   opus:
   #     model: vercel/anthropic/claude-opus-4.8
   #     comment: "Use for architecture, difficult debugging, and critical review."
@@ -483,25 +651,21 @@ models:
   #     options:
   #       anthropic:
   #         thinking:
-  #           # newer Anthropic models use type: "adaptive" and display: "summarized"
+  #           # Adaptive thinking has no budgetTokens; use it only with enabled thinking.
   #           type: adaptive
   #           display: summarized
-  #           budgetTokens: 12000
   #       gateway:
   #         order: [anthropic, vertex, bedrock]
-  # def:
   #   sonnet:
-  #     model: "openrouter/anthropic/claude-sonnet-4.5"
+  #     model: openrouter/anthropic/claude-sonnet-4.5
   #     options:
-  #       # Opt in to Anthropic cache-control injection for the system prompt and
-  #       # latest user message. Disabled by default because cache writes can
-  #       # increase cost and are often ineffective with tool-result pruning.
+  #       # Optional cache-control injection for system/latest-user messages.
+  #       # Cache writes may increase cost, especially with historical pruning.
   #       anthropic_prompt_cache: true
-  #       anthropic:
-  #         thinking:
-  #           type: enabled
-  #       gateway:
-  #         order: [anthropic, vertex, bedrock]
+  #       openrouter:
+  #         reasoning:
+  #           enabled: true
+  #           max_tokens: 12000
 
   main:
     # Can be either a full spec (provider/model) or an alias from models.def.
@@ -509,29 +673,34 @@ models:
     # Optional portable AI SDK reasoning effort.
     # reasoning: provider-default
     # Optional ordered fallback chain. A slot chain takes precedence over a chain
-    # declared by the models.def alias selected above. Runtime fallback skips
-    # candidates outside the head model's provider family; a claude-code head
-    # does not run automatic fallback at all.
+    # declared by the models.def alias selected above. An ai-sdk head can switch
+    # upstream vendors (OpenAI, Anthropic, OpenRouter, etc.) and skips claude-code
+    # candidates; a claude-code head does not run automatic fallback.
     # fallback:
     #   - openrouter/anthropic/claude-sonnet-4.5
-    #   - model: openai/gpt-4o
-    #     reasoning: medium
-    # For non-official OpenAI-compatible upstreams, use:
-    # model: "openai-compatible/your-model-id"
+    #   - model: openrouter/openai/gpt-4o-mini
+    #     reasoning: none
     # options:
-    #   temperature: 0.2
-    #   # For direct openai/codex providers, append commentary/final_answer
-    #   # channel guidance to the end of the system prompt.
+    #   openrouter:
+    #     temperature: 0.1
+    # Alternative direct OpenAI configuration: replace BOTH model and options.
+    # model: openai/gpt-5.5
+    # options:
+    #   # Append commentary/final_answer guidance for direct openai/codex.
     #   response_commentary: true
-    #   # Allow this direct openai/codex model to use OpenAI server-side compaction.
+    #   # Permit server-side compaction for direct openai/codex only.
     #   openai_server_compaction: true
-    #   # For openai/codex providers, parallelToolCalls defaults to true.
-    #   # Set false to force sequential provider-side tool calling.
     #   openai:
+    #     # Defaults to true; false requests sequential provider tool calls.
     #     parallelToolCalls: false
-    #   # openai-compatible provider options use the openaiCompatible namespace.
+    # Non-official compatible upstream: replace BOTH model and options instead.
+    # model: openai-compatible/your-model-id
+    # options:
     #   openaiCompatible:
-    #     temperature: 0.2
+    #     reasoningEffort: medium
+    # Options must be a flat provider-specific object OR a namespace map.
+    # Do not mix flat fields with namespaces. Options vary by provider: temperature
+    # is forwarded by OpenRouter, but is not an openai/openaiCompatible option here.
 
   # Fast/cheap model for lightweight features (router gate, etc.)
   fast:
@@ -540,11 +709,13 @@ models:
     # reasoning: none
     # fallback: [openrouter/openai/gpt-4o]
     # options:
-    #   temperature: 0.0
+    #   openrouter:
+    #     temperature: 0.0
 
   capability:
     # Providers to always treat as unresolved when querying models.dev.
-    # This keeps runtime behavior predictable for providers with unstable metadata.
+    # Suppresses registry lookup, not explicit overrides: overrides still resolve,
+    # including inherit from a resolvable model. It does not block provider calls.
     forceUnknownProviders: ["openai-compatible"]
 
     # Optional manual capability overrides keyed by provider/model spec.
@@ -557,7 +728,11 @@ models:
     #     limit:
     #       context: 262144
     #
-    #   # Full manual override (no inherit): limit.context is required.
+    #   # Full manual override (no inherit): limit.context is required at parsing and resolution.
+    #   # No implicit registry base is merged. cost needs both input and output;
+    #   # modalities needs input. Missing limit.output becomes 0; missing cost or
+    #   # attachment/modalities remains unknown. Inherited partial patches can parse
+    #   # yet fail resolution if their base is unavailable. Prices: USD / 1M tokens.
     #   "custom/private-model":
     #     limit:
     #       context: 131072
@@ -571,10 +746,11 @@ models:
     #     attachment: true
     #
     #   # Inherited override with an explicit over-200k pricing tier patch.
+    #   # Inherit a different spec: self-inheritance fails with an override cycle.
     #   # Note: this only affects cost estimation; limit.context remains what
     #   # you set here (or inherit from models.dev).
     #   "vercel/anthropic/claude-opus-4.6":
-    #     inherit: "vercel/anthropic/claude-opus-4.6"
+    #     inherit: "anthropic/claude-opus-4.6"
     #     cost:
     #       context_over_200k:
     #         input: 10
@@ -592,6 +768,7 @@ models:
 # - Matches are case-insensitive; the canonical casing is preserved from config.
 # - Tokens are sanitized (whitespace -> '_' and leading @/# stripped).
 # - Optional comments are injected into the system prompt alongside alias + raw id.
+#   Keep comments appropriate for agent-visible context; they are not private notes.
 entity:
   users: {}
   sessions:

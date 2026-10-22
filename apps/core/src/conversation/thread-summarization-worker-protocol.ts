@@ -4,7 +4,7 @@ import { z } from "zod";
 const nonemptyStringSchema = z.string().min(1);
 const countSchema = z.number().int().nonnegative();
 const discordMessageRefSchema = z.strictObject({
-  surface: z.enum(["discord", "native"]).optional(),
+  surface: z.enum(["discord", "native", "telegram"]).optional(),
   channelId: nonemptyStringSchema,
   messageId: nonemptyStringSchema,
 });
@@ -75,6 +75,8 @@ export const threadSummarizationWorkerRequestSchema = z.strictObject({
   searchDbPath: nonemptyStringSchema,
   surfaceDbPath: nonemptyStringSchema.optional(),
   nativeDbPath: nonemptyStringSchema.optional(),
+  telegramDbPath: nonemptyStringSchema.optional(),
+  telegramBotName: nonemptyStringSchema.optional(),
 });
 
 export type ThreadSummarizationWorkerRequest = z.infer<

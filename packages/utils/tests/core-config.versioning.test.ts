@@ -13,6 +13,77 @@ import {
 import { deriveSubagentIdleTimeoutMs } from "../subagent-idle-timeout";
 
 describe("core config versioning", () => {
+  it("preserves explicit v1 web tool settings", async () => {
+    // Given
+    const raw = {
+      configVersion: 1,
+      tools: {
+        web: {
+          extract: {
+            providers: ["exa", "firecrawl"],
+          },
+          fetch: {
+            mode: "browser",
+          },
+        },
+      },
+    };
+
+    // When
+    const parsed = await parseCoreConfig(raw);
+
+    // Then
+    expect(parsed.tools.web.extract.providers).toEqual(["exa", "firecrawl"]);
+    expect(parsed.tools.web.fetch.mode).toBe("browser");
+  });
+
+  it("preserves explicit v2 batch and media tool settings", async () => {
+    // Given
+    const raw = {
+      configVersion: 2,
+      tools: {
+        batch: {
+          maxCalls: 4,
+        },
+        media: {
+          maxInlineBytesPerPart: 1_024,
+          maxInlineBytesTotal: 2_048,
+        },
+      },
+    };
+
+    // When
+    const parsed = await parseCoreConfig(raw);
+
+    // Then
+    expect(parsed.tools.batch.maxCalls).toBe(4);
+    expect(parsed.tools.media).toEqual({
+      maxInlineBytesPerPart: 1_024,
+      maxInlineBytesTotal: 2_048,
+    });
+  });
+
+  it("ignores the removed v2 tools.generate image routing block", async () => {
+    // Given
+    const raw = {
+      configVersion: 2,
+      tools: {
+        generate: {
+          image: {
+            provider: "openai-compatible",
+            routes: { "gpt-image-2": "openai/gpt-image-2" },
+          },
+        },
+      },
+    };
+
+    // When
+    const parsed = await parseCoreConfig(raw);
+
+    // Then
+    expect(parsed.tools).not.toHaveProperty("generate");
+  });
+
   it("accepts opt-in image table style in both config versions without changing defaults", () => {
     const v1 = parseCoreConfigV1ToUniversal({
       surface: {
@@ -56,6 +127,15 @@ describe("core config versioning", () => {
     const invalid = parseCoreConfigResult({ configVersion: 2, tools: { output: null } });
     expect(invalid.status).toBe("error");
     if (invalid.status === "error") expect(invalid.error._tag).toBe("CoreConfigV2Invalid");
+
+    const deprecated = parseCoreConfigResult({
+      configVersion: 2,
+      surface: { telegram: { tokenEnv: "TELEGRAM_BOT_TOKEN" } },
+    });
+    expect(deprecated.status).toBe("error");
+    if (deprecated.status === "error") {
+      expect(deprecated.error._tag).toBe("CoreConfigV2Invalid");
+    }
   });
 
   it("keeps legacy config exceptions as Error and ZodError", async () => {
@@ -71,6 +151,12 @@ describe("core config versioning", () => {
     await expect(
       parseCoreConfig({ configVersion: 2, tools: { output: null } }),
     ).rejects.toBeInstanceOf(ZodError);
+    await expect(
+      parseCoreConfig({
+        configVersion: 2,
+        surface: { telegram: { tokenEnv: "TELEGRAM_BOT_TOKEN" } },
+      }),
+    ).rejects.toThrow("surface.telegram.tokenEnv was removed");
   });
 
   it("parses explicit v1 configs with current defaults", async () => {
@@ -156,6 +242,43 @@ describe("core config versioning", () => {
     expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);
     expect(parsed.models.main.reasoning).toBeUndefined();
     expect(parsed.workflows.maxActiveRuns).toBe(64);
+  });
+
+  it("isolates v2 surface defaults between parsed configs", () => {
+    const first = parseCoreConfigV2ToUniversal({ configVersion: 2 });
+    const second = parseCoreConfigV2ToUniversal({ configVersion: 2 });
+
+    first.surface.workingIndicators.push("First-only");
+    first.surface.discord.allowedChannelIds.push("first-only");
+    first.surface.telegram.allowedChatIds.push("first-only");
+    first.surface.telegram.workingIndicators.push("Telegram-only");
+
+    expect(second.surface.workingIndicators).not.toContain("First-only");
+    expect(second.surface.discord.workingIndicators).not.toContain("First-only");
+    expect(second.surface.discord.allowedChannelIds).not.toContain("first-only");
+    expect(second.surface.telegram.allowedChatIds).not.toContain("first-only");
+    expect(second.surface.telegram.workingIndicators).not.toContain("Telegram-only");
+  });
+
+  it("uses shared v2 working indicators unless Discord overrides them", () => {
+    const shared = ["Shared status"];
+    const parsed = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      surface: {
+        workingIndicators: shared,
+      },
+    });
+    const overridden = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      surface: {
+        workingIndicators: shared,
+        discord: { workingIndicators: ["Discord status"] },
+      },
+    });
+
+    expect(parsed.surface.discord.workingIndicators).toEqual(shared);
+    expect(overridden.surface.workingIndicators).toEqual(shared);
+    expect(overridden.surface.discord.workingIndicators).toEqual(["Discord status"]);
   });
 
   it("parses the v2 global workflow active-run cap", async () => {

@@ -34,6 +34,8 @@ Terminal results and operation outputs are stored inline up to 64 KiB and otherw
 
 Progress cards are projected from durable run state and expose state-appropriate pause, resume, and cancel controls. Completion delivery and progress projection retry independently of workflow execution.
 
+Telegram progress delivery is live-authorized rather than frozen at trigger creation. The scheduler checks the current `allowedChatIds` before committing a due run, and the projector checks again immediately before every send, edit, or deleted-card recreation. Revoking a chat therefore blocks future Telegram output from persisted runs and schedules without discarding their durable records.
+
 ## Runtime Compatibility
 
 The current runtime is `lilac-workflow-js-v4`. Compatible migrations preserve journals; runtime clean breaks archive bounded audit summaries and retire incompatible executable records. Schema 23 retired v3 runs, triggers, dispatches, and receipts while leaving source definition files available for validation and saving as v4 revisions.

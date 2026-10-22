@@ -4,6 +4,7 @@ import { z } from "zod";
 import { cloneDefaultWorkingIndicators } from "../working-indicators";
 
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
+import { cloneDefaultTelegramSurface } from "./telegram-surface";
 
 import type {
   ConfigParser,
@@ -793,6 +794,10 @@ function coreConfigV1ToUniversal(
           fallbackMode: "source",
         },
       },
+      // v1's input schema is frozen, so the Telegram surface cannot be
+      // configured on v1. Synthesise the v2 defaults (disabled) so both
+      // versions expose the same universal shape.
+      telegram: cloneDefaultTelegramSurface(),
     },
     agent: {
       ...agentRest,
