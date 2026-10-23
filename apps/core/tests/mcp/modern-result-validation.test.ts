@@ -226,7 +226,8 @@ describe("modern MCP result validation", () => {
     await expect(fetching).rejects.toBe(cancellation);
   });
 
-  it("blocks legacy initialization after the AI SDK discovery timeout", async () => {
+  it("cancels HTTP discovery through the caller deadline without downgrading", async () => {
+    const controller = new AbortController();
     const methods: string[] = [];
     const transport = enforceModernMcpResultContract({
       type: "http",
@@ -241,6 +242,7 @@ describe("modern MCP result validation", () => {
             return;
           }
           signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          controller.abort(new Error("caller deadline reached"));
         });
       }),
     });
@@ -249,9 +251,10 @@ describe("modern MCP result validation", () => {
       createMCPClient({
         transport,
         protocolVersionDiscovery: true,
+        initializationOptions: { signal: controller.signal },
         clientName: "http-timeout-test",
       }),
-    ).rejects.toThrow("Legacy initialization lacks valid discovery evidence");
+    ).rejects.toThrow("MCP client initialization was aborted");
     expect(methods).toEqual(["server/discover"]);
   });
 
