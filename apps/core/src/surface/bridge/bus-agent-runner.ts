@@ -6446,7 +6446,9 @@ export async function startBusAgentRunner(params: {
                 editingToolMode,
                 anthropicPromptCachingEnabled,
                 providerOptionsForAgent,
-                agentSystem,
+                agentSystem: toolset.mcpDiagnostics
+                  ? `${agentSystem}\n\n${toolset.mcpDiagnostics}`
+                  : agentSystem,
                 experimentalDownload,
                 toolset,
                 requestContext: level1RequestContext,

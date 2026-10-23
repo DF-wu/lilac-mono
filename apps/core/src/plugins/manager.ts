@@ -1,3 +1,4 @@
+import type { McpRunScope } from "../mcp/registry-types";
 import { bindMcpToolToSession } from "../mcp/session-context";
 import type { ToolSet } from "ai";
 import type { ClaudeCodeToolCatalogMetadataMap } from "@stanley2058/lilac-claude-code-bridge";
@@ -120,6 +121,7 @@ export type BuildLevel1ToolsetParams = {
 };
 
 export type BuiltLevel1Toolset = {
+  mcpDiagnostics?: string;
   release(): Promise<ResultType<void, ToolPluginCleanupError>>;
   /** Every executable tool, including deferred plugin and MCP tools. */
   tools: ToolSet;
@@ -243,14 +245,21 @@ export function createCoreToolPluginManager(params: {
       return Result.err(pluginOperationFailure("init", initializationError));
     }
     const generation = manager.acquireGeneration();
+    const mcpRun = params.runtime.mcpRegistry?.acquireRun?.(
+      buildParams.requestContext?.requestId ?? crypto.randomUUID(),
+    );
+    const release = async () => {
+      const [, result] = await Promise.all([mcpRun?.release(), generation.release()]);
+      return result;
+    };
     const [built] = await Promise.allSettled([
-      assembleLevel1ToolsetResult(buildParams, generation),
+      assembleLevel1ToolsetResult(buildParams, generation, mcpRun),
     ]);
     if (built.status === "fulfilled") {
       const toolset = built.value.match({ ok: (value) => value, err: () => null });
-      if (toolset) return Result.ok({ ...toolset, release: generation.release });
+      if (toolset) return Result.ok({ ...toolset, release });
     }
-    const [cleanup] = await Promise.allSettled([generation.release()]);
+    const [cleanup] = await Promise.allSettled([release()]);
     if (built.status === "rejected" && isPluginPanic(built.reason)) {
       return adaptToolResultToHost(Result.err(built.reason));
     }
@@ -268,12 +277,13 @@ export function createCoreToolPluginManager(params: {
       err: (error) =>
         logger.error("failed toolset generation cleanup", formatTaggedErrorForLog(error)),
     });
-    return built.value.map((toolset) => ({ ...toolset, release: generation.release }));
+    return built.value.map((toolset) => ({ ...toolset, release }));
   }
 
   async function assembleLevel1ToolsetResult(
     buildParams: BuildLevel1ToolsetParams,
     generation: ReturnType<typeof manager.acquireGeneration>,
+    mcpRun?: McpRunScope,
   ): Promise<
     ResultType<
       Omit<BuiltLevel1Toolset, "release">,
@@ -557,7 +567,10 @@ export function createCoreToolPluginManager(params: {
     }
     for (const entry of mcpTools) {
       const namespaceSummary = mcpNamespaceSummaryByServerId.get(entry.serverId);
-      const scopedTool = bindMcpToolToSession(entry.tool, buildParams.requestContext?.sessionId);
+      const scopedTool = bindMcpToolToSession(
+        mcpRun?.bindTool(entry) ?? entry.tool,
+        buildParams.requestContext?.sessionId,
+      );
       candidates.push({
         identity: entry.identity,
         ...(entry.title === undefined ? {} : { title: entry.title }),
@@ -602,7 +615,18 @@ export function createCoreToolPluginManager(params: {
       assignOpaqueTool(tools, "find_tools", searchTool);
     }
 
+    const mcpDiagnostics = params.runtime.mcpRegistry
+      ?.list()
+      .filter((status) => status.status !== "available")
+      .filter(
+        (status) =>
+          buildParams.runProfile === "primary" ||
+          mcpTools.some((entry) => entry.serverId === status.serverId),
+      )
+      .map((status) => `${status.serverId}: ${status.error}`)
+      .join("\n");
     return Result.ok({
+      ...(mcpDiagnostics ? { mcpDiagnostics: `MCP server availability:\n${mcpDiagnostics}` } : {}),
       tools,
       specs,
       directToolNames,

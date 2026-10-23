@@ -2480,6 +2480,13 @@ export async function createCoreRuntime(
   });
   const mcpRegistryCreated = createMcpRegistryResult({
     configPath: mcpConfigPath,
+    onRecoveryEvent: (event) => {
+      if (event.event === "exhausted") {
+        logger.error("MCP recovery exhausted", event);
+        return;
+      }
+      logger.info("MCP recovery", event);
+    },
     reportFatalError,
     dependencies: {
       createAuthProvider: ({ server }) => mcpOAuthProviders.getProvider(server.id),

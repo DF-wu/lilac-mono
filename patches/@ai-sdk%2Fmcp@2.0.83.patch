@@ -1,8 +1,8 @@
 diff --git a/dist/index.d.ts b/dist/index.d.ts
-index 7c9c531..f369a3f 100644
+index ff29f87..2dc92bb 100644
 --- a/dist/index.d.ts
 +++ b/dist/index.d.ts
-@@ -567,6 +567,10 @@ declare const CallToolResultSchema: z.ZodUnion<[z.ZodUnion<[z.ZodObject<{
+@@ -227,6 +227,10 @@ declare const CallToolResultSchema: z.ZodUnion<[z.ZodUnion<[z.ZodObject<{
      type: z.ZodLiteral<"image">;
      data: z.ZodBase64;
      mimeType: z.ZodString;
@@ -13,7 +13,7 @@ index 7c9c531..f369a3f 100644
    }, z.core.$loose>, z.ZodObject<{
      type: z.ZodLiteral<"resource">;
      resource: z.ZodUnion<readonly [z.ZodObject<{
-@@ -610,6 +614,11 @@ declare const CallToolResultSchema: z.ZodUnion<[z.ZodUnion<[z.ZodObject<{
+@@ -270,6 +274,11 @@ declare const CallToolResultSchema: z.ZodUnion<[z.ZodUnion<[z.ZodObject<{
      type: "image";
      data: string;
      mimeType: string;
@@ -25,7 +25,7 @@ index 7c9c531..f369a3f 100644
    } | {
      [x: string]: unknown;
      type: "resource";
-@@ -664,6 +673,10 @@ declare const CallToolResultSchema: z.ZodUnion<[z.ZodUnion<[z.ZodObject<{
+@@ -324,6 +333,10 @@ declare const CallToolResultSchema: z.ZodUnion<[z.ZodUnion<[z.ZodObject<{
      type: z.ZodLiteral<"image">;
      data: z.ZodBase64;
      mimeType: z.ZodString;
@@ -37,10 +37,10 @@ index 7c9c531..f369a3f 100644
      type: z.ZodLiteral<"resource">;
      resource: z.ZodUnion<readonly [z.ZodObject<{
 diff --git a/dist/index.js b/dist/index.js
-index 8af9cf3..e9cfa16 100644
+index 18b4e84..abe0660 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -139,6 +139,7 @@ const CallToolResultWithContentSchema = ResultSchema.extend({
+@@ -140,6 +140,7 @@ const CallToolResultWithContentSchema = ResultSchema.extend({
  	content: z.array(z.union([
  		TextContentSchema,
  		ImageContentSchema,
@@ -48,7 +48,7 @@ index 8af9cf3..e9cfa16 100644
  		EmbeddedResourceSchema,
  		ResourceLinkContentSchema,
  		UnknownContentSchema
-@@ -155,10 +156,7 @@ const CallToolResultWithStructuredContentSchema = ResultSchema.extend({
+@@ -156,10 +157,7 @@ const CallToolResultWithStructuredContentSchema = ResultSchema.extend({
  	isError: z.boolean().default(false).optional()
  }).transform((result) => ({
  	...result,
@@ -60,16 +60,7 @@ index 8af9cf3..e9cfa16 100644
  })).pipe(CallToolResultWithContentSchema);
  const CallToolResultSchema = CallToolResultWithContentSchema.or(CallToolResultWithStructuredContentSchema).or(ResultSchema.extend({ toolResult: z.unknown().nonoptional() }));
  const ResourceTemplateSchema = z.object({
-@@ -1985,7 +1983,7 @@ async function readMCPAppResource({ client, uri, options }) {
- //#region src/tool/mcp-client.ts
- const CLIENT_VERSION = "1.0.0";
- const DEFAULT_MAX_TOOL_CALL_RETRIES = 0;
--const DEFAULT_PROTOCOL_DISCOVERY_TIMEOUT = 1e3;
-+const DEFAULT_PROTOCOL_DISCOVERY_TIMEOUT = 3e3;
- const MODERN_PROTOCOL_ERROR_CODES = [
- 	-32020,
- 	-32021,
-@@ -2054,27 +2052,21 @@ function mcpToModelOutput({ output }) {
+@@ -2307,27 +2305,21 @@ function mcpToModelOutput({ output }) {
  		type: "json",
  		value: result
  	};
@@ -112,7 +103,7 @@ index 8af9cf3..e9cfa16 100644
  }
  async function createMCPClient(config) {
  	const client = new DefaultMCPClient(config);
-@@ -2128,7 +2120,6 @@ var DefaultMCPClient = class {
+@@ -2388,7 +2380,6 @@ var DefaultMCPClient = class {
  		this.transport.onmessage = (message) => {
  			if ("method" in message) {
  				if ("id" in message) this.onRequestMessage(message);
@@ -120,7 +111,16 @@ index 8af9cf3..e9cfa16 100644
  				return;
  			}
  			this.onResponse(message);
-@@ -2367,6 +2358,7 @@ var DefaultMCPClient = class {
+@@ -2510,7 +2501,7 @@ var DefaultMCPClient = class {
+ 	applyInitializeResult(result) {
+ 		if (!SUPPORTED_PROTOCOL_VERSIONS.includes(result.protocolVersion)) throw new MCPClientError({ message: `Server's protocol version is not supported: ${result.protocolVersion}` });
+ 		this.serverCapabilities = result.capabilities;
+-		this.protocolEra = "legacy";
++		this.protocolEra = result.protocolVersion === LATEST_PROTOCOL_VERSION ? "modern" : "legacy";
+ 		this.protocolVersion = result.protocolVersion;
+ 		this._serverInfo = result.serverInfo;
+ 		this._initializeResult = result;
+@@ -2638,6 +2629,7 @@ var DefaultMCPClient = class {
  		});
  	}
  	async listTools({ params, options } = {}) {
@@ -128,7 +128,7 @@ index 8af9cf3..e9cfa16 100644
  		const result = await this.request({
  			request: {
  				method: "tools/list",
-@@ -2383,7 +2375,7 @@ var DefaultMCPClient = class {
+@@ -2654,7 +2646,7 @@ var DefaultMCPClient = class {
  		const tools = definitions.tools.filter((toolDefinition) => {
  			const result = getMCPToolHeaderBindings(toolDefinition.inputSchema);
  			if (!result.success) {
@@ -137,7 +137,7 @@ index 8af9cf3..e9cfa16 100644
  				return false;
  			}
  			this.toolHeaderBindings.set(toolDefinition.name, result.bindings);
-@@ -2568,11 +2560,7 @@ var DefaultMCPClient = class {
+@@ -2839,11 +2831,7 @@ var DefaultMCPClient = class {
  					description,
  					title: resolvedTitle,
  					metadata,
@@ -150,7 +150,7 @@ index 8af9cf3..e9cfa16 100644
  					execute,
  					toModelOutput: mcpToModelOutput
  				}) : tool({
-@@ -2743,7 +2731,7 @@ var DefaultMCPClient = class {
+@@ -3014,7 +3002,7 @@ var DefaultMCPClient = class {
  		}
  		const messageId = Number(response.id);
  		const handler = this.responseHandlers.get(messageId);
@@ -160,19 +160,10 @@ index 8af9cf3..e9cfa16 100644
  		handler("result" in response ? response : new MCPClientError({
  			message: response.error.message,
 diff --git a/src/tool/mcp-client.ts b/src/tool/mcp-client.ts
-index 08bfa7e..2ab8e14 100644
+index 2c9de8d..3f68874 100644
 --- a/src/tool/mcp-client.ts
 +++ b/src/tool/mcp-client.ts
-@@ -78,7 +78,7 @@ import {
- } from './types';
- const CLIENT_VERSION = '1.0.0';
- const DEFAULT_MAX_TOOL_CALL_RETRIES = 0;
--const DEFAULT_PROTOCOL_DISCOVERY_TIMEOUT = 1000;
-+const DEFAULT_PROTOCOL_DISCOVERY_TIMEOUT = 3000;
- const MODERN_PROTOCOL_ERROR_CODES = [-32020, -32021, -32022];
- 
- const DEFAULT_RETRY_ERROR_CODES = [
-@@ -227,10 +227,19 @@ function mcpToModelOutput({
+@@ -235,10 +235,19 @@ function mcpToModelOutput({
            data: { type: 'data' as const, data: part.data as string },
          };
        }
@@ -192,7 +183,7 @@ index 08bfa7e..2ab8e14 100644
    return { type: 'content', value: convertedContent };
  }
  
-@@ -464,13 +473,9 @@ class DefaultMCPClient implements MCPClient {
+@@ -526,13 +535,9 @@ class DefaultMCPClient implements Omit<MCPClient, 'experimental_events'> {
        if ('method' in message) {
          if ('id' in message) {
            this.onRequestMessage(message);
@@ -208,7 +199,16 @@ index 08bfa7e..2ab8e14 100644
          return;
        }
  
-@@ -908,6 +913,7 @@ class DefaultMCPClient implements MCPClient {
+@@ -751,7 +756,7 @@ class DefaultMCPClient implements Omit<MCPClient, 'experimental_events'> {
+     }
+ 
+     this.serverCapabilities = result.capabilities;
+-    this.protocolEra = 'legacy';
++    this.protocolEra = result.protocolVersion === LATEST_PROTOCOL_VERSION ? 'modern' : 'legacy';
+     this.protocolVersion = result.protocolVersion;
+     this._serverInfo = result.serverInfo;
+     this._initializeResult = result;
+@@ -989,6 +994,7 @@ class DefaultMCPClient implements Omit<MCPClient, 'experimental_events'> {
      params?: PaginatedRequest['params'];
      options?: RequestOptions;
    } = {}): Promise<ListToolsResult> {
@@ -216,7 +216,7 @@ index 08bfa7e..2ab8e14 100644
      const result = await this.request({
        request: { method: 'tools/list', params },
        resultSchema: ListToolsResultSchema,
-@@ -936,6 +942,7 @@ class DefaultMCPClient implements MCPClient {
+@@ -1017,6 +1023,7 @@ class DefaultMCPClient implements Omit<MCPClient, 'experimental_events'> {
          this.onError(
            new MCPClientError({
              message: `Ignoring MCP tool "${toolDefinition.name}": ${result.error}`,
@@ -224,7 +224,7 @@ index 08bfa7e..2ab8e14 100644
            }),
          );
          return false;
-@@ -1249,11 +1256,7 @@ class DefaultMCPClient implements MCPClient {
+@@ -1330,11 +1337,7 @@ class DefaultMCPClient implements Omit<MCPClient, 'experimental_events'> {
                description,
                title: resolvedTitle,
                metadata,
@@ -237,7 +237,7 @@ index 08bfa7e..2ab8e14 100644
                execute,
                toModelOutput: mcpToModelOutput,
              })
-@@ -1516,13 +1519,8 @@ class DefaultMCPClient implements MCPClient {
+@@ -1597,13 +1600,8 @@ class DefaultMCPClient implements Omit<MCPClient, 'experimental_events'> {
      const messageId = Number(response.id);
      const handler = this.responseHandlers.get(messageId);
  
@@ -254,10 +254,10 @@ index 08bfa7e..2ab8e14 100644
      this.responseHandlers.delete(messageId);
  
 diff --git a/src/tool/types.ts b/src/tool/types.ts
-index c3e64af..0d0a1b3 100644
+index 6dfda91..b684aa2 100644
 --- a/src/tool/types.ts
 +++ b/src/tool/types.ts
-@@ -296,6 +296,7 @@ const CallToolResultWithContentSchema = ResultSchema.extend({
+@@ -304,6 +304,7 @@ const CallToolResultWithContentSchema = ResultSchema.extend({
      z.union([
        TextContentSchema,
        ImageContentSchema,
@@ -265,7 +265,7 @@ index c3e64af..0d0a1b3 100644
        EmbeddedResourceSchema,
        ResourceLinkContentSchema,
        UnknownContentSchema,
-@@ -316,12 +317,7 @@ const CallToolResultWithStructuredContentSchema = ResultSchema.extend({
+@@ -324,12 +325,7 @@ const CallToolResultWithStructuredContentSchema = ResultSchema.extend({
    .transform(
      (result): z.infer<typeof CallToolResultWithContentSchema> => ({
        ...result,

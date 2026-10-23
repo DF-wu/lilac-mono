@@ -75,6 +75,7 @@ export type McpReloadOutcome = {
 
 export interface McpRegistryClient {
   readonly serverInfo: MCPClient["serverInfo"];
+  readonly initializeResult?: MCPClient["initializeResult"];
   listTools(options?: Parameters<MCPClient["listTools"]>[0]): Promise<ListToolsResult>;
   toolsFromDefinitions(definitions: ListToolsResult): ReturnType<MCPClient["toolsFromDefinitions"]>;
   close(): Promise<void>;
@@ -104,6 +105,7 @@ export type McpRegistryDependencies = {
     readonly configPath: string;
     readonly valueContext: McpValueResolutionContext;
   }) => OAuthClientProvider | undefined | Promise<OAuthClientProvider | undefined>;
+  readonly scheduleRetry?: (callback: () => void, delayMs: number) => () => void;
   readonly scheduleDeadline?: (callback: () => void, delayMs: number) => () => void;
 };
 
@@ -111,12 +113,26 @@ export type McpRegistryOptions = {
   readonly configPath: string;
   readonly reportFatalError: (error: Error) => void;
   readonly initDeadlineMs?: number;
+  readonly onRecoveryEvent?: (event: McpRecoveryEvent) => void;
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly readTextFile?: (filePath: string) => Promise<string>;
   readonly dependencies?: McpRegistryDependencies;
 };
 
+export type McpRecoveryEvent = {
+  readonly serverId: string;
+  readonly event: "started" | "attempt" | "recovered" | "exhausted";
+  readonly attempt: number;
+  readonly error?: string;
+};
+
+export interface McpRunScope {
+  bindTool(entry: McpCatalogTool): McpConvertedTool;
+  release(): Promise<void>;
+}
+
 export interface McpRegistryApi {
+  acquireRun?(runId: string): McpRunScope;
   init(): Promise<void>;
   waitUntilInitialized?(): Promise<Result<void, McpRegistryStateError>>;
   reload(serverId?: string): Promise<Result<readonly McpReloadOutcome[], McpRegistryReloadFailure>>;

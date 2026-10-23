@@ -1080,7 +1080,7 @@ describe("McpRegistry startup and discovery", () => {
         status: "unavailable",
         phase: "runtime",
       });
-      expect(registry.getTools()).toEqual([]);
+      expect(registry.getTools()).toHaveLength(1);
     } finally {
       releaseSessionGet.resolve();
       await registry.shutdown();
@@ -2085,7 +2085,7 @@ describe("McpRegistry reload and terminal failures", () => {
       phase: "runtime",
       error: "refresh transport failed",
     });
-    expect(registry.getTools()).toEqual([]);
+    expect(registry.getTools()).toHaveLength(1);
     expect(client.closeCount).toBe(1);
     await registry.shutdown();
   });
@@ -2348,7 +2348,7 @@ describe("McpRegistry reload and terminal failures", () => {
     await registry.init();
     transport?.onclose?.();
     expect(sdkCloseCount).toBe(1);
-    expect(registry.getTools()).toEqual([]);
+    expect(registry.getTools()).toHaveLength(1);
     expect(registry.list()[0]).toMatchObject({
       serverId: "local",
       status: "unavailable",
@@ -2406,7 +2406,10 @@ describe("McpRegistry reload and terminal failures", () => {
       reportFatalError: reportUnexpectedFatalError,
       dependencies: {
         readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("local")])),
-        createClient: async () => client,
+        createClient: async () =>
+          client.closeCount === 0
+            ? client
+            : new FakeMcpClient({ first: { tools: [mcpToolDefinition("run")] } }),
       },
     });
     await registry.init();
@@ -2438,11 +2441,9 @@ describe("McpRegistry reload and terminal failures", () => {
     await expect(execute({}, { toolCallId: "third", messages: [], context: {} })).rejects.toThrow(
       "transport request rejected",
     );
-    expect(registry.getTools()).toEqual([]);
+    expect(registry.getTools()).toHaveLength(1);
     expect(registry.list()[0]).toMatchObject({
-      status: "unavailable",
-      phase: "runtime",
-      error: "transport request rejected",
+      status: "available",
     });
     expect(client.closeCount).toBe(1);
     await registry.shutdown();
@@ -2518,7 +2519,7 @@ describe("McpRegistry reload and terminal failures", () => {
     await registry.shutdown();
   });
 
-  it("terminally removes tools on uncaught errors and retries only on explicit reload", async () => {
+  it("retains tools on uncaught errors and supports explicit reload during recovery", async () => {
     const token = "super-secret-token";
     let config: MCPClientConfig | undefined;
     let createCount = 0;
@@ -2557,7 +2558,7 @@ describe("McpRegistry reload and terminal failures", () => {
         `Authorization: Bearer ${token} from https://example.invalid/mcp?token=${token}&state=nope`,
       ),
     );
-    expect(registry.getTools()).toEqual([]);
+    expect(registry.getTools()).toHaveLength(1);
     expect(registry.list()[0]).toMatchObject({ status: "unavailable", phase: "runtime" });
     const error = (registry.list()[0] as { error: string }).error;
     expect(error).not.toContain(token);
