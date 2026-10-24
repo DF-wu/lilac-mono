@@ -17,7 +17,7 @@ user asks to change it. An explicit watch destination does not replace the insta
 ## Establish the files and cadence
 
 1. Inspect the active `HEARTBEAT.md`, `heartbeat/WORK.md`, and relevant `AGENTS.md` instructions.
-   For the legacy ownership/inbox protocol, use [migration.md](migration.md).
+   For monolithic working notes or the legacy ownership/inbox protocol, use [migration.md](migration.md).
 2. Create missing files from the skill's assets. Preserve existing instructions and watches. Agree
    through conversation on changes to discovery or outreach preferences; the starter workflow allows
    inferred watches and agent-authored findings on relevant ongoing responsibilities.

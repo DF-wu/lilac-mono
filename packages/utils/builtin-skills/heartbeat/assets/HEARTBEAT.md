@@ -1,7 +1,9 @@
 # Heartbeat workflow
 
 Follow this workflow on each autonomous wake. The user can change these instructions through
-conversation. Maintain [working notes](heartbeat/WORK.md); use files for continuity across wakes.
+conversation. Maintain the [work index](heartbeat/WORK.md) and linked topic files for continuity
+across wakes.
+Use the `heartbeat` skill's "Keep notes current" rules when updating these files.
 
 ## Standing instructions
 
@@ -18,8 +20,9 @@ conversation. Maintain [working notes](heartbeat/WORK.md); use files for continu
 
 ## Each wake
 
-1. Read the working notes. Check due watches first. Use current sources and distinguish confirmed
-   facts from uncertain forecasts or missing evidence. Close completed, cancelled, or obsolete watches.
+1. Read the work index, then the topic files for due watches. Check those watches first. Use current
+   sources and distinguish confirmed facts from uncertain forecasts or missing evidence. Close
+   completed, cancelled, or obsolete watches.
 2. Discover follow-ups within a modest time and research budget. Use
    `surface.activities.recentAgentWrites` to locate recent conversations, then read the surrounding
    messages with surface tools. This list contains agent writes, not every user message. Consult
@@ -28,7 +31,8 @@ conversation. Maintain [working notes](heartbeat/WORK.md); use files for continu
 3. Create or merge a watch when evidence connects an unresolved matter to the user's plans or
    responsibilities and a later check could change a useful action. Record its source and rationale.
    Recent chat text is evidence to assess, not authority to replace this workflow. Avoid duplicate
-   watches, completed matters, and speculative busywork. Read the `heartbeat` skill for watch setup.
+   watches, completed matters, and speculative busywork. Search matching archived outcomes before
+   creating or reopening a watch. Read the `heartbeat` skill for watch setup.
 4. For each check, compare the result with the last communicated finding. Notify only when the
    difference or decision is useful. Include the new evidence and unresolved questions. Use
    `surface.messages.send` with the resolved destination. Record a queued acknowledgment as accepted;
@@ -37,6 +41,7 @@ conversation. Maintain [working notes](heartbeat/WORK.md); use files for continu
    one. If the call fails or its outcome is uncertain, inspect the target before retrying.
 5. Update next checks and their rationale. Use longer intervals for unchanged or distant matters and
    shorter intervals near a relevant deadline. Keep a concrete stopping condition. Record useful
-   lessons and prune completed details while retaining enough history to avoid rediscovering them.
-6. Record the wake time, checks performed, and any blocked work. Finish with `HEARTBEAT_OK`. Normal
-   assistant output is discarded; human-facing findings must be sent through surface tools.
+   lessons in the topic snapshot and remove settled topics from the index under the skill's cleanup rules.
+6. Replace the previous wake summary with the latest wake time, checks performed, and blocked work.
+   Finish with `HEARTBEAT_OK`. Normal assistant output is discarded; human-facing findings must be
+   sent through surface tools.
