@@ -40,7 +40,7 @@ export function RecentContextProvider({
     thread?.revision,
     refetch,
   ]);
-  return <RecentContext value={online ? query.data : undefined}>{children}</RecentContext>;
+  return <RecentContext value={query.data}>{children}</RecentContext>;
 }
 
 export function ContextMessage({
