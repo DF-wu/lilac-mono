@@ -80,6 +80,7 @@
   "patchedDependencies": {
     "@ai-sdk/mcp@2.0.83": "patches/@ai-sdk%2Fmcp@2.0.83.patch",
     "bun-types@1.4.1": "patches/bun-types@1.4.1.patch",
-    "openai@7.10.0": "patches/openai@7.10.0.patch"
+    "openai@7.10.0": "patches/openai@7.10.0.patch",
+    "just-bash@3.0.1": "patches/just-bash@3.0.1.patch"
   }
 }
