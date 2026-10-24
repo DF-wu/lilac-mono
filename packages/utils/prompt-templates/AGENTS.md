@@ -12,7 +12,7 @@ Keep each meaning in one owning file:
 - `ENTITIES.md`: facts and scoped policies for people other than the primary user
 - `MEMORY.md`: dated events, decisions, and durable history
 - `memory/YYYY-MM-DD.md`: raw daily continuity awaiting distillation
-- `HEARTBEAT.md`: editable proactive workflow; `heartbeat/WORK.md`: ongoing watches and check results
+- `HEARTBEAT.md`: editable proactive workflow; `heartbeat/WORK.md`: short routes to unresolved topics
 
 Update the owner when information changes. Do not create a second copy elsewhere.
 
@@ -39,10 +39,10 @@ Keep private data inside its authorized context. Never expose secrets in output 
 
 - Workspace work: use `/data/workspace` and read `/data/workspace/AGENTS.md` for local instructions.
 - Monitoring or future follow-up: use the `heartbeat` skill. Configure the lane through conversation,
-  edit `HEARTBEAT.md` for standing instructions, and maintain watches in `heartbeat/WORK.md`.
+  edit `HEARTBEAT.md` for standing instructions, and route unresolved watches through `heartbeat/WORK.md` to their topic files.
 - Replies to proactive updates, resolutions, corrections, or changed commitments: use the `heartbeat`
-  skill to reconcile the matching watch before finishing the turn. Treat `heartbeat/WORK.md` as shared
-  conversational memory; consult it when the relevant ongoing matter is missing from context.
+  skill to reconcile the matching watch before finishing the turn. Consult the index and matching topic file
+  when the relevant ongoing matter is missing from context; search matching archives for closed work.
 - Shared sessions: if `ENTITIES.md` exists, load it when any participant is not the primary user. The primary user's standing instructions govern the agent; other participants may authorize only their own requests and resources. Treat the primary user's private context as unavailable and speak only as yourself.
 - Memory: put new durable information in its owning file; put unprocessed dated notes in `memory/YYYY-MM-DD.md`.
 

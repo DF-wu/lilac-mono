@@ -24,8 +24,17 @@ an expected stage has not been observed.
 Active files under `DATA_DIR/prompts`:
 
 - `HEARTBEAT.md`: standing workflow and communication preferences.
-- `heartbeat/WORK.md`: watches, evidence, next checks, previous notifications, discovery progress,
-  and learned lessons. Conversation and heartbeat can both make targeted edits.
+- `heartbeat/WORK.md`: short routes to unresolved topics, next actions or resume conditions, and the
+  latest discovery cursor and coverage gap.
+- `heartbeat/topics/<topic>.md`: current watch state, evidence links, authorization and delivery
+  instructions, last communicated finding, next check, and stopping condition.
+- `heartbeat/archive/<topic>.md`: concise closed outcomes and source references when useful for
+  preventing duplicate work or explaining a decision. Read matching records on demand.
+
+Conversation and heartbeat can both make targeted edits. Replace superseded state and unchanged-check
+timestamps instead of appending history. Remove settled topics from the active index. Existing
+monolithic notes need a conversational migration using the skill's migration reference; deployment
+preserves them and customized workflows.
 
 The `heartbeat` skill's migration reference preserves unfinished work and explicit destinations. Old
 inbox/archive files stay available until conversion is verified. They are no longer the routine handoff
@@ -35,10 +44,10 @@ mechanism after migration.
 
 1. **Default delivery.** Ask for a temporary heartbeat watch due now that sends one uniquely labeled
    setup message to the default destination and stops after success. Let the conversation become idle.
-   Check the received message, its recorded reference, and the completed watch. If you temporarily
+   Check the received message, its recorded reference, and the archived outcome. If you temporarily
    shorten the cron interval, restore it after verification.
 2. **Thread override.** In another thread, ask: “Watch this test event and keep me posted here. On the
-   next heartbeat, send one test update and finish.” Confirm `WORK.md` records that concrete thread.
+   next heartbeat, send one test update and finish.” Confirm the linked topic file records that concrete thread.
    The update should appear there, not in the default channel. On native, receiving it should not start
    another agent run. Reply in the thread to continue the conversation.
 3. **Explicit watch.** Ask the agent to monitor a changing source you control. Change the source,
