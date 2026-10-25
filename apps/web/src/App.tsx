@@ -24,6 +24,7 @@ import { FileViewerProvider } from "./components/file-viewer-context";
 import { RightPanel } from "./components/FileViewer";
 import { useEventCallback } from "./use-event-callback";
 import { ActorAvatar } from "./components/ActorAvatar";
+import { AvatarConnectionContext } from "./components/ui/avatar";
 import { defaultRightPanel } from "./panel-store";
 import { WorkspacePanels, WorkspaceSidePanel } from "./components/WorkspacePanels";
 import { PanelToggleButton } from "./components/PanelToggleButton";
@@ -114,9 +115,12 @@ import "./styles.css";
 export type { AppProps } from "./types";
 const noSkills: readonly SkillChoice[] = [];
 export function App(props: AppProps) {
+  const online = useNativeOnline(props.client);
   return (
     <WorkspaceProvider {...props}>
-      <Workspace {...props} />
+      <AvatarConnectionContext value={online}>
+        <Workspace {...props} />
+      </AvatarConnectionContext>
     </WorkspaceProvider>
   );
 }
