@@ -1,3 +1,4 @@
+import { CopySessionIdContextMenuItem } from "./CopySessionIdMenuItem";
 import { CopyReferenceItem } from "./ConversationReference";
 import { memo, useState } from "react";
 import { useLocation } from "@tanstack/react-router";
@@ -176,11 +177,14 @@ export const SidebarThread = memo(function SidebarThread({
                   {thread.archived ? "Unarchive" : "Archive"}
                 </ContextMenuItem>
               ) : null}
-              <ContextMenuItem variant="destructive" onClick={() => onDelete(id)}>
-                <Trash2 />
-                Delete
-              </ContextMenuItem>
             </>
+          ) : null}
+          {thread ? <CopySessionIdContextMenuItem threadId={id} /> : null}
+          {editable ? (
+            <ContextMenuItem variant="destructive" onClick={() => onDelete(id)}>
+              <Trash2 />
+              Delete
+            </ContextMenuItem>
           ) : null}
         </ContextMenuContent>
       ) : null}

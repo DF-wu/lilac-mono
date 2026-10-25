@@ -1,3 +1,4 @@
+import { CopySessionIdMenuItem } from "./components/CopySessionIdMenuItem";
 import { DirectThreadCard, DirectThreadTitle } from "./components/DirectThreadCard";
 import { currentPushDeviceId } from "./push-device";
 import { NativeComputerViewer } from "./components/ComputerViewer";
@@ -1005,6 +1006,7 @@ function Workspace(props: AppProps) {
                     onToggleSidebar={panels.getState().toggleSidebar}
                     onToggleRight={() => panels.getState().toggle(selectedId)}
                     onNewThread={createThread}
+                    threadId={actionThread?.id}
                     archived={actionThread?.archived}
                     onShare={actionThread?.capabilities.share ? () => setSharing(true) : undefined}
                     onRename={
@@ -1224,35 +1226,37 @@ function Workspace(props: AppProps) {
                                       <Users />
                                     </IconButton>
                                   ) : null}
-                                  {thread.capabilities.edit && thread.kind !== "dm" ? (
-                                    <DropdownMenu>
-                                      <DropdownMenuTrigger
-                                        render={
-                                          <IconButton
-                                            label="Conversation actions"
-                                            tooltip="Options"
+                                  <DropdownMenu>
+                                    <DropdownMenuTrigger
+                                      render={
+                                        <IconButton label="Conversation actions" tooltip="Options">
+                                          <MoreHorizontal />
+                                        </IconButton>
+                                      }
+                                    />
+                                    <DropdownMenuContent align="end" className="min-w-44">
+                                      {thread.capabilities.edit && thread.kind !== "dm" ? (
+                                        <>
+                                          <DropdownMenuItem
+                                            onClick={() =>
+                                              setRename({ id: thread.id, title: thread.title })
+                                            }
                                           >
-                                            <MoreHorizontal />
-                                          </IconButton>
-                                        }
-                                      />
-                                      <DropdownMenuContent align="end">
-                                        <DropdownMenuItem
-                                          onClick={() =>
-                                            setRename({ id: thread.id, title: thread.title })
-                                          }
-                                        >
-                                          <Pencil />
-                                          Rename
-                                        </DropdownMenuItem>
-                                        <DropdownMenuItem
-                                          onClick={() =>
-                                            void update(thread.id, { archived: !thread.archived })
-                                          }
-                                        >
-                                          {thread.archived ? <ArchiveRestore /> : <Archive />}
-                                          {thread.archived ? "Unarchive" : "Archive"}
-                                        </DropdownMenuItem>
+                                            <Pencil />
+                                            Rename
+                                          </DropdownMenuItem>
+                                          <DropdownMenuItem
+                                            onClick={() =>
+                                              void update(thread.id, { archived: !thread.archived })
+                                            }
+                                          >
+                                            {thread.archived ? <ArchiveRestore /> : <Archive />}
+                                            {thread.archived ? "Unarchive" : "Archive"}
+                                          </DropdownMenuItem>
+                                        </>
+                                      ) : null}
+                                      <CopySessionIdMenuItem threadId={thread.id} />
+                                      {thread.capabilities.edit && thread.kind !== "dm" ? (
                                         <DropdownMenuItem
                                           variant="destructive"
                                           onClick={() => setConfirmDelete(thread.id)}
@@ -1260,9 +1264,9 @@ function Workspace(props: AppProps) {
                                           <Trash2 />
                                           Delete
                                         </DropdownMenuItem>
-                                      </DropdownMenuContent>
-                                    </DropdownMenu>
-                                  ) : null}
+                                      ) : null}
+                                    </DropdownMenuContent>
+                                  </DropdownMenu>
                                 </>
                               ) : null;
                               return (
