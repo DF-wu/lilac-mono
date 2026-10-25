@@ -1,3 +1,4 @@
+import { CopySessionIdMenuItem } from "./CopySessionIdMenuItem";
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -39,6 +40,7 @@ export function FloatingChatMenu({
   onToggleSidebar,
   onToggleRight,
   onNewThread,
+  threadId,
   archived,
   onShare,
   onRename,
@@ -51,6 +53,7 @@ export function FloatingChatMenu({
   onToggleSidebar: () => void;
   onToggleRight: () => void;
   onNewThread: () => void;
+  threadId?: string;
   archived?: boolean;
   onShare?: () => void;
   onRename?: () => void;
@@ -224,6 +227,7 @@ export function FloatingChatMenu({
               {archived ? "Unarchive" : "Archive"}
             </DropdownMenuItem>
           ) : null}
+          {threadId ? <CopySessionIdMenuItem threadId={threadId} /> : null}
           {onDelete ? (
             <DropdownMenuItem variant="destructive" onClick={onDelete}>
               <Trash2 />

@@ -4,6 +4,8 @@ import * as React from "react";
 import { Avatar as AvatarPrimitive } from "@base-ui/react/avatar";
 import { cn } from "cn";
 
+export const AvatarConnectionContext = React.createContext(true);
+
 function Avatar({
   className,
   size = "default",
@@ -24,12 +26,27 @@ function Avatar({
   );
 }
 
-function AvatarImage({ className, ...props }: AvatarPrimitive.Image.Props) {
+function AvatarImage({ className, onLoadingStatusChange, ...props }: AvatarPrimitive.Image.Props) {
+  const online = React.useContext(AvatarConnectionContext);
+  const previousOnline = React.useRef(online);
+  const loaded = React.useRef(false);
+  const [attempt, setAttempt] = React.useState(0);
+  React.useEffect(() => {
+    const recovered = online && !previousOnline.current;
+    previousOnline.current = online;
+    // Cached screens mount before authentication recovers. Base UI does not retry the same URL.
+    if (recovered && !loaded.current) setAttempt((value) => value + 1);
+  }, [online]);
   return (
     <AvatarPrimitive.Image
+      key={attempt}
       data-slot="avatar-image"
       className={cn("aspect-square size-full rounded-full object-cover", className)}
       {...props}
+      onLoadingStatusChange={(status) => {
+        loaded.current = status === "loaded";
+        onLoadingStatusChange?.(status);
+      }}
     />
   );
 }

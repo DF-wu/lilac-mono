@@ -1,3 +1,7 @@
+import {
+  CopySessionIdMenuItem,
+  CopySessionIdContextMenuItem,
+} from "./components/CopySessionIdMenuItem";
 import { ContextMessage, NextContextStart, TimestampSeparator } from "./components/RecentContext";
 import { DirectThreadCard } from "./components/DirectThreadCard";
 import { ComputerViewer } from "./components/ComputerViewer";
@@ -1534,7 +1538,7 @@ function Overlays() {
             Thread actions
             <ChevronDown />
           </DropdownMenuTrigger>
-          <DropdownMenuContent>
+          <DropdownMenuContent className="min-w-44">
             <DropdownMenuItem onClick={() => setAction("Rename selected")}>
               <Pencil />
               Rename
@@ -1543,11 +1547,21 @@ function Overlays() {
               <Archive />
               Archive
             </DropdownMenuItem>
+            <CopySessionIdMenuItem threadId="demo-thread" />
             <DropdownMenuSeparator />
             <DropdownMenuItem variant="destructive" onClick={() => setAction("Delete selected")}>
               <Trash2 />
               Delete
             </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+        <DropdownMenu>
+          <DropdownMenuTrigger render={<Button variant="secondary" />}>
+            DM actions
+            <ChevronDown />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent className="min-w-44">
+            <CopySessionIdMenuItem threadId="demo-dm" />
           </DropdownMenuContent>
         </DropdownMenu>
         <Popover>
@@ -1586,6 +1600,7 @@ function Overlays() {
             <Archive />
             Archive
           </ContextMenuItem>
+          <CopySessionIdContextMenuItem threadId="demo-thread" />
           <ContextMenuSeparator />
           <ContextMenuItem variant="destructive" onClick={() => setAction("Delete selected")}>
             <Trash2 />
