@@ -14,12 +14,14 @@ import {
   subagentHistoryOptions,
   composerDraftOptions,
   updateComposerDraft,
+  loadComposerDraft,
   searchOptions,
   userOptions,
   queueOptions,
   refreshQueue,
 } from "../src/queries";
 
+import { applyOptionShortcut, type QuestionPrompt } from "../src/question-reply";
 import { sidebarOptions, settledCountOptions, refreshSidebar } from "../src/sidebar-queries";
 
 type Rpc = NonNullable<NativeClient["rpc"]>;
@@ -42,6 +44,17 @@ function clientWith(rpc: QueryRPC | (() => QueryRPC | undefined)) {
   Object.defineProperty(client, "rpc", { get: () => (typeof rpc === "function" ? rpc() : rpc) });
   return client;
 }
+const prompt: QuestionPrompt = {
+  ordinal: 1,
+  total: 1,
+  header: "Deploy target",
+  question: "Where should this deploy?",
+  options: [
+    { index: 1, label: "Preview link", description: "Preview link", token: "preview" },
+    { index: 2, label: "Staging", description: "Staging", token: "staging" },
+  ],
+  customToken: "custom",
+};
 function cache() {
   return new QueryClient({ defaultOptions: { queries: { staleTime: 30_000, retry: false } } });
 }
@@ -221,6 +234,51 @@ test("late draft hydration cannot overwrite a newer edit or another thread's dra
   await hydration;
   expect(queries.getQueryData(a.queryKey)?.text).toBe("Rewound input");
   expect(queries.getQueryData(b.queryKey)?.text).toBe("Other thread");
+  queries.clear();
+});
+
+test("an option shortcut waits for the saved reply and keeps edits made while it loads", async () => {
+  const scope: CacheScope = {
+    installationId: "fixture",
+    principalId: "owner",
+    protocolVersion: 1,
+    projectionVersion: 1,
+  };
+  const saved = Promise.withResolvers<{ text: string; skillIds: string[] }>();
+  const storage = {
+    readDraft: () => saved.promise,
+    saveDraft: async () => {},
+    listLocalDrafts: async () => [],
+    deleteDraft: async () => {},
+  };
+  const queries = cache();
+  const reply = composerDraftOptions(scope, "thread:question:call", storage);
+  const loading = loadComposerDraft(queries, reply);
+  saved.resolve({ text: "Use the EU region", skillIds: ["deploy"] });
+  const loaded = (await loading).unwrap();
+  expect(loaded).toEqual({ text: "Use the EU region", skillIds: ["deploy"], attachments: [] });
+  expect(applyOptionShortcut(loaded.text, [prompt], 1, 2)).toBe(
+    "Staging (option 2)\n\nUse the EU region",
+  );
+
+  const other = Promise.withResolvers<{ text: string; skillIds: string[] }>();
+  const edited = composerDraftOptions(scope, "thread:question:other", {
+    ...storage,
+    readDraft: () => other.promise,
+  });
+  const pending = loadComposerDraft(queries, edited);
+  const typed = { text: "Typed while loading", skillIds: [], attachments: [] };
+  updateComposerDraft(queries, "thread:question:other", typed);
+  other.resolve({ text: "Older saved reply", skillIds: [] });
+  expect((await pending).unwrap()).toEqual(typed);
+
+  const failure = new Error("IndexedDB is unavailable");
+  const broken = composerDraftOptions(scope, "thread:question:broken", {
+    ...storage,
+    readDraft: () => Promise.reject(failure),
+  });
+  const failed = await loadComposerDraft(queries, broken);
+  expect(failed.isErr() && failed.error).toBe("IndexedDB is unavailable");
   queries.clear();
 });
 
