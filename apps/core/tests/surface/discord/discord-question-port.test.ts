@@ -38,6 +38,10 @@ describe("Discord question port", () => {
     } as const;
 
     const presented = await port.present({
+      requestId: "request-1",
+      questionCallId: "question-1",
+      userId: "user-1",
+      mode: "sync",
       sessionRef: { platform: "discord", channelId: "channel" },
       replyTo: { platform: "discord", channelId: "channel", messageId: "turn" },
       prompt,

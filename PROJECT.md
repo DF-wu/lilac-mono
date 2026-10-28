@@ -103,6 +103,14 @@ cover. Rewind fences the discarded generation, waits for runner cancellation, re
 transcript references and finishes its persisted mutation before admitting new work. Startup resumes
 unfinished mutations before recovering native requests. See [native migrations](MIGRATIONS.md#native-output-recovery-frontier).
 
+Native structured questions use a native question port with canonical display records in the native
+store. Deferred calls remain pending across turn completion and restart. Ordinary native inputs carry
+an optional question-reply reference; input acceptance and question resolution commit together.
+`questions.pending` finds unanswered calls outside the loaded history window. The web uses the ordinary
+composer for freeform answers and attachments. Explicit sync calls wait for a reply. Discord retains
+its shared question service and live continuation. Deferred calls have no inactivity timeout; sync calls
+retain the ten-minute timeout. TUI question controls are not implemented.
+
 Native thread and subagent views subscribe through `streams.*` with a display target and replay
 checkpoint. Both reuse the semantic output publisher, display projection, native replay tables,
 client store, and web turn renderer. Child `agent-stream` records hold workflow identity and a

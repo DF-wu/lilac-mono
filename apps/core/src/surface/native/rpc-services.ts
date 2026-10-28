@@ -1,3 +1,4 @@
+import type { NativeQuestions } from "./questions";
 import type { NativePush } from "./push";
 import type { NativeComputer } from "./computer";
 import type { NativeReferences } from "./references";
@@ -36,6 +37,7 @@ import type { NativeSearchStore } from "./store-search";
 import type { NativeSurfaceStore } from "./store-surface";
 
 export type NativeRpcServiceOptions = {
+  questions?: Pick<NativeQuestions, "read" | "pending" | "dismiss">;
   push?: NativePush;
   computer?: Pick<NativeComputer, "read">;
   references?: Pick<NativeReferences, "resolve" | "read" | "range">;
@@ -1023,6 +1025,17 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
           });
         });
       },
+    },
+    questions: {
+      read: (principal, input) =>
+        options.questions?.read(principal.userId, input) ??
+        Result.err(nativeFailure("not-found", "Questions are unavailable")),
+      pending: (principal, input) =>
+        options.questions?.pending(principal.userId, input) ??
+        Result.err(nativeFailure("not-found", "Questions are unavailable")),
+      dismiss: (principal, input) =>
+        options.questions?.dismiss(principal.userId, input) ??
+        Result.err(nativeFailure("not-found", "Questions are unavailable")),
     },
     computer: {
       read: (principal, input, signal) =>

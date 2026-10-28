@@ -1,3 +1,5 @@
+import type { QuestionService } from "../../../src/question/question-service";
+import type { QuestionCall } from "../../../src/question/question-domain";
 import { DurableWorkflowStore } from "../../../src/workflow/durable-workflow-store";
 import { WorkflowLiveParentBridge } from "../../../src/workflow/workflow-live-parent-bridge";
 import { WorkflowSubagentDispatcher } from "../../../src/workflow/workflow-subagent-dispatcher";
@@ -14251,4 +14253,121 @@ it("persists heartbeat handoff before deferred messages have surface references"
   } finally {
     store.close();
   }
+});
+
+describe("deferred questions in the production runner", () => {
+  it.each(["answer", "cancel"] as const)(
+    "settles a silent pending-question request on %s",
+    async (action) => {
+      const bus = createLilacBus(createInMemoryRawBus());
+      const pluginManager = corePrimaryTestPluginManager();
+      const requestId = "question-runner-test";
+      const pendingObserved = deferred<void>();
+      let listener: ((requestId: string) => void) | undefined;
+      let pending: QuestionCall | undefined;
+      let modelCalls = 0;
+      const questions = {
+        subscribe: (callback: (requestId: string) => void) => {
+          listener = callback;
+          return () => {
+            listener = undefined;
+          };
+        },
+        listDeferred: () => {
+          if (pending?.state === "pending") pendingObserved.resolve(undefined);
+          return Result.ok(pending ? [pending] : []);
+        },
+        cancelRequest: async () => {},
+      } as unknown as QuestionService;
+      const config = parseCoreConfigV2ToUniversal({});
+      config.models.main = { model: "openai/question-test" };
+      const lifecycle = await observeRequestLifecycle(bus, requestId);
+      const runner = await startBusAgentRunner({
+        bus,
+        blobStore: transcriptResultValue(await createMemoryBlobStore()),
+        pluginManager,
+        questions,
+        config,
+        subscriptionId: "question-runner-test",
+        reportFatalPanic: (panic) => {
+          throw panic;
+        },
+        issueControlCapability: () => ({ capability: "question-test", principal: null }),
+        createAgent: (options) =>
+          new AiSdkPiAgent({
+            ...options,
+            model: new MockLanguageModelV4({
+              modelId: "question-test",
+              doStream: async ({ prompt }) => {
+                modelCalls++;
+                if (modelCalls === 1) {
+                  pending = {
+                    questionCallId: "q1",
+                    requestDeliveryId: "d1",
+                    requestId,
+                    toolCallId: "t1",
+                    platform: "discord",
+                    mode: "deferred",
+                    sessionId: "question-channel",
+                    userId: "u1",
+                    input: { questions: [] },
+                    currentIndex: 0,
+                    answers: [],
+                    messageId: "q1",
+                    state: "pending",
+                    createdAt: 1,
+                    updatedAt: 1,
+                  };
+                  return level1TextStep("NO_REPLY");
+                }
+                expect(JSON.stringify(prompt)).toContain("question_result");
+                expect(JSON.stringify(prompt)).toContain("Use staging");
+                return level1TextStep("Using staging.");
+              },
+            }),
+          }),
+      });
+      try {
+        await publishRunnerRequest({
+          bus,
+          requestId,
+          requestDeliveryId: crypto.randomUUID(),
+          sessionId: "question-channel",
+          requestClient: "discord",
+          text: "Choose a target",
+        });
+        expect(
+          await Promise.race([pendingObserved.promise.then(() => "pending"), lifecycle.terminal]),
+          lifecycle.details.join("; "),
+        ).toBe("pending");
+        if (action === "cancel") {
+          await publishRunnerRequest({
+            bus,
+            requestId,
+            sessionId: "question-channel",
+            requestClient: "discord",
+            queue: "interrupt",
+            text: "cancel",
+            raw: { cancel: true },
+          });
+          expect(await lifecycle.terminal).toBe("cancelled");
+          expect(modelCalls).toBe(1);
+          return;
+        }
+        pending = {
+          ...pending!,
+          state: "answered",
+          answers: [{ questionId: "target", answer: { kind: "custom", text: "Use staging" } }],
+        };
+        listener!(requestId);
+        expect(await lifecycle.terminal).toBe("resolved");
+        expect(modelCalls).toBe(2);
+      } finally {
+        await lifecycle.stop();
+        await runner.stop();
+        await pluginManager.destroy();
+        await bus.close();
+      }
+    },
+  );
 });

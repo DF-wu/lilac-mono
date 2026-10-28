@@ -1,7 +1,7 @@
 import type { NativeRuntimeOptions } from "../../../src/surface/native/runtime";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { MockLanguageModelV4 } from "ai/test";
+import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import { createNativeIntegrationFixture, nativeFixtureTextResponse } from "./integration-fixture";
 import { seedNativeBrowserFixture } from "./browser-seed";
 
@@ -60,6 +60,92 @@ const HTML_PREVIEW_PAGE = `<!doctype html>
 </html>
 `;
 
+const fixtureQuestions = [
+  {
+    id: "target",
+    header: "Deploy target",
+    question: "Where should I deploy the preview build?",
+    options: [
+      {
+        id: "link",
+        label: "Preview link",
+        description: "Create an isolated link that expires in 7 days.",
+      },
+      {
+        id: "staging",
+        label: "Staging",
+        description: "Replace the shared staging build. Teammates see it right away.",
+      },
+    ],
+  },
+  {
+    id: "database",
+    header: "Database",
+    question: "Which data should the preview use?",
+    options: [
+      {
+        id: "snapshot",
+        label: "Nightly snapshot",
+        description: "Copy last night's data with personal fields removed.",
+      },
+      { id: "empty", label: "Empty", description: "Start with the schema and fixture users only." },
+      {
+        id: "replica",
+        label: "Read replica",
+        description: "Read live production data. Writes stay disabled.",
+      },
+    ],
+  },
+  {
+    id: "notify",
+    header: "Notify",
+    question: "Who should get the preview link?",
+    options: [
+      { id: "me", label: "Just me", description: "Send the link only to you." },
+      { id: "team", label: "Team channel", description: "Post the link in #web-previews." },
+    ],
+  },
+];
+
+// Question replies use the ordinary input path with their original prompt context.
+async function fixtureStream({ prompt }: Parameters<MockLanguageModelV4["doStream"]>[0]) {
+  const last = prompt.at(-1);
+  if (last?.role === "tool") return nativeFixtureTextResponse("NO_REPLY");
+  const request = JSON.stringify(prompt.findLast((item) => item.role === "user"));
+  if (request.includes("question_result") || request.includes("Reply to question "))
+    return nativeFixtureTextResponse("Thanks. I'll continue with those choices.");
+  if (/ask me/iu.test(request))
+    return {
+      stream: simulateReadableStream({
+        chunks: [
+          {
+            type: "tool-call" as const,
+            toolCallId: `ask_${crypto.randomUUID()}`,
+            toolName: "question",
+            input: JSON.stringify({
+              questions: /one question/iu.test(request)
+                ? fixtureQuestions.slice(0, 1)
+                : fixtureQuestions,
+            }),
+          },
+          {
+            type: "finish" as const,
+            finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
+            usage: {
+              inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 },
+              outputTokens: { total: 0, text: 0, reasoning: 0 },
+            },
+          },
+        ],
+      }),
+    };
+  return nativeFixtureTextResponse(
+    /html preview/iu.test(request)
+      ? "Here is this week's run summary.\n\n```html-preview-file\nhtml-preview/weekly-runs.html\n```\n\nThursday had the most runs."
+      : "Fixture response.\n\nReady for the next message.",
+  );
+}
+
 export const browserFixtureParticipant = {
   username: "participant",
   password: "native-participant-password",
@@ -83,15 +169,8 @@ export async function startNativeBrowserFixture(
   const fixture = await createNativeIntegrationFixture({
     mcpRegistry,
     // Prompts that mention an HTML preview get a reply with a saved chart page.
-    model: new MockLanguageModelV4({
-      modelId: "native-fixture",
-      doStream: async ({ prompt }) =>
-        nativeFixtureTextResponse(
-          /html preview/iu.test(JSON.stringify(prompt.findLast((item) => item.role === "user")))
-            ? "Here is this week's run summary.\n\n```html-preview-file\nhtml-preview/weekly-runs.html\n```\n\nThursday had the most runs."
-            : "Fixture response.\n\nReady for the next message.",
-        ),
-    }),
+    model: new MockLanguageModelV4({ modelId: "native-fixture", doStream: fixtureStream }),
+    questions: true,
     port,
     allowedOrigins: [
       `http://127.0.0.1:${port}`,

@@ -3975,6 +3975,7 @@ export async function createCoreRuntime(
 
           // Start agent runner last so it can't publish replies before relay is online.
           const startedAgentRunner = await startBusAgentRunner({
+            questions: questionService,
             bus: durableBus,
             blobStore: activeBlobStore,
             requestDelivery: requestDeliveryCoordinator,

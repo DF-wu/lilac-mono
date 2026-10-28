@@ -13,6 +13,7 @@ import {
   type QuestionCall,
   type QuestionCallState,
   type QuestionInput,
+  type QuestionPlatform,
 } from "./question-domain";
 
 type QuestionCallRow = {
@@ -21,6 +22,7 @@ type QuestionCallRow = {
   request_id: string;
   tool_call_id: string;
   platform: string;
+  mode: string;
   session_id: string;
   user_id: string;
   input_json: string;
@@ -40,7 +42,13 @@ type QuestionTokenRow = {
   option_index: number | null;
 };
 
-const questionCallStateSchema = z.enum(["pending", "answered", "cancelled", "interrupted"]);
+const questionCallStateSchema = z.enum([
+  "pending",
+  "answered",
+  "cancelled",
+  "interrupted",
+  "expired",
+]);
 
 export class QuestionStoreFailed extends TaggedError("QuestionStoreFailed")<{
   readonly operation: string;
@@ -118,7 +126,8 @@ export function decodeQuestionCallRow(
     !input.success ||
     !answers.success ||
     !state.success ||
-    row.platform !== "discord" ||
+    (row.platform !== "discord" && row.platform !== "native") ||
+    (row.mode !== "sync" && row.mode !== "deferred") ||
     !Number.isSafeInteger(row.current_index) ||
     row.current_index < 0 ||
     row.current_index >= input.data.questions.length
@@ -135,7 +144,8 @@ export function decodeQuestionCallRow(
     requestDeliveryId: row.request_delivery_id,
     requestId: row.request_id,
     toolCallId: row.tool_call_id,
-    platform: "discord",
+    platform: row.platform,
+    mode: row.mode,
     sessionId: row.session_id,
     userId: row.user_id,
     input: input.data,
@@ -171,14 +181,15 @@ export class SqliteQuestionStore {
         request_delivery_id TEXT NOT NULL,
         request_id TEXT NOT NULL,
         tool_call_id TEXT NOT NULL,
-        platform TEXT NOT NULL CHECK (platform = 'discord'),
+        platform TEXT NOT NULL CHECK (platform IN ('discord', 'native')),
+        mode TEXT NOT NULL DEFAULT 'sync' CHECK (mode IN ('sync', 'deferred')),
         session_id TEXT NOT NULL,
         user_id TEXT NOT NULL,
         input_json TEXT NOT NULL,
         current_index INTEGER NOT NULL,
         answers_json TEXT NOT NULL,
         message_id TEXT,
-        state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'cancelled', 'interrupted')),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'cancelled', 'interrupted', 'expired')),
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         UNIQUE (request_delivery_id, tool_call_id),
@@ -200,6 +211,74 @@ export class SqliteQuestionStore {
       CREATE INDEX IF NOT EXISTS agent_question_tokens_call_idx
         ON agent_question_tokens(question_call_id, question_index);
     `);
+    adaptToolResultToHost(this.migrateDiscordSchema());
+    this.#database.run(
+      "CREATE INDEX IF NOT EXISTS agent_question_calls_request_idx ON agent_question_calls(request_id, mode)",
+    );
+  }
+
+  listDeferred(requestId: string): ResultType<QuestionCall[], QuestionStoreError> {
+    const rows = captureStoreOperation("list-deferred", () =>
+      this.#database
+        .query<QuestionCallRow, [string]>(
+          "SELECT * FROM agent_question_calls WHERE request_id = ? AND mode = 'deferred' AND message_id IS NOT NULL ORDER BY created_at, question_call_id",
+        )
+        .all(requestId),
+    );
+    return rows.andThen((values) => Result.all(values.map(decodeQuestionCallRow)));
+  }
+
+  private migrateDiscordSchema(): ResultType<void, QuestionStoreError> {
+    return runBunSqliteTransaction(
+      this.#database,
+      () => {
+        const schema = this.#database
+          .query<{ sql: string }, []>(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_question_calls'",
+          )
+          .get();
+        if (!schema || !schema.sql.includes("platform = 'discord'")) return Result.ok(undefined);
+        this.#database.run(
+          "CREATE TEMP TABLE question_tokens_backup AS SELECT * FROM agent_question_tokens",
+        );
+        this.#database.run("DROP TABLE agent_question_tokens");
+        this.#database.run(
+          "ALTER TABLE agent_question_calls RENAME TO agent_question_calls_legacy",
+        );
+        this.#database.run(
+          schema.sql
+            .replace("platform = 'discord'", "platform IN ('discord', 'native')")
+            .replace("'cancelled', 'interrupted'", "'cancelled', 'interrupted', 'expired'"),
+        );
+        this.#database.run(
+          "INSERT INTO agent_question_calls SELECT * FROM agent_question_calls_legacy",
+        );
+        this.#database.run(
+          "ALTER TABLE agent_question_calls ADD COLUMN mode TEXT NOT NULL DEFAULT 'sync' CHECK (mode IN ('sync', 'deferred'))",
+        );
+        this.#database.run("DROP TABLE agent_question_calls_legacy");
+        this.#database.run(`CREATE TABLE agent_question_tokens (
+        token_sha256 TEXT PRIMARY KEY NOT NULL,
+        question_call_id TEXT NOT NULL REFERENCES agent_question_calls(question_call_id) ON DELETE CASCADE,
+        question_index INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('option', 'custom')),
+        option_index INTEGER,
+        created_at INTEGER NOT NULL
+      ) STRICT`);
+        this.#database.run(
+          "INSERT INTO agent_question_tokens SELECT * FROM question_tokens_backup",
+        );
+        this.#database.run("DROP TABLE question_tokens_backup");
+        this.#database.run(
+          "CREATE INDEX agent_question_calls_pending_idx ON agent_question_calls(state, created_at)",
+        );
+        this.#database.run(
+          "CREATE INDEX agent_question_tokens_call_idx ON agent_question_tokens(question_call_id, question_index)",
+        );
+        return Result.ok(undefined);
+      },
+      (cause) => storeFailure("migrate-discord-schema", cause),
+    );
   }
 
   close(): void {
@@ -234,6 +313,8 @@ export class SqliteQuestionStore {
     readonly sessionId: string;
     readonly userId: string;
     readonly questionInput: QuestionInput;
+    readonly platform?: QuestionPlatform;
+    readonly mode?: "sync" | "deferred";
     readonly tokens: readonly QuestionActionToken[];
   }): ResultType<QuestionCall, QuestionStoreError> {
     const now = this.#now();
@@ -241,18 +322,23 @@ export class SqliteQuestionStore {
       this.#database,
       () => {
         const inserted = this.#database
-          .query<never, [string, string, string, string, string, string, string, number, number]>(
+          .query<
+            never,
+            [string, string, string, string, string, string, string, string, string, number, number]
+          >(
             `INSERT OR IGNORE INTO agent_question_calls (
-              question_call_id, request_delivery_id, request_id, tool_call_id, platform,
+              question_call_id, request_delivery_id, request_id, tool_call_id, platform, mode,
               session_id, user_id, input_json, current_index, answers_json, message_id,
               state, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'discord', ?, ?, ?, 0, '[]', NULL, 'pending', ?, ?)`,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '[]', NULL, 'pending', ?, ?)`,
           )
           .run(
             input.questionCallId,
             input.requestDeliveryId,
             input.requestId,
             input.toolCallId,
+            input.platform ?? "discord",
+            input.mode ?? "sync",
             input.sessionId,
             input.userId,
             JSON.stringify(input.questionInput),
@@ -317,7 +403,7 @@ export class SqliteQuestionStore {
 
   validateActivity(input: {
     readonly tokenSha256: string;
-    readonly platform: "discord";
+    readonly platform: QuestionPlatform;
     readonly channelId: string;
     readonly messageId: string;
     readonly userId: string;
@@ -354,7 +440,7 @@ export class SqliteQuestionStore {
 
   applyAnswer(input: {
     readonly tokenSha256: string;
-    readonly platform: "discord";
+    readonly platform: QuestionPlatform;
     readonly channelId: string;
     readonly messageId: string;
     readonly userId: string;
@@ -445,7 +531,7 @@ export class SqliteQuestionStore {
 
   transitionPending(
     questionCallId: string,
-    state: Extract<QuestionCallState, "cancelled" | "interrupted">,
+    state: Extract<QuestionCallState, "cancelled" | "interrupted" | "expired">,
   ): ResultType<void, QuestionStoreFailed> {
     return captureStoreOperation("transition-pending", () => {
       const now = this.#now();
