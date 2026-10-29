@@ -31,8 +31,17 @@ import {
   type ToolResultArtifactStore,
 } from "../../src/artifacts/tool-result-artifact-store";
 
-const STDIN_PROBE_COMMAND =
-  "if cat >/dev/null 2>&1; then echo stdin_read_ok; else echo stdin_read_err; exit 7; fi";
+// Probe fd 0 directly instead of relying on an external cat implementation.
+const STDIN_PROBE_COMMAND = `'${process.execPath.replaceAll("'", "'\\''")}' -e '
+  const { readSync } = require("node:fs");
+  try {
+    console.log("stdin_bytes=" + readSync(0, Buffer.alloc(1), 0, 1, null));
+  } catch (error) {
+    if (error.code !== "EBADF") throw error;
+    console.log("stdin_read_err:EBADF");
+    process.exit(7);
+  }
+'`;
 
 type MockFetch = (
   input: Parameters<typeof fetch>[0],
@@ -312,8 +321,7 @@ rmdir "$media_dir"`,
 
     expect(res.exitCode).toBe(7);
     expect(res.executionError).toBeUndefined();
-    expect(res.stdout).toContain("stdin_read_err");
-    expect(res.stdout).not.toContain("stdin_read_ok");
+    expect(res.stdout).toBe("stdin_read_err:EBADF\n");
   });
 
   it("supports stdinMode=eof as a compatibility fallback", async () => {
@@ -321,7 +329,7 @@ rmdir "$media_dir"`,
 
     expect(res.exitCode).toBe(0);
     expect(res.executionError).toBeUndefined();
-    expect(res.stdout).toContain("stdin_read_ok");
+    expect(res.stdout).toBe("stdin_bytes=0\n");
   });
 
   it("stores large output as an artifact without changing execution success", async () => {

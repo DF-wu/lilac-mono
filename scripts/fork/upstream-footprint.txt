@@ -23,6 +23,7 @@ docker/direct-entrypoint.sh  # container identity variants and legacy blob migra
 docker/verify-image.sh  # verifies the container identity variants
 __tests__/docker-build-script.test.ts  # covers the container identity variants
 bun.lock  # grammY (Telegram Bot API) dependency
+apps/core/tests/tools/bash.test.ts  # probes stdin with readSync to distinguish EBADF from EOF across cat implementations
 
 # --- OpenAI web.search provider (staged for an upstream contribution; remove once accepted)
 apps/core/src/tool-server/tools/web-search.ts  # exports OpenAIWebSearchProvider
