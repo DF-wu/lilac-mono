@@ -161,6 +161,26 @@ describe("native question wire", () => {
     expect(nativeContract.questions.pending).toBeDefined();
   });
 
+  test("the sidebar shows needs input only to the respondent until the question is answered", async () => {
+    const f = await fixture();
+    const handle = (await f.service.begin(f.args)).unwrap();
+    const question = f.native
+      .read("alice", { threadId: f.thread.id, messageId: handle.questionCallId })
+      .unwrap();
+    if (question.view.state !== "pending") throw new Error("Missing question");
+    f.store.settleInput(f.request.id, "admitted").unwrap();
+    f.store.markInputCompleted(f.request.id).unwrap();
+    expect(f.store.getThread("alice", f.thread.id).unwrap().displayStatus).toBe("input");
+    expect(f.store.getThread("owner", f.thread.id).unwrap().displayStatus).not.toBe("input");
+    f.store
+      .acceptInput(
+        "alice",
+        reply(f.thread.id, handle.questionCallId, question.view.prompt.customToken),
+      )
+      .unwrap();
+    expect(f.store.getThread("alice", f.thread.id).unwrap().displayStatus).not.toBe("input");
+  });
+
   test("deferred calls never schedule the sync inactivity deadline", async () => {
     jest.useFakeTimers({ now: 0 });
     const f = await fixture();

@@ -25,7 +25,7 @@ export const nativeThreadSchema = z.strictObject({
   starterId: identitySchema,
   starterAvatarUrl: z.string().max(2048).optional(),
   starterDisplayName: z.string().max(256).optional(),
-  displayStatus: z.enum(["idle", "completed", "working", "error"]).optional(),
+  displayStatus: z.enum(["idle", "completed", "working", "error", "input"]).optional(),
   activeRunId: runIdentitySchema.optional(),
   workingSince: revisionSchema.optional(),
   archived: z.boolean(),

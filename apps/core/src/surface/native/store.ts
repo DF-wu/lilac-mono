@@ -655,6 +655,8 @@ export class NativeStore {
       .get(thread.id);
     if (!row) return Result.ok({ displayStatus: thread.activeRunId ? "working" : "idle" });
     const db = this.db;
+    // A run that is still going stays "working" so push and browser notifications see one run end.
+    const awaitsAnswer = !thread.activeRunId && this.awaitsAnswer(user.id, thread);
     return Result.gen(function* () {
       const { value: record } = yield* decodeNativeRecord(row);
       if (record.kind !== "turn")
@@ -665,6 +667,7 @@ export class NativeStore {
           displayStatus: "working" as const,
           workingSince: turn.startedAt ?? row.first_created_at ?? undefined,
         });
+      if (awaitsAnswer) return Result.ok({ displayStatus: "input" as const });
       if (turn.state === "failed") return Result.ok({ displayStatus: "error" as const });
       if (turn.state !== "complete") return Result.ok({ displayStatus: "idle" as const });
       const read = db
@@ -678,6 +681,16 @@ export class NativeStore {
           (read.position === turn.position && read.message_index >= row.last_message_index));
       return Result.ok({ displayStatus: checked ? ("idle" as const) : ("completed" as const) });
     });
+  }
+
+  /** A question in the current history still waits for this user's answer. */
+  private awaitsAnswer(userId: string, thread: NativeThreadRecord): boolean {
+    // instr skips JSON parsing for turns that never asked a question.
+    return !!this.db
+      .query<{ found: number }, [string, string, number]>(
+        "SELECT 1 AS found FROM native_records r WHERE r.kind='turn' AND r.thread_id=? AND instr(r.data_json,'\"data-question\"')>0 AND EXISTS(SELECT 1 FROM json_each(r.data_json,'$.value.messages') m, json_each(m.value,'$.parts') p WHERE json_extract(p.value,'$.type')='data-question' AND json_extract(p.value,'$.data.view.state')='pending' AND json_extract(p.value,'$.data.respondentId')=? AND json_extract(p.value,'$.data.historyGeneration')=?) LIMIT 1",
+      )
+      .get(thread.id, userId, thread.historyGeneration);
   }
 
   private capabilities(user: NativeUser, thread: NativeThreadRecord): NativeThread["capabilities"] {

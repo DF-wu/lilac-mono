@@ -532,7 +532,9 @@ Display catalogs optionally carry `agent` identity. Existing disposable client c
 remain readable and use the default identity until catalog reconciliation. Thread summaries add
 optional `starterDisplayName` and `displayStatus` display fields; the server emits these using existing
 thread/read state. The existing `native_surface_read` table is initialized by `NativeStore`, with no
-schema or read-state migration.
+schema or read-state migration. `displayStatus` also accepts `input` when a native question in the
+current history waits for the viewer and no run is active; clients older than this value reject the
+summary until they reload the current web bundle, and no stored data changes.
 
 The filesystem `fs.read_bytes` request accepts optional `prefixBytes` from 1 through 65,536.
 Without it, reads retain their whole-file limit and result shape. Prefix reads return at most that
