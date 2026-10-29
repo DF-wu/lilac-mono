@@ -3,16 +3,17 @@ import { NativeClient } from "@stanley2058/lilac-client";
 import type { NativeQuestion, ReplayCheckpoint } from "@stanley2058/lilac-client-protocol";
 import {
   activeReplyQuestion,
-  applyOptionShortcut,
   autoReplyQuestion,
-  nextReplyQuestion,
-  chosenOptions,
   mergeClosedReply,
+  nextPromptStep,
+  promptAnswered,
   questionPrompts,
   questionSignature,
   questionSlotsChanged,
   questionReplyTarget,
   questionTitle,
+  replyText,
+  type PromptAnswer,
   type QuestionPrompt,
 } from "../src/question-reply";
 
@@ -48,29 +49,37 @@ function question(id: string, prompts?: QuestionPrompt[]): NativeQuestion {
 }
 
 describe("question reply", () => {
-  test("a single prompt gets a readable line that is not a Markdown list", () => {
-    expect(applyOptionShortcut("", [target], 1, 2)).toBe("Staging (option 2)");
-    expect(applyOptionShortcut("Staging (option 2)", [target], 1, 1)).toBe(
-      "Preview link (option 1)",
+  test("a prompt is answered by an option, typed text, or a file", () => {
+    expect(promptAnswered({ text: "  ", attachments: 0 })).toBe(false);
+    expect(promptAnswered({ option: 2, text: "", attachments: 0 })).toBe(true);
+    expect(promptAnswered({ text: "EU only", attachments: 0 })).toBe(true);
+    expect(promptAnswered({ text: "", attachments: 1 })).toBe(true);
+  });
+
+  test("a single prompt replies with its answer alone, typed text replacing the option", () => {
+    const answers = (answer: PromptAnswer) => new Map([[1, answer]]);
+    expect(replyText([target], answers({ option: 2, text: "", attachments: 0 }))).toBe("Staging");
+    expect(replyText([target], answers({ option: 2, text: " EU only ", attachments: 0 }))).toBe(
+      "EU only",
     );
   });
 
-  test("shortcuts keep the user's own text below the chosen lines", () => {
-    expect(applyOptionShortcut("Use the EU region", [target], 1, 1)).toBe(
-      "Preview link (option 1)\n\nUse the EU region",
+  test("several prompts reply with one labeled block each in prompt order", () => {
+    const answers = new Map<number, PromptAnswer>([
+      [2, { text: "Copy last week\nwithout emails", attachments: 0 }],
+      [1, { option: 1, text: "", attachments: 0 }],
+    ]);
+    expect(replyText([target, database], answers)).toBe(
+      "Deploy target: Preview link\n\nDatabase:\nCopy last week\nwithout emails",
     );
   });
 
-  test("several prompts keep one labeled line each in prompt order", () => {
-    const prompts = [target, database];
-    const first = applyOptionShortcut("", prompts, 2, 3);
-    expect(first).toBe("Database: Replica (option 3)");
-    const both = applyOptionShortcut(first, prompts, 1, 1);
-    expect(both).toBe("Deploy target: Preview link (option 1)\nDatabase: Replica (option 3)");
-    expect(applyOptionShortcut(both, prompts, 2, 2)).toBe(
-      "Deploy target: Preview link (option 1)\nDatabase: Empty (option 2)",
-    );
-    expect(chosenOptions(both, prompts)).toEqual(["1:1", "2:3"]);
+  test("answering moves to the next unanswered prompt and submits when none is left", () => {
+    expect(nextPromptStep([true, false, false], 0)).toBe(1);
+    expect(nextPromptStep([false, true, true], 2)).toBe(0);
+    expect(nextPromptStep([true, true, false], 0)).toBe(2);
+    expect(nextPromptStep([true, true], 1)).toBe("submit");
+    expect(nextPromptStep([true], 0)).toBe("submit");
   });
 
   test("the whole call is answered with the first prompt's token", () => {
@@ -102,20 +111,12 @@ describe("question reply", () => {
     expect(activeReplyQuestion(both, undefined)).toBe(undefined);
     expect(activeReplyQuestion(both, { messageId: "older", replying: true })).toBe(older);
     expect(activeReplyQuestion(both, { messageId: "newer", replying: false })).toBe(undefined);
-    expect(autoReplyQuestion(both, undefined, true)).toBe("newer");
+    expect(autoReplyQuestion(both, undefined, true)).toBe("older");
     expect(autoReplyQuestion(both, undefined, false)).toBe(undefined);
     // A new question neither replaces the current reply nor overrides leaving reply mode.
     expect(autoReplyQuestion(both, { messageId: "older", replying: true }, true)).toBe(undefined);
     expect(autoReplyQuestion(both, { messageId: "older", replying: false }, true)).toBe(undefined);
-    expect(autoReplyQuestion(both, { messageId: "gone", replying: false }, true)).toBe("newer");
-  });
-
-  test("next question cycles through every pending call", () => {
-    const items = [question("a"), question("b"), question("c")];
-    expect(nextReplyQuestion(items, "a")).toBe("b");
-    expect(nextReplyQuestion(items, "b")).toBe("c");
-    expect(nextReplyQuestion(items, "c")).toBe("a");
-    expect(nextReplyQuestion(items.slice(0, 1), "a")).toBe(undefined);
+    expect(autoReplyQuestion(both, { messageId: "gone", replying: false }, true)).toBe("older");
   });
 
   test("a closed reply joins the regular draft with its text, files, and skills", () => {
@@ -125,12 +126,12 @@ describe("question reply", () => {
       attachments: ["a"],
     };
     const leftover = {
-      text: "Staging (option 2) $deploy",
+      text: "EU only $deploy",
       skillIds: ["deploy", "agent-browser"],
       attachments: ["b"],
     };
     expect(mergeClosedReply(regular, leftover)).toEqual({
-      text: "Draft note $agent-browser\n\nStaging (option 2) $deploy",
+      text: "Draft note $agent-browser\n\nEU only $deploy",
       skillIds: ["agent-browser", "deploy"],
       attachments: ["a", "b"],
     });

@@ -10,6 +10,7 @@ import {
   type QuestionReplyView,
   type QuestionServices,
 } from "../src/components/message-services";
+import { QuestionPanel } from "../src/components/QuestionReply";
 
 const pending: NativeQuestion["view"] = {
   state: "pending",
@@ -61,7 +62,6 @@ function question(
 }
 
 const questions: QuestionServices = {
-  onOption: () => {},
   onReply: () => {},
   onDismiss: async () => undefined,
 };
@@ -69,7 +69,7 @@ const questions: QuestionServices = {
 function render(
   data: NativeQuestion,
   services: Partial<MessageServices> = {},
-  reply: QuestionReplyView = { chosen: [] },
+  reply: QuestionReplyView = {},
 ) {
   return renderToStaticMarkup(
     <MessageIdentityContext
@@ -98,36 +98,29 @@ function render(
 }
 
 describe("question card", () => {
-  test("the respondent gets numbered option shortcuts, reply, and dismiss without a form", () => {
+  test("the respondent's card is one line that opens the question in the composer", () => {
     const html = render(question(pending));
-    expect(html).not.toContain("<form");
-    expect(html).not.toContain("<textarea");
-    expect(html).not.toContain("Other");
-    expect(html.match(/data-ui="question-option"/g)).toHaveLength(2);
-    expect(html).toContain('aria-label="1. Snapshot"');
-    expect(html).toContain('aria-pressed="false"');
-    expect(html).toContain("Reply");
-    expect(html).toContain('aria-label="Dismiss question"');
-    expect(html).not.toContain('type="submit"');
+    expect(html).toContain("Needs your answer");
+    expect(html).toContain("Database");
+    expect(html).toContain("Answer");
+    expect(html).not.toContain('data-ui="question-option"');
+    expect(html).not.toContain("Which data should the preview use?");
+    expect(html.match(/<button/g)).toHaveLength(1);
   });
 
-  test("every prompt in the call is shown at once under one title", () => {
+  test("a call with several prompts is named by its count", () => {
     const html = render(
       question(pending, "alex", [pending.state === "pending" ? pending.prompt : second, second]),
     );
     expect(html).toContain("2 questions");
-    expect(html).toContain("2. Database");
-    expect(html).toContain("3. Notify");
-    expect(html.match(/data-ui="question-option"/g)).toHaveLength(4);
-    expect(html.match(/Dismiss question/g)).toHaveLength(1);
     expect(html.match(/class="lucide lucide-message-circle-question/g)).toHaveLength(1);
   });
 
-  test("the reply target marks options already in the draft", () => {
-    const html = render(question(pending), {}, { messageId: "call", chosen: ["2:2"] });
+  test("the card being answered points to the composer instead of offering Answer", () => {
+    const html = render(question(pending), {}, { messageId: "call" });
     expect(html).toContain("data-replying");
-    expect(html).toContain("Answer in the message box");
-    expect(html).toMatch(/aria-pressed="true"[^>]*aria-label="2. Empty"/);
+    expect(html).toContain("Answering below");
+    expect(html).not.toContain("<button");
   });
 
   test("other viewers and viewers without edit access get a read-only card", () => {
@@ -183,5 +176,56 @@ describe("question card", () => {
     expect(render(question({ state: "expired" }))).toContain("Question expired");
     expect(render(question({ state: "cancelled" }))).toContain("Question dismissed");
     expect(render(question({ state: "interrupted" }))).toContain("Question interrupted");
+  });
+});
+
+describe("question panel", () => {
+  const prompt = pending.state === "pending" ? pending.prompt : second;
+  const call = question(pending, "alex", [prompt, second]);
+  function panel(props: Partial<Parameters<typeof QuestionPanel>[0]> = {}) {
+    return renderToStaticMarkup(
+      <QuestionPanel
+        question={call}
+        step={0}
+        typed={false}
+        answered={[false, false]}
+        onChoose={() => {}}
+        onStep={() => {}}
+        onExit={() => {}}
+        onDismiss={async () => undefined}
+        {...props}
+      />,
+    );
+  }
+
+  test("shows only the prompt on screen with numbered options and its step", () => {
+    const html = panel();
+    expect(html).toContain("Which data should the preview use?");
+    expect(html).not.toContain("Who should get the link?");
+    expect(html.match(/data-ui="question-option"/g)).toHaveLength(2);
+    expect(html).toContain('aria-keyshortcuts="1"');
+    expect(html).toContain("1/2");
+    expect(html).toMatch(
+      /<button[^>]*disabled=""[^>]*aria-label="Previous question"|aria-label="Previous question"[^>]*disabled=""/,
+    );
+    expect(html).toMatch(
+      /<button[^>]*disabled=""[^>]*aria-label="Next question"|aria-label="Next question"[^>]*disabled=""/,
+    );
+    expect(html).toContain('aria-label="Dismiss question"');
+    expect(html).toContain('aria-label="Write a message instead"');
+  });
+
+  test("marks the chosen option until a typed answer replaces it", () => {
+    expect(panel({ chosen: 2 })).toMatch(/aria-pressed="true"[^>]*>.*Empty/);
+    expect(panel({ chosen: 2, typed: true })).not.toContain('aria-pressed="true"');
+  });
+
+  test("moves to the second prompt", () => {
+    const html = panel({ step: 1, answered: [true, false] });
+    expect(html).toContain("Who should get the link?");
+    expect(html).toContain("2/2");
+    expect(html).not.toMatch(
+      /<button[^>]*disabled=""[^>]*aria-label="Previous question"|aria-label="Previous question"[^>]*disabled=""/,
+    );
   });
 });

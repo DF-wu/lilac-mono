@@ -19,15 +19,14 @@ export type MessageServices = Pick<AppProps, "resourceUrl"> & {
   questions?: QuestionServices;
 };
 export type QuestionServices = {
-  /** Puts the option into the reply draft. It never sends. */
-  onOption: (messageId: string, ordinal: number, index: number) => void;
+  /** Opens the question in the composer. */
   onReply: (messageId: string) => void;
   /** Resolves with an error message when the dismissal is not accepted. */
   onDismiss: (question: NativeQuestion) => Promise<string | undefined>;
 };
-/** The question the composer is replying to, and its options already in the reply draft. */
-export type QuestionReplyView = { messageId?: string; chosen: readonly string[] };
-export const QuestionReplyContext = createContext<QuestionReplyView>({ chosen: [] });
+/** The question the composer is answering. */
+export type QuestionReplyView = { messageId?: string };
+export const QuestionReplyContext = createContext<QuestionReplyView>({});
 export const MessageServicesContext = createContext<MessageServices | undefined>(undefined);
 export const DisplayStreamContext = createContext<DisplayStreamTarget | undefined>(undefined);
 export function useMessageServices() {

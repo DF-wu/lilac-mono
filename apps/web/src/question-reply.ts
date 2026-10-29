@@ -21,57 +21,52 @@ export function questionReplyTarget(question: NativeQuestion): QuestionReplyTarg
   return first ? { messageId: question.questionCallId, token: first.customToken } : undefined;
 }
 
-export function questionDraftKey(threadId: string, messageId: string) {
-  return `${threadId}:question:${messageId}`;
+/** Each prompt keeps its own typed answer, so moving between prompts never mixes them. */
+export function questionDraftKey(threadId: string, messageId: string, ordinal: number) {
+  return `${threadId}:question:${messageId}:${ordinal}`;
 }
 
-function shortcutLine(prompts: readonly QuestionPrompt[], prompt: QuestionPrompt, index: number) {
-  const option = prompt.options.find((item) => item.index === index);
-  if (!option) return undefined;
-  // "1." would start a Markdown list in the composer, so the number trails the label.
-  const answer = `${option.label} (option ${option.index})`;
-  return prompts.length > 1 ? `${prompt.header}: ${answer}` : answer;
+/** A prompt's answer: typed text wins over the chosen option. */
+export type PromptAnswer = { option?: number; text: string; attachments: number };
+
+export function promptAnswered(answer: PromptAnswer): boolean {
+  return !!answer.text.trim() || answer.option !== undefined || answer.attachments > 0;
 }
 
-function lineOwner(line: string, prompts: readonly QuestionPrompt[]) {
-  return prompts.findIndex((prompt) =>
-    prompt.options.some((option) => line === shortcutLine(prompts, prompt, option.index)),
-  );
-}
-
-/**
- * Writes the chosen option as one readable line per prompt, kept in prompt order above the rest
- * of the reply. Choosing again for the same prompt replaces its line.
- */
-export function applyOptionShortcut(
-  text: string,
+/** The reply message for a call. One prompt sends its answer alone; several get labeled blocks. */
+export function replyText(
   prompts: readonly QuestionPrompt[],
-  ordinal: number,
-  index: number,
+  answers: ReadonlyMap<number, PromptAnswer>,
 ): string {
-  const target = prompts.findIndex((prompt) => prompt.ordinal === ordinal);
-  const line = target < 0 ? undefined : shortcutLine(prompts, prompts[target]!, index);
-  if (!line) return text;
-  const chosen = new Map<number, string>([[target, line]]);
-  const rest: string[] = [];
-  for (const current of text ? text.split("\n") : []) {
-    const owner = lineOwner(current, prompts);
-    if (owner < 0) rest.push(current);
-    else if (!chosen.has(owner)) chosen.set(owner, current);
-  }
-  const answers = [...chosen].sort(([a], [b]) => a - b).map(([, value]) => value);
-  while (rest[0] === "") rest.shift();
-  return [...answers, ...(rest.length ? ["", ...rest] : [])].join("\n");
+  return prompts
+    .map((prompt) => {
+      const answer = answers.get(prompt.ordinal);
+      const typed = answer?.text.trim() ?? "";
+      const value =
+        typed || prompt.options.find((option) => option.index === answer?.option)?.label || "";
+      if (prompts.length === 1) return value;
+      return value.includes("\n") ? `${prompt.header}:\n${value}` : `${prompt.header}: ${value}`;
+    })
+    .join("\n\n");
 }
 
-/** Options whose shortcut line is in the reply, as `ordinal:index`. */
-export function chosenOptions(text: string, prompts: readonly QuestionPrompt[]): string[] {
-  const lines = new Set(text.split("\n"));
-  return prompts.flatMap((prompt) =>
-    prompt.options
-      .filter((option) => lines.has(shortcutLine(prompts, prompt, option.index)!))
-      .map((option) => `${prompt.ordinal}:${option.index}`),
-  );
+/** The send button's name while answering. */
+export function answerLabel(last: boolean, promptCount: number): string {
+  if (!last) return "Continue";
+  return promptCount > 1 ? "Submit answers" : "Submit answer";
+}
+
+export function answerPlaceholder(chosen: boolean): string {
+  return chosen ? "Type a different answer…" : "Or type your own answer…";
+}
+
+/** Where to go after a prompt is answered: the next unanswered prompt, or the reply when none is left. */
+export function nextPromptStep(answered: readonly boolean[], current: number): number | "submit" {
+  for (let offset = 1; offset <= answered.length; offset++) {
+    const step = (current + offset) % answered.length;
+    if (!answered[step]) return step;
+  }
+  return "submit";
 }
 
 /** Pending questions the viewer can answer, oldest first. */
@@ -85,14 +80,35 @@ export function answerableQuestions(
 }
 
 type ReplyChoice = { messageId: string; replying: boolean };
+/** The prompt on screen and the options chosen so far, by prompt ordinal. */
+export type ReplyProgress = { step: number; options: Readonly<Record<number, number>> };
 type ReplyState = {
   choices: ReadonlyMap<string, ReplyChoice>;
+  progress: ReadonlyMap<string, ReplyProgress>;
   choose: (threadId: string, choice: ReplyChoice) => void;
+  update: (key: string, change: ProgressChange) => void;
 };
 
-/** Reply mode per thread. It outlives Chat so navigating away keeps the user's choice. */
+export function replyProgressKey(threadId: string, messageId: string) {
+  return `${threadId}:${messageId}`;
+}
+export const emptyProgress: ReplyProgress = { step: 0, options: {} };
+/** Returns the next progress, or undefined to forget the call. */
+export type ProgressChange = (current: ReplyProgress) => ReplyProgress | undefined;
+
+/** Reply mode per thread and progress per call. It outlives Chat so navigating away keeps both. */
 export const questionReplyStore = createStore<ReplyState>((set) => ({
   choices: new Map(),
+  progress: new Map(),
+  update(key, change) {
+    set((state) => {
+      const next = change(state.progress.get(key) ?? emptyProgress);
+      const progress = new Map(state.progress);
+      if (next) progress.set(key, next);
+      else progress.delete(key);
+      return { progress };
+    });
+  },
   choose(threadId, choice) {
     set((state) => {
       const current = state.choices.get(threadId);
@@ -113,7 +129,7 @@ export function activeReplyQuestion(
 }
 
 /**
- * The question to open automatically: the newest one, only when no current choice still applies
+ * The question to open automatically: the oldest one, only when no current choice still applies
  * and the regular draft is empty, so a new question never takes over a message being written.
  */
 export function autoReplyQuestion(
@@ -123,17 +139,7 @@ export function autoReplyQuestion(
 ): string | undefined {
   if (!regularDraftEmpty) return undefined;
   if (choice && pending.some((item) => item.questionCallId === choice.messageId)) return undefined;
-  return pending.at(-1)?.questionCallId;
-}
-
-/** The question after `current`, wrapping around, so every pending call stays reachable. */
-export function nextReplyQuestion(
-  pending: readonly NativeQuestion[],
-  current: string,
-): string | undefined {
-  if (pending.length < 2) return undefined;
-  const position = pending.findIndex((item) => item.questionCallId === current);
-  return pending[(position + 1) % pending.length]?.questionCallId;
+  return pending[0]?.questionCallId;
 }
 
 type ReplyDraft<Attachment> = { text: string; skillIds: string[]; attachments: Attachment[] };

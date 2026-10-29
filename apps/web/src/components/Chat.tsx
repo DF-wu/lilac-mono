@@ -27,10 +27,13 @@ import {
 } from "./message-services";
 import {
   activeReplyQuestion,
+  answerLabel,
+  answerPlaceholder,
   answerableQuestions,
   autoReplyQuestion,
-  applyOptionShortcut,
-  chosenOptions,
+  emptyProgress,
+  nextPromptStep,
+  promptAnswered,
   questionDraftKey,
   questionPrompts,
   questionReplyStore,
@@ -38,8 +41,13 @@ import {
   questionSignature,
   questionSlotsChanged,
   mergeClosedReply,
+  replyProgressKey,
+  replyText,
+  type ProgressChange,
+  type PromptAnswer,
 } from "../question-reply";
-import { QuestionReplyBar } from "./QuestionReply";
+import { QuestionPanel, QuestionWaiting } from "./QuestionReply";
+import { composerSubmissionMarkdown, createComposerEditor } from "./composer-document";
 import { useWorkspace } from "../workspace-context";
 import {
   useCallback,
@@ -139,7 +147,21 @@ export function Chat(props: ChatProps) {
   const replyChoice = useStore(questionReplyStore, (state) => state.choices.get(threadId));
   const replyQuestion = activeReplyQuestion(answerable, replyChoice);
   const replyMessageId = replyQuestion?.questionCallId;
-  const draftKey = replyMessageId ? questionDraftKey(threadId, replyMessageId) : threadId;
+  const replyPrompts = useMemo(
+    () => (replyQuestion ? questionPrompts(replyQuestion) : []),
+    [replyQuestion],
+  );
+  const progressKey = replyMessageId ? replyProgressKey(threadId, replyMessageId) : "";
+  const progress = useStore(
+    questionReplyStore,
+    (state) => state.progress.get(progressKey) ?? emptyProgress,
+  );
+  const replyStep = Math.min(progress.step, Math.max(replyPrompts.length - 1, 0));
+  const replyPrompt = replyPrompts[replyStep];
+  const draftKey =
+    replyMessageId && replyPrompt
+      ? questionDraftKey(threadId, replyMessageId, replyPrompt.ordinal)
+      : threadId;
   const draftOptions = composerDraftOptions(scope, draftKey, draftCache);
   const draftQuery = useQuery({
     ...draftOptions,
@@ -383,20 +405,32 @@ export function Chat(props: ChatProps) {
   useEffect(() => {
     if (autoReply) chooseReply(autoReply, true);
   }, [autoReply, threadId]);
-  const previousReply = useRef<{ threadId: string; messageId: string }>(undefined);
+  const previousReply = useRef<{ threadId: string; messageId: string; ordinals: number[] }>(
+    undefined,
+  );
   useEffect(() => {
     const previous = previousReply.current;
-    previousReply.current = replyMessageId ? { threadId, messageId: replyMessageId } : undefined;
+    previousReply.current = replyMessageId
+      ? { threadId, messageId: replyMessageId, ordinals: replyPrompts.map((item) => item.ordinal) }
+      : undefined;
     if (!previous || previous.threadId !== threadId || previous.messageId === replyMessageId)
       return;
     if (pendingQuestions.data?.some((item) => item.questionCallId === previous.messageId)) return;
-    // The question closed elsewhere, so an unsent reply moves to the regular draft.
-    const key = questionDraftKey(threadId, previous.messageId);
-    const leftover = getDraft(key);
-    if (!leftover.text.trim() && !leftover.attachments.length && !leftover.skillIds.length) return;
-    commitDraft(mergeClosedReply(getDraft(threadId), leftover), threadId);
-    commitDraft(emptyDraft, key);
-    toast.add({ title: "The question closed. Your reply is now a regular draft." });
+    questionReplyStore
+      .getState()
+      .update(replyProgressKey(threadId, previous.messageId), () => undefined);
+    // The question closed elsewhere, so unsent typed answers move to the regular draft.
+    let moved = false;
+    for (const ordinal of previous.ordinals) {
+      const key = questionDraftKey(threadId, previous.messageId, ordinal);
+      const leftover = getDraft(key);
+      if (!leftover.text.trim() && !leftover.attachments.length && !leftover.skillIds.length)
+        continue;
+      commitDraft(mergeClosedReply(getDraft(threadId), leftover), threadId);
+      commitDraft(emptyDraft, key);
+      moved = true;
+    }
+    if (moved) toast.add({ title: "The question closed. Your reply is now a regular draft." });
   }, [replyMessageId, threadId]);
   useEffect(() => {
     const changed = previousActive.current !== active;
@@ -532,13 +566,14 @@ export function Chat(props: ChatProps) {
       for (const attachment of entry.submission.attachments) pool.release(threadId, attachment.key);
     void refreshQueue();
   }
-  function submit(submission: ComposerSubmission) {
+  function submit(
+    submission: ComposerSubmission,
+    questionReply?: ComposerSubmission["questionReply"],
+  ) {
     if (local) {
       props.onLocalSubmit(threadId, submission);
       return;
     }
-    const questionReply = replyQuestion && questionReplyTarget(replyQuestion);
-    if (questionReply) chooseReply(questionReply.messageId, false);
     const entry: PendingInput = {
       commandId: crypto.randomUUID(),
       text: submission.text,
@@ -547,7 +582,8 @@ export function Chat(props: ChatProps) {
       state: "preparing",
     };
     commitPending((entries) => [...entries, entry]);
-    commitDraft({ text: "", skillIds: [], attachments: [], savedText: draft.savedText });
+    if (!questionReply)
+      commitDraft({ text: "", skillIds: [], attachments: [], savedText: draft.savedText });
     void deliver(entry);
   }
   async function cancel() {
@@ -664,37 +700,128 @@ export function Chat(props: ChatProps) {
   );
   const chooseReply = (messageId: string, replying: boolean) =>
     questionReplyStore.getState().choose(threadId, { messageId, replying });
-  const questionOption = useEventCallback(
-    async (messageId: string, ordinal: number, index: number) => {
-      const question = answerable.find((item) => item.questionCallId === messageId);
-      if (!question) return;
-      chooseReply(messageId, true);
-      const key = questionDraftKey(threadId, messageId);
-      const loaded = local
-        ? Result.ok(getDraft(key))
-        : await loadComposerDraft(queries, composerDraftOptions(scope, key, draftCache));
-      // Skip the shortcut if the user moved on or the question closed while the draft loaded.
-      const choice = questionReplyStore.getState().choices.get(threadId);
-      const open = queries
-        .getQueryData(pendingQuestionsOptions(client, threadId).queryKey)
-        ?.some((item) => item.questionCallId === messageId);
-      const moved =
-        currentId.current !== threadId || choice?.messageId !== messageId || !choice.replying;
-      if (moved || !open) return;
-      const current = loaded.match({
-        ok: (value) => value,
-        err: (message) => {
-          setError(message);
-          return undefined;
-        },
-      });
-      if (!current) return;
-      const text = applyOptionShortcut(current.text, questionPrompts(question), ordinal, index);
-      commitDraft({ ...current, text }, key);
-    },
-  );
+  const updateProgress = (messageId: string, change: ProgressChange) =>
+    questionReplyStore.getState().update(replyProgressKey(threadId, messageId), change);
+  const loadDraft = async (key: string) =>
+    (await loadComposerDraft(queries, composerDraftOptions(scope, key, draftCache))).match({
+      ok: (value) => value,
+      err: (message) => {
+        setError(message);
+        return undefined;
+      },
+    });
+  const replyAnswered = replyPrompts.map((prompt) => {
+    const current =
+      prompt.ordinal === replyPrompt?.ordinal
+        ? draft
+        : getDraft(questionDraftKey(threadId, replyMessageId!, prompt.ordinal));
+    return promptAnswered({
+      option: progress.options[prompt.ordinal],
+      text: current.text,
+      attachments: current.attachments.length,
+    });
+  });
+  const replyChosen = replyPrompt ? progress.options[replyPrompt.ordinal] : undefined;
+  const replyLast =
+    nextPromptStep(
+      replyAnswered.map((answered, step) => answered || step === replyStep),
+      replyStep,
+    ) === "submit";
+  const sendingReply = useRef(false);
+  async function sendReply(question: NativeQuestion) {
+    const target = questionReplyTarget(question);
+    if (!target || sendingReply.current) return;
+    const messageId = question.questionCallId;
+    const prompts = questionPrompts(question);
+    sendingReply.current = true;
+    const drafts = await Promise.all(
+      prompts.map((prompt) => loadDraft(questionDraftKey(threadId, messageId, prompt.ordinal))),
+    );
+    sendingReply.current = false;
+    const choice = questionReplyStore.getState().choices.get(threadId);
+    if (currentId.current !== threadId || choice?.messageId !== messageId || !choice.replying)
+      return;
+    const options =
+      questionReplyStore.getState().progress.get(replyProgressKey(threadId, messageId))?.options ??
+      {};
+    const answers = new Map<number, PromptAnswer>();
+    const typed = new Map<number, PromptAnswer>();
+    for (const [position, prompt] of prompts.entries()) {
+      const saved = drafts[position];
+      if (!saved) return;
+      const answer = { option: options[prompt.ordinal], attachments: saved.attachments.length };
+      const text = composerSubmissionMarkdown(createComposerEditor(saved.text));
+      answers.set(prompt.ordinal, { ...answer, text });
+      typed.set(prompt.ordinal, { ...answer, text: saved.text });
+    }
+    const missing = prompts.findIndex((prompt) => !promptAnswered(answers.get(prompt.ordinal)!));
+    if (missing >= 0) {
+      updateProgress(messageId, (current) => ({ ...current, step: missing }));
+      return;
+    }
+    const keys = drafts.flatMap((saved) => saved!.attachments);
+    chooseReply(messageId, false);
+    updateProgress(messageId, () => undefined);
+    submit(
+      {
+        text: replyText(prompts, answers),
+        ...(keys.length ? { attachmentText: replyText(prompts, typed) } : {}),
+        // The composer keeps at most 32 skill references per draft.
+        skillIds: [...new Set(drafts.flatMap((saved) => saved!.skillIds))].slice(0, 32),
+        mode: "followup",
+        attachments: pool.get(threadId).filter((attachment) => keys.includes(attachment.key)),
+      },
+      target,
+    );
+    for (const prompt of prompts)
+      commitDraft(emptyDraft, questionDraftKey(threadId, messageId, prompt.ordinal));
+  }
+  const questionAdvance = useEventCallback(() => {
+    if (!replyQuestion) return;
+    const next = nextPromptStep(
+      replyAnswered.map((answered, step) => answered || step === replyStep),
+      replyStep,
+    );
+    if (next === "submit") return void sendReply(replyQuestion);
+    updateProgress(replyQuestion.questionCallId, (current) => ({ ...current, step: next }));
+  });
+  const autoAdvance = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(autoAdvance.current), [threadId, replyMessageId, replyStep]);
+  const questionChoose = useEventCallback(async (ordinal: number, index: number) => {
+    if (!replyQuestion || replyPrompt?.ordinal !== ordinal) return;
+    const messageId = replyQuestion.questionCallId;
+    const key = draftKey;
+    const current = getDraft(key);
+    // An option replaces the typed answer, so the text moves to the regular draft instead of vanishing.
+    if (current.text.trim()) {
+      const regular = await loadDraft(threadId);
+      if (!regular) return;
+      commitDraft(
+        mergeClosedReply<string, Draft>(regular, {
+          text: current.text,
+          skillIds: current.skillIds,
+          attachments: [],
+        }),
+        threadId,
+      );
+      commitDraft({ ...current, text: "", skillIds: [] }, key);
+      toast.add({ title: "Your typed answer moved to your message draft." });
+    }
+    updateProgress(messageId, (progress) => ({
+      ...progress,
+      options: { ...progress.options, [ordinal]: index },
+    }));
+    clearTimeout(autoAdvance.current);
+    // A short pause shows the choice before the next prompt replaces it.
+    autoAdvance.current = setTimeout(questionAdvance, 200);
+  });
+  const questionStep = useEventCallback((step: number) => {
+    if (replyMessageId) updateProgress(replyMessageId, (current) => ({ ...current, step }));
+  });
   const questionReply = useEventCallback((messageId: string) => chooseReply(messageId, true));
-  const questionExit = useEventCallback((messageId: string) => chooseReply(messageId, false));
+  const questionExit = useEventCallback(() => {
+    if (replyMessageId) chooseReply(replyMessageId, false);
+  });
   const questionDismiss = useCallback(
     async (question: NativeQuestion) => {
       const rpc = client.rpc;
@@ -717,15 +844,31 @@ export function Chat(props: ChatProps) {
     },
     [client, threadId],
   );
-  const questionServices = useMemo<QuestionServices>(
-    () => ({ onOption: questionOption, onReply: questionReply, onDismiss: questionDismiss }),
-    [questionOption, questionReply, questionDismiss],
+  const dismissReply = useEventCallback(() =>
+    replyQuestion ? questionDismiss(replyQuestion) : Promise.resolve(undefined),
   );
-  const replyPrompts = replyQuestion ? questionPrompts(replyQuestion) : undefined;
-  const chosenKey = replyPrompts ? chosenOptions(draft.text, replyPrompts).join(",") : "";
+  const questionServices = useMemo<QuestionServices>(
+    () => ({ onReply: questionReply, onDismiss: questionDismiss }),
+    [questionReply, questionDismiss],
+  );
   const replyView = useMemo<QuestionReplyView>(
-    () => ({ messageId: replyMessageId, chosen: chosenKey ? chosenKey.split(",") : [] }),
-    [replyMessageId, chosenKey],
+    () => ({ messageId: replyMessageId }),
+    [replyMessageId],
+  );
+  const replyReady = replyChosen !== undefined;
+  const replyCount = replyPrompt ? replyPrompts.length : 0;
+  // The composer is memoized, so typing and streaming must not hand it a new object each render.
+  const composerAnswer = useMemo(
+    () =>
+      replyCount
+        ? {
+            label: answerLabel(replyLast, replyCount),
+            last: replyLast,
+            ready: replyReady,
+            onAdvance: questionAdvance,
+          }
+        : undefined,
+    [replyCount, replyLast, replyReady, questionAdvance],
   );
   const composerSkills = useEventCallback((skillIds: string[]) =>
     commitDraft({ ...getDraft(), skillIds }),
@@ -927,19 +1070,9 @@ export function Chat(props: ChatProps) {
       <div hidden={!editable}>
         <Composer
           documentKey={draftKey}
-          header={
-            answerable.length ? (
-              <QuestionReplyBar
-                question={replyQuestion}
-                waiting={answerable}
-                chosen={replyView.chosen}
-                onOption={questionOption}
-                onReply={questionReply}
-                onExit={questionExit}
-              />
-            ) : undefined
-          }
-          placeholder={replyQuestion ? `Answer ${identities.agent.displayName}…` : undefined}
+          header={questionHeader()}
+          placeholder={replyPrompt ? answerPlaceholder(replyChosen !== undefined) : undefined}
+          answer={composerAnswer}
           autoFocus={props.autoFocus}
           loadingDraft={!draftLoaded}
           windowDrop={props.foreground}
@@ -968,6 +1101,25 @@ export function Chat(props: ChatProps) {
       {!editable && thread ? <div className="read-only">Read-only</div> : null}
     </div>
   );
+  function questionHeader() {
+    if (replyQuestion)
+      return (
+        <QuestionPanel
+          question={replyQuestion}
+          step={replyStep}
+          chosen={replyChosen}
+          typed={!!draft.text.trim()}
+          answered={replyAnswered}
+          disabled={!draftLoaded}
+          onChoose={questionChoose}
+          onStep={questionStep}
+          onExit={questionExit}
+          onDismiss={dismissReply}
+        />
+      );
+    if (answerable.length) return <QuestionWaiting waiting={answerable} onReply={questionReply} />;
+    return undefined;
+  }
   function renderEmptyConversation() {
     if (local)
       return (

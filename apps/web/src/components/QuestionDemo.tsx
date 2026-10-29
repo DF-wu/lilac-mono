@@ -1,17 +1,21 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { RotateCcw } from "lucide-react";
 import type { NativeQuestion } from "@stanley2058/lilac-client-protocol";
 import {
-  applyOptionShortcut,
-  chosenOptions,
+  answerLabel,
+  answerPlaceholder,
+  nextPromptStep,
+  promptAnswered,
   questionPrompts,
+  replyText,
+  type PromptAnswer,
   type QuestionPrompt,
 } from "../question-reply";
 import type { Attachment } from "../types";
 import { Composer } from "./Composer";
 import { Markdown } from "./Markdown";
 import { QuestionCard } from "./QuestionCard";
-import { QuestionReplyBar } from "./QuestionReply";
+import { QuestionPanel, QuestionWaiting } from "./QuestionReply";
 import { MessageIdentityContext } from "./message-identity";
 import {
   MessageServicesContext,
@@ -114,10 +118,102 @@ function demoAttachment(file: File): Attachment {
   };
 }
 
-/** The card in the conversation and the composer answering it, sharing one reply draft. */
+type ReplySummary = Extract<NativeQuestion["view"], { state: "answered" }>["summary"];
+
+/**
+ * Preview-only answering state for a question, mirroring Chat: one prompt at a time, options
+ * move on after a short pause, and the message box holds a typed answer for the prompt on screen.
+ */
+export function useQuestionReplyDemo(
+  item: NativeQuestion,
+  onSend: (text: string, summary: ReplySummary) => void,
+) {
+  const [step, setStep] = useState(0);
+  const [options, setOptions] = useState<Record<number, number>>({});
+  const [typed, setTyped] = useState<Record<number, string>>({});
+  const [files, setFiles] = useState(0);
+  const all = questionPrompts(item);
+  const prompt = all[Math.min(step, all.length - 1)]!;
+  const answers = new Map<number, PromptAnswer>(
+    all.map((entry) => [
+      entry.ordinal,
+      {
+        option: options[entry.ordinal],
+        text: typed[entry.ordinal] ?? "",
+        attachments: entry.ordinal === prompt.ordinal ? files : 0,
+      },
+    ]),
+  );
+  const answered = all.map((entry) => promptAnswered(answers.get(entry.ordinal)!));
+  const next = nextPromptStep(
+    answered.map((value, index) => value || index === step),
+    step,
+  );
+  const advance = useRef(() => {});
+  advance.current = () => {
+    if (next !== "submit") return setStep(next);
+    onSend(replyText(all, answers), {
+      answers: all.map((entry) => {
+        const answer = answers.get(entry.ordinal)!;
+        const option = entry.options.find((choice) => choice.index === answer.option);
+        return {
+          header: entry.header,
+          answer:
+            option && !answer.text.trim()
+              ? { kind: "option" as const, label: option.label }
+              : { kind: "custom" as const },
+        };
+      }),
+    });
+  };
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const chosen = options[prompt.ordinal];
+  return {
+    documentKey: `${item.questionCallId}-reply-${prompt.ordinal}`,
+    text: typed[prompt.ordinal] ?? "",
+    onText: (text: string) => setTyped((current) => ({ ...current, [prompt.ordinal]: text })),
+    setFiles,
+    reset() {
+      setStep(0);
+      setOptions({});
+      setTyped({});
+      setFiles(0);
+    },
+    panel: (props: { onExit: () => void; onDismiss: () => void }) => (
+      <QuestionPanel
+        question={item}
+        step={step}
+        chosen={chosen}
+        typed={!!typed[prompt.ordinal]?.trim()}
+        answered={answered}
+        onChoose={(ordinal, index) => {
+          setTyped((current) => ({ ...current, [ordinal]: "" }));
+          setOptions((current) => ({ ...current, [ordinal]: index }));
+          clearTimeout(timer.current);
+          timer.current = setTimeout(() => advance.current(), 200);
+        }}
+        onStep={setStep}
+        onExit={props.onExit}
+        onDismiss={async () => {
+          props.onDismiss();
+          return undefined;
+        }}
+      />
+    ),
+    placeholder: answerPlaceholder(chosen !== undefined),
+    answer: {
+      label: answerLabel(next === "submit", all.length),
+      last: next === "submit",
+      ready: chosen !== undefined,
+      onAdvance: () => advance.current(),
+    },
+  };
+}
+
+/** The card in the conversation and the composer answering it one prompt at a time. */
 function ReplyDemo({ total }: { total: number }) {
   const [state, setState] = useState<"pending" | "regular" | "sent">("pending");
-  const [reply, setReply] = useState("");
   const [regular, setRegular] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [sent, setSent] = useState<string>();
@@ -136,17 +232,15 @@ function ReplyDemo({ total }: { total: number }) {
       ),
     [state, total],
   );
-  const all = questionPrompts(item);
+  const reply = useQuestionReplyDemo(item, (text) => {
+    setSent(text);
+    setAttachments([]);
+    setState("sent");
+  });
   const replying = state === "pending";
-  const chosen = useMemo(() => chosenOptions(reply, all), [reply, all]);
-  const choose = (_messageId: string, ordinal: number, index: number) => {
-    setState("pending");
-    setReply((text) => applyOptionShortcut(text, all, ordinal, index));
-  };
   const services: MessageServices = {
     ...baseServices,
     questions: {
-      onOption: choose,
       onReply: () => setState("pending"),
       onDismiss: async () => {
         setState("sent");
@@ -154,6 +248,15 @@ function ReplyDemo({ total }: { total: number }) {
       },
     },
   };
+  function header() {
+    if (state === "sent") return undefined;
+    if (replying)
+      return reply.panel({
+        onExit: () => setState("regular"),
+        onDismiss: () => setState("sent"),
+      });
+    return <QuestionWaiting waiting={[item]} onReply={() => setState("pending")} />;
+  }
   return (
     <div className="flex min-w-0 flex-col gap-3">
       <div className="flex justify-end">
@@ -161,8 +264,8 @@ function ReplyDemo({ total }: { total: number }) {
           label="Reset question demo"
           tooltip="Reset"
           onClick={() => {
+            reply.reset();
             setState("pending");
-            setReply("");
             setSent(undefined);
             setAttachments([]);
           }}
@@ -171,12 +274,7 @@ function ReplyDemo({ total }: { total: number }) {
         </IconButton>
       </div>
       <MessageServicesContext value={services}>
-        <QuestionReplyContext
-          value={{
-            messageId: replying ? item.questionCallId : undefined,
-            chosen,
-          }}
-        >
+        <QuestionReplyContext value={{ messageId: replying ? item.questionCallId : undefined }}>
           <QuestionCard question={item} />
         </QuestionReplyContext>
       </MessageServicesContext>
@@ -186,31 +284,23 @@ function ReplyDemo({ total }: { total: number }) {
         </div>
       ) : null}
       <Composer
-        documentKey={replying ? `demo-${total}-reply` : `demo-${total}`}
-        text={replying ? reply : regular}
-        onText={replying ? setReply : setRegular}
-        header={
-          state === "sent" ? undefined : (
-            <QuestionReplyBar
-              question={replying ? item : undefined}
-              waiting={[item]}
-              chosen={chosen}
-              onOption={choose}
-              onReply={() => setState("pending")}
-              onExit={() => setState("regular")}
-            />
-          )
-        }
-        placeholder={replying ? "Answer Lilac…" : undefined}
+        documentKey={replying ? reply.documentKey : `demo-${total}`}
+        text={replying ? reply.text : regular}
+        onText={replying ? reply.onText : setRegular}
+        header={header()}
+        placeholder={replying ? reply.placeholder : undefined}
+        answer={replying ? reply.answer : undefined}
         attachments={replying ? attachments : []}
         onAttach={(files) => {
           const added = files.map(demoAttachment);
           setAttachments((items) => [...items, ...added]);
+          reply.setFiles((count) => count + added.length);
           return added;
         }}
-        onRemoveAttachment={(key) =>
-          setAttachments((items) => items.filter((attachment) => attachment.key !== key))
-        }
+        onRemoveAttachment={(key) => {
+          setAttachments((items) => items.filter((attachment) => attachment.key !== key));
+          reply.setFiles((count) => Math.max(0, count - 1));
+        }}
         onRetryAttachment={noop}
         skillIds={[]}
         onSkills={noop}
@@ -219,16 +309,7 @@ function ReplyDemo({ total }: { total: number }) {
         canCancel={false}
         disabled={false}
         onModelChange={noop}
-        onSubmit={(submission) => {
-          if (!replying) {
-            setRegular("");
-            return;
-          }
-          setSent(submission.text);
-          setReply("");
-          setAttachments([]);
-          setState("sent");
-        }}
+        onSubmit={() => setRegular("")}
         onCancel={noop}
       />
     </div>

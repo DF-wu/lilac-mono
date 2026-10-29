@@ -18,7 +18,7 @@ import {
   type DragEvent,
   type ReactNode,
 } from "react";
-import { ArrowUp, CircleAlert, Paperclip, Square, Upload } from "lucide-react";
+import { ArrowRight, ArrowUp, CircleAlert, Paperclip, Square, Upload } from "lucide-react";
 import { createPortal } from "react-dom";
 import { hasFileDrag, installWindowFileDrop } from "../window-file-drop";
 import "./composer-drop.css";
@@ -72,6 +72,8 @@ export type ComposerProps = Partial<Pick<ChatCommon, "client" | "scope" | "catal
   /** Shown above the editor inside the composer, such as the question being answered. */
   header?: ReactNode;
   placeholder?: string;
+  /** Answering a question: send moves to the next prompt or submits every answer. */
+  answer?: { label: string; last: boolean; ready: boolean; onAdvance: () => void };
 };
 
 export const Composer = memo(function Composer(props: ComposerProps) {
@@ -230,21 +232,21 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     setSelected((from + (down ? 1 : menuSize - 1)) % menuSize);
   }
 
+  const answer = props.answer;
+  const empty = !text.trim() && attachments.length === 0;
   function submit() {
-    if (
-      disabled ||
-      props.offline ||
-      !editorReady ||
-      props.submitting ||
-      (!text.trim() && attachments.length === 0)
-    )
-      return;
+    if (disabled || props.offline || !editorReady || props.submitting) return;
+    if (answer ? empty && !answer.ready : empty) return;
     if (input.current?.hasMissingAttachments()) {
       toast.add({ title: "Reattach or remove the missing files before sending.", type: "error" });
       return;
     }
     if (text.length > 65_536) {
       toast.add({ title: "Messages can contain up to 65,536 characters.", type: "error" });
+      return;
+    }
+    if (answer) {
+      answer.onAdvance();
       return;
     }
     if (!commandId && matching.length > 1) {
@@ -458,6 +460,8 @@ export const Composer = memo(function Composer(props: ComposerProps) {
   const editorKeyDown = useEventCallback(keydown);
   const editorPaste = useEventCallback(paste);
 
+  const sendLabel =
+    answer?.label ?? (active && custom ? "Queue command as follow-up" : "Send message");
   return (
     <div
       className={`composer-wrap relative ${dragging ? "is-dragging" : ""}`}
@@ -614,7 +618,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
             onChange={props.onModelChange}
           />
           <span className="toolbar-spacer flex-1" />
-          {active ? (
+          {active && !answer ? (
             <div className="queue-mode flex shrink-0 items-center text-muted-foreground">
               <Select
                 disabled={!!custom}
@@ -667,10 +671,10 @@ export const Composer = memo(function Composer(props: ComposerProps) {
             </IconButton>
           ) : null}
           <IconButton
-            label={active && custom ? "Queue command as follow-up" : "Send message"}
+            label={sendLabel}
             tooltip={
               <>
-                {active && custom ? "Queue command as follow-up" : "Send message"}
+                {sendLabel}
                 <Kbd>Enter</Kbd>
               </>
             }
@@ -682,11 +686,11 @@ export const Composer = memo(function Composer(props: ComposerProps) {
               props.offline ||
               !editorReady ||
               props.submitting ||
-              (!text.trim() && !attachments.length)
+              (answer ? empty && !answer.ready : empty)
             }
             onClick={submit}
           >
-            <ArrowUp />
+            {answer && !answer.last ? <ArrowRight /> : <ArrowUp />}
           </IconButton>
         </footer>
       </div>

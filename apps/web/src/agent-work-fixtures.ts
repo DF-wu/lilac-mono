@@ -321,6 +321,51 @@ function turn(
     messages: [prompt, ...messages],
   };
 }
+/** The question the "Needs input" stage asks, as a pending native question for the demo viewer. */
+export const demoQuestion: Extract<DisplayPart, { type: "data-question" }>["data"] = (() => {
+  const prompts = [
+    {
+      header: "Plan",
+      question: "Would you prefer an outdoor plan or a quieter indoor visit?",
+      options: [
+        ["Riverside walk", "Best if Saturday morning stays dry."],
+        ["Museum visit", "Open 10:00–18:00 and unaffected by rain."],
+      ],
+    },
+    {
+      header: "Start time",
+      question: "When should the day start?",
+      options: [
+        ["Morning", "Leave around 9:00 to beat the crowds."],
+        ["Afternoon", "Start after lunch, around 13:00."],
+      ],
+    },
+  ].map((source, position, all) => ({
+    ordinal: position + 1,
+    total: all.length,
+    header: source.header,
+    question: source.question,
+    options: source.options.map(([label, description], index) => ({
+      index: index + 1,
+      label: label!,
+      description: description!,
+      token: `demo-question-${position}-${index}`,
+    })),
+    customToken: `demo-question-${position}-custom`,
+  }));
+  return {
+    questionCallId: "demo_question",
+    requestId: "demo_request",
+    respondentId: "demo_user",
+    historyGeneration: 0,
+    mode: "deferred",
+    prompts,
+    view: { state: "pending", prompt: prompts[0]! },
+  };
+})();
+const demoQuestionMessage = message("demo_question", [
+  { type: "data-question", id: "demo_question", data: demoQuestion },
+]);
 const thought = activity(
   "demo_think",
   "thinking",
@@ -795,26 +840,9 @@ export const agentWorkStages: AgentWorkStage[] = [
   {
     id: "needs-input",
     label: "Needs input",
-    description: "A choice presented to the user. Buttons only update this demo.",
-    frames: [
-      turn([
-        message("demo_question", [
-          { type: "text", text: "Would you prefer an outdoor plan or a quieter indoor visit?" },
-          {
-            type: "data-actions",
-            id: "demo_choices",
-            data: {
-              requestId: "demo_request",
-              revision: 1,
-              actions: [
-                { actionId: "outdoor", label: "Riverside walk", style: "primary" },
-                { actionId: "indoor", label: "Museum visit", style: "secondary" },
-              ],
-            },
-          },
-        ]),
-      ]),
-    ],
+    description:
+      "A deferred question. The composer answers one prompt at a time; replies only update this demo.",
+    frames: [turn([message("demo_work", [thought]), demoQuestionMessage], "complete")],
   },
   {
     id: "compacting",
