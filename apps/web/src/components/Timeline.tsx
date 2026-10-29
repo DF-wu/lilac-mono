@@ -1,3 +1,4 @@
+import { useMessageTouchMenu } from "./use-message-touch-menu";
 import { joinMessageTurns, lastTurnMessageTime, sameMessageAuthor } from "../message-grouping";
 import {
   ContextMenu,
@@ -75,6 +76,7 @@ import { citationStore } from "../citation-store";
 import { useStore } from "zustand";
 import { copyAssistantSelection } from "../markdown-copy";
 import { WorkflowCard } from "./WorkflowCard";
+import { QuestionCard } from "./QuestionCard";
 import { readMotionDuration } from "../theme/motion";
 import { Button } from "./ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
@@ -178,10 +180,11 @@ function useMessageServicesValue({
   upload,
   onAction,
   onReaction,
+  questions,
 }: MessageServices) {
   return useMemo(
-    () => ({ canEdit, rewindDisabled, resourceUrl, upload, onAction, onReaction }),
-    [canEdit, rewindDisabled, resourceUrl, upload, onAction, onReaction],
+    () => ({ canEdit, rewindDisabled, resourceUrl, upload, onAction, onReaction, questions }),
+    [canEdit, rewindDisabled, resourceUrl, upload, onAction, onReaction, questions],
   );
 }
 
@@ -670,8 +673,12 @@ function AgentTurn(props: TurnProps) {
   // Start times never change, so one stable map keeps streaming updates from rerendering every row.
   const [times] = useState(() => new Map<string, number>());
   recordActivityTimes(times, slot.messages);
+  // A trailing question card stays visible below the folded work so it can be answered.
   const lastIntermediate = remaining.findLastIndex(
-    (message) => message.role !== "assistant" || message.metadata?.phase !== "final",
+    (message) =>
+      message.role !== "assistant" ||
+      (message.metadata?.phase !== "final" &&
+        !message.parts.some((part) => part.type === "data-question")),
   );
   const intermediate = remaining.slice(0, lastIntermediate + 1);
   const finals = remaining.slice(lastIntermediate + 1);
@@ -1292,6 +1299,7 @@ const MessageBody = memo(function MessageBody(
       ? { surface: conversation.surface, sessionId: conversation.sessionId, messageId: message.id }
       : reference;
   const [copyError, setCopyError] = useState<string>();
+  const touchMenu = useMessageTouchMenu();
   const [copiedAt, setCopiedAt] = useState(0);
   useEffect(() => {
     if (!copiedAt) return;
@@ -1404,15 +1412,7 @@ const MessageBody = memo(function MessageBody(
           data-slot="message"
           className="select-text"
           style={{ WebkitTouchCallout: "default" }}
-          onContextMenu={(event) => {
-            if (window.getSelection()?.toString()) {
-              event.preventBaseUIHandler();
-              event.stopPropagation();
-            }
-          }}
-          onTouchStart={(event) => {
-            if (window.getSelection()?.toString()) event.preventBaseUIHandler();
-          }}
+          {...touchMenu}
           render={
             <ChatMessage
               align={self ? "end" : "start"}
@@ -1502,6 +1502,8 @@ const MessageBody = memo(function MessageBody(
                           actions={message.parts.find((item) => item.type === "data-actions")}
                         />
                       );
+                    case "data-question":
+                      return <QuestionCard key={part.id} question={part.data} />;
                     case "data-reactions":
                       return lastContent < 0 ? (
                         <Bubble

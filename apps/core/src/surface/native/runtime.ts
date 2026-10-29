@@ -1,3 +1,4 @@
+import { NativeQuestions } from "./questions";
 import { reconcileNativeDeferredSends, subscribeNativeDeferredSends } from "./deferred-sends";
 import { NativePush } from "./push";
 import { NativeComputer } from "./computer";
@@ -265,8 +266,10 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     kick,
     notifyPostedMessage: (threadId) => push.posted(threadId),
   });
+  const questions = new NativeQuestions(store);
   const descriptor = createNativeSurfaceRuntimeDescriptor({
     adapter,
+    question: questions.port,
     resolveWorkflowAdapter: (threadId) =>
       store
         .getThreadRecord(nativeThreadId(threadId))
@@ -310,6 +313,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     streamingMode: () => deployment().outputStreaming,
   });
   const services = createNativeRpcServices({
+    questions,
     push,
     computer: new NativeComputer(store, options.mcpRegistry),
     references,
@@ -510,6 +514,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   > {
     outputStopping = false;
     return Result.gen(async function* () {
+      yield* questions.recover();
       yield* linkProjectedMessages();
       const started = await options.bus.subscribeTopic(
         "evt.native.output",

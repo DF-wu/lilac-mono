@@ -115,6 +115,7 @@ import { ThreadSettleButton } from "./components/ThreadSettleButton";
 import { ThreadQueueDemo } from "./components/ThreadQueueDemo";
 import { DeploymentSettingsForm } from "./components/DeploymentSettings";
 import { AgentWorkDemo } from "./components/AgentWorkDemo";
+import { QuestionDemo } from "./components/QuestionDemo";
 import { CitationDemo } from "./components/CitationDemo";
 import { WorkingIndicatorsContext } from "./components/WorkVerb";
 import { SidebarSearch } from "./components/SidebarSearch";
@@ -910,6 +911,9 @@ function Messages() {
         </Specimen>
       </div>
       <ThinkingSpinnerDemo />
+      <Specimen title="Questions">
+        <QuestionDemo />
+      </Specimen>
       <Specimen title="HTML preview">
         <HtmlPreviewFrame src={galleryPreviewSrc} title="weekly-runs.html" />
       </Specimen>

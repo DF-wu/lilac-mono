@@ -16,6 +16,7 @@ import {
   useRef,
   useState,
   type DragEvent,
+  type ReactNode,
 } from "react";
 import { ArrowUp, CircleAlert, Paperclip, Square, Upload } from "lucide-react";
 import { createPortal } from "react-dom";
@@ -68,6 +69,9 @@ export type ComposerProps = Partial<Pick<ChatCommon, "client" | "scope" | "catal
   onModelChange: (modelId: string) => void;
   onSubmit: (value: ComposerSubmission) => void;
   onCancel: () => void;
+  /** Shown above the editor inside the composer, such as the question being answered. */
+  header?: ReactNode;
+  placeholder?: string;
 };
 
 export const Composer = memo(function Composer(props: ComposerProps) {
@@ -76,9 +80,11 @@ export const Composer = memo(function Composer(props: ComposerProps) {
   const scope = props.scope ?? workspace?.scope;
   const { agent } = useContext(MessageIdentityContext);
   const { text, onText, attachments, active, disabled, catalog } = props;
-  const placeholder = active
-    ? `Steer ${agent.displayName}, or queue a follow-up…`
-    : `Message ${agent.displayName}…`;
+  const placeholder =
+    props.placeholder ??
+    (active
+      ? `Steer ${agent.displayName}, or queue a follow-up…`
+      : `Message ${agent.displayName}…`);
   const input = useRef<ComposerEditorHandle>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const insertingCompletion = useRef<"hide" | "keep">(undefined);
@@ -559,6 +565,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
         </PopoverContent>
       </Popover>
       <div className="composer bg-surface text-card-foreground rounded-lg p-3">
+        {props.header}
         <Suspense
           fallback={
             <div role="status" aria-label="Loading editor">

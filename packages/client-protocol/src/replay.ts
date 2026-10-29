@@ -1,3 +1,4 @@
+import { nativeQuestionSchema } from "./questions.ts";
 import { conversationReferenceSchema } from "./references.ts";
 import type { UIMessage } from "ai";
 import { z } from "zod";
@@ -114,6 +115,11 @@ export const workflowCardSchema = z.strictObject({
   sensitive: z.boolean(),
 });
 export const displayPartSchema = z.discriminatedUnion("type", [
+  z.strictObject({
+    type: z.literal("data-question"),
+    id: identitySchema,
+    data: nativeQuestionSchema,
+  }),
   z.strictObject({ type: z.literal("text"), text: z.string().max(MAX_REPLAY_TEXT_LENGTH) }),
   z.strictObject({
     type: z.literal("data-activity"),

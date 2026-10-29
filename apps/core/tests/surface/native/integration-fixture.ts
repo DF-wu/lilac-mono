@@ -50,6 +50,10 @@ import {
   type NativeRuntimeOptions,
 } from "../../../src/surface/native/runtime";
 import type { CoreToolPluginManager, BuiltLevel1Toolset } from "../../../src/plugins";
+import { QuestionService } from "../../../src/question/question-service";
+import { SqliteQuestionStore } from "../../../src/question/question-store";
+import { nativeSurfaceProtocol } from "../../../src/surface/native/native-protocol";
+import { createQuestionTool } from "../../../src/tools/question";
 
 export function integrationValue<T, E>(result: ResultType<T, E>): T {
   return result.match({
@@ -80,12 +84,12 @@ export function nativeFixtureTextResponse(text: string) {
   };
 }
 
-function fixturePluginManager(): CoreToolPluginManager {
+function fixturePluginManager(questions?: QuestionService): CoreToolPluginManager {
   const toolset: BuiltLevel1Toolset = {
-    tools: {},
+    tools: questions ? { question: createQuestionTool(questions) } : {},
     specs: new Map(),
     contributionInfo: new Map(),
-    directToolNames: new Set(),
+    directToolNames: new Set(questions ? ["question"] : []),
     catalog: [],
     catalogMetadata: {},
     genericOutputNormalizerBypassTools: new Set(),
@@ -104,6 +108,25 @@ function fixturePluginManager(): CoreToolPluginManager {
   };
 }
 
+function fixtureQuestions(
+  store: SqliteQuestionStore,
+  runtime: Awaited<ReturnType<typeof createNativeRuntime>> extends ResultType<infer T, unknown>
+    ? T
+    : never,
+) {
+  const question = runtime.descriptor.createQuestion?.(runtime.descriptor.adapter);
+  if (!question) throw new Error("Native question port is unavailable");
+  const resolved = { platform: "native" as const, protocol: nativeSurfaceProtocol, question };
+  return new QuestionService({
+    store,
+    surfaces: {
+      entries: () => [resolved],
+      resolve: (platform) => (platform === "native" ? resolved : null),
+    },
+    logger: { warn: () => {} },
+  });
+}
+
 export async function createNativeIntegrationFixture(
   options: {
     mcpRegistry?: NativeRuntimeOptions["mcpRegistry"];
@@ -114,6 +137,8 @@ export async function createNativeIntegrationFixture(
     installationSecrets?: NativeInstallationSecrets;
     publishableKey?: string;
     model?: MockLanguageModelV4;
+    /** Runs the shared question service and offers the question tool to the model. */
+    questions?: boolean;
     seed?: (
       store: import("../../../src/surface/native/store").NativeStore,
       transcript: SqliteTranscriptStore,
@@ -344,8 +369,14 @@ export async function createNativeIntegrationFixture(
     }),
   );
   integrationValue(await runtime.startOutput());
-  const pluginManager = fixturePluginManager();
+  const questionStore = options.questions
+    ? new SqliteQuestionStore({ dbPath: requestDb })
+    : undefined;
+  const questions = questionStore ? fixtureQuestions(questionStore, runtime) : undefined;
+  if (questions) integrationValue(await questions.start());
+  const pluginManager = fixturePluginManager(questions);
   runner = await startBusAgentRunner({
+    questions,
     bus,
     blobStore: blobs,
     config,
@@ -390,6 +421,7 @@ export async function createNativeIntegrationFixture(
   });
   await options.seed?.(store, transcript, installation.database);
   integrationValue(await runtime.recover());
+  await questions?.finishStartupRecovery();
   runner.activate();
   const address = integrationValue(runtime.startIngress());
   const url = address.url;
@@ -450,6 +482,8 @@ export async function createNativeIntegrationFixture(
     for (const socket of sockets) socket.close();
     await runtime.stopIngress();
     await runner?.stop();
+    await questions?.stop();
+    questionStore?.close();
     subagentWorkflows.close();
     await runtime.stopOutput();
     await pluginManager.destroy();

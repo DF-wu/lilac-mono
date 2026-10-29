@@ -1,3 +1,4 @@
+import { Result } from "better-result";
 import { RecentContextProvider } from "./RecentContext";
 import { currentPushDeviceId } from "../push-device";
 import { watchReadLifecycle } from "../read-lifecycle";
@@ -12,11 +13,33 @@ import {
   participantOptions,
   composerDraftOptions,
   updateComposerDraft,
+  pendingQuestionsOptions,
+  loadComposerDraft,
   queueOptions,
   refreshQueue as refreshQueueQuery,
   useNativeOnline,
 } from "../queries";
 import { MessageIdentityContext } from "./message-identity";
+import {
+  QuestionReplyContext,
+  type QuestionReplyView,
+  type QuestionServices,
+} from "./message-services";
+import {
+  activeReplyQuestion,
+  answerableQuestions,
+  autoReplyQuestion,
+  applyOptionShortcut,
+  chosenOptions,
+  questionDraftKey,
+  questionPrompts,
+  questionReplyStore,
+  questionReplyTarget,
+  questionSignature,
+  questionSlotsChanged,
+  mergeClosedReply,
+} from "../question-reply";
+import { QuestionReplyBar } from "./QuestionReply";
 import { useWorkspace } from "../workspace-context";
 import {
   useCallback,
@@ -31,6 +54,7 @@ import {
 import { X, RotateCcw } from "lucide-react";
 import type {
   NativeInput,
+  NativeQuestion,
   DisplayPart,
   NativeThread,
   ReadyTurnSlot,
@@ -90,15 +114,40 @@ export function Chat(props: ChatProps) {
   const localThread = useStore(draftStore, (state) => state.localDrafts.get(threadId));
   const editable = local ? !!localThread : !!thread?.capabilities.edit;
   const queries = useQueryClient();
-  const draftOptions = composerDraftOptions(scope, threadId, draftCache);
+  const identity = useContext(MessageIdentityContext);
+  const online = useNativeOnline(client);
+  const pendingQuestions = useQuery({
+    ...pendingQuestionsOptions(client, threadId),
+    enabled: online && !local,
+  });
+  const inFlightReplies = props.pending
+    .flatMap((entry) =>
+      entry.state !== "rejected" && entry.submission.questionReply
+        ? [entry.submission.questionReply.messageId]
+        : [],
+    )
+    .join("\n");
+  const answerable = useMemo(
+    () =>
+      editable
+        ? answerableQuestions(pendingQuestions.data, identity.viewerId).filter(
+            (question) => !inFlightReplies.split("\n").includes(question.questionCallId),
+          )
+        : [],
+    [editable, pendingQuestions.data, identity.viewerId, inFlightReplies],
+  );
+  const replyChoice = useStore(questionReplyStore, (state) => state.choices.get(threadId));
+  const replyQuestion = activeReplyQuestion(answerable, replyChoice);
+  const replyMessageId = replyQuestion?.questionCallId;
+  const draftKey = replyMessageId ? questionDraftKey(threadId, replyMessageId) : threadId;
+  const draftOptions = composerDraftOptions(scope, draftKey, draftCache);
   const draftQuery = useQuery({
     ...draftOptions,
-    initialData: props.draft,
+    initialData: draftKey === threadId ? props.draft : undefined,
     enabled: !local,
   });
   const draft = localThread?.draft ?? draftQuery.data ?? emptyDraft;
   const draftLoaded = local ? !!localThread : !draftQuery.isPending;
-  const identity = useContext(MessageIdentityContext);
   const [view, setView] = useState<{
     id: string;
     error?: string;
@@ -142,18 +191,18 @@ export function Chat(props: ChatProps) {
     view.id === threadId ? view : {};
   const currentId = useRef(threadId);
   currentId.current = threadId;
-  const getDraft = () =>
+  const getDraft = (key = draftKey) =>
     local
       ? (draftStore.getState().localDrafts.get(threadId)?.draft ?? emptyDraft)
-      : (queries.getQueryData(draftOptions.queryKey) ?? emptyDraft);
-  const commitDraft = (value: Draft) => {
+      : (queries.getQueryData(composerDraftOptions(scope, key, draftCache).queryKey) ?? emptyDraft);
+  const commitDraft = (value: Draft, key = draftKey) => {
     if (local) {
       props.onLocalChange(threadId, (current) => ({ ...current, draft: value }));
       return;
     }
-    updateComposerDraft(queries, threadId, value);
-    props.onDraft(threadId, value);
-    if (draftCache) void attempt(() => draftCache.saveDraft(scope, threadId, value), setError);
+    updateComposerDraft(queries, key, value);
+    if (key === threadId) props.onDraft(threadId, value);
+    if (draftCache) void attempt(() => draftCache.saveDraft(scope, key, value), setError);
   };
   const pendingEntries = props.pending;
   const commitPending = (update: (entries: PendingInput[]) => PendingInput[]) =>
@@ -179,7 +228,6 @@ export function Chat(props: ChatProps) {
   const previousActive = useRef(active);
   const canEdit = useRef(editable);
   canEdit.current = editable;
-  const online = useNativeOnline(client);
   const participants = useQuery({
     ...participantOptions(client, threadId),
     enabled: online && !local,
@@ -308,6 +356,49 @@ export function Chat(props: ChatProps) {
     [client, threadId, refreshQueue],
   );
   useEffect(() => {
+    if (local) return;
+    const refresh = () =>
+      void queries.invalidateQueries({
+        queryKey: pendingQuestionsOptions(client, threadId).queryKey,
+        exact: true,
+      });
+    const seen = new Map(store.slotIds.map((id) => [id, questionSignature(store.get(id))]));
+    const stopStore = store.subscribe((change) => {
+      if (questionSlotsChanged(seen, change.slotIds, (id) => store.get(id))) refresh();
+    });
+    const stopClient = client.subscribe((event) => {
+      if (event.kind === "connection" && event.state === "online") refresh();
+      if (event.kind === "input" && event.threadId === threadId) refresh();
+    });
+    return () => {
+      stopStore();
+      stopClient();
+    };
+  }, [client, store, threadId, local, queries]);
+  const regularDraftEmpty =
+    draftKey === threadId ? !draft.text.trim() && !draft.attachments.length : false;
+  const autoReply = draftLoaded
+    ? autoReplyQuestion(answerable, replyChoice, regularDraftEmpty)
+    : undefined;
+  useEffect(() => {
+    if (autoReply) chooseReply(autoReply, true);
+  }, [autoReply, threadId]);
+  const previousReply = useRef<{ threadId: string; messageId: string }>(undefined);
+  useEffect(() => {
+    const previous = previousReply.current;
+    previousReply.current = replyMessageId ? { threadId, messageId: replyMessageId } : undefined;
+    if (!previous || previous.threadId !== threadId || previous.messageId === replyMessageId)
+      return;
+    if (pendingQuestions.data?.some((item) => item.questionCallId === previous.messageId)) return;
+    // The question closed elsewhere, so an unsent reply moves to the regular draft.
+    const key = questionDraftKey(threadId, previous.messageId);
+    const leftover = getDraft(key);
+    if (!leftover.text.trim() && !leftover.attachments.length && !leftover.skillIds.length) return;
+    commitDraft(mergeClosedReply(getDraft(threadId), leftover), threadId);
+    commitDraft(emptyDraft, key);
+    toast.add({ title: "The question closed. Your reply is now a regular draft." });
+  }, [replyMessageId, threadId]);
+  useEffect(() => {
     const changed = previousActive.current !== active;
     previousActive.current = active;
     if (changed) void refreshQueue();
@@ -372,6 +463,16 @@ export function Chat(props: ChatProps) {
       });
       return;
     }
+    const questionReply = entry.submission.questionReply;
+    if (questionReply && !(await questionStillOpen(questionReply))) {
+      setPending(entry.commandId, {
+        state: "rejected",
+        error: "This question closed before your answer arrived.",
+        submission: { ...entry.submission, questionReply: undefined },
+        questionClosed: true,
+      });
+      return;
+    }
     return {
       threadId: threadId,
       commandId: entry.commandId,
@@ -397,7 +498,22 @@ export function Chat(props: ChatProps) {
       attachmentIds: ids.filter((id): id is string => !!id),
       skillIds: entry.submission.skillIds,
       command: entry.submission.command,
+      ...(questionReply ? { questionReply } : {}),
     };
+  }
+  async function questionStillOpen(target: { messageId: string; token: string }) {
+    const fetched = await Result.tryPromise({
+      try: () => queries.query({ ...pendingQuestionsOptions(client, threadId), staleTime: 0 }),
+      catch: () => undefined,
+    });
+    // Without a fresh list the server still rejects a stale token, so let it decide.
+    const questions = fetched.match({ ok: (value) => value, err: () => undefined });
+    if (!questions) return true;
+    return questions.some(
+      (question) =>
+        question.questionCallId === target.messageId &&
+        questionReplyTarget(question)?.token === target.token,
+    );
   }
   async function deliver(entry: PendingInput, retryFailed = false) {
     let awaitingProjection = false;
@@ -421,10 +537,12 @@ export function Chat(props: ChatProps) {
       props.onLocalSubmit(threadId, submission);
       return;
     }
+    const questionReply = replyQuestion && questionReplyTarget(replyQuestion);
+    if (questionReply) chooseReply(questionReply.messageId, false);
     const entry: PendingInput = {
       commandId: crypto.randomUUID(),
       text: submission.text,
-      submission,
+      submission: questionReply ? { ...submission, questionReply } : submission,
       optimisticSlotIds: serverActive ? undefined : [...store.slotIds],
       state: "preparing",
     };
@@ -543,6 +661,71 @@ export function Chat(props: ChatProps) {
       );
     },
     [client, threadId],
+  );
+  const chooseReply = (messageId: string, replying: boolean) =>
+    questionReplyStore.getState().choose(threadId, { messageId, replying });
+  const questionOption = useEventCallback(
+    async (messageId: string, ordinal: number, index: number) => {
+      const question = answerable.find((item) => item.questionCallId === messageId);
+      if (!question) return;
+      chooseReply(messageId, true);
+      const key = questionDraftKey(threadId, messageId);
+      const loaded = local
+        ? Result.ok(getDraft(key))
+        : await loadComposerDraft(queries, composerDraftOptions(scope, key, draftCache));
+      // Skip the shortcut if the user moved on or the question closed while the draft loaded.
+      const choice = questionReplyStore.getState().choices.get(threadId);
+      const open = queries
+        .getQueryData(pendingQuestionsOptions(client, threadId).queryKey)
+        ?.some((item) => item.questionCallId === messageId);
+      const moved =
+        currentId.current !== threadId || choice?.messageId !== messageId || !choice.replying;
+      if (moved || !open) return;
+      const current = loaded.match({
+        ok: (value) => value,
+        err: (message) => {
+          setError(message);
+          return undefined;
+        },
+      });
+      if (!current) return;
+      const text = applyOptionShortcut(current.text, questionPrompts(question), ordinal, index);
+      commitDraft({ ...current, text }, key);
+    },
+  );
+  const questionReply = useEventCallback((messageId: string) => chooseReply(messageId, true));
+  const questionExit = useEventCallback((messageId: string) => chooseReply(messageId, false));
+  const questionDismiss = useCallback(
+    async (question: NativeQuestion) => {
+      const rpc = client.rpc;
+      const target = questionReplyTarget(question);
+      if (!rpc || !target) return "Reconnect to dismiss";
+      let failure: string | undefined;
+      await attempt(
+        () =>
+          rpc.questions.dismiss({
+            threadId,
+            messageId: target.messageId,
+            historyGeneration: question.historyGeneration,
+            token: target.token,
+          }),
+        (message) => {
+          failure = message;
+        },
+      );
+      return failure;
+    },
+    [client, threadId],
+  );
+  const questionServices = useMemo<QuestionServices>(
+    () => ({ onOption: questionOption, onReply: questionReply, onDismiss: questionDismiss }),
+    [questionOption, questionReply, questionDismiss],
+  );
+  const replyPrompts = replyQuestion ? questionPrompts(replyQuestion) : undefined;
+  const chosenKey = replyPrompts ? chosenOptions(draft.text, replyPrompts).join(",") : "";
+  const replyView = useMemo<QuestionReplyView>(
+    () => ({ messageId: replyMessageId, chosen: chosenKey ? chosenKey.split(",") : [] }),
+    [replyMessageId, chosenKey],
   );
   const composerSkills = useEventCallback((skillIds: string[]) =>
     commitDraft({ ...getDraft(), skillIds }),
@@ -681,7 +864,7 @@ export function Chat(props: ChatProps) {
                     )
                   }
                 >
-                  Retry message
+                  {entry.questionClosed ? "Send as message" : "Retry message"}
                 </Button>
               ) : null}
             </div>
@@ -743,7 +926,20 @@ export function Chat(props: ChatProps) {
       ) : null}
       <div hidden={!editable}>
         <Composer
-          documentKey={threadId}
+          documentKey={draftKey}
+          header={
+            answerable.length ? (
+              <QuestionReplyBar
+                question={replyQuestion}
+                waiting={answerable}
+                chosen={replyView.chosen}
+                onOption={questionOption}
+                onReply={questionReply}
+                onExit={questionExit}
+              />
+            ) : undefined
+          }
+          placeholder={replyQuestion ? `Answer ${identities.agent.displayName}…` : undefined}
           autoFocus={props.autoFocus}
           loadingDraft={!draftLoaded}
           windowDrop={props.foreground}
@@ -795,24 +991,27 @@ export function Chat(props: ChatProps) {
       <div className="chat-workspace min-h-0 flex flex-col flex-1" data-thread-id={threadId}>
         <UploadProgressContext.Provider value={uploadProgress}>
           <RecentContextProvider thread={thread}>
-            <Timeline
-              optimisticTurn={optimisticTurn}
-              onOptimisticResolved={resolveOptimistic}
-              emptyContent={renderEmptyConversation()}
-              header={props.header}
-              footer={composer}
-              onLatestVisibleChange={setLatestVisible}
-              client={client}
-              threadId={threadId}
-              canEdit={editable && draftLoaded}
-              resourceUrl={messageResourceUrl}
-              upload={recoveryUpload}
-              onRewind={setRewindTarget}
-              rewindDisabled={active || thread?.kind === "dm"}
-              timestamps={thread?.kind === "dm"}
-              onAction={onAction}
-              onReaction={onReaction}
-            />
+            <QuestionReplyContext value={replyView}>
+              <Timeline
+                optimisticTurn={optimisticTurn}
+                onOptimisticResolved={resolveOptimistic}
+                emptyContent={renderEmptyConversation()}
+                header={props.header}
+                footer={composer}
+                onLatestVisibleChange={setLatestVisible}
+                client={client}
+                threadId={threadId}
+                canEdit={editable && draftLoaded}
+                resourceUrl={messageResourceUrl}
+                upload={recoveryUpload}
+                onRewind={setRewindTarget}
+                rewindDisabled={active || thread?.kind === "dm"}
+                timestamps={thread?.kind === "dm"}
+                onAction={onAction}
+                onReaction={onReaction}
+                questions={questionServices}
+              />
+            </QuestionReplyContext>
           </RecentContextProvider>
         </UploadProgressContext.Provider>
 

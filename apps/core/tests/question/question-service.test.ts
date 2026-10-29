@@ -78,6 +78,7 @@ class TestQuestionPort implements SurfaceQuestionPort<"discord"> {
   interactionUpdates: SurfaceQuestionInteractionUpdate[] = [];
   handler: SurfaceQuestionAnswerHandler<"discord"> | null = null;
   activityHandler: SurfaceQuestionActivityHandler<"discord"> | null = null;
+  dismissHandler: SurfaceQuestionActivityHandler<"discord"> | undefined;
   interactionUpdateGate: Promise<void> | null = null;
   interactionUpdateStarted: (() => void) | null = null;
   finishGate: Promise<void> | null = null;
@@ -110,9 +111,11 @@ class TestQuestionPort implements SurfaceQuestionPort<"discord"> {
   async subscribeAnswers(
     handler: SurfaceQuestionAnswerHandler<"discord">,
     handleActivity: SurfaceQuestionActivityHandler<"discord">,
+    handleDismiss?: SurfaceQuestionActivityHandler<"discord">,
   ) {
     this.handler = handler;
     this.activityHandler = handleActivity;
+    this.dismissHandler = handleDismiss;
     return {
       stop: async () => {
         this.handler = null;
@@ -247,6 +250,86 @@ afterEach(async () => {
 });
 
 describe("question service", () => {
+  it("does not acknowledge dismissal when its durable transition fails", async () => {
+    const store = await createStore((dbPath) => new TransitionFailingQuestionStore({ dbPath }));
+    const port = new TestQuestionPort();
+    const service = createService(store, port);
+    (await service.start()).unwrap();
+    const handle = (
+      await service.begin({
+        requestDeliveryId: "delivery-1",
+        requestId: "request-1",
+        toolCallId: "tool-call-1",
+        sessionId: "channel-1",
+        userId: "user-1",
+        questions: singleQuestionInput,
+      })
+    ).unwrap();
+    const dismissed = await port.dismissHandler!({
+      platform: "discord",
+      channelId: "channel-1",
+      messageRef: { platform: "discord", channelId: "channel-1", messageId: "card-1" },
+      principal: { platform: "discord", userId: "user-1" },
+      token: port.prompts[0]!.customToken,
+    });
+    expect(dismissed.isErr()).toBe(true);
+    expect((await handle.completion).isErr()).toBe(true);
+    expect(service.listDeferred("request-1").isErr()).toBe(true);
+    await service.stop();
+    store.close();
+  });
+
+  it("replays an existing synchronous call with its original delivery mode", async () => {
+    const store = await createStore();
+    const port = new TestQuestionPort();
+    const service = createService(store, port);
+    (await service.start()).unwrap();
+    const args = {
+      requestDeliveryId: "delivery-1",
+      requestId: "request-1",
+      toolCallId: "tool-call-1",
+      sessionId: "channel-1",
+      userId: "user-1",
+      questions: singleQuestionInput,
+    };
+    const original = (await service.begin({ ...args, mode: "sync" })).unwrap();
+    (await port.answerOption(1)).unwrap();
+    const replayed = (await service.begin(args)).unwrap();
+    expect(replayed.mode).toBe("sync");
+    expect(replayed.questionCallId).toBe(original.questionCallId);
+    expect((await replayed.completion).unwrap()).toEqual((await original.completion).unwrap());
+    expect(service.listDeferred("request-1").unwrap()).toEqual([]);
+    await service.stop();
+    store.close();
+  });
+
+  it("returns a deferred handle before the answer and reuses it on replay", async () => {
+    const store = await createStore();
+    const port = new TestQuestionPort();
+    const service = createService(store, port);
+    (await service.start()).unwrap();
+    const args = {
+      requestDeliveryId: "delivery-1",
+      requestId: "request-1",
+      toolCallId: "tool-call-1",
+      sessionId: "channel-1",
+      userId: "user-1",
+      questions: singleQuestionInput,
+      mode: "deferred" as const,
+    };
+    const handle = (await service.begin(args)).unwrap();
+    expect(service.listDeferred("request-1").unwrap()[0]?.state).toBe("pending");
+    expect((await service.begin(args)).unwrap().questionCallId).toBe(handle.questionCallId);
+    expect(port.prompts).toHaveLength(1);
+    (await port.answerOption(1)).unwrap();
+    expect((await handle.completion).unwrap()[0]?.answer).toEqual({
+      kind: "option",
+      optionId: "staging",
+    });
+    await service.stop();
+    store.close();
+  });
+
   it("runs sequential prompts on one card and returns stable IDs to the model", async () => {
     const store = await createStore();
     const port = new TestQuestionPort();
@@ -434,6 +517,29 @@ describe("question service", () => {
     });
     expect(port.finishes).toEqual([expect.objectContaining({ state: "interrupted" })]);
 
+    store.close();
+  });
+
+  it("does not expire deferred questions after the old sync timeout", async () => {
+    jest.useFakeTimers({ now: 0 });
+    const store = await createStore();
+    const port = new TestQuestionPort();
+    const service = createService(store, port);
+    (await service.start()).unwrap();
+    const handle = (
+      await service.begin({
+        requestDeliveryId: "delivery-1",
+        requestId: "request-1",
+        toolCallId: "deferred-timeout",
+        sessionId: "channel-1",
+        userId: "user-1",
+        questions: input,
+      })
+    ).unwrap();
+    jest.advanceTimersByTime(QUESTION_INACTIVITY_TIMEOUT_MS * 100);
+    expect(store.getById(handle.questionCallId).unwrap()?.state).toBe("pending");
+    expect(port.finishes).toEqual([]);
+    await service.stop();
     store.close();
   });
 

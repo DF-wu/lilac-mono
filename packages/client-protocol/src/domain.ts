@@ -114,6 +114,9 @@ export const nativeInputSchema = z
       .string()
       .regex(/^[a-f0-9]{64}$/)
       .optional(),
+    questionReply: z
+      .strictObject({ messageId: identitySchema, token: z.string().min(1).max(128) })
+      .optional(),
     text: z.string().max(65_536),
     mode: z.enum(["prompt", "steer", "followup"]),
     attachmentIds: z.array(identitySchema).max(32),

@@ -213,6 +213,7 @@ export async function persistBlobBackedAgentRunCheckpoint(input: {
   readonly corePrimaryLineage?: CorePrimaryLineageV2;
   readonly nativeOutput?: NativeOutputFrontier;
   readonly loadedCatalogIds?: readonly string[];
+  readonly questionResultIds?: readonly string[];
   readonly currentTurnUserId?: string;
   readonly retainedRequestDeliveries: readonly {
     readonly requestDeliveryId: string;
@@ -290,6 +291,7 @@ export async function persistBlobBackedAgentRunCheckpoint(input: {
     ...(input.corePrimaryLineage ? { corePrimaryLineage: input.corePrimaryLineage } : {}),
     ...(input.nativeOutput ? { nativeOutput: input.nativeOutput } : {}),
     ...(input.loadedCatalogIds ? { loadedCatalogIds: input.loadedCatalogIds } : {}),
+    ...(input.questionResultIds ? { questionResultIds: input.questionResultIds } : {}),
     ...(input.currentTurnUserId ? { currentTurnUserId: input.currentTurnUserId } : {}),
     retainedRequestDeliveries: input.retainedRequestDeliveries,
   });

@@ -1,3 +1,8 @@
+import type {
+  QuestionRequest,
+  QuestionHandle,
+  QuestionServiceError,
+} from "../question/question-service";
 import { TaggedError, type Result as ResultType } from "better-result";
 
 import type { SurfaceOperationError } from "./adapter";
@@ -86,8 +91,13 @@ export type SurfaceQuestionAnswerSubscription = {
 };
 
 export type SurfaceQuestionPort<P extends RegisteredSurfacePlatform> = {
+  begin?(input: QuestionRequest): Promise<ResultType<QuestionHandle, QuestionServiceError>>;
   present(input: {
     readonly sessionRef: SessionRefFor<P>;
+    readonly requestId: string;
+    readonly questionCallId: string;
+    readonly userId: string;
+    readonly mode: "sync" | "deferred";
     readonly replyTo?: MsgRefFor<P>;
     readonly prompt: SurfaceQuestionPrompt;
   }): Promise<ResultType<MsgRefFor<P>, SurfaceOperationError>>;
@@ -95,6 +105,7 @@ export type SurfaceQuestionPort<P extends RegisteredSurfacePlatform> = {
   subscribeAnswers(
     handler: SurfaceQuestionAnswerHandler<P>,
     handleActivity: SurfaceQuestionActivityHandler<P>,
+    handleDismiss?: SurfaceQuestionActivityHandler<P>,
   ): Promise<SurfaceQuestionAnswerSubscription>;
 };
 
