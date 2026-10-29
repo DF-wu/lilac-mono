@@ -3343,6 +3343,7 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
   },
   ...[
     "SqliteQuestionStore.create",
+    "SqliteQuestionStore.migrateDiscordSchema",
     "SqliteQuestionStore.replaceTokens",
     "SqliteQuestionStore.applyAnswer",
     "SqliteQuestionStore.interruptPending",

@@ -89,6 +89,17 @@ export function createNativeRouter(
     return next();
   });
   return api.router({
+    questions: {
+      read: secured.questions.read.handler(async ({ context, input }) =>
+        nativeRpcValue(await services.questions.read(context.principal, input)),
+      ),
+      pending: secured.questions.pending.handler(async ({ context, input }) =>
+        nativeRpcValue(await services.questions.pending(context.principal, input)),
+      ),
+      dismiss: secured.questions.dismiss.handler(async ({ context, input }) =>
+        nativeRpcValue(await services.questions.dismiss(context.principal, input)),
+      ),
+    },
     notifications: {
       presence: secured.notifications.presence.handler(async ({ context, input }) =>
         nativeRpcValue(

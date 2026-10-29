@@ -115,6 +115,7 @@ import { ThreadSettleButton } from "./components/ThreadSettleButton";
 import { ThreadQueueDemo } from "./components/ThreadQueueDemo";
 import { DeploymentSettingsForm } from "./components/DeploymentSettings";
 import { AgentWorkDemo } from "./components/AgentWorkDemo";
+import { QuestionDemo } from "./components/QuestionDemo";
 import { CitationDemo } from "./components/CitationDemo";
 import { WorkingIndicatorsContext } from "./components/WorkVerb";
 import { SidebarSearch } from "./components/SidebarSearch";
@@ -181,7 +182,7 @@ const threadStates = [
   { state: "completed", label: "Completed · unread", title: "A few places to visit in Kyoto" },
   { state: "working", label: "Working", title: "Compare the two proposals" },
   { state: "error", label: "Error", title: "Find the missing receipt" },
-  { state: "input", label: "Needs input · preview only", title: "Which date works for everyone?" },
+  { state: "input", label: "Needs input", title: "Which date works for everyone?" },
 ] as const;
 const swatches = [
   ["Canvas", "background", "foreground"],
@@ -910,6 +911,9 @@ function Messages() {
         </Specimen>
       </div>
       <ThinkingSpinnerDemo />
+      <Specimen title="Questions">
+        <QuestionDemo />
+      </Specimen>
       <Specimen title="HTML preview">
         <HtmlPreviewFrame src={galleryPreviewSrc} title="weekly-runs.html" />
       </Specimen>

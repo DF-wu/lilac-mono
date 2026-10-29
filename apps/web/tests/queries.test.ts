@@ -14,6 +14,7 @@ import {
   subagentHistoryOptions,
   composerDraftOptions,
   updateComposerDraft,
+  loadComposerDraft,
   searchOptions,
   userOptions,
   queueOptions,
@@ -221,6 +222,48 @@ test("late draft hydration cannot overwrite a newer edit or another thread's dra
   await hydration;
   expect(queries.getQueryData(a.queryKey)?.text).toBe("Rewound input");
   expect(queries.getQueryData(b.queryKey)?.text).toBe("Other thread");
+  queries.clear();
+});
+
+test("a saved answer loads before the reply is assembled and keeps edits made while it loads", async () => {
+  const scope: CacheScope = {
+    installationId: "fixture",
+    principalId: "owner",
+    protocolVersion: 1,
+    projectionVersion: 1,
+  };
+  const saved = Promise.withResolvers<{ text: string; skillIds: string[] }>();
+  const storage = {
+    readDraft: () => saved.promise,
+    saveDraft: async () => {},
+    listLocalDrafts: async () => [],
+    deleteDraft: async () => {},
+  };
+  const queries = cache();
+  const reply = composerDraftOptions(scope, "thread:question:call:1", storage);
+  const loading = loadComposerDraft(queries, reply);
+  saved.resolve({ text: "Use the EU region", skillIds: ["deploy"] });
+  const loaded = (await loading).unwrap();
+  expect(loaded).toEqual({ text: "Use the EU region", skillIds: ["deploy"], attachments: [] });
+
+  const other = Promise.withResolvers<{ text: string; skillIds: string[] }>();
+  const edited = composerDraftOptions(scope, "thread:question:other:1", {
+    ...storage,
+    readDraft: () => other.promise,
+  });
+  const pending = loadComposerDraft(queries, edited);
+  const typed = { text: "Typed while loading", skillIds: [], attachments: [] };
+  updateComposerDraft(queries, "thread:question:other:1", typed);
+  other.resolve({ text: "Older saved reply", skillIds: [] });
+  expect((await pending).unwrap()).toEqual(typed);
+
+  const failure = new Error("IndexedDB is unavailable");
+  const broken = composerDraftOptions(scope, "thread:question:broken", {
+    ...storage,
+    readDraft: () => Promise.reject(failure),
+  });
+  const failed = await loadComposerDraft(queries, broken);
+  expect(failed.isErr() && failed.error).toBe("IndexedDB is unavailable");
   queries.clear();
 });
 

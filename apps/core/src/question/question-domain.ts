@@ -60,6 +60,17 @@ export const questionInputSchema = z
     });
   });
 
+export const questionToolInputSchema = questionInputSchema.safeExtend({
+  mode: z
+    .enum(["deferred", "sync"])
+    .optional()
+    .describe(
+      "Defaults to deferred. Use sync only when no useful work can proceed without the answer.",
+    ),
+});
+
+export type QuestionPlatform = "discord" | "native";
+
 export type QuestionInput = z.output<typeof questionInputSchema>;
 export type QuestionDefinition = QuestionInput["questions"][number];
 
@@ -68,6 +79,12 @@ export const questionAnswerSchema = z.strictObject({
   answer: z.discriminatedUnion("kind", [
     z.strictObject({ kind: z.literal("option"), optionId: z.string().min(1) }),
     z.strictObject({ kind: z.literal("custom"), text: z.string().min(1).max(4_000) }),
+    z.strictObject({
+      kind: z.literal("message"),
+      text: z.string(),
+      messageId: z.string(),
+      attachmentIds: z.array(z.string()),
+    }),
   ]),
 });
 
@@ -76,14 +93,15 @@ export const questionAnswersSchema = z.array(questionAnswerSchema).max(3);
 export type QuestionAnswer = z.output<typeof questionAnswerSchema>;
 export type QuestionAnswers = z.output<typeof questionAnswersSchema>;
 
-export type QuestionCallState = "pending" | "answered" | "cancelled" | "interrupted";
+export type QuestionCallState = "pending" | "answered" | "cancelled" | "interrupted" | "expired";
 
 export type QuestionCall = {
   readonly questionCallId: string;
   readonly requestDeliveryId: string;
   readonly requestId: string;
   readonly toolCallId: string;
-  readonly platform: "discord";
+  readonly platform: QuestionPlatform;
+  readonly mode: "deferred" | "sync";
   readonly sessionId: string;
   readonly userId: string;
   readonly input: QuestionInput;

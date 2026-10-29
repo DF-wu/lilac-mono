@@ -10,6 +10,8 @@ export type PendingInput = {
   error?: string;
   optimisticSlotIds?: readonly string[];
   receipt?: NativeInputReceipt;
+  /** The question this answered closed first, so a retry sends a regular message. */
+  questionClosed?: boolean;
   state: "preparing" | "uncertain" | "rejected" | "accepted";
 };
 

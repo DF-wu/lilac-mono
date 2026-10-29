@@ -10,12 +10,15 @@ import { useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Pause, Play, RotateCcw } from "lucide-react";
 import {
   agentWorkStages,
+  demoQuestion,
   rebaseWorkflowTimes,
   workflowActionFrame,
   type AgentWorkFrame,
 } from "../agent-work-fixtures";
 import { MessageIdentityContext } from "./message-identity";
-import { type MessageServices } from "./message-services";
+import { QuestionReplyContext, type MessageServices } from "./message-services";
+import { useQuestionReplyDemo } from "./QuestionDemo";
+import { QuestionWaiting } from "./QuestionReply";
 import { Timeline } from "./Timeline";
 import { FileViewerContext } from "./file-viewer-context";
 import demoRouteImage from "../assets/logo.svg";
@@ -209,11 +212,64 @@ export function AgentWorkDemo() {
       `Selected: ${part.data.actions.find((action) => action.actionId === actionId)?.label ?? actionId}`,
     );
   };
+  const asking =
+    !workflowOverride &&
+    slot.messages.some((message) =>
+      message.parts.some(
+        (part) => part.type === "data-question" && part.data.view.state === "pending",
+      ),
+    );
+  const [answering, setAnswering] = useState(true);
+  // Answering settles the card as the server's replay would; the reply text shows below the demo.
+  function settleQuestion(
+    reply?: string,
+    summary?: Extract<typeof demoQuestion.view, { state: "answered" }>["summary"],
+  ) {
+    setWorkflowOverride({
+      ...slot,
+      messages: slot.messages.map((message) => ({
+        ...message,
+        parts: message.parts.map((part) =>
+          part.type === "data-question"
+            ? {
+                ...part,
+                data: {
+                  ...part.data,
+                  view: summary
+                    ? { state: "answered" as const, summary }
+                    : { state: "cancelled" as const },
+                },
+              }
+            : part,
+        ),
+      })),
+    });
+    question.reset();
+    setFeedback(reply ? `Sent: ${reply.replaceAll("\n\n", " · ")}` : "Question dismissed.");
+  }
+  const question = useQuestionReplyDemo(demoQuestion, settleQuestion);
+  const replying = asking && answering;
+  function questionHeader() {
+    if (replying)
+      return question.panel({
+        onExit: () => setAnswering(false),
+        onDismiss: () => settleQuestion(),
+      });
+    if (!asking) return undefined;
+    return <QuestionWaiting waiting={[demoQuestion]} onReply={() => setAnswering(true)} />;
+  }
   const services: MessageServices = {
     canEdit: true,
     resourceUrl: () => "",
     onAction,
     onReaction: () => {},
+    questions: {
+      onReply: () => setAnswering(true),
+      onDismiss: async () => {
+        settleQuestion();
+        return undefined;
+      },
+    },
   };
   return (
     <div className="ds-agent-demo flex flex-col gap-4 min-w-0" ref={container}>
@@ -305,82 +361,90 @@ export function AgentWorkDemo() {
             <div className="chat-panel flex flex-col">
               <MessageIdentityContext value={identities}>
                 <FileViewerContext value={demoFileViewer}>
-                  <Timeline
-                    optimisticTurn={optimistic}
-                    onOptimisticResolved={() => setOptimistic(undefined)}
-                    client={client}
-                    threadId="demo"
-                    {...services}
-                    onRewind={() => select(0)}
-                    emptyMessage="Send a message to start the demo."
-                    footer={
-                      <div className="p-4">
-                        {optimistic && !optimistic.confirmedSlotId ? (
-                          <Button
-                            variant="secondary"
-                            onClick={() => {
-                              setOptimistic({ ...optimistic, confirmedSlotId: slot.slotId });
-                              setSent(true);
-                              setPlayhead({ stage: 0, frame: 0, playing: true });
+                  <QuestionReplyContext
+                    value={{ messageId: replying ? demoQuestion.questionCallId : undefined }}
+                  >
+                    <Timeline
+                      optimisticTurn={optimistic}
+                      onOptimisticResolved={() => setOptimistic(undefined)}
+                      client={client}
+                      threadId="demo"
+                      {...services}
+                      onRewind={() => select(0)}
+                      emptyMessage="Send a message to start the demo."
+                      footer={
+                        <div className="p-4">
+                          {optimistic && !optimistic.confirmedSlotId ? (
+                            <Button
+                              variant="secondary"
+                              onClick={() => {
+                                setOptimistic({ ...optimistic, confirmedSlotId: slot.slotId });
+                                setSent(true);
+                                setPlayhead({ stage: 0, frame: 0, playing: true });
+                              }}
+                            >
+                              Confirm send
+                            </Button>
+                          ) : null}
+                          <Composer
+                            documentKey={replying ? question.documentKey : "demo"}
+                            text={replying ? question.text : text}
+                            onText={replying ? question.onText : setText}
+                            header={questionHeader()}
+                            placeholder={replying ? question.placeholder : undefined}
+                            answer={replying ? question.answer : undefined}
+                            skillIds={[]}
+                            onSkills={() => {}}
+                            onCommand={() => {}}
+                            attachments={[]}
+                            onAttach={() => {}}
+                            onRemoveAttachment={() => {}}
+                            onRetryAttachment={() => {}}
+                            active={
+                              (stage.id !== "conversation" || sent) &&
+                              (slot.state === "pending" || slot.state === "running")
+                            }
+                            canCancel={
+                              playhead.playing &&
+                              (slot.state === "pending" || slot.state === "running")
+                            }
+                            disabled={!!optimistic}
+                            windowDrop={false}
+                            onModelChange={() => {}}
+                            onCancel={() =>
+                              setPlayhead((current) => ({ ...current, playing: false }))
+                            }
+                            onSubmit={(submission) => {
+                              setWorkflowOverride(undefined);
+                              setRun((value) => value + 1);
+                              setPromptText(submission.text);
+                              setText("");
+                              setOptimistic({
+                                precedingSlotIds: [],
+                                slot: {
+                                  kind: "ready",
+                                  slotId: `sending:demo:${run + 1}`,
+                                  turnId: `sending:demo:${run + 1}`,
+                                  position: 0,
+                                  state: "pending",
+                                  messages: [
+                                    {
+                                      id: `demo-command:${run + 1}`,
+                                      role: "user",
+                                      metadata: { authorId: "demo_user" },
+                                      parts: [{ type: "text", text: submission.text }],
+                                    },
+                                  ],
+                                },
+                              });
+                              setSent(false);
+                              setPlayhead({ stage: 0, frame: 0, playing: false });
                             }}
-                          >
-                            Confirm send
-                          </Button>
-                        ) : null}
-                        <Composer
-                          text={text}
-                          onText={setText}
-                          skillIds={[]}
-                          onSkills={() => {}}
-                          onCommand={() => {}}
-                          attachments={[]}
-                          onAttach={() => {}}
-                          onRemoveAttachment={() => {}}
-                          onRetryAttachment={() => {}}
-                          active={
-                            (stage.id !== "conversation" || sent) &&
-                            (slot.state === "pending" || slot.state === "running")
-                          }
-                          canCancel={
-                            playhead.playing &&
-                            (slot.state === "pending" || slot.state === "running")
-                          }
-                          disabled={!!optimistic}
-                          windowDrop={false}
-                          onModelChange={() => {}}
-                          onCancel={() =>
-                            setPlayhead((current) => ({ ...current, playing: false }))
-                          }
-                          onSubmit={(submission) => {
-                            setWorkflowOverride(undefined);
-                            setRun((value) => value + 1);
-                            setPromptText(submission.text);
-                            setText("");
-                            setOptimistic({
-                              precedingSlotIds: [],
-                              slot: {
-                                kind: "ready",
-                                slotId: `sending:demo:${run + 1}`,
-                                turnId: `sending:demo:${run + 1}`,
-                                position: 0,
-                                state: "pending",
-                                messages: [
-                                  {
-                                    id: `demo-command:${run + 1}`,
-                                    role: "user",
-                                    metadata: { authorId: "demo_user" },
-                                    parts: [{ type: "text", text: submission.text }],
-                                  },
-                                ],
-                              },
-                            });
-                            setSent(false);
-                            setPlayhead({ stage: 0, frame: 0, playing: false });
-                          }}
-                        />
-                      </div>
-                    }
-                  />
+                          />
+                        </div>
+                      }
+                    />
+                  </QuestionReplyContext>
                 </FileViewerContext>
               </MessageIdentityContext>
             </div>

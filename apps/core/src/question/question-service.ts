@@ -17,7 +17,7 @@ import type { SurfaceOperationError } from "../surface/adapter";
 import type { MsgRefFor } from "../surface/types";
 import { isAdapterPlatform } from "../shared/is-adapter-platform";
 import type { QuestionActionToken, QuestionAnswers, QuestionCall } from "./question-domain";
-import type { QuestionInput } from "./question-domain";
+import type { QuestionPlatform, QuestionInput } from "./question-domain";
 import {
   QuestionStoreCorrupt,
   QuestionStoreFailed,
@@ -61,7 +61,30 @@ type QuestionServiceLogger = {
   warn(message: string, context: Readonly<Record<string, unknown>>): void;
 };
 
+export type QuestionRequest = {
+  readonly requestDeliveryId: string;
+  readonly requestId: string;
+  readonly toolCallId: string;
+  readonly sessionId: string;
+  readonly userId: string;
+  readonly platform?: QuestionPlatform;
+  readonly mode?: "deferred" | "sync";
+  readonly replyTo?: MsgRefFor<QuestionPlatform>;
+  readonly questions: QuestionInput;
+  readonly signal?: AbortSignal;
+  readonly onActivity?: () => void;
+};
+
+export type QuestionHandle = {
+  readonly mode: "sync" | "deferred";
+  readonly questionCallId: string;
+  readonly completion: Promise<ResultType<QuestionAnswers, QuestionServiceError>>;
+};
+
 type PendingQuestion = {
+  mode: "sync" | "deferred";
+  readonly requestId: string;
+  readonly completion: Promise<ResultType<QuestionAnswers, QuestionServiceError>>;
   readonly resolve: (result: ResultType<QuestionAnswers, QuestionServiceError>) => void;
   readonly onActivity?: () => void;
   timeout: ReturnType<typeof setTimeout> | null;
@@ -143,7 +166,7 @@ function questionSummary(call: QuestionCall): SurfaceQuestionSummary {
     answers: call.answers.map((answer) => {
       const question = call.input.questions.find((candidate) => candidate.id === answer.questionId);
       const selectedAnswer = answer.answer;
-      if (selectedAnswer.kind === "custom") {
+      if (selectedAnswer.kind !== "option") {
         return {
           header: question?.header ?? answer.questionId,
           answer: { kind: "custom" as const },
@@ -164,6 +187,8 @@ function questionSummary(call: QuestionCall): SurfaceQuestionSummary {
 }
 
 export class QuestionService {
+  readonly #deferredFailures = new Map<string, QuestionServiceError>();
+  readonly #listeners = new Set<(requestId: string) => void>();
   readonly #waiters = new Map<string, PendingQuestion>();
   readonly #subscriptions: SurfaceQuestionAnswerSubscription[] = [];
   readonly #startupInterrupted: QuestionCall[] = [];
@@ -184,9 +209,14 @@ export class QuestionService {
     for (const resolved of this.input.surfaces.entries()) {
       const subscription = await resolved.question.subscribeAnswers(
         async (answer, updateInteraction) =>
-          await this.handleAnswer(answer as SurfaceQuestionAnswer<"discord">, updateInteraction),
+          await this.handleAnswer(
+            answer as SurfaceQuestionAnswer<QuestionPlatform>,
+            updateInteraction,
+          ),
         async (activity) =>
-          await this.handleActivity(activity as SurfaceQuestionActivity<"discord">),
+          await this.handleActivity(activity as SurfaceQuestionActivity<QuestionPlatform>),
+        async (activity) =>
+          await this.handleDismiss(activity as SurfaceQuestionActivity<QuestionPlatform>),
       );
       this.#subscriptions.push(subscription);
     }
@@ -210,9 +240,9 @@ export class QuestionService {
       if (!call.messageId) continue;
       const surface = this.input.surfaces.resolve(call.platform);
       if (!surface) continue;
-      const finished = await (surface.question as SurfaceQuestionPort<"discord">).finish({
+      const finished = await (surface.question as SurfaceQuestionPort<QuestionPlatform>).finish({
         messageRef: {
-          platform: "discord",
+          platform: call.platform,
           channelId: call.sessionId,
           messageId: call.messageId,
         },
@@ -244,23 +274,46 @@ export class QuestionService {
       await operation;
     }
     this.#waiters.clear();
+    this.#deferredFailures.clear();
   }
 
-  async ask(input: {
-    readonly requestDeliveryId: string;
-    readonly requestId: string;
-    readonly toolCallId: string;
-    readonly sessionId: string;
-    readonly userId: string;
-    readonly replyTo?: MsgRefFor<"discord">;
-    readonly questions: QuestionInput;
-    readonly signal?: AbortSignal;
-    readonly onActivity?: () => void;
-  }): Promise<ResultType<QuestionAnswers, QuestionServiceError>> {
+  subscribe(listener: (requestId: string) => void): () => void {
+    this.#listeners.add(listener);
+    return () => {
+      this.#listeners.delete(listener);
+    };
+  }
+
+  listDeferred(requestId: string) {
+    const failure = this.#deferredFailures.get(requestId);
+    if (failure) return Result.err(failure);
+    return this.input.store.listDeferred(requestId);
+  }
+
+  async cancelRequest(requestId: string): Promise<void> {
+    for (const [id, pending] of this.#waiters) {
+      if (pending.requestId !== requestId) continue;
+      await this.queueTerminalOperation(id, pending, () =>
+        this.cancelPendingQuestion(id, pending.resolve),
+      );
+    }
+    this.#deferredFailures.delete(requestId);
+  }
+
+  async ask(input: QuestionRequest): Promise<ResultType<QuestionAnswers, QuestionServiceError>> {
+    const started = await this.begin({ ...input, mode: "sync" });
+    const outcome = started.match<
+      { handle: QuestionHandle; error: null } | { handle: null; error: QuestionServiceError }
+    >({ ok: (handle) => ({ handle, error: null }), err: (error) => ({ handle: null, error }) });
+    if (outcome.error) return Result.err(outcome.error);
+    return await outcome.handle!.completion;
+  }
+
+  async begin(input: QuestionRequest): Promise<ResultType<QuestionHandle, QuestionServiceError>> {
     if (input.signal?.aborted) {
       return Result.err(new QuestionCancelled({ message: "Question cancelled" }));
     }
-    const resolved = this.input.surfaces.resolve("discord");
+    const resolved = this.input.surfaces.resolve(input.platform ?? "discord");
     if (!resolved) {
       return Result.err(
         new QuestionUnavailable({
@@ -268,6 +321,7 @@ export class QuestionService {
         }),
       );
     }
+    if (resolved.question.begin) return resolved.question.begin(input);
     const existing = this.input.store.getByIdentity(input.requestDeliveryId, input.toolCallId);
     const existingOutcome = existing.match<
       | { readonly kind: "call"; readonly call: QuestionCall | null }
@@ -277,15 +331,23 @@ export class QuestionService {
       err: (error) => ({ kind: "error", error }),
     });
     if (existingOutcome.kind === "error") return Result.err(existingOutcome.error);
-    if (existingOutcome.call?.state === "answered") {
-      return Result.ok(existingOutcome.call.answers);
-    }
     if (existingOutcome.call) {
-      return Result.err(
-        new QuestionInterrupted({
-          message: "The previous question call did not complete",
-        }),
-      );
+      const call = existingOutcome.call;
+      if (!call.messageId)
+        return Result.err(
+          new QuestionInterrupted({ message: "The previous question was not presented" }),
+        );
+      const pending = this.#waiters.get(call.questionCallId);
+      const completion =
+        pending?.completion ??
+        Promise.resolve(
+          call.state === "answered"
+            ? Result.ok(call.answers)
+            : Result.err(
+                new QuestionInterrupted({ message: "The previous question call did not complete" }),
+              ),
+        );
+      return Result.ok({ mode: call.mode, questionCallId: call.questionCallId, completion });
     }
 
     const questionCallId = crypto.randomUUID();
@@ -294,7 +356,8 @@ export class QuestionService {
       requestDeliveryId: input.requestDeliveryId,
       requestId: input.requestId,
       toolCallId: input.toolCallId,
-      platform: "discord",
+      platform: input.platform ?? "discord",
+      mode: input.mode ?? "deferred",
       sessionId: input.sessionId,
       userId: input.userId,
       input: input.questions,
@@ -314,6 +377,8 @@ export class QuestionService {
       sessionId: input.sessionId,
       userId: input.userId,
       questionInput: input.questions,
+      platform: input.platform ?? "discord",
+      mode: input.mode ?? "deferred",
       tokens: issued.tokens,
     });
     const createdOutcome = created.match<
@@ -325,9 +390,13 @@ export class QuestionService {
     });
     if (createdOutcome.kind === "error") return Result.err(createdOutcome.error);
 
-    const port = resolved.question as SurfaceQuestionPort<"discord">;
+    const port = resolved.question as SurfaceQuestionPort<QuestionPlatform>;
     const presented = await port.present({
-      sessionRef: { platform: "discord", channelId: input.sessionId },
+      sessionRef: { platform: input.platform ?? "discord", channelId: input.sessionId },
+      requestId: input.requestId,
+      questionCallId,
+      userId: input.userId,
+      mode: input.mode ?? "deferred",
       ...(input.replyTo ? { replyTo: input.replyTo } : {}),
       prompt: issued.prompt,
     });
@@ -351,7 +420,7 @@ export class QuestionService {
       this.input.store.transitionPending(questionCallId, "cancelled");
       await port.finish({
         messageRef: {
-          platform: "discord",
+          platform: input.platform ?? "discord",
           channelId: input.sessionId,
           messageId: presentedOutcome.messageId,
         },
@@ -359,48 +428,74 @@ export class QuestionService {
       });
       return Result.err(boundError);
     }
-    return await this.waitForAnswer(questionCallId, input.signal, input.onActivity);
+    const completion = this.waitForAnswer(
+      questionCallId,
+      input.requestId,
+      input.mode ?? "deferred",
+      input.signal,
+      input.onActivity,
+    );
+    return Result.ok({ mode: input.mode ?? "deferred", questionCallId, completion });
   }
 
-  private async waitForAnswer(
+  private waitForAnswer(
     questionCallId: string,
+    requestId: string,
+    mode: "sync" | "deferred",
     signal?: AbortSignal,
     onActivity?: () => void,
   ): Promise<ResultType<QuestionAnswers, QuestionServiceError>> {
-    return await new Promise((resolve) => {
-      const settle = (result: ResultType<QuestionAnswers, QuestionServiceError>) => {
-        signal?.removeEventListener("abort", abort);
-        this.clearQuestionTimeout(questionCallId);
-        this.#waiters.delete(questionCallId);
-        resolve(result);
-      };
-      const abort = () => {
-        const waiter = this.#waiters.get(questionCallId);
-        if (!waiter || waiter.terminalOperation) return;
-        this.clearQuestionTimeout(questionCallId);
-        const operation = this.queueTerminalOperation(questionCallId, waiter, () =>
-          this.cancelPendingQuestion(questionCallId, settle),
-        );
-        void operation;
-      };
-      this.#waiters.set(questionCallId, {
-        resolve: settle,
-        ...(onActivity ? { onActivity } : {}),
-        timeout: null,
-        interactionOperation: null,
-        terminalOperation: null,
-      });
-      this.resetQuestionTimeout(questionCallId);
-      signal?.addEventListener("abort", abort, { once: true });
-      if (signal?.aborted) abort();
-      const stored = this.input.store.getById(questionCallId);
-      stored.match({
-        ok: (call) => {
-          if (call?.state === "answered") settle(Result.ok(call.answers));
+    const completion = Promise.withResolvers<ResultType<QuestionAnswers, QuestionServiceError>>();
+    const settle = (result: ResultType<QuestionAnswers, QuestionServiceError>) => {
+      signal?.removeEventListener("abort", abort);
+      this.clearQuestionTimeout(questionCallId);
+      this.#waiters.delete(questionCallId);
+      result.match({
+        ok: () => undefined,
+        err: (error) => {
+          if (
+            mode === "sync" ||
+            error._tag === "QuestionCancelled" ||
+            error._tag === "QuestionTimedOut" ||
+            error._tag === "QuestionInterrupted"
+          )
+            return;
+          this.#deferredFailures.set(requestId, error);
         },
-        err: (error) => settle(Result.err(error)),
       });
+      completion.resolve(result);
+      for (const listener of this.#listeners) listener(requestId);
+    };
+    const abort = () => {
+      const waiter = this.#waiters.get(questionCallId);
+      if (!waiter || waiter.terminalOperation) return;
+      this.clearQuestionTimeout(questionCallId);
+      const operation = this.queueTerminalOperation(questionCallId, waiter, () =>
+        this.cancelPendingQuestion(questionCallId, settle),
+      );
+      void operation;
+    };
+    this.#waiters.set(questionCallId, {
+      requestId,
+      mode,
+      completion: completion.promise,
+      resolve: settle,
+      ...(onActivity ? { onActivity } : {}),
+      timeout: null,
+      interactionOperation: null,
+      terminalOperation: null,
     });
+    this.resetQuestionTimeout(questionCallId);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    const stored = this.input.store.getById(questionCallId);
+    stored.match({
+      ok: (call) => {
+        if (call?.state === "answered") settle(Result.ok(call.answers));
+      },
+      err: (error) => settle(Result.err(error)),
+    });
+    return completion.promise;
   }
 
   private clearQuestionTimeout(questionCallId: string): void {
@@ -412,7 +507,7 @@ export class QuestionService {
 
   private resetQuestionTimeout(questionCallId: string): void {
     const waiter = this.#waiters.get(questionCallId);
-    if (!waiter) return;
+    if (!waiter || waiter.mode === "deferred") return;
     this.clearQuestionTimeout(questionCallId);
     const timeout = setTimeout(() => {
       const current = this.#waiters.get(questionCallId);
@@ -465,7 +560,7 @@ export class QuestionService {
   ): Promise<void> {
     const transitionError = await this.transitionAndFinishQuestion(
       questionCallId,
-      "cancelled",
+      "expired",
       "expired",
     );
     if (transitionError) {
@@ -521,7 +616,7 @@ export class QuestionService {
 
   private async transitionAndFinishQuestion(
     questionCallId: string,
-    storeState: "cancelled" | "interrupted",
+    storeState: "cancelled" | "interrupted" | "expired",
     surfaceState: "cancelled" | "expired" | "interrupted",
   ): Promise<QuestionStoreFailed | null> {
     const transitioned = this.input.store.transitionPending(questionCallId, storeState);
@@ -535,7 +630,7 @@ export class QuestionService {
   }
 
   private async handleAnswer(
-    answer: SurfaceQuestionAnswer<"discord">,
+    answer: SurfaceQuestionAnswer<QuestionPlatform>,
     updateInteraction: SurfaceQuestionInteractionUpdater,
   ): Promise<
     ResultType<
@@ -624,8 +719,45 @@ export class QuestionService {
     return Result.err(answerHandlingFailure(updateError));
   }
 
+  private async handleDismiss(
+    activity: SurfaceQuestionActivity<QuestionPlatform>,
+  ): Promise<ResultType<SurfaceQuestionAnswerDisposition, SurfaceQuestionAnswerHandlingFailed>> {
+    const validated = this.input.store.validateActivity({
+      tokenSha256: sha256(activity.token),
+      platform: activity.platform,
+      channelId: activity.channelId,
+      messageId: activity.messageRef.messageId,
+      userId: activity.principal.userId,
+    });
+    const result = validated.mapError(answerHandlingFailure);
+    const outcome = result.match<
+      | { value: ValidateQuestionActivityResult; error: null }
+      | { value: null; error: SurfaceQuestionAnswerHandlingFailed }
+    >({ ok: (value) => ({ value, error: null }), err: (error) => ({ value: null, error }) });
+    if (outcome.error) return Result.err(outcome.error);
+    const value = outcome.value!;
+    if (value.disposition !== "accepted") return Result.ok(value.disposition);
+    const waiter = this.#waiters.get(value.questionCallId);
+    if (!waiter) return Result.ok("stale");
+    await this.queueTerminalOperation(value.questionCallId, waiter, () =>
+      this.cancelPendingQuestion(value.questionCallId, waiter.resolve),
+    );
+    const settled = await waiter.completion;
+    return settled.match<
+      ResultType<SurfaceQuestionAnswerDisposition, SurfaceQuestionAnswerHandlingFailed>
+    >({
+      ok: () => Result.ok("stale"),
+      err: (error) => {
+        if (error._tag === "QuestionCancelled") return Result.ok("accepted");
+        if (error._tag === "QuestionTimedOut" || error._tag === "QuestionInterrupted")
+          return Result.ok("stale");
+        return Result.err(answerHandlingFailure(error));
+      },
+    });
+  }
+
   private async handleActivity(
-    activity: SurfaceQuestionActivity<"discord">,
+    activity: SurfaceQuestionActivity<QuestionPlatform>,
   ): Promise<ResultType<SurfaceQuestionAnswerDisposition, SurfaceQuestionAnswerHandlingFailed>> {
     const validated = this.input.store.validateActivity({
       tokenSha256: sha256(activity.token),
@@ -662,11 +794,11 @@ export class QuestionService {
     const resolved = this.input.surfaces.resolve(call.platform);
     if (!resolved) return;
     const messageRef = {
-      platform: "discord" as const,
+      platform: call.platform,
       channelId: call.sessionId,
       messageId: call.messageId,
     };
-    const port = resolved.question as SurfaceQuestionPort<"discord">;
+    const port = resolved.question as SurfaceQuestionPort<QuestionPlatform>;
     const finished = await port.finish({ messageRef, state });
     finished.match({
       ok: () => undefined,

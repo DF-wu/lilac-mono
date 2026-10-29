@@ -2,6 +2,7 @@ import { isNativeServiceMessage } from "./message-ownership";
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import type {
+  NativeQuestion,
   NativeDeploymentSettings,
   SidebarPreferences,
   NativeRpcInputs,
@@ -166,7 +167,7 @@ export class NativeStore {
     return nativeStoreTransaction(this.db, () => {
       const version =
         this.db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
-      if (version > 5)
+      if (version > 6)
         return Result.err(
           nativeFailure("invalid", "Native store version is newer than this build"),
         );
@@ -192,7 +193,7 @@ export class NativeStore {
         CREATE INDEX IF NOT EXISTS native_thread_preferences_order ON native_thread_preferences(user_id,section,position,thread_id);
         CREATE TABLE IF NOT EXISTS native_push_keys (id INTEGER PRIMARY KEY CHECK(id=1),public_key TEXT NOT NULL,private_key TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS native_push_subscriptions (endpoint TEXT PRIMARY KEY,user_id TEXT NOT NULL,p256dh TEXT NOT NULL,auth TEXT NOT NULL,completion INTEGER NOT NULL,failure INTEGER NOT NULL);
-        PRAGMA user_version = 5;`);
+        PRAGMA user_version = 6;`);
       return Result.ok(undefined);
     });
   }
@@ -654,6 +655,8 @@ export class NativeStore {
       .get(thread.id);
     if (!row) return Result.ok({ displayStatus: thread.activeRunId ? "working" : "idle" });
     const db = this.db;
+    // A run that is still going stays "working" so push and browser notifications see one run end.
+    const awaitsAnswer = !thread.activeRunId && this.awaitsAnswer(user.id, thread);
     return Result.gen(function* () {
       const { value: record } = yield* decodeNativeRecord(row);
       if (record.kind !== "turn")
@@ -664,6 +667,7 @@ export class NativeStore {
           displayStatus: "working" as const,
           workingSince: turn.startedAt ?? row.first_created_at ?? undefined,
         });
+      if (awaitsAnswer) return Result.ok({ displayStatus: "input" as const });
       if (turn.state === "failed") return Result.ok({ displayStatus: "error" as const });
       if (turn.state !== "complete") return Result.ok({ displayStatus: "idle" as const });
       const read = db
@@ -677,6 +681,16 @@ export class NativeStore {
           (read.position === turn.position && read.message_index >= row.last_message_index));
       return Result.ok({ displayStatus: checked ? ("idle" as const) : ("completed" as const) });
     });
+  }
+
+  /** A question in the current history still waits for this user's answer. */
+  private awaitsAnswer(userId: string, thread: NativeThreadRecord): boolean {
+    // instr skips JSON parsing for turns that never asked a question.
+    return !!this.db
+      .query<{ found: number }, [string, string, number]>(
+        "SELECT 1 AS found FROM native_records r WHERE r.kind='turn' AND r.thread_id=? AND instr(r.data_json,'\"data-question\"')>0 AND EXISTS(SELECT 1 FROM json_each(r.data_json,'$.value.messages') m, json_each(m.value,'$.parts') p WHERE json_extract(p.value,'$.type')='data-question' AND json_extract(p.value,'$.data.view.state')='pending' AND json_extract(p.value,'$.data.respondentId')=? AND json_extract(p.value,'$.data.historyGeneration')=?) LIMIT 1",
+      )
+      .get(thread.id, userId, thread.historyGeneration);
   }
 
   private capabilities(user: NativeUser, thread: NativeThreadRecord): NativeThread["capabilities"] {
@@ -1648,7 +1662,24 @@ export class NativeStore {
             Result.gen(function* () {
               if (thread.historyGeneration !== input.historyGeneration || thread.mutationPending)
                 return Result.err(nativeFailure("stale", "Thread history is changing"));
-              const effectiveMode = input.command && thread.activeRunId ? "followup" : input.mode;
+              const question = input.questionReply
+                ? yield* this.authorizeQuestionReply(
+                    actorId,
+                    input.threadId,
+                    input.historyGeneration,
+                    input.questionReply,
+                  )
+                : undefined;
+              if (question && !input.text.trim() && input.attachmentIds.length === 0)
+                return Result.err(
+                  nativeFailure("invalid", "A question reply requires text or an attachment"),
+                );
+              if (question && input.command)
+                return Result.err(nativeFailure("invalid", "Commands cannot answer a question"));
+              const answeringActiveSync =
+                question?.mode === "sync" && thread.activeRunId === question.requestId;
+              const requestedMode = input.command && thread.activeRunId ? "followup" : input.mode;
+              const effectiveMode = answeringActiveSync ? "steer" : requestedMode;
               const pendingCount =
                 this.db
                   .query<{ count: number }, [string]>(
@@ -1683,6 +1714,10 @@ export class NativeStore {
                     nativeFailure("forbidden", "Attachment is unavailable to this input"),
                   );
               }
+              if (question && uploads.some((upload) => upload.state !== "ready"))
+                return Result.err(
+                  nativeFailure("conflict", "Wait for question attachments to finish uploading"),
+                );
               const id = randomUUID();
               const messageId = randomUUID();
               let accepted: NativeInputRecord = {
@@ -1698,6 +1733,7 @@ export class NativeStore {
                 position: thread.nextPosition,
                 historyGeneration: thread.historyGeneration,
                 text: input.text,
+                questionReply: input.questionReply,
                 mode: effectiveMode,
                 runId: thread.activeRunId,
                 state: uploads.some((upload) => upload.state !== "ready") ? "uploading" : "queued",
@@ -1708,6 +1744,21 @@ export class NativeStore {
                 command: input.command,
                 createdAt: this.now(),
               };
+              if (question) {
+                yield* this.updateQuestion(actorId, thread.id, {
+                  ...question,
+                  prompts:
+                    question.prompts ??
+                    (question.view.state === "pending" ? [question.view.prompt] : undefined),
+                  view: {
+                    state: "answered",
+                    summary: { answers: [] },
+                    replyMessageId: messageId,
+                    replyInputId: id,
+                  },
+                });
+                thread = yield* this.getThreadRecord(thread.id);
+              }
               const earlierFull = this.db
                 .query(
                   "SELECT 1 FROM native_records INDEXED BY native_pending_inputs WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.mode')!='steer' AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL LIMIT 1",
@@ -2928,6 +2979,221 @@ export class NativeStore {
             },
           });
         return Result.ok(receipt);
+      }, this),
+    );
+  }
+
+  createQuestion(
+    actorId: string,
+    threadId: string,
+    messageId: string,
+    create: () => NativeStoreResult<NativeQuestion>,
+  ): NativeStoreResult<NativeQuestion> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* (this: NativeStore) {
+        const thread = yield* this.authorizeThread(actorId, threadId, true);
+        if (thread.mutationPending)
+          return Result.err(nativeFailure("stale", "Thread history is changing"));
+        const proposed = yield* create();
+        const existing = yield* this.readRows(
+          "SELECT * FROM native_records WHERE kind='turn' AND thread_id=? AND EXISTS(SELECT 1 FROM json_each(json_extract(data_json,'$.value.messages')) m WHERE json_extract(m.value,'$.id')=?) LIMIT 1",
+          [threadId, messageId],
+        );
+        if (existing.length) {
+          const previous = yield* this.readQuestion(actorId, threadId, messageId);
+          if (previous.respondentId !== actorId)
+            return Result.err(nativeFailure("forbidden", "Question belongs to another respondent"));
+          if (
+            previous.historyGeneration !== thread.historyGeneration ||
+            previous.requestId !== proposed.requestId
+          )
+            return Result.err(nativeFailure("stale", "Question belongs to an earlier request"));
+          return Result.ok(previous);
+        }
+        const request = yield* this.getInputByRequestId(proposed.requestId);
+        if (
+          !request?.turnId ||
+          request.threadId !== threadId ||
+          request.historyGeneration !== thread.historyGeneration ||
+          request.completedAt !== undefined
+        )
+          return Result.err(nativeFailure("stale", "Question request is unavailable"));
+        const question = { ...proposed, historyGeneration: thread.historyGeneration };
+        yield* this.appendMessage(threadId, thread.historyGeneration, request.turnId, {
+          id: messageId,
+          role: "assistant",
+          parts: [{ type: "data-question", id: messageId, data: question }],
+        });
+        return Result.ok(question);
+      }, this),
+    );
+  }
+
+  interruptPendingSyncQuestions(): NativeStoreResult<void> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* (this: NativeStore) {
+        const records = yield* this.readRows(
+          "SELECT * FROM native_records WHERE kind='turn' AND EXISTS(SELECT 1 FROM json_each(json_extract(data_json,'$.value.messages')) m, json_each(json_extract(m.value,'$.parts')) p WHERE json_extract(p.value,'$.type')='data-question' AND json_extract(p.value,'$.data.view.state')='pending' AND json_extract(p.value,'$.data.mode')='sync')",
+          [],
+        );
+        for (const record of records) {
+          if (record.kind !== "turn") continue;
+          for (const message of record.value.messages) {
+            for (const part of message.parts) {
+              if (
+                part.type !== "data-question" ||
+                part.data.view.state !== "pending" ||
+                part.data.mode !== "sync"
+              )
+                continue;
+              const request = yield* this.getInputByRequestId(part.data.requestId);
+              if (!request) continue;
+              const thread = yield* this.getThreadRecord(request.threadId);
+              if (
+                thread.deleted ||
+                thread.mutationPending ||
+                part.data.historyGeneration !== thread.historyGeneration
+              )
+                continue;
+              yield* this.updateQuestion(thread.starterId, thread.id, {
+                ...part.data,
+                view: { state: "interrupted" },
+              });
+            }
+          }
+        }
+        return Result.ok(undefined);
+      }, this),
+    );
+  }
+
+  dismissQuestion(
+    actorId: string,
+    input: NativeRpcInputs["questions"]["dismiss"],
+  ): NativeStoreResult<{ ok: true }> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* (this: NativeStore) {
+        const question = yield* this.authorizeQuestionReply(
+          actorId,
+          input.threadId,
+          input.historyGeneration,
+          input,
+        );
+        yield* this.updateQuestion(actorId, input.threadId, {
+          ...question,
+          view: { state: "cancelled" },
+        });
+        return Result.ok({ ok: true as const });
+      }, this),
+    );
+  }
+
+  finishQuestion(
+    actorId: string,
+    threadId: string,
+    messageId: string,
+    state: "cancelled" | "expired" | "interrupted",
+  ): NativeStoreResult<void> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* (this: NativeStore) {
+        const question = yield* this.readQuestion(actorId, threadId, messageId);
+        if (question.view.state !== "pending") return Result.ok(undefined);
+        return this.updateQuestion(actorId, threadId, { ...question, view: { state } });
+      }, this),
+    );
+  }
+
+  readQuestion(
+    actorId: string,
+    threadId: string,
+    messageId: string,
+  ): NativeStoreResult<NativeQuestion> {
+    return this.readDisplayMessage(actorId, threadId, messageId).andThen((message) => {
+      const part = message.parts.find((entry) => entry.type === "data-question");
+      if (!part || part.type !== "data-question")
+        return Result.err(nativeFailure("not-found", "Question is unavailable"));
+      return Result.ok(part.data);
+    });
+  }
+
+  listPendingQuestions(actorId: string, threadId: string): NativeStoreResult<NativeQuestion[]> {
+    return Result.gen(function* (this: NativeStore) {
+      const thread = yield* this.authorizeThread(actorId, threadId);
+      const records = yield* this.readRows(
+        "SELECT * FROM native_records WHERE kind='turn' AND thread_id=? AND EXISTS(SELECT 1 FROM json_each(json_extract(data_json,'$.value.messages')) m, json_each(json_extract(m.value,'$.parts')) p WHERE json_extract(p.value,'$.type')='data-question' AND json_extract(p.value,'$.data.view.state')='pending') ORDER BY position",
+        [threadId],
+      );
+      const questions: NativeQuestion[] = [];
+      for (const record of records) {
+        if (record.kind !== "turn") continue;
+        for (const message of record.value.messages)
+          for (const part of message.parts)
+            if (
+              part.type === "data-question" &&
+              part.data.view.state === "pending" &&
+              part.data.historyGeneration === thread.historyGeneration
+            )
+              questions.push(part.data);
+      }
+      return Result.ok(questions);
+    }, this);
+  }
+
+  authorizeQuestionReply(
+    actorId: string,
+    threadId: string,
+    historyGeneration: number,
+    reply: { messageId: string; token: string },
+  ): NativeStoreResult<NativeQuestion> {
+    return Result.gen(function* (this: NativeStore) {
+      const thread = yield* this.authorizeThread(actorId, threadId, true);
+      const question = yield* this.readQuestion(actorId, threadId, reply.messageId);
+      if (question.respondentId !== actorId)
+        return Result.err(nativeFailure("forbidden", "Question belongs to another respondent"));
+      if (
+        thread.mutationPending ||
+        historyGeneration !== thread.historyGeneration ||
+        question.historyGeneration !== historyGeneration ||
+        question.view.state !== "pending"
+      )
+        return Result.err(nativeFailure("stale", "Question is no longer pending"));
+      if (reply.token !== question.view.prompt.customToken)
+        return Result.err(nativeFailure("stale", "Question token is no longer valid"));
+      return Result.ok(question);
+    }, this);
+  }
+
+  updateQuestion(
+    actorId: string,
+    threadId: string,
+    question: NativeQuestion,
+  ): NativeStoreResult<void> {
+    return this.updateSurfaceMessage(actorId, threadId, question.questionCallId, {
+      id: question.questionCallId,
+      role: "assistant",
+      parts: [{ type: "data-question", id: question.questionCallId, data: question }],
+    });
+  }
+
+  readDisplayMessage(
+    actorId: string,
+    threadId: string,
+    messageId: string,
+  ): NativeStoreResult<DisplayMessage> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        yield* this.authorizeThread(actorId, threadId);
+        const records = yield* this.readRows(
+          "SELECT * FROM native_records WHERE kind='turn' AND thread_id=? AND EXISTS(SELECT 1 FROM json_each(json_extract(data_json,'$.value.messages')) m WHERE json_extract(m.value,'$.id')=?) LIMIT 1",
+          [threadId, messageId],
+        );
+        const record = records[0];
+        const message =
+          record?.kind === "turn"
+            ? record.value.messages.find((entry) => entry.id === messageId)
+            : undefined;
+        if (!message) return Result.err(nativeFailure("not-found", "Message is unavailable"));
+        return Result.ok(message);
       }, this),
     );
   }

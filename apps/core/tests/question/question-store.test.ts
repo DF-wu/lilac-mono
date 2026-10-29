@@ -185,3 +185,72 @@ describe("SQLite question store", () => {
     store.close();
   });
 });
+
+describe("question schema migration", () => {
+  it.each([false, true])(
+    "preserves legacy calls and tokens with consumed_at=%s",
+    async (hasConsumedAt) => {
+      const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-question-migration-"));
+      temporaryDirectories.push(directory);
+      const dbPath = path.join(directory, "delivery.db");
+      const db = new Database(dbPath);
+      db.run(`CREATE TABLE request_delivery_records(request_delivery_id TEXT PRIMARY KEY NOT NULL) STRICT;
+      INSERT INTO request_delivery_records VALUES ('delivery-1');
+      CREATE TABLE agent_question_calls (
+        question_call_id TEXT PRIMARY KEY NOT NULL, request_delivery_id TEXT NOT NULL,
+        request_id TEXT NOT NULL, tool_call_id TEXT NOT NULL, platform TEXT NOT NULL CHECK (platform = 'discord'),
+        session_id TEXT NOT NULL, user_id TEXT NOT NULL, input_json TEXT NOT NULL, current_index INTEGER NOT NULL,
+        answers_json TEXT NOT NULL, message_id TEXT, state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'cancelled', 'interrupted')),
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(request_delivery_id,tool_call_id),
+        FOREIGN KEY(request_delivery_id) REFERENCES request_delivery_records(request_delivery_id) ON DELETE CASCADE
+      ) STRICT;
+      CREATE TABLE agent_question_tokens (
+        token_sha256 TEXT PRIMARY KEY NOT NULL, question_call_id TEXT NOT NULL REFERENCES agent_question_calls(question_call_id) ON DELETE CASCADE,
+        question_index INTEGER NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('option','custom')), option_index INTEGER, ${hasConsumedAt ? "consumed_at INTEGER," : ""} created_at INTEGER NOT NULL
+      ) STRICT;`);
+      db.run(
+        "INSERT INTO agent_question_calls VALUES ('legacy','delivery-1','r1','t1','discord','channel','user',?,0,'[]','card','pending',1,1)",
+        [JSON.stringify(questions)],
+      );
+      db.run(`INSERT INTO agent_question_tokens (
+      token_sha256, question_call_id, question_index, kind, option_index, created_at
+    ) VALUES ('hash','legacy',0,'option',1,1)`);
+      db.close();
+      const store = new SqliteQuestionStore({ dbPath });
+      expect(store.getById("legacy").unwrap()?.mode).toBe("sync");
+      expect(
+        store
+          .applyAnswer({
+            tokenSha256: "hash",
+            platform: "discord",
+            channelId: "channel",
+            messageId: "card",
+            userId: "user",
+            answer: { kind: "option", optionIndex: 1 },
+          })
+          .unwrap().disposition,
+      ).toBe("accepted");
+      const native = store
+        .create({
+          questionCallId: "native",
+          requestDeliveryId: "delivery-1",
+          requestId: "r2",
+          toolCallId: "t2",
+          platform: "native",
+          mode: "deferred",
+          sessionId: "thread",
+          userId: "user",
+          questionInput: questions,
+          tokens: [],
+        })
+        .unwrap();
+      expect(native.platform).toBe("native");
+      store.bindMessage("native", "native-card").unwrap();
+      store.transitionPending("native", "expired").unwrap();
+      store.close();
+      const reopened = new SqliteQuestionStore({ dbPath });
+      expect(reopened.listDeferred("r2").unwrap()[0]?.state).toBe("expired");
+      reopened.close();
+    },
+  );
+});

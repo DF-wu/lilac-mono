@@ -171,6 +171,41 @@ async function expectSocketRejected(url: URL, headers: Record<string, string> = 
 }
 
 describe("native gateway", () => {
+  test("question operations cross the authenticated socket and list pending questions", async () => {
+    const { url, token, services } = await fixture();
+    const calls: unknown[] = [];
+    services.questions = {
+      read: (principal, input) => {
+        calls.push([principal.userId, input]);
+        return Result.ok({
+          questionCallId: "q1",
+          requestId: "r1",
+          respondentId: "owner",
+          historyGeneration: 0,
+          mode: "deferred",
+          view: { state: "interrupted" },
+        });
+      },
+      pending: (principal, input) => {
+        calls.push([principal.userId, input]);
+        return Result.ok([]);
+      },
+      dismiss: (principal, input) => {
+        calls.push([principal.userId, input]);
+        return Result.ok({ ok: true });
+      },
+    };
+    const { client } = connect(url, token);
+    const target = { threadId: "thread", messageId: "q1" };
+    expect((await client.questions.read(target)).view.state).toBe("interrupted");
+    expect(await client.questions.pending({ threadId: target.threadId })).toEqual([]);
+    expect(
+      await client.questions.dismiss({ ...target, historyGeneration: 0, token: "token" }),
+    ).toEqual({ ok: true });
+    expect(calls).toHaveLength(3);
+    expect(calls[1]).toEqual(["owner", { threadId: "thread" }]);
+  });
+
   test("notification presence receives a socket lifetime signal", async () => {
     const { url, token, services } = await fixture();
     const closed = Promise.withResolvers<void>();

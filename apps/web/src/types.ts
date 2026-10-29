@@ -43,6 +43,8 @@ export type ComposerSubmission = {
   modelId?: string;
   command?: { id: string; arguments: string };
   attachments: Attachment[];
+  /** Answers this pending question with the whole message. */
+  questionReply?: { messageId: string; token: string };
 };
 export type ChatCommon = Pick<AppProps, "client" | "scope" | "resourceUrl" | "upload"> & {
   thread: NativeThread;
