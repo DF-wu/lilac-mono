@@ -266,7 +266,10 @@ export class SqliteQuestionStore {
         created_at INTEGER NOT NULL
       ) STRICT`);
         this.#database.run(
-          "INSERT INTO agent_question_tokens SELECT * FROM question_tokens_backup",
+          `INSERT INTO agent_question_tokens (
+            token_sha256, question_call_id, question_index, kind, option_index, created_at
+          ) SELECT token_sha256, question_call_id, question_index, kind, option_index, created_at
+            FROM question_tokens_backup`,
         );
         this.#database.run("DROP TABLE question_tokens_backup");
         this.#database.run(
