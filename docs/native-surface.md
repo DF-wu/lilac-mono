@@ -133,7 +133,7 @@ authenticated resource endpoint and preserve the original resource's access rule
 Settings > Deployment controls response streaming for the instance. Paragraph publishes text at
 blank-line boundaries. Full publishes the
 buffered text at model-step completion or tool handoff. Clients never receive token-by-token text.
-Compaction and activity remain explicit display events. Native structured questions are unsupported.
+Compaction and activity remain explicit display events. Native structured questions are available through the protocol and web question cards; the TUI has no answer controls.
 
 Old-message selection and storage retention are separate settings:
 `oldMessageSelectionMaxAgeMs` and `storageRetentionMaxAgeMs`. Both default to `null`, which disables
@@ -264,7 +264,7 @@ Search supports lexical, semantic, and hybrid retrieval with shared ranking and 
 Use `surface: native` or `surface: discord` to restrict a search. Compact results, metadata, reads, and
 automatic recall include `surface`. Native conversation-memory IDs use `native:<threadId>` and can be
 passed directly to `conversation.thread.read`. Summarization maintenance uses the shared runner and
-supports native IDs, dry runs, force, clear, and embedding refresh. Structured questions remain unavailable.
+supports native IDs, dry runs, force, clear, and embedding refresh. Structured questions use the `question` tool and the native protocol described below.
 
 ## Persistence and rollback
 
@@ -362,3 +362,32 @@ Use HTTPS. On iOS/iPadOS 16.4 or newer, add Lilac to the Home Screen and enable 
 installed web app. Core generates and retains signing keys automatically. No Firebase project or Apple
 developer account is required. Core needs outbound HTTPS access to the browser's push service. Delivery
 is best effort; failed transient sends are not queued. Explicit logout removes this browser's subscription.
+
+## Structured question protocol
+
+The Level 1 `question` tool defaults to deferred mode. It creates a `data-question` display part in the
+request turn and returns a question-call ID. Normal replay, reconnect snapshots and turn hydration carry
+that part. The agent may finish its current turn; the question remains pending until answered or
+dismissed, including across Core restart. Deferred questions have no inactivity timeout.
+`mode: "sync"` waits inside the tool call and retains a ten-minute timeout. Core startup interrupts
+persisted sync calls whose live wait ended with the previous process.
+
+`questions.read({ threadId, messageId })` returns the call, where `messageId` is its question-call ID.
+`questions.pending({ threadId })` lists pending calls independently of the loaded history window.
+`prompts` contains the complete set of questions. `view.prompt` retains the first prompt for display
+compatibility. One freeform message answers the entire call; the agent interprets which answers the
+message provides. The protocol does not enforce an option selection or an answer to every prompt.
+
+Submit an ordinary native input with `questionReply: { messageId, token }`, using the first prompt's
+`customToken`. Normal text and attachments are accepted, including an attachment-only reply. Input
+acceptance and question resolution commit atomically; retries reuse the same command ID. Files must
+finish uploading first. The reply reaches the model through normal native message delivery with the
+original question context. The answered view links to the reply message. Explicit sync calls return a
+`kind: "message"` answer with the reply text, message ID and attachment IDs. Replies to an active sync
+call steer its existing run, even when the composer normally queues follow-ups.
+
+`questions.dismiss` accepts thread ID, message ID, history generation and the same token. Only the
+intended respondent with current thread edit access can answer or dismiss. Stale tokens, duplicate
+answers under new command IDs and discarded history are rejected. The web uses its ordinary composer
+for replies and attachments; numbered options populate the draft without sending. Other viewers see
+read-only questions. The TUI has no question controls in this release.

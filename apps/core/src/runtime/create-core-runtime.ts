@@ -4031,6 +4031,7 @@ export async function createCoreRuntime(
 
           // Subscribe while paused before surface routers can replay retained adapter events.
           const startedAgentRunner = await startBusAgentRunner({
+            questions: questionService,
             bus: durableBus,
             blobStore: activeBlobStore,
             requestDelivery: requestDeliveryCoordinator,

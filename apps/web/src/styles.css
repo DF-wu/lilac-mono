@@ -622,6 +622,10 @@
   background: color-mix(in srgb, var(--ui-surface) 75%, transparent);
   backdrop-filter: blur(16px);
 }
+/* Option text over a see-through composer competes with the conversation behind it. */
+.chat-sticky-footer .composer:has([data-ui="question-panel"]) {
+  background: var(--ui-surface);
+}
 
 .composer-wrap,
 .composer {

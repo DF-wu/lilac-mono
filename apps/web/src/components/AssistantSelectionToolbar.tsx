@@ -21,6 +21,7 @@ export function AssistantSelectionToolbar({
   useEffect(() => {
     if (!viewport) return;
     let dragging = false;
+    let touchInput = false;
     let dismissed = false;
     let frame: number | undefined;
     let multiClick: ReturnType<typeof setTimeout> | undefined;
@@ -50,6 +51,7 @@ export function AssistantSelectionToolbar({
     };
     const down = (event: PointerEvent) => {
       if (toolbar.current?.contains(event.target instanceof Node ? event.target : null)) return;
+      touchInput = event.pointerType === "touch";
       const target = event.target instanceof Element ? event.target : undefined;
       dragging =
         event.button === 0 &&
@@ -57,8 +59,9 @@ export function AssistantSelectionToolbar({
         viewport.contains(target) &&
         !target.closest("button,[role=button],input,textarea,[contenteditable]");
       dismissed = !dragging;
-      clear();
+      if (!touchInput || !dragging) clear();
       clearTimeout(multiClick);
+      multiClick = undefined;
     };
     const up = (event: MouseEvent) => {
       if (!dragging) return;
@@ -77,6 +80,14 @@ export function AssistantSelectionToolbar({
       if (button.current === document.activeElement) return;
       cancelAnimationFrame(frame ?? 0);
       frame = requestAnimationFrame(() => capture());
+    };
+    const selectionChanged = () => {
+      // Native selection handles can take over touch input without delivering pointerup.
+      if (touchInput) {
+        dragging = false;
+        dismissed = false;
+      }
+      changed();
     };
     const key = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -97,7 +108,8 @@ export function AssistantSelectionToolbar({
     document.addEventListener("pointerdown", down, true);
     document.addEventListener("mouseup", up);
     document.addEventListener("pointerup", released);
-    document.addEventListener("selectionchange", changed);
+    document.addEventListener("pointercancel", released);
+    document.addEventListener("selectionchange", selectionChanged);
     document.addEventListener("keydown", key);
     viewport.addEventListener("scroll", dismiss, { passive: true });
     window.addEventListener("resize", dismiss);
@@ -108,7 +120,8 @@ export function AssistantSelectionToolbar({
       document.removeEventListener("pointerdown", down, true);
       document.removeEventListener("mouseup", up);
       document.removeEventListener("pointerup", released);
-      document.removeEventListener("selectionchange", changed);
+      document.removeEventListener("pointercancel", released);
+      document.removeEventListener("selectionchange", selectionChanged);
       document.removeEventListener("keydown", key);
       viewport.removeEventListener("scroll", dismiss);
       window.removeEventListener("resize", dismiss);

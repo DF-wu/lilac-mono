@@ -1,4 +1,5 @@
 import { ORPCError } from "@orpc/client";
+import { Result } from "better-result";
 import { useCallback, useSyncExternalStore } from "react";
 import {
   onlineManager,
@@ -35,6 +36,22 @@ export function updateComposerDraft(queries: QueryClient, threadId: string, draf
   // A late IndexedDB read must not replace text written after hydration started.
   void queries.cancelQueries({ queryKey, exact: true });
   queries.setQueryData(queryKey, draft);
+}
+
+/**
+ * Waits for a draft's saved copy to load, then returns the cached draft. Edits made while it loaded
+ * cancel the read, so the cache holds them instead.
+ */
+export async function loadComposerDraft(
+  queries: QueryClient,
+  options: ReturnType<typeof composerDraftOptions>,
+): Promise<Result<Draft, string>> {
+  const read = await Result.tryPromise({
+    try: () => queries.query(options),
+    catch: (cause) => (cause instanceof Error ? cause.message : "The saved draft did not load"),
+  });
+  const cached = queries.getQueryData(options.queryKey);
+  return cached ? Result.ok(cached) : read;
 }
 
 const subscribeBrowserOnline = onlineManager.subscribe.bind(onlineManager);
@@ -77,6 +94,16 @@ export function participantOptions(client: NativeClient, threadId: string) {
       ? ({ signal }) =>
           queryNativeRPC(client, (rpc) => rpc.participants.list({ threadId }, { signal }))
       : skipToken,
+  });
+}
+
+export function pendingQuestionsOptions(client: NativeClient, threadId: string) {
+  return queryOptions({
+    queryKey: ["questions", "pending", threadId],
+    queryFn: ({ signal }) =>
+      queryNativeRPC(client, (rpc) => rpc.questions.pending({ threadId }, { signal })),
+    // Replays and reconnects invalidate this list; "static" would ignore those invalidations.
+    staleTime: Infinity,
   });
 }
 

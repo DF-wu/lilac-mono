@@ -365,7 +365,20 @@ export function createNativeExecution(options: {
         thread.kind === "dm"
           ? "This is an ongoing personal conversation that may span unrelated topics. Follow the latest message, use earlier messages when relevant, and treat completed requests as history. Ask briefly when a reference is ambiguous. Older conversation can be searched.\n\n"
           : "";
-      const body = dmInstruction + (skillText ? `${skillText}\n\n${commandText}` : commandText);
+      const question = input.questionReply
+        ? yield* store.readQuestion(
+            input.initiatingUserId,
+            input.threadId,
+            input.questionReply.messageId,
+          )
+        : undefined;
+      const questionContext = question
+        ? `Reply to question ${question.questionCallId}:\n${JSON.stringify((question.prompts ?? []).map((prompt) => ({ header: prompt.header, question: prompt.question, options: prompt.options.map(({ index, label, description }) => ({ index, label, description })) })))}\n\n`
+        : "";
+      const body =
+        dmInstruction +
+        questionContext +
+        (skillText ? `${skillText}\n\n${commandText}` : commandText);
       const text = `${header}\n${escapeSurfaceMetadataTags(body)}`;
       const parts: Extract<StoredMessageV1, { role: "user" }>["content"] = [{ type: "text", text }];
       for (const attachmentId of input.attachmentIds) {

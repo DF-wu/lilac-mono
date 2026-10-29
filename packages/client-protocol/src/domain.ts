@@ -25,7 +25,7 @@ export const nativeThreadSchema = z.strictObject({
   starterId: identitySchema,
   starterAvatarUrl: z.string().max(2048).optional(),
   starterDisplayName: z.string().max(256).optional(),
-  displayStatus: z.enum(["idle", "completed", "working", "error"]).optional(),
+  displayStatus: z.enum(["idle", "completed", "working", "error", "input"]).optional(),
   activeRunId: runIdentitySchema.optional(),
   workingSince: revisionSchema.optional(),
   archived: z.boolean(),
@@ -113,6 +113,9 @@ export const nativeInputSchema = z
     deviceId: z
       .string()
       .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    questionReply: z
+      .strictObject({ messageId: identitySchema, token: z.string().min(1).max(128) })
       .optional(),
     text: z.string().max(65_536),
     mode: z.enum(["prompt", "steer", "followup"]),

@@ -1,3 +1,4 @@
+import type { SurfaceQuestionPort } from "../question";
 import { Result } from "better-result";
 
 import type { SurfaceAdapter, SurfaceOperationResult } from "../adapter";
@@ -102,6 +103,7 @@ export function createNativeWorkflowProgressPort(
 
 export function createNativeSurfaceRuntimeDescriptor(input: {
   readonly adapter: SurfaceAdapter;
+  readonly question?: SurfaceQuestionPort<"native">;
   readonly resolveWorkflowAdapter: NativeWorkflowAdapterResolver;
   readonly requestIngress?: SurfaceRequestIngress;
   readonly health?: SurfaceRuntimeHealthPort;
@@ -109,6 +111,7 @@ export function createNativeSurfaceRuntimeDescriptor(input: {
   return {
     protocol: nativeSurfaceProtocol,
     adapter: input.adapter,
+    ...(input.question ? { createQuestion: () => input.question! } : {}),
     createWorkflowProgress: () => createNativeWorkflowProgressPort(input.resolveWorkflowAdapter),
     ...(input.requestIngress ? { requestIngress: input.requestIngress } : {}),
     ...(input.health ? { health: input.health } : {}),

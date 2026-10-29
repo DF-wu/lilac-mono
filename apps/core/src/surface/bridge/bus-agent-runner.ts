@@ -1,3 +1,6 @@
+import { adaptToolResultToHost } from "../../tools/tool-result-adapters";
+import type { QuestionService } from "../../question/question-service";
+import { QuestionContinuation } from "../../question/question-continuation";
 import { autoInjectPlannerContext, decisionAutoInjectContext } from "./bus-agent-runner/text-units";
 import {
   buildGeneratedMessage,
@@ -607,6 +610,7 @@ export type BusAgentRunnerTerminalCleanup = {
     | "control-capability-expire"
     | "workflow-request-expire"
     | "run-idle-watchdog-stop"
+    | "questions-cancel"
     | "agent-unsubscribe"
     | "compaction-unsubscribe"
     | "output-publisher-drain"
@@ -1956,6 +1960,7 @@ type Enqueued = {
   recoveryMcpImages?: McpImageCheckpointReference[];
   previousRecoveryCheckpoint?: AgentRunCheckpointV1;
   loadedCatalogIds?: readonly string[];
+  questionResultIds?: readonly string[];
   acceptedCorePrimaryLineage?: CorePrimaryLineageV2;
   acceptedCurrentTurnUserId?: string;
   retainedRequestDeliveries?: readonly AgentRunnerRetainedRequestDelivery[];
@@ -2722,6 +2727,7 @@ type SessionQueue = {
     storedMessages: StoredMessageV1[];
     corePrimaryLineage?: CorePrimaryLineageV2;
     toolAuthority: LineageToolAuthority;
+    questionContinuation: QuestionContinuation;
     modelOverride?: string;
     currentTurnUserId?: string;
     currentTurnMessageRef?: MsgRef;
@@ -2879,6 +2885,7 @@ export function formatBusAgentRunnerDrainFailureForLog(
 }
 
 export async function startBusAgentRunner(params: {
+  questions?: QuestionService;
   bus: LilacBus;
   blobStore: AnthropicFallbackBlobStore;
   resourceAccess?: Pick<ResourceAccess, "describe" | "open">;
@@ -3182,6 +3189,7 @@ export async function startBusAgentRunner(params: {
       shouldAbandon: () => run.checkpointWriter.abandoned,
       ...(run.corePrimaryLineage ? { corePrimaryLineage: run.corePrimaryLineage } : {}),
       loadedCatalogIds: run.toolAuthority.snapshot(),
+      questionResultIds: run.questionContinuation.checkpoint(messages),
       ...(run.currentTurnUserId ? { currentTurnUserId: run.currentTurnUserId } : {}),
       retainedRequestDeliveries: [...run.retainedRequestDeliveries]
         .filter(([retainedRequestDeliveryId]) =>
@@ -3534,6 +3542,7 @@ export async function startBusAgentRunner(params: {
     });
     input.recovery.checkpointMessages = input.messages;
     input.recovery.nativeOutputFrontier = input.checkpoint.nativeOutput;
+    input.entry.questionResultIds = input.checkpoint.questionResultIds;
     input.entry.storedRecoveryCheckpoint = [...input.checkpoint.messages];
     input.entry.recoveryMcpImages = input.checkpoint.mcpImages;
     input.entry.retainedRequestDeliveries = input.checkpoint.retainedRequestDeliveries;
@@ -4947,6 +4956,7 @@ export async function startBusAgentRunner(params: {
       if (!state.running || !state.activeRun) continue;
       shutdownAbortRequestIds.add(state.activeRun.requestId);
       state.agent?.abort();
+      state.activeRun.notifyWaiters();
     }
 
     await new Promise((resolve) => setTimeout(resolve, 150));
@@ -5482,6 +5492,12 @@ export async function startBusAgentRunner(params: {
       continuationWaiters.clear();
       for (const waiter of current) waiter();
     };
+    const questionContinuation = new QuestionContinuation(next.questionResultIds);
+    const stopQuestionNotifications = params.questions?.subscribe((requestId) => {
+      if (requestId === next.requestId) notifyContinuationWaiters();
+    });
+    const deferredQuestions = () =>
+      params.questions ? adaptToolResultToHost(params.questions.listDeferred(next.requestId)) : [];
     const waitForContinuationSignalSince = async (version: number, abortSignal?: AbortSignal) => {
       if (continuationSignalVersion !== version || abortSignal?.aborted) return;
       await new Promise<void>((resolve) => {
@@ -5525,6 +5541,7 @@ export async function startBusAgentRunner(params: {
       storedMessages: next.storedMessages,
       corePrimaryLineage: next.corePrimaryLineage,
       toolAuthority,
+      questionContinuation,
       modelOverride: next.modelOverride,
       currentTurnUserId: next.currentTurnUserId,
       currentTurnMessageRef: next.currentTurnMessageRef,
@@ -5545,6 +5562,7 @@ export async function startBusAgentRunner(params: {
       setCurrentTurnContext: () => undefined,
       cancel: () => {
         cancelledByRequestId.add(headers.request_id);
+        notifyContinuationWaiters();
         customCommandAbortController?.abort();
         rejectPreAgentCancellation?.(new PreAgentRunCancelledError());
         rejectPreAgentCancellation = null;
@@ -7274,7 +7292,15 @@ export async function startBusAgentRunner(params: {
               modelInputMessages: context.modelInputMessages,
               abortSignal: context.abortSignal,
             });
-            return adaptDeferredDrainToHost(drained);
+            const decision = adaptDeferredDrainToHost(drained);
+            const answers = questionContinuation.drain(
+              deferredQuestions(),
+              context.modelInputMessages,
+            );
+            return {
+              append: [...decision.append, ...answers],
+              forceNextTurn: decision.forceNextTurn || answers.length > 0,
+            };
           });
 
           state.agent = agent;
@@ -8166,6 +8192,7 @@ export async function startBusAgentRunner(params: {
               return signalBusAgentRunnerHostFailure(new ShutdownDrainingAbort());
             }
 
+            if (cancelledByRequestId.has(headers.request_id)) break;
             const continuationWaitVersion = continuationSignalVersion;
             const deferredWaitState = liveParentSession?.snapshot();
 
@@ -8186,6 +8213,24 @@ export async function startBusAgentRunner(params: {
               continue;
             }
 
+            const questions = deferredQuestions();
+            const answers = questionContinuation.drain(questions, agent.state.messages);
+            if (answers.length > 0) {
+              agent.appendMessages(answers);
+              await waitForRunAtHost(agent.continue());
+              continue;
+            }
+            if (questions.some((question) => question.state === "pending")) {
+              runIdleWatchdog?.pause();
+              if (liveParentSession && deferredWaitState?.hasOutstandingRuns) {
+                await waitForDeferredWake(deferredWaitState.signalVersion, continuationWaitVersion);
+              } else {
+                await waitForContinuationSignalSince(continuationWaitVersion);
+              }
+              runIdleWatchdog?.start();
+              if (cancelledByRequestId.has(headers.request_id)) break;
+              continue;
+            }
             if (!deferredWaitState?.hasOutstandingRuns) {
               break;
             }
@@ -9009,6 +9054,12 @@ export async function startBusAgentRunner(params: {
             run: () => session.close(),
           });
         }
+        stopQuestionNotifications?.();
+        if (params.questions)
+          terminalCleanups.push({
+            label: "questions-cancel",
+            run: () => params.questions!.cancelRequest(next.requestId),
+          });
         const cleanupBatch = startBusAgentRunnerTerminalCleanup(terminalCleanups);
         terminalCleanupOperations = [...terminalCleanupOperations, ...cleanupBatch.operations];
         terminalCleanupCompletion = terminalCleanupCompletion
@@ -9086,6 +9137,8 @@ export async function startBusAgentRunner(params: {
           });
         }
         await liveParentSession?.close();
+        stopQuestionNotifications?.();
+        await params.questions?.cancelRequest(next.requestId);
         await Promise.all([...level1ToolsetReleases].map(releaseLevel1Toolset));
       }
       const finalReplayDeadline = outputPublisher.getFinalReplayDeadline();
@@ -9574,6 +9627,7 @@ export async function startBusAgentRunner(params: {
             },
             storedRecoveryCheckpoint: [...recoveryHead.checkpoint.messages],
             recoveryMcpImages: recoveryHead.checkpoint.mcpImages,
+            questionResultIds: recoveryHead.checkpoint.questionResultIds,
             ...(recoveryHead.checkpoint.loadedCatalogIds
               ? {
                   loadedCatalogIds: [...recoveryHead.checkpoint.loadedCatalogIds],

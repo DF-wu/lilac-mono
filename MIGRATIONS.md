@@ -1,5 +1,39 @@
 # MIGRATIONS.md
 
+## Deferred questions and native schema 6
+
+The Level 1 `question` tool now defaults to `mode: "deferred"`. It returns
+`{ mode: "deferred", status: "accepted", questionCallId }` after presentation. Pass `mode: "sync"`
+to await `{ mode: "sync", status: "answered", questionCallId, answers }`. Update callers that expect
+the old `{ answers }` result. Deferred questions have no inactivity timeout. Explicit sync calls retain
+the ten-minute timeout and are interrupted on Core restart; cancellation and expiry never select an option.
+
+Native questions are canonical display records in the native store. Deferred calls survive turn
+completion and Core restart. A native reply uses ordinary `inputs.submit` with optional
+`questionReply: { messageId, token }`, normal text and attachments. Acceptance atomically resolves the
+whole question call and retains the input receipt. Retry the same command ID to recover that receipt.
+The normal native delivery path supplies the reply and original question context to the agent.
+Explicit sync native calls route replies into the active run as steering and return a `kind: "message"`
+answer with text, message ID and attachment IDs. Discord retains its sequential cards and live request continuation via `question_result`; pending
+Discord calls are interrupted on restart. Agent-run checkpoints gain optional `questionResultIds` for
+that continuation path. Older checkpoints remain readable.
+
+Question-store initialization rebuilds the old Discord-only calls table in one transaction, retaining
+calls and action tokens. It adds `mode` with `sync` for existing rows and the `expired` terminal state.
+Native initialization advances SQLite schema 5 to 6 without rewriting existing records; input records
+gain optional question-reply references. Older binaries reject schema 6.
+
+Native display/replay adds `data-question`. The oRPC contract adds `questions.read`, `questions.pending`,
+and `questions.dismiss`. Replies and dismissals require the intended authenticated respondent, edit
+access, the current history generation and a pending question token. Ready attachments use the same
+ownership checks as normal messages. Pending questions are queryable independently of the history
+window. Deploy Core and clients together because old strict decoders reject new display and input
+fields. Back up request-delivery, agent-run and native stores before upgrading; rollback requires that
+coordinated backup.
+
+The web client uses its ordinary composer to answer questions, including attachments. Numbered options
+populate the draft without sending it. The TUI has no question controls in this release.
+
 ## Native schema 5: initiating notification device
 
 Native input submissions and persisted input records gain optional `deviceId`, the lowercase SHA-256
@@ -498,7 +532,9 @@ Display catalogs optionally carry `agent` identity. Existing disposable client c
 remain readable and use the default identity until catalog reconciliation. Thread summaries add
 optional `starterDisplayName` and `displayStatus` display fields; the server emits these using existing
 thread/read state. The existing `native_surface_read` table is initialized by `NativeStore`, with no
-schema or read-state migration.
+schema or read-state migration. `displayStatus` also accepts `input` when a native question in the
+current history waits for the viewer and no run is active; clients older than this value reject the
+summary until they reload the current web bundle, and no stored data changes.
 
 The filesystem `fs.read_bytes` request accepts optional `prefixBytes` from 1 through 65,536.
 Without it, reads retain their whole-file limit and result shape. Prefix reads return at most that

@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { Result } from "better-result";
-import type { DisplayMessage } from "@stanley2058/lilac-client-protocol";
+import type { DisplayMessage, NativeQuestion } from "@stanley2058/lilac-client-protocol";
 import type { SqliteTranscriptStore } from "../../../src/transcript/transcript-store";
 import { NativeStore } from "../../../src/surface/native/store";
 
@@ -377,8 +377,10 @@ export function seedNativeBrowserFixture(
     .unwrap();
   store.shareThread("owner", { threadId: rich.id, userId: "participant", grant: "read" }).unwrap();
   const dm = seedDirectMessages(options.database, options.transcript);
+  const questions = seedQuestionThread(store, options.transcript);
   return {
     dm,
+    questions,
     rich: rich.id,
     history: long.id,
     largeTurn: largeTurn.id,
@@ -387,4 +389,68 @@ export function seedNativeBrowserFixture(
     historyTurns,
     sidebarThreads,
   };
+}
+
+function seedQuestionThread(store: NativeStore, transcript: SqliteTranscriptStore | undefined) {
+  const thread = store
+    .createThread("owner", { commandId: "browser-questions", title: "Preview deploy questions" })
+    .unwrap();
+  const input = completedTurn(
+    store,
+    transcript,
+    thread.id,
+    0,
+    "Check with me before you deploy the preview.",
+    "These cards show settled questions. Send `ask me` for live ones.",
+  );
+  const question = (id: string, respondentId: string, view: NativeQuestion["view"]) => {
+    store
+      .appendMessage(thread.id, 0, input.turnId!, {
+        id,
+        role: "assistant",
+        metadata: { authorId: "lilac", createdAt: Date.now() },
+        parts: [
+          {
+            type: "data-question",
+            id,
+            data: {
+              questionCallId: id,
+              requestId: input.requestId,
+              respondentId,
+              historyGeneration: 0,
+              mode: "deferred",
+              view,
+            },
+          },
+        ],
+      })
+      .unwrap();
+  };
+  question("seed_question_answered", "owner", {
+    state: "answered",
+    summary: {
+      answers: [
+        { header: "Deploy target", answer: { kind: "option", label: "Preview link" } },
+        { header: "Database", answer: { kind: "custom" } },
+      ],
+    },
+  });
+  question("seed_question_expired", "owner", { state: "expired" });
+  question("seed_question_cancelled", "owner", { state: "cancelled" });
+  // Another respondent's question stays read-only for the owner.
+  question("seed_question_other", "participant", {
+    state: "pending",
+    prompt: {
+      ordinal: 1,
+      total: 1,
+      header: "Reviewer",
+      question: "Should I request your review on the preview pull request?",
+      options: [
+        { index: 1, label: "Yes", description: "Add you as a reviewer.", token: "seed-other-1" },
+        { index: 2, label: "No", description: "Leave reviewers unchanged.", token: "seed-other-2" },
+      ],
+      customToken: "seed-other-custom",
+    },
+  });
+  return thread.id;
 }

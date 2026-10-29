@@ -48,6 +48,7 @@ export const agentRunCheckpointV1Schema = z
     corePrimaryLineage: corePrimaryLineageV2Schema.optional(),
     nativeOutput: nativeOutputFrontierSchema.optional(),
     loadedCatalogIds: z.array(z.string().min(1)).optional(),
+    questionResultIds: z.array(z.string().min(1)).optional(),
     currentTurnUserId: z.string().optional(),
     retainedRequestDeliveries: z.array(retainedDeliverySchema),
   })
@@ -983,6 +984,7 @@ export function createAgentRunCheckpoint(input: {
   readonly corePrimaryLineage?: CorePrimaryLineageV2;
   readonly nativeOutput?: NativeOutputFrontier;
   readonly loadedCatalogIds?: readonly string[];
+  readonly questionResultIds?: readonly string[];
   readonly currentTurnUserId?: string;
   readonly retainedRequestDeliveries?: readonly {
     readonly requestDeliveryId: string;
@@ -996,6 +998,7 @@ export function createAgentRunCheckpoint(input: {
     ...(input.corePrimaryLineage ? { corePrimaryLineage: input.corePrimaryLineage } : {}),
     ...(input.nativeOutput ? { nativeOutput: input.nativeOutput } : {}),
     ...(input.loadedCatalogIds ? { loadedCatalogIds: [...input.loadedCatalogIds] } : {}),
+    ...(input.questionResultIds ? { questionResultIds: [...input.questionResultIds] } : {}),
     ...(input.currentTurnUserId ? { currentTurnUserId: input.currentTurnUserId } : {}),
     retainedRequestDeliveries: [...(input.retainedRequestDeliveries ?? [])],
   };

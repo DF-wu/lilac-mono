@@ -1,3 +1,4 @@
+import { nativeQuestionSchema } from "./questions.ts";
 import { conversationReferenceSchema } from "./references.ts";
 import type { InferContractRouterInputs, InferContractRouterOutputs } from "@orpc/contract";
 import { eventIterator, oc } from "@orpc/contract";
@@ -155,6 +156,21 @@ export const notificationContentSchema = z.strictObject({
   tag: z.string().max(1024),
 });
 export const nativeContract = {
+  questions: {
+    read: procedure
+      .input(threadIdInput.extend({ messageId: identitySchema }))
+      .output(nativeQuestionSchema),
+    pending: procedure.input(threadIdInput).output(z.array(nativeQuestionSchema)),
+    dismiss: procedure
+      .input(
+        threadIdInput.extend({
+          messageId: identitySchema,
+          historyGeneration: revisionSchema,
+          token: z.string().min(1).max(128),
+        }),
+      )
+      .output(successSchema),
+  },
   notifications: {
     presence: procedure
       .input(
