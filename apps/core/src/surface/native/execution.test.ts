@@ -1,3 +1,4 @@
+import { NativeQuestions } from "./questions";
 import { describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import {
@@ -177,6 +178,155 @@ function fixture(blobStore?: BlobStore, direct = false) {
 }
 
 describe("native execution admission", () => {
+  test("a deferred question reply starts a new run with its original context and attachments", async () => {
+    const f = fixture();
+    try {
+      const first = f.submit("Ask me where");
+      value(await f.execution.kick(f.thread.id));
+      const request = f.request();
+      const native = new NativeQuestions(f.store);
+      const question = value(
+        await native.begin({
+          platform: "native",
+          requestId: request.requestId,
+          requestDeliveryId: request.requestDeliveryId!,
+          sessionId: f.thread.id,
+          userId: "owner",
+          toolCallId: "question",
+          questions: {
+            questions: [
+              {
+                id: "target",
+                header: "Target",
+                question: "Where should it go?",
+                options: [
+                  { id: "a", label: "Preview", description: "Temporary" },
+                  { id: "b", label: "Staging", description: "Shared" },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+      const pending = value(
+        native.read("owner", { threadId: f.thread.id, messageId: question.questionCallId }),
+      );
+      if (pending.view.state !== "pending") throw new Error("Missing question");
+      const { prompts: _prompts, ...legacy } = pending;
+      value(f.store.updateQuestion("owner", f.thread.id, legacy));
+      value(
+        f.transcripts.saveRequestTranscript({
+          requestId: request.requestId,
+          sessionId: request.sessionId,
+          requestClient: "native",
+          messages: [{ role: "user", content: "Ask me where" }],
+        }),
+      );
+      value(await f.execution.runnerLifecycle.settled(request, "completed"));
+      expect(value(native.pending("owner", { threadId: f.thread.id }))).toHaveLength(1);
+      const upload = value(
+        f.store.reserveUpload("owner", {
+          threadId: f.thread.id,
+          filename: "reference.png",
+          mediaType: "image/png",
+          size: 10,
+        }),
+      );
+      const claimed = value(f.store.claimUpload("owner", upload.id));
+      value(
+        f.store.settleUpload(upload.id, {
+          attempt: claimed.attempt,
+          historyGeneration: 0,
+          state: "ready",
+          resourceUri: "resource://reference",
+        }),
+      );
+      const reply = value(
+        f.store.acceptInput("owner", {
+          threadId: f.thread.id,
+          historyGeneration: 0,
+          commandId: "reply",
+          mode: "prompt",
+          text: "1",
+          attachmentIds: [upload.id],
+          skillIds: [],
+          questionReply: {
+            messageId: question.questionCallId,
+            token: pending.view.prompt.customToken,
+          },
+        }),
+      );
+      value(await f.execution.kick(f.thread.id));
+      expect(reply.turnId).not.toBe(first.turnId);
+      const message = f.published.at(-1)?.data.messages.at(-1);
+      expect(JSON.stringify(message)).toContain("Where should it go?");
+      expect(JSON.stringify(message)).toContain("resource://reference");
+      expect(JSON.stringify(message)).toContain("reference.png");
+      expect(JSON.stringify(message)).not.toContain(pending.view.prompt.customToken);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("a synchronous question reply steers the existing run instead of queuing a second run", async () => {
+    const f = fixture();
+    try {
+      f.submit("Ask me");
+      value(await f.execution.kick(f.thread.id));
+      const request = f.request();
+      const native = new NativeQuestions(f.store);
+      const handle = value(
+        await native.begin({
+          mode: "sync",
+          platform: "native",
+          requestId: request.requestId,
+          requestDeliveryId: request.requestDeliveryId!,
+          sessionId: f.thread.id,
+          userId: "owner",
+          toolCallId: "sync",
+          questions: {
+            questions: [
+              {
+                id: "target",
+                header: "Target",
+                question: "Where?",
+                options: [
+                  { id: "a", label: "A", description: "A" },
+                  { id: "b", label: "B", description: "B" },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+      const question = value(
+        native.read("owner", { threadId: f.thread.id, messageId: handle.questionCallId }),
+      );
+      if (question.view.state !== "pending") throw new Error("Missing question");
+      const receipt = value(
+        f.store.acceptInput("owner", {
+          threadId: f.thread.id,
+          commandId: "sync-reply",
+          historyGeneration: 0,
+          mode: "followup",
+          text: "1",
+          attachmentIds: [],
+          skillIds: [],
+          questionReply: {
+            messageId: handle.questionCallId,
+            token: question.view.prompt.customToken,
+          },
+        }),
+      );
+      value(await f.execution.kick(f.thread.id));
+      expect(f.request().requestId).toBe(request.requestId);
+      expect(value(f.store.getInput(receipt.inputId)).mode).toBe("steer");
+      expect(value(await handle.completion)[0]?.answer.kind).toBe("message");
+    } finally {
+      f.close();
+    }
+  });
+
   test.each(["published", "invalid", "transport", "cleanup", "missing", "expired"] as const)(
     "prepares retained blob history and preserves ownership: %s",
     async (outcome) => {

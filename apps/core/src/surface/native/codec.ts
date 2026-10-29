@@ -76,6 +76,7 @@ export const nativeInputRecordSchema = z.strictObject({
   turnId: id.optional(),
   position: revision,
   historyGeneration: revision,
+  questionReply: z.strictObject({ messageId: id, token: z.string().min(1).max(128) }).optional(),
   text: z.string(),
   mode: z.enum(["prompt", "steer", "followup"]),
   runId: id.optional(),
