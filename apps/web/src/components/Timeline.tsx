@@ -1,3 +1,4 @@
+import { useMessageTouchMenu } from "./use-message-touch-menu";
 import { joinMessageTurns, lastTurnMessageTime, sameMessageAuthor } from "../message-grouping";
 import {
   ContextMenu,
@@ -1298,6 +1299,7 @@ const MessageBody = memo(function MessageBody(
       ? { surface: conversation.surface, sessionId: conversation.sessionId, messageId: message.id }
       : reference;
   const [copyError, setCopyError] = useState<string>();
+  const touchMenu = useMessageTouchMenu();
   const [copiedAt, setCopiedAt] = useState(0);
   useEffect(() => {
     if (!copiedAt) return;
@@ -1410,15 +1412,7 @@ const MessageBody = memo(function MessageBody(
           data-slot="message"
           className="select-text"
           style={{ WebkitTouchCallout: "default" }}
-          onContextMenu={(event) => {
-            if (window.getSelection()?.toString()) {
-              event.preventBaseUIHandler();
-              event.stopPropagation();
-            }
-          }}
-          onTouchStart={(event) => {
-            if (window.getSelection()?.toString()) event.preventBaseUIHandler();
-          }}
+          {...touchMenu}
           render={
             <ChatMessage
               align={self ? "end" : "start"}
