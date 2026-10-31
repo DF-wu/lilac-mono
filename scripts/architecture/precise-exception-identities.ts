@@ -609,6 +609,7 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ["src/tool-result-output-normalizer.ts", "serializeOutput", "signal"],
   ],
   "packages/utils": [
+    ["claude-sdk.ts", "signalClaudeUtilityFailure", "signal"],
     ["agent-prompts.ts", "exists", "signal"],
     ["agent-prompts.ts", "loadPromptTemplateState", "signal"],
     ["agent-prompts.ts", "parsePromptTemplateState", "signal"],

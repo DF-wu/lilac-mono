@@ -10,7 +10,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ExternalToolExecutionOutcome, ToolResultOutput } from "@stanley2058/lilac-agent";
 import { isRecord, opaqueErrorMessage } from "@stanley2058/lilac-utils/runtime-utils";
 import { asSchema, type ToolSet } from "ai";
-import type { ClaudeCodeSettings } from "ai-sdk-provider-claude-code";
+import type { ClaudeCodeSettings } from "@stanley2058/lilac-utils/claude-sdk";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import path from "node:path";
 
@@ -447,15 +447,7 @@ export async function createClaudeCodeToolBridgeResult(options: {
       );
     }
     const schema = asSchema(definition.inputSchema);
-    if (!schema.validate) {
-      return Result.err(
-        new ClaudeCodeToolBridgeConfigurationFailed({
-          toolName,
-          message: `Cannot expose Claude MCP tool '${toolName}': input validation is missing`,
-        }),
-      );
-    }
-    validators.set(toolName, schema.validate);
+    if (schema.validate) validators.set(toolName, schema.validate);
     const catalogMetadata = options.catalogMetadata?.[toolName];
     const declared = resultOutcome(
       await captureClaudeToolPromise(async () =>
@@ -500,8 +492,7 @@ export async function createClaudeCodeToolBridgeResult(options: {
       ? requestedName
       : canonicalLilacToolName(requestedName);
     const validate = validators.get(toolName);
-    if (!validate || !exposedNames.has(toolName))
-      return toolError(`Unknown Lilac tool '${toolName}'`);
+    if (!exposedNames.has(toolName)) return toolError(`Unknown Lilac tool '${toolName}'`);
 
     const rawInput = { ...request.params.arguments };
     const nonce = rawInput[nonceKey];
@@ -521,7 +512,10 @@ export async function createClaudeCodeToolBridgeResult(options: {
 
     return scheduler.run(toolName, async () => {
       extra.signal.throwIfAborted();
-      const validation = await validate(rawInput);
+      // Imported MCP schemas delegate validation to their server, as in the shared tool executor.
+      const validation = validate
+        ? await validate(rawInput)
+        : { success: true as const, value: rawInput };
       if (!validation.success) {
         return toolError(validation.error.message);
       }

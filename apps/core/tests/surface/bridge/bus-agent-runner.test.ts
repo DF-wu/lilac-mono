@@ -1,3 +1,4 @@
+import { executeAiSdkModelCall } from "@stanley2058/lilac-agent/adapters/ai-sdk/model-call";
 import type { QuestionService } from "../../../src/question/question-service";
 import type { QuestionCall } from "../../../src/question/question-domain";
 import { DurableWorkflowStore } from "../../../src/workflow/durable-workflow-store";
@@ -5349,6 +5350,7 @@ describe("durable accepted runner recovery", () => {
         });
         return {
           agentModel: model,
+          executeCall: executeAiSdkModelCall,
           continuationModel: model,
           createUtilityModelResult: () => Result.ok(model),
           createUtilityModel: () => model,
@@ -8553,7 +8555,7 @@ describe("startBusAgentRunner prefix-lineage tool authority", () => {
           forceUnknownProviders: ["openrouter"],
           overrides: {
             "openrouter/openai/gpt-4o": {
-              limit: { context: 10_000, output: 1_000 },
+              limit: { context: 4_000, output: 1_000 },
             },
           },
         },
@@ -8583,7 +8585,7 @@ describe("startBusAgentRunner prefix-lineage tool authority", () => {
 
     const sessionId = "tool-compaction-channel";
     const seedRequestId = "discord:tool-compaction:seed";
-    const historicalMessages = Array.from({ length: 12 }, (_, index) =>
+    const historicalMessages = Array.from({ length: 120 }, (_, index) =>
       index % 2 === 0
         ? ({ role: "user", content: `historical question ${index} ${"x".repeat(10_000)}` } as const)
         : ({ role: "assistant", content: `historical answer ${index}` } as const),
@@ -8930,6 +8932,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
         });
         return {
           agentModel: model,
+          executeCall: executeAiSdkModelCall,
           continuationModel: model,
           createUtilityModelResult: () => Result.ok(model),
           createUtilityModel: () => model,
@@ -9242,6 +9245,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       });
       return {
         agentModel: model,
+        executeCall: executeAiSdkModelCall,
         continuationModel: model,
         createUtilityModelResult: () => Result.ok(model),
         createUtilityModel: () => model,
@@ -9706,6 +9710,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
         });
         return {
           agentModel: failingModel,
+          executeCall: executeAiSdkModelCall,
           continuationModel: failingModel,
           createUtilityModelResult: () => Result.ok(failingModel),
           createUtilityModel: () => failingModel,
@@ -9974,6 +9979,7 @@ describe("Core-primary local compaction replacement", () => {
           materializedStarts.push(start);
           return {
             agentModel: mainModel,
+            executeCall: executeAiSdkModelCall,
             continuationModel: mainModel,
             createUtilityModelResult: () => Result.ok(summaryModel),
             createUtilityModel: () => summaryModel,
@@ -10059,6 +10065,7 @@ describe("Core-primary local compaction replacement", () => {
         summaryModel,
         resolveContextLimit: async () => ({ context: 2_000, output: 200 }),
         resolveSummaryContextLimit: () => 2_000,
+        inputEstimateFloor: () => (replacement === undefined ? 2_000 : null),
         thresholdInputSource: "transcript-estimate",
         keepRecentTurns: 2,
         keepRecentTokens: 1_000,

@@ -1920,6 +1920,7 @@ export function persistHeartbeatSurfaceHandoffs(params: {
 }
 
 type Enqueued = {
+  nativeHistoryProviderState?: HistoryProviderState;
   queueEntryId: string;
   requestDeliveryId?: string;
   requestId: string;
@@ -1992,6 +1993,7 @@ export type NativeRunnerLifecycle = {
     {
       readonly safetyMode: SessionSafetyMode;
       readonly resolvedModelRequest?: DurableResolvedModelRequest;
+      readonly historyProviderState?: HistoryProviderState;
     },
     Error
   >;
@@ -4980,6 +4982,10 @@ export async function startBusAgentRunner(params: {
         ok: (value) => value.safetyMode,
         err: () => "restricted",
       });
+      next.nativeHistoryProviderState = validated.match({
+        ok: (value) => value.historyProviderState,
+        err: () => undefined,
+      });
       next.nativeResolvedModelRequest = validated.match({
         ok: (value) => value.resolvedModelRequest,
         err: () => undefined,
@@ -6691,6 +6697,7 @@ export async function startBusAgentRunner(params: {
             transcriptStore: params.transcriptStore,
             sourceMessages: seededSessionMessages,
             sourceTranscript: seededSessionTranscript,
+            sourceProviderState: next.nativeHistoryProviderState,
             getCurrentTurnMessages: () => initialMessages,
             onReplayFallback: (error) =>
               logger.warn(
@@ -9291,6 +9298,7 @@ export async function startBusAgentRunner(params: {
     {
       readonly safetyMode: SessionSafetyMode;
       readonly resolvedModelRequest?: DurableResolvedModelRequest;
+      readonly historyProviderState?: HistoryProviderState;
     },
     Error
   > {

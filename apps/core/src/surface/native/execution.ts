@@ -97,7 +97,15 @@ export function createNativeExecution(options: {
         yield* store.settleInput(input.id, "target-ended");
         return Result.err(nativeFailure("stale", "The steering target has ended"));
       }
+      const previousRequestId = yield* store.getLatestCanonicalRequestId(input.threadId);
+      const previous = previousRequestId
+        ? yield* (
+            options.transcriptStore.getRequestTranscript?.({ requestId: previousRequestId }) ??
+              Result.ok(null)
+          )
+        : null;
       return Result.ok({
+        ...(previous?.providerState ? { historyProviderState: previous.providerState } : {}),
         safetyMode:
           input.pinnedToolMode === "full" ? ("trusted" as const) : ("restricted" as const),
         resolvedModelRequest: input.resolvedModelRequest,

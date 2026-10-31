@@ -1,7 +1,7 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { claudeCodeExecutableSettings } from "@stanley2058/lilac-utils/claude-code-executable";
 import { tool } from "ai";
-import { createClaudeCode, type ClaudeCodeSettings } from "ai-sdk-provider-claude-code";
+import { createClaudeCode, type ClaudeCodeSettings } from "@stanley2058/lilac-utils/claude-sdk";
 import { Panic } from "better-result";
 import { z } from "zod";
 

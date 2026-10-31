@@ -4,10 +4,17 @@ import type { ModelMessage } from "ai";
 import { Panic, Result } from "better-result";
 import { AgentExecutor } from "@stanley2058/lilac-agent/agent-executor";
 import {
-  ClaudeCodeAgentAdapter,
+  ClaudeCodeAgentAdapter as NativeClaudeCodeAgentAdapter,
   type ClaudeCodeAgentLifecycle,
 } from "../claude-code-agent-adapter";
 import type { MaterializedClaudeCodeRun } from "../claude-code-run";
+
+import { executeAiSdkModelCall } from "@stanley2058/lilac-agent/adapters/ai-sdk/model-call";
+class ClaudeCodeAgentAdapter extends NativeClaudeCodeAgentAdapter {
+  constructor(...args: ConstructorParameters<typeof NativeClaudeCodeAgentAdapter>) {
+    super(args[0], args[1], executeAiSdkModelCall);
+  }
+}
 
 const usage = {
   inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
@@ -134,6 +141,32 @@ describe("ClaudeCodeAgentAdapter", () => {
       expect(agent.state.messages.filter((m) => m.content === "update")).toHaveLength(1);
     },
   );
+
+  test("injects text-array steering and commits its original message once", async () => {
+    const f = fixture({ immediateDelivery: true });
+    const original = f.nativeRun.control.inject;
+    const sent: string[] = [];
+    f.nativeRun.control.inject = (text, callback) => {
+      sent.push(text);
+      return original(text, callback);
+    };
+    const agent = new AgentExecutor({ system: "test", adapter: f.adapter });
+    const running = agent.prompt("question");
+    await f.started;
+    const message: ModelMessage = {
+      role: "user",
+      content: [{ type: "text", text: "change direction" }],
+    };
+    agent.steer(message);
+    await f.injected;
+    f.finish();
+    await running;
+    expect(sent).toEqual(["change direction"]);
+    expect(
+      agent.state.messages.filter((m) => JSON.stringify(m) === JSON.stringify(message)),
+    ).toHaveLength(1);
+    expect(f.calls()).toBe(1);
+  });
 
   test("records successful native cursor before the host boundary mutates history", async () => {
     const f = fixture();

@@ -1381,6 +1381,7 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         "applyAdjacentToolPart",
         "lowerAssistantExchange",
         "preparePlainTextReplayForTarget",
+        "prepareContextHandoff",
       ].map((exportName) => ({
         identity: { module: "session-continuation.ts", exportName },
         category: "projection" as const,
@@ -1825,6 +1826,14 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
   [
     "packages/claude-code-bridge",
     [
+      {
+        identity: { module: "claude-sdk-call.ts", exportName: "executeClaudeSdkCall.receive" },
+        category: "plugin",
+      },
+      ...["decodeClaudeToolContent", "restoreClaudeToolOutput"].map((exportName) => ({
+        identity: { module: "claude-sdk-call.ts", exportName },
+        category: "plugin" as const,
+      })),
       ...[
         "decodeClaudeNativeSessionStart",
         "decodeClaudeContextUsage",
@@ -5476,7 +5485,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "747afd090dba4ff74fe5df8bcc755b9e1e038bc4b4beaf65019f9b8074852e91";
+  "531ff18847d6aa412d4126078a37ab94b45dbcaacd3b31d12dd590b4281541bd";
 
 export const architectureManifest = {
   version: 1,

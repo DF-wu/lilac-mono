@@ -5,7 +5,7 @@ import {
   createClaudeCode,
   type SpawnedProcess,
   type SpawnOptions,
-} from "ai-sdk-provider-claude-code";
+} from "@stanley2058/lilac-utils/claude-sdk";
 import { Panic } from "better-result";
 
 import {

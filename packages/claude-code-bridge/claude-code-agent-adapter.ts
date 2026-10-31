@@ -13,7 +13,8 @@ import {
   type AiSdkPiAgentOptions,
   type PrepareModelCall,
 } from "@stanley2058/lilac-agent";
-import { AiSdkAgentAdapter } from "@stanley2058/lilac-agent/adapters/ai-sdk/adapter";
+import { ModelCallAgentAdapter } from "@stanley2058/lilac-agent/adapters/ai-sdk/adapter";
+import { executeClaudeSdkCall } from "./claude-sdk-call";
 import { createAgentEventChannel } from "@stanley2058/lilac-agent/agent-execution-events";
 import type { AgentExecutionHost } from "@stanley2058/lilac-agent/agent-execution-host";
 import { resultOutcome } from "@stanley2058/lilac-agent/agent-runtime-support";
@@ -44,12 +45,19 @@ type Injection = {
   callback?: boolean;
 };
 
+function nativeUserText(message: Extract<ModelMessage, { role: "user" }>): string | undefined {
+  if (typeof message.content === "string") return message.content;
+  if (!message.content.every((part) => part.type === "text")) return undefined;
+  return message.content.map((part) => part.text).join("\n\n");
+}
+
 export class ClaudeCodeAgentAdapter<TOOLS extends ToolSet = ToolSet> implements AgentAdapter<
   AgentExecutionHost<TOOLS>
 > {
   constructor(
     private readonly options: AiSdkPiAgentOptions<TOOLS>,
     private readonly lifecycle: ClaudeCodeAgentLifecycle,
+    private readonly executeModelCall: typeof executeClaudeSdkCall = executeClaudeSdkCall,
   ) {}
 
   createExecution(
@@ -166,11 +174,14 @@ export class ClaudeCodeAgentAdapter<TOOLS extends ToolSet = ToolSet> implements 
         return decision;
       },
     };
-    const sdk = new AiSdkAgentAdapter({
-      ...this.options,
-      prepareModelCall: this.lifecycle.prepareModelCall ?? this.options.prepareModelCall,
-      sendToolsToModel: false,
-    }).createExecution({ ...context, host: wrappedHost });
+    const sdk = new ModelCallAgentAdapter(
+      {
+        ...this.options,
+        prepareModelCall: this.lifecycle.prepareModelCall ?? this.options.prepareModelCall,
+        sendToolsToModel: false,
+      },
+      (input) => (this.lifecycle.currentRun()?.executeCall ?? this.executeModelCall)(input),
+    ).createExecution({ ...context, host: wrappedHost });
     const drain = async (): Promise<void> => {
       for await (const event of sdk.events) {
         if (event.type !== "terminal") {
@@ -282,11 +293,13 @@ export class ClaudeCodeAgentAdapter<TOOLS extends ToolSet = ToolSet> implements 
         if (input.messages.length !== 1)
           return returnAtBoundary("Claude native injection requires one user text message");
         const message = input.messages[0];
-        if (message?.role !== "user" || typeof message.content !== "string")
+        if (message?.role !== "user")
           return returnAtBoundary("Claude native injection requires one user text message");
         const run = this.lifecycle.currentRun();
         if (!run) return returnAtBoundary("Claude query is not available for injection");
-        const text = message.content;
+        const text = nativeUserText(message);
+        if (text === undefined)
+          return returnAtBoundary("Claude native injection requires user text");
         const entry: Injection = { input, state: "submitting" };
         const submitted = resultOutcome(
           captureAgentOperation(() =>

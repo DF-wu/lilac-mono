@@ -4,7 +4,8 @@ import { isDeepStrictEqual } from "node:util";
 import type { ModelMessage } from "ai";
 import {
   hashCanonicalMessagesV1,
-  preparePlainTextReplayForTarget,
+  isGeneratedMessage,
+  prepareContextHandoff,
   type HistoryProviderState,
   type PrepareModelCall,
 } from "@stanley2058/lilac-agent";
@@ -127,6 +128,11 @@ export function selectCorePrimaryClaudePrefix(input: {
   readonly executionCwd: string;
 }): CorePrimaryPrefixSelection {
   if (input.lineage?.state !== "complete") return { mode: "fresh", reason: "fresh-only" };
+  const latestRequest = input.lineage.segments
+    .flatMap((segment) => segment.atoms)
+    .findLast((atom) => atom.kind === "request");
+  if (latestRequest?.kind === "request" && latestRequest.providerFamily !== "claude-code")
+    return { mode: "fresh", reason: "fresh-only" };
   const binding = input.binding;
   if (!binding) return { mode: "fresh", reason: "missing-binding" };
   if (binding.lineageVersion !== input.lineage.lineageVersion) {
@@ -208,10 +214,35 @@ export function prepareCorePrimaryHistoryView(input: {
   readonly canonicalMessages: readonly ModelMessage[];
   readonly lineage: CorePrimaryLineageV2 | undefined;
   readonly replayHistoricalPrefix: boolean;
+  readonly sourceProviderState?: HistoryProviderState;
   readonly targetFamily: "claude-code" | "ai-sdk";
   readonly modelSpecifier: string;
   readonly canonicalStartIndex?: number;
 }): ModelMessage[] {
+  if (!input.lineage) {
+    const currentStart = Math.max(
+      0,
+      input.canonicalMessages.findLastIndex(
+        (message) => message.role === "user" && !isGeneratedMessage(message),
+      ),
+    );
+    const history = input.canonicalMessages.slice(0, currentStart);
+    const foreignTools = history.some(
+      (message) =>
+        message.role === "assistant" &&
+        Array.isArray(message.content) &&
+        message.content.some(
+          (part) =>
+            part.type === "tool-call" &&
+            Boolean(part.providerExecuted) !== (input.targetFamily === "claude-code"),
+        ),
+    );
+    const crossed =
+      input.sourceProviderState !== undefined &&
+      input.sourceProviderState.lastFamily !== input.targetFamily;
+    if (!foreignTools && !crossed) return [...input.canonicalMessages];
+    return [...prepareContextHandoff(history), ...input.canonicalMessages.slice(currentStart)];
+  }
   if (!input.replayHistoricalPrefix) return [...input.canonicalMessages];
   const requestedHistoricalEnd = Math.max(
     0,
@@ -229,7 +260,7 @@ export function prepareCorePrimaryHistoryView(input: {
   // lineage boundary classifies the whole transcript as portable history.
   const historicalEnd = structuralToolExchangeStart ?? requestedHistoricalEnd;
   return [
-    ...preparePlainTextReplayForTarget(input.canonicalMessages.slice(0, historicalEnd), {
+    ...prepareContextHandoff(input.canonicalMessages.slice(0, historicalEnd), {
       providerFamily: input.targetFamily,
       modelSpecifier: input.modelSpecifier,
       maxToolInputChars: TEXT_REPLAY_TOOL_INPUT_CHARS,
@@ -341,7 +372,9 @@ export function createCorePrimaryClaudeRuntime(input: {
 
       const projectCanonicalStoredMessages =
         input.projectCanonicalStoredMessages ?? projectStoredMessagesV1;
-      const selectionFor = (canonicalMessages: readonly ModelMessage[]) => {
+      const selectionFor = (
+        canonicalMessages: readonly ModelMessage[],
+      ): CorePrimaryPrefixSelection => {
         const canonicalStoredMessages = projectCanonicalStoredMessages(canonicalMessages).match({
           ok: (messages) => messages,
           err: () => undefined,

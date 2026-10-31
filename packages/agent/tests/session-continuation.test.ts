@@ -7,6 +7,7 @@ import {
   hashCanonicalMessagesV1,
   hashExecutionScopeV1,
   preparePlainTextReplayForTarget,
+  prepareContextHandoff,
   type ExecutionScopeHashInputV1,
   type TextReplayTarget,
 } from "../session-continuation";
@@ -825,5 +826,43 @@ describe("preparePlainTextReplayForTarget", () => {
           typeof message.content === "string",
       ),
     ).toBe(true);
+  });
+});
+
+describe("portable context handoff", () => {
+  it("bounds old facts, omits reasoning, and never emits executable tools", () => {
+    const history: ModelMessage[] = [
+      { role: "user", content: "old context ".repeat(100) },
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "private reasoning" },
+          { type: "tool-call", toolCallId: "old", toolName: "read", input: { path: "a" } },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "old",
+            toolName: "read",
+            output: { type: "text", value: "read result" },
+          },
+        ],
+      },
+    ];
+    const before = structuredClone(history);
+    const handoff = prepareContextHandoff(history);
+    expect(handoff).toHaveLength(1);
+    expect(handoff[0]?.role).toBe("user");
+    const text = handoff[0]?.content;
+    expect(typeof text).toBe("string");
+    expect(text).toContain("[Conversation handoff]");
+    expect(text).toContain("Tool read:");
+    expect(text).toContain("read result");
+    expect(text).not.toContain("private reasoning");
+    expect(text).not.toContain("old context ".repeat(100));
+    expect(history).toEqual(before);
   });
 });

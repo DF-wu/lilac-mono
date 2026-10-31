@@ -11,7 +11,7 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGroq } from "@ai-sdk/groq";
 import type { OpenAICompatibleProvider } from "@ai-sdk/openai-compatible";
 import { createGateway } from "ai";
-import { createClaudeCode } from "ai-sdk-provider-claude-code";
+import { createClaudeCode } from "./claude-sdk";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 

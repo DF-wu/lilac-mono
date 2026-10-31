@@ -3,7 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
-import { tool, type ToolSet } from "ai";
+import { jsonSchema, tool, type ToolSet } from "ai";
 import { Panic } from "better-result";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -57,6 +57,59 @@ function permissionOptions(
 }
 
 describe("Claude Code tool bridge", () => {
+  it("exposes imported MCP JSON schemas without a local validator and preserves correlation", async () => {
+    const seen: unknown[] = [];
+    const schema = {
+      type: "object" as const,
+      properties: { code: { type: "string" as const } },
+      required: ["code"],
+      additionalProperties: false,
+    };
+    const bridge = await createClaudeCodeToolBridge({
+      tools: {
+        mcp_computer_use_execute: tool({
+          inputSchema: jsonSchema<{ code: string }>(schema),
+          execute: () => "unused",
+        }),
+      },
+      execute: async (request) => {
+        seen.push(request);
+        return {
+          result: "done",
+          isError: false,
+          outcome: "success",
+          toolOutput: { type: "text", value: "done" },
+        };
+      },
+    });
+    const client = await connectBridge(bridge);
+    expect((await client.listTools()).tools[0]?.inputSchema).toEqual(schema);
+    const permission = await bridge.canUseTool(
+      "mcp__lilac__mcp_computer_use_execute",
+      { code: "return 1" },
+      permissionOptions("toolu_computer"),
+    );
+    if (!permission || permission.behavior !== "allow") throw new Error("Expected allow");
+    const result = await client.callTool({
+      name: "mcp_computer_use_execute",
+      arguments: permission.updatedInput,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(seen).toEqual([
+      expect.objectContaining({
+        toolCallId: "toolu_computer",
+        toolName: "mcp_computer_use_execute",
+        input: { code: "return 1" },
+      }),
+    ]);
+    const uncorrelated = await client.callTool({
+      name: "mcp_computer_use_execute",
+      arguments: { code: "return 1" },
+    });
+    expect(uncorrelated.isError).toBe(true);
+    expect(seen).toHaveLength(1);
+  });
+
   it("omits portable find_tools, and preserves input transforms exactly once", async () => {
     let transforms = 0;
     const seen: unknown[] = [];
@@ -111,6 +164,20 @@ describe("Claude Code tool bridge", () => {
     ]);
     expect(result.isError).not.toBe(true);
     expect(result.structuredContent).toEqual({ value: 3 });
+    const invalidPermission = await bridge.canUseTool(
+      "mcp__lilac__transformed",
+      { value: 2 },
+      permissionOptions("toolu_invalid"),
+    );
+    if (!invalidPermission || invalidPermission.behavior !== "allow")
+      throw new Error("Expected allow");
+    const invalid = await client.callTool({
+      name: "transformed",
+      arguments: invalidPermission.updatedInput,
+    });
+    expect(invalid.isError).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(transforms).toBe(1);
   });
 
   it("fails closed without valid correlation and supports parallel identical calls", async () => {

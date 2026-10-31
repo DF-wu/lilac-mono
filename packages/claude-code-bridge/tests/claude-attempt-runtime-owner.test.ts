@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { PrepareModelCallContext } from "@stanley2058/lilac-agent";
 import type { ModelMessage } from "ai";
-import { createClaudeCode } from "ai-sdk-provider-claude-code";
+import { createClaudeCode } from "@stanley2058/lilac-utils/claude-sdk";
 import { Result } from "better-result";
 
 import {

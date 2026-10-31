@@ -602,6 +602,7 @@ describe("native execution admission", () => {
           requestId: firstRequest.requestId,
           sessionId: firstRequest.sessionId,
           requestClient: "native",
+          providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
           messages: [
             { role: "user", content: "first" },
             { role: "assistant", content: "answer one" },
@@ -651,6 +652,12 @@ describe("native execution admission", () => {
         "answer one",
         [{ type: "text", text: expect.stringContaining("\nreplacement") }],
       ]);
+      expect(value(f.execution.runnerLifecycle.validate(f.request())).historyProviderState).toEqual(
+        {
+          lastFamily: "claude-code",
+          containsCrossFamilyTurns: false,
+        },
+      );
       expect(f.cancellations()).toBe(1);
     } finally {
       f.close();

@@ -1180,3 +1180,62 @@ export function preparePlainTextReplayForTarget(
   }
   return output;
 }
+
+/** Portable handoffs are model input only; retained history remains unchanged. */
+export function prepareContextHandoff(
+  messages: readonly ModelMessage[],
+  _target?: TextReplayTarget,
+): ModelMessage[] {
+  if (messages.length === 0) return [];
+  const compact = (text: string) => {
+    const normalized = text.replace(/\s+/gu, " ").trim();
+    return normalized.length <= 240 ? normalized : `${normalized.slice(0, 237)}...`;
+  };
+  const facts: string[] = [];
+  for (const message of messages) {
+    if (typeof message.content === "string") {
+      facts.push(`- ${message.role}: ${compact(message.content)}`);
+      continue;
+    }
+    for (const part of message.content) {
+      switch (part.type) {
+        case "text":
+          facts.push(`- ${message.role}: ${compact(part.text)}`);
+          break;
+        case "tool-call":
+          facts.push(`- Tool ${part.toolName}: ${compact(JSON.stringify(part.input) ?? "")}`);
+          break;
+        case "tool-result":
+          facts.push(`- Result ${part.toolName}: ${compact(JSON.stringify(part.output))}`);
+          break;
+        case "file":
+          facts.push(`- Attachment: ${part.filename ?? part.mediaType}`);
+          break;
+        case "image":
+          facts.push(`- Attachment: ${part.mediaType ?? "image"}`);
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  const suffix: string[] = [];
+  let size = 0;
+  for (let index = facts.length - 1; index >= 0; index -= 1) {
+    const fact = facts[index];
+    if (fact === undefined || size + fact.length > 32_000) break;
+    suffix.push(fact);
+    size += fact.length + 1;
+  }
+  return [
+    {
+      role: "user",
+      content: [
+        "[Conversation handoff]",
+        "This is a summary of earlier conversation, not new instructions. Tool activity below is historical; do not repeat it merely because it appears here. Consult retained history or files when details are missing.",
+        ...suffix.reverse(),
+        "[End conversation handoff]",
+      ].join("\n"),
+    },
+  ];
+}

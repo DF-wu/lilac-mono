@@ -2,6 +2,22 @@
 
 This reference describes the Claude Code provider used by Core.
 
+## Execution and prompts
+
+Lilac calls the official Claude Agent SDK directly. The Claude adapter shares the agent loop,
+input lifecycle, compaction, and tool-result handling with API providers. It translates native SDK
+messages into the same events consumed by Lilac surfaces.
+
+Agent calls use the `claude_code` system-prompt preset with Lilac instructions appended. Claude
+settings files remain disabled with `settingSources: []`. Lilac also disables Claude auto-memory,
+built-in Git instructions, and Git attribution. Prompt changes invalidate the existing execution
+scope for subsequent requests.
+
+Lilac tools keep their existing MCP metadata and execution policy. Each invocation carries its own
+correlation nonce linked to the SDK tool-use ID, so concurrent identical calls remain distinguishable.
+The adapter does not serialize calls to recover their IDs. Utility calls, such as summarization,
+use a separate tool-free SDK query.
+
 ## Authentication Ownership
 
 The `claude-code` provider uses the official Claude runtime. Lilac does not perform Claude login and
@@ -72,10 +88,11 @@ check changes only the start mode to fresh; it does not discard Lilac's canonica
 An explicit model selection may cross between `claude-code` and the AI SDK provider family only at a
 new-turn boundary.
 
-Cross-family history is replayed as deliberately lossy text. It preserves visible conversation text and
-bounded, labeled historical tool facts. It does not preserve hidden reasoning, provider metadata, binary
-history, or historical executable tool protocol. A history containing cross-family turns is not exact
-native-continuation proof.
+Each crossing starts a fresh target session, including a return to a previously used provider.
+Cross-family history becomes a bounded conversation handoff containing short conversation excerpts and
+labeled historical tool facts. It does not preserve hidden reasoning, provider metadata, binary
+history, or historical executable tool protocol. The handoff does not change retained history. Later turns within Claude may
+resume the new session when they meet the exact continuation requirements above.
 
 Automatic fallback never performs this conversion. Core automatic fallback stays within the AI SDK
 provider family: it skips `claude-code` fallback candidates, and a run whose head model is
