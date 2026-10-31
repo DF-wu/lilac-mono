@@ -312,10 +312,11 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     live: options.runner,
     streamingMode: () => deployment().outputStreaming,
   });
+  const computer = new NativeComputer(store, options.mcpRegistry);
   const services = createNativeRpcServices({
     questions,
     push,
-    computer: new NativeComputer(store, options.mcpRegistry),
+    computer,
     references,
     files: liveFiles,
     subagents,
@@ -334,6 +335,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     ...(clerk ? { lookupUser: clerk.lookupUser, profileProvider: clerk } : {}),
   });
   const gateway = createNativeGateway({
+    computer,
     metrics,
     reportFatalError: options.reportFatalError,
     hostname: nativeConfig.host,

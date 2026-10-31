@@ -490,6 +490,45 @@ export class McpRegistry implements McpRegistryApi {
     return this.toolSnapshot;
   }
 
+  async getHttpConnection(
+    serverId: string,
+  ): Promise<ResultType<{ url: string; headers: Readonly<Record<string, string>> } | null, Error>> {
+    const entry = this.entries.get(serverId);
+    if (
+      this.stopped ||
+      entry?.status.status !== "available" ||
+      entry.definition.transportConfig.transport !== "http"
+    )
+      return Result.ok(null);
+    const resolved = await this.resolveTransport(entry.definition);
+    const transport = resolved.match({ ok: (value) => value.input, err: () => null });
+    if (!transport) return Result.err(new Error("MCP transport unavailable"));
+    if (transport.transport !== "http") return Result.ok(null);
+    const headers = new Headers(transport.headers);
+    if (transport.authProvider) return this.httpOAuthConnection(transport);
+    return Result.ok({ url: transport.url, headers: Object.fromEntries(headers) });
+  }
+
+  private async httpOAuthConnection(
+    transport: Extract<McpRegistryTransportInput, { transport: "http" }>,
+  ): Promise<ResultType<{ url: string; headers: Readonly<Record<string, string>> } | null, Error>> {
+    const provider = transport.authProvider;
+    if (!provider) return Result.ok(null);
+    const captured = await Result.tryPromise({
+      try: () => Promise.resolve(provider.tokens()),
+      catch: captureError,
+    });
+    if (captured.isErr()) {
+      rethrowPanic(captured.error.cause);
+      return Result.err(new Error("MCP credentials unavailable"));
+    }
+    const tokens = captured.value;
+    if (!tokens) return Result.ok(null);
+    const headers = new Headers(transport.headers);
+    headers.set("authorization", `Bearer ${tokens.access_token}`);
+    return Result.ok({ url: transport.url, headers: Object.fromEntries(headers) });
+  }
+
   acquireRun(runId: string): McpRunScope {
     if (this.stopped) return executionUnavailable("MCP registry has been shut down");
     const run = this.runs.get(runId) ?? {

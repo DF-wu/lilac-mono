@@ -119,7 +119,7 @@ function ComputerPanel({
     "connecting",
   );
   const [controlling, setControlling] = useState(false);
-  const origin = new URL(desktop.url).origin;
+  const origin = new URL(desktop.url, window.location.origin).origin;
   const src = computerFrameUrl(desktop.url, window.location.origin);
 
   useEffect(() => {

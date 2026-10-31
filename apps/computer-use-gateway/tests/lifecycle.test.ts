@@ -359,6 +359,11 @@ test("viewer lookup is session scoped and never provisions or refreshes expiry",
   expect(value(lifecycle.viewer(sessionA))).toEqual({ status: "absent" });
   expect(docker.starts).toBe(0);
   const provisioned = value(await lifecycle.provision(sessionA, 60));
+  expect(value(lifecycle.viewerContainer(sessionA, provisioned.generation))).toBe(
+    docker.containers[0]!.id,
+  );
+  expect(lifecycle.viewerContainer(sessionB, provisioned.generation).isErr()).toBe(true);
+  expect(lifecycle.viewerContainer(sessionA, randomUUID()).isErr()).toBe(true);
   advance(1000);
   expect(value(lifecycle.viewer(sessionA))).toMatchObject({
     status: "ready",
@@ -369,6 +374,7 @@ test("viewer lookup is session scoped and never provisions or refreshes expiry",
   });
   expect(value(lifecycle.viewer(sessionB))).toEqual({ status: "absent" });
   advance(60000);
+  expect(lifecycle.viewerContainer(sessionA, provisioned.generation).isErr()).toBe(true);
   expect(value(lifecycle.viewer(sessionA))).toEqual({ status: "absent" });
   expect(docker.starts).toBe(1);
   value(await lifecycle.terminate(sessionA));

@@ -3764,12 +3764,23 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               },
               category: "wire" as const,
             },
+            {
+              identity: {
+                module: "src/surface/native/computer.ts",
+                exportName: "decodeNativeViewerRequest",
+              },
+              category: "request" as const,
+            },
           ]
         : []),
       ...(root === "apps/web"
         ? [
             {
               identity: { module: "src/computer-viewer.ts", exportName: "decodeComputerState" },
+              category: "wire" as const,
+            },
+            {
+              identity: { module: "src/computer-viewer.ts", exportName: "decodeComputerCommand" },
               category: "wire" as const,
             },
           ]
@@ -4026,6 +4037,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             },
             {
               identity: { module: "src/contracts.ts", exportName: "decodeSessionHeader" },
+              category: "request" as const,
+            },
+            {
+              identity: { module: "src/contracts.ts", exportName: "decodeViewerGeneration" },
               category: "request" as const,
             },
             {

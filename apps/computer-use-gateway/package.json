@@ -8,9 +8,10 @@
     "build": "bun build src/main.ts --target=bun --outdir=dist"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@stanley2058/lilac-utils": "workspace:*",
     "better-result": "catalog:",
-    "zod": "^4.3.6",
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@ai-sdk/mcp": "2.0.83"

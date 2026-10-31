@@ -1,5 +1,14 @@
 # MIGRATIONS.md
 
+## Native computer viewer through Core
+
+`computer.read.desktop.url` can now be a root-relative `/computer.html?...` URL. Native web resolves
+it against the Core origin and uses the dedicated authenticated `/api/computer/socket` lane. Core
+connects to the computer-use gateway's new bearer-authenticated `/viewer/socket` endpoint with a
+canonical session hash and desktop generation. Deploy Core/web and gateway together and reload
+existing browser clients. There is no stored-data migration or runner rebuild requirement. Direct
+`provision` viewer URLs are unchanged.
+
 ## Deferred questions and native schema 6
 
 The Level 1 `question` tool now defaults to `mode: "deferred"`. It returns

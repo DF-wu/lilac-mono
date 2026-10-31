@@ -132,6 +132,9 @@ export interface McpRunScope {
 }
 
 export interface McpRegistryApi {
+  getHttpConnection?(
+    serverId: string,
+  ): Promise<Result<{ url: string; headers: Readonly<Record<string, string>> } | null, Error>>;
   acquireRun?(runId: string): McpRunScope;
   init(): Promise<void>;
   waitUntilInitialized?(): Promise<Result<void, McpRegistryStateError>>;

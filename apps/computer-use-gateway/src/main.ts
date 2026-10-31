@@ -4,7 +4,7 @@ import { decodeConfig, failure } from "./contracts";
 import { DockerCli } from "./docker";
 import { createExpiryTick } from "./expiry";
 import { ComputerLifecycle } from "./lifecycle";
-import { createGatewayHandler } from "./server";
+import { createComputerGatewayServer } from "./viewer-server";
 import { RunnerStore } from "./store";
 
 async function main() {
@@ -21,7 +21,7 @@ async function main() {
       store.close();
       return Result.err(error);
     }
-    const handler = createGatewayHandler(lifecycle, config.bearer);
+    const handler = createComputerGatewayServer(lifecycle, config.bearer);
     const listening = Result.try({
       try: () =>
         Bun.serve({
@@ -29,7 +29,8 @@ async function main() {
           hostname: "0.0.0.0",
           maxRequestBodySize: 262144,
           idleTimeout: 0,
-          fetch: handler,
+          fetch: handler.fetch,
+          websocket: handler.websocket,
         }),
       catch: () => failure("unavailable", "Cannot listen on gateway port 8080"),
     });
@@ -52,6 +53,7 @@ async function main() {
     });
     clearInterval(timer);
     await lifecycle.drain();
+    handler.close();
     await server.stop();
     store.close();
     return Result.ok(undefined);

@@ -216,7 +216,7 @@ export const nativeContract = {
         desktop: z
           .strictObject({
             generation: z.string().min(1).max(128),
-            url: z.url().max(8192),
+            url: z.union([z.url().max(8192), z.string().startsWith("/computer.html?").max(8192)]),
             password: z.string().min(1).max(256),
             expiresAt: z.string().max(64),
           })

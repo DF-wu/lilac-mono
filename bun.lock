@@ -18,6 +18,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@modelcontextprotocol/sdk": "^1.29.0",
+        "@stanley2058/lilac-utils": "workspace:*",
         "better-result": "catalog:",
         "zod": "^4.3.6",
       },
@@ -147,6 +148,7 @@
         "@clerk/react": "^6.16.1",
         "@clerk/ui": "^1.33.1",
         "@dnd-kit/core": "^6.3.1",
+        "@novnc/novnc": "^1.7.0",
         "@orpc/client": "1.15.1",
         "@platejs/basic-nodes": "^53.0.0",
         "@platejs/code-block": "^53.0.0",
@@ -192,6 +194,7 @@
       "devDependencies": {
         "@babel/core": "^8.0.6",
         "@rolldown/plugin-babel": "^0.2.4",
+        "@types/novnc__novnc": "^1.6.0",
         "@types/react": "^19.3.0",
         "@types/react-dom": "^19.3.0",
         "@vitejs/plugin-react": "^6.1.1",
@@ -712,6 +715,8 @@
     "@noble/hashes": ["@noble/hashes@1.8.0", "", {}, "sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A=="],
 
     "@nodable/entities": ["@nodable/entities@2.2.0", "", {}, "sha512-9uGyhaQavEUMC8AIddIjau4NsnsXhou+j5sBAGojCM1oxmQpVKTWR/9JxABD6UAv12vpIms55fPZKFQEhG6uBg=="],
+
+    "@novnc/novnc": ["@novnc/novnc@1.7.0", "", {}, "sha512-ucEJOx4T2avIRCleodk7YobZj5O2Ga2AeLfQ69A/yjG9HHba2+PDgwSkN3FttrmG+70ZGx21sElNFouK13RzyA=="],
 
     "@octokit/auth-app": ["@octokit/auth-app@8.2.0", "", { "dependencies": { "@octokit/auth-oauth-app": "^9.0.3", "@octokit/auth-oauth-user": "^6.0.2", "@octokit/request": "^10.0.6", "@octokit/request-error": "^7.0.2", "@octokit/types": "^16.0.0", "toad-cache": "^3.7.0", "universal-github-app-jwt": "^2.2.0", "universal-user-agent": "^7.0.0" } }, "sha512-vVjdtQQwomrZ4V46B9LaCsxsySxGoHsyw6IYBov/TqJVROrlYdyNgw5q6tQbB7KZt53v1l1W53RiqTvpzL907g=="],
 
@@ -1340,6 +1345,8 @@
     "@types/ms": ["@types/ms@2.1.0", "", {}, "sha512-GsCCIZDE/p3i96vtEqx+7dBUGXrc7zeSK3wwPHIaRThS+9OhWIXRqzs4d6k1SVU8g91DrNRWxWUGhp5KXQb2VA=="],
 
     "@types/node": ["@types/node@25.0.6", "", { "dependencies": { "undici-types": "~7.16.0" } }, "sha512-NNu0sjyNxpoiW3YuVFfNz7mxSQ+S4X2G28uqg2s+CzoqoQjLPsWSbsFFyztIAqt2vb8kfEAsJNepMGPTxFDx3Q=="],
+
+    "@types/novnc__novnc": ["@types/novnc__novnc@1.6.0", "", {}, "sha512-kIH/PQACbf9qj6whiSXRKECpyzgs6IFNVsW4wohyqQUZfQHdLhuGRMLi9XEhBiISSh0lKCSbBa7kScuPu9Gk+Q=="],
 
     "@types/parse-json": ["@types/parse-json@4.0.2", "", {}, "sha512-dISoDXWWQwUquiKsyZ4Ng+HX2KsPL7LyHKHQwgGFEA3IaKac4Obd+h2a/a6waisAoepJlBcx9paWqjA8/HVjCw=="],
 

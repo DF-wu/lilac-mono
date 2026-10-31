@@ -15,6 +15,7 @@ import { createNativeGateway, type NativeGatewayOptions } from "./gateway";
 import { nativeRpcValue, type NativeRpcServices } from "./rpc";
 import { nativeFailure } from "./errors";
 import { createNativeMetrics, type NativeMetricSink } from "./metrics";
+import { BinaryRelay } from "@stanley2058/lilac-utils/binary-relay";
 
 const cleanup: (() => void | Promise<void>)[] = [];
 afterEach(async () => {
@@ -33,7 +34,11 @@ const checkpoint = {
   cursor: "n_0_1",
 };
 
-async function fixture(webRoot?: string, resources?: NativeGatewayOptions["resources"]) {
+async function fixture(
+  webRoot?: string,
+  resources?: NativeGatewayOptions["resources"],
+  computer?: NativeGatewayOptions["computer"],
+) {
   const measurements: { event: string; fields: Parameters<NativeMetricSink>[1] }[] = [];
   const metrics = createNativeMetrics((event, fields) => measurements.push({ event, fields }));
   const fatalErrors: Error[] = [];
@@ -105,6 +110,7 @@ async function fixture(webRoot?: string, resources?: NativeGatewayOptions["resou
     },
   } as unknown as NativeRpcServices;
   const gateway = createNativeGateway({
+    computer,
     metrics,
     hostname: "127.0.0.1",
     port: 0,
@@ -151,6 +157,93 @@ function connect(url: string, token: string) {
   );
   return { socket, client };
 }
+
+test("computer lane authenticates separately, carries binary frames, and closes on logout", async () => {
+  const received = Promise.withResolvers<number[]>();
+  const disconnected = Promise.withResolvers<void>();
+  let calls = 0;
+  const current = await fixture(undefined, undefined, {
+    async connect(actor, thread, generation, _signal, authenticated) {
+      calls++;
+      expect(actor).toBe(user.id);
+      expect(thread).toBe("desktop-thread");
+      expect(generation).toBe("936ea9b5-eae1-4c79-97af-c56fd48b2c8c");
+      const relay = new BinaryRelay(
+        async (bytes) => {
+          received.resolve([...bytes]);
+        },
+        () => disconnected.resolve(),
+        authenticated,
+      );
+      relay.push(new Uint8Array([82, 70, 66]));
+      return Result.ok(relay);
+    },
+  });
+  const endpoint = new URL(
+    "api/computer/socket?threadId=desktop-thread&generation=936ea9b5-eae1-4c79-97af-c56fd48b2c8c",
+    current.url,
+  );
+  await expectSocketRejected(endpoint);
+  await expectSocketRejected(endpoint, {
+    authorization: `Bearer ${current.token}`,
+    origin: "https://other.example",
+  });
+  expect(calls).toBe(0);
+  endpoint.protocol = "ws:";
+  const socket = new (WebSocket as unknown as {
+    new (url: URL, options: { headers: Record<string, string> }): WebSocket;
+  })(endpoint, { headers: { authorization: `Bearer ${current.token}` } });
+  cleanup.push(() => socket.close());
+  socket.binaryType = "arraybuffer";
+  const greeting = Promise.withResolvers<number[]>();
+  socket.addEventListener("message", (event) => greeting.resolve([...new Uint8Array(event.data)]));
+  expect(await greeting.promise).toEqual([82, 70, 66]);
+  socket.send(new Uint8Array([7, 8]));
+  expect(await received.promise).toEqual([7, 8]);
+  const logout = await fetch(new URL("api/auth/logout", current.url), {
+    method: "POST",
+    headers: { authorization: `Bearer ${current.token}` },
+  });
+  expect(logout.status).toBe(200);
+  await disconnected.promise;
+  expect(calls).toBe(1);
+  expect(current.fatalErrors).toEqual([]);
+});
+
+test("computer lane reserves capacity during handshakes and releases failed upgrades", async () => {
+  const admitted = Promise.withResolvers<void>();
+  const proceed = Promise.withResolvers<void>();
+  let calls = 0;
+  const current = await fixture(undefined, undefined, {
+    async connect() {
+      if (++calls === 64) admitted.resolve();
+      await proceed.promise;
+      return Result.ok(
+        new BinaryRelay(
+          async () => {},
+          () => {},
+        ),
+      );
+    },
+  });
+  const url = new URL(
+    "api/computer/socket?threadId=t&generation=936ea9b5-eae1-4c79-97af-c56fd48b2c8c",
+    current.url,
+  );
+  const headers = { authorization: `Bearer ${current.token}` };
+  const pending = Array.from({ length: 64 }, () => fetch(url, { headers }));
+  try {
+    await admitted.promise;
+    expect((await fetch(url, { headers })).status).toBe(503);
+    expect(calls).toBe(64);
+  } finally {
+    proceed.resolve();
+  }
+  const responses = await Promise.all(pending);
+  expect(responses.every((response) => response.status === 426)).toBe(true);
+  expect((await fetch(url, { headers })).status).toBe(426);
+  expect(calls).toBe(65);
+});
 
 async function expectSocketRejected(url: URL, headers: Record<string, string> = {}) {
   const endpoint = new URL(url);

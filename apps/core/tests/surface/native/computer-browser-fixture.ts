@@ -4,7 +4,7 @@ import { Result } from "better-result";
 import { decodeConfig } from "../../../../computer-use-gateway/src/contracts";
 import { DockerCli } from "../../../../computer-use-gateway/src/docker";
 import { ComputerLifecycle } from "../../../../computer-use-gateway/src/lifecycle";
-import { createGatewayHandler } from "../../../../computer-use-gateway/src/server";
+import { createComputerGatewayServer } from "../../../../computer-use-gateway/src/viewer-server";
 import { RunnerStore } from "../../../../computer-use-gateway/src/store";
 import { McpRegistry } from "../../../src/mcp/registry";
 import { hashMcpSession } from "../../../src/mcp/session-context";
@@ -22,7 +22,12 @@ const config = decodeConfig({
 const store = RunnerStore.open(":memory:").unwrap();
 const lifecycle = new ComputerLifecycle(store, new DockerCli(config), config);
 (await lifecycle.reconcile()).unwrap();
-const gateway = Bun.serve({ port: 0, fetch: createGatewayHandler(lifecycle, secret) });
+const viewerServer = createComputerGatewayServer(lifecycle, secret);
+const gateway = Bun.serve({
+  port: 0,
+  fetch: viewerServer.fetch,
+  websocket: viewerServer.websocket,
+});
 const registry = new McpRegistry({
   configPath: "/unused-viewer-fixture.yaml",
   reportFatalError: (error) => {
@@ -62,6 +67,7 @@ async function close() {
   await lifecycle.terminate(session);
   await fixture.close();
   await registry.shutdown();
+  viewerServer.close();
   await gateway.stop(true);
   store.close();
   process.exit(0);

@@ -56,6 +56,12 @@ model. Runners receive neither its Docker socket nor bearer secret.
 See [computer-use deployment and operation](docs/computer-use.md) for image builds, optional Compose,
 limits, agent instructions, verification, and deferred work. The default Core deployment is unchanged.
 
+Native web serves a bundled noVNC viewer from Core and uses a separate authenticated binary WebSocket
+lane. Core checks thread edit authority and forwards to the configured gateway with its credentials
+and canonical session hash. The gateway binds the connection to the current desktop generation and
+uses Docker exec to relay runner-loopback VNC. Native viewing needs no browser access to runner ports
+or per-desktop DNS/TLS routing. Direct provision links retain their existing published-port contract.
+
 ## Workspace Ownership
 
 The fail-closed workspace inventory is `ACTIVE_WORKSPACES` in `scripts/architecture/manifest.ts`. Every current workspace has an explicit owner:

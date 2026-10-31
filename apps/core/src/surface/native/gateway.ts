@@ -1,4 +1,6 @@
 import path from "node:path";
+import type { BinaryRelay } from "@stanley2058/lilac-utils/binary-relay";
+import { decodeNativeViewerRequest, type NativeComputer } from "./computer";
 import { RPCHandler } from "@orpc/server/bun-ws";
 import { AsyncIteratorClass, onError, ORPCError } from "@orpc/server";
 import {
@@ -21,6 +23,7 @@ import {
 
 export class NativeGatewayError extends TaggedError("NativeGatewayError")<{ message: string }> {}
 export type NativeGatewayOptions = {
+  computer?: Pick<NativeComputer, "connect">;
   metrics?: NativeMetrics;
   hostname: string;
   port: number;
@@ -41,6 +44,8 @@ export type NativeGatewayOptions = {
 };
 type Peer = { send: (message: string | ArrayBufferLike | Uint8Array) => number };
 type SocketData = {
+  viewer?: BinaryRelay;
+  viewerCheck?: ReturnType<typeof setInterval>;
   connection: AbortController;
   metrics: ReturnType<NativeMetrics["connection"]>;
   context: NativeRpcContext;
@@ -249,6 +254,7 @@ export function createNativeGateway(options: NativeGatewayOptions) {
   });
   let server: Bun.Server<SocketData> | undefined;
   const sockets = new Set<Bun.ServerWebSocket<SocketData>>();
+  let viewerAdmissions = 0;
   const requests = new Set<Promise<Response | undefined>>();
   const rpcOperations = new Set<Promise<void>>();
   const requestControllers = new Set<AbortController>();
@@ -271,13 +277,72 @@ export function createNativeGateway(options: NativeGatewayOptions) {
     );
   }
 
+  function refreshSession(socket: Bun.ServerWebSocket<SocketData>) {
+    scheduleExpiry(socket);
+    for (const peer of sockets) {
+      if (
+        !peer.data.viewer ||
+        peer.data.context.principal.sessionId !== socket.data.context.principal.sessionId
+      )
+        continue;
+      peer.data.context.principal = socket.data.context.principal;
+      scheduleExpiry(peer);
+    }
+  }
+
+  async function connectViewer(
+    request: Request,
+    context: NativeRpcContext,
+  ): Promise<{ relay: BinaryRelay } | { response: Response }> {
+    const input = decodeNativeViewerRequest(new URL(request.url));
+    if (!input) return { response: privateJson({ error: "Invalid viewer request" }, 400) };
+    if (!options.computer) return { response: privateJson({ error: "Computer unavailable" }, 404) };
+    if (viewerAdmissions >= 64)
+      return { response: privateJson({ error: "Viewer capacity exceeded" }, 503) };
+    viewerAdmissions++;
+    let released = false;
+    let transferred = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      viewerAdmissions--;
+    };
+    using admission = {
+      [Symbol.dispose]() {
+        if (!transferred) release();
+      },
+    };
+    const connected = await options.computer.connect(
+      context.principal.userId,
+      input.threadId,
+      input.generation,
+      request.signal,
+      () =>
+        accepting &&
+        options.auth.checkSession(context.principal).match({ ok: () => true, err: () => false }),
+    );
+    const decision = connected.match<{ relay: BinaryRelay } | { response: Response }>({
+      ok: (relay) => ({ relay }),
+      err: (error) => ({ response: httpFailure(error) }),
+    });
+    if ("response" in decision) return decision;
+    decision.relay.whenClosed(release);
+    transferred = true;
+    if (request.signal.aborted || !accepting) {
+      decision.relay.close();
+      return { response: privateJson({ error: "Server stopping" }, 503) };
+    }
+    return decision;
+  }
+
   async function authenticateRequest(
     request: Request,
     running: Bun.Server<SocketData>,
     original: Request,
   ): Promise<Response | undefined> {
     const url = new URL(request.url);
-    const isSocket = url.pathname === "/api/socket";
+    const isViewer = url.pathname === "/api/computer/socket";
+    const isSocket = url.pathname === "/api/socket" || isViewer;
     const principal = await options.auth.authenticate(request, {
       socket: isSocket,
       mutation: request.method !== "GET" && request.method !== "HEAD",
@@ -300,6 +365,9 @@ export function createNativeGateway(options: NativeGatewayOptions) {
         refreshed: () => {},
         loggedOut: () => closeSession(user.sessionId),
       };
+      const selected = isViewer ? await connectViewer(request, context) : { relay: undefined };
+      if ("response" in selected) return selected.response;
+      const viewer = selected.relay;
       if (
         running.upgrade(original, {
           data: {
@@ -309,10 +377,12 @@ export function createNativeGateway(options: NativeGatewayOptions) {
             inflight: 0,
             budget: 120,
             refill: Date.now(),
+            viewer,
           },
         })
       )
         return;
+      viewer?.close();
       return privateJson({ error: "WebSocket upgrade required" }, 426);
     }
     if (url.pathname === "/api/bootstrap" && request.method === "GET") {
@@ -466,8 +536,14 @@ export function createNativeGateway(options: NativeGatewayOptions) {
                 return;
               }
               sockets.add(socket);
+              if (socket.data.viewer) {
+                socket.data.viewer.attach(socket);
+                socket.data.viewerCheck = setInterval(() => socket.data.viewer?.check(), 1000);
+                scheduleExpiry(socket);
+                return;
+              }
               socket.data.metrics.opened();
-              socket.data.context.refreshed = () => scheduleExpiry(socket);
+              socket.data.context.refreshed = () => refreshSession(socket);
               socket.data.context.loggedOut = () => {
                 socket.data.ending = true;
                 for (const peer of sockets)
@@ -502,6 +578,10 @@ export function createNativeGateway(options: NativeGatewayOptions) {
               scheduleExpiry(socket);
             },
             message(socket, message) {
+              if (socket.data.viewer) {
+                socket.data.viewer.receive(message);
+                return;
+              }
               const operation = deliverSocketMessage(socket, message);
               rpcOperations.add(operation);
               void operation.then(() => rpcOperations.delete(operation));
@@ -509,9 +589,14 @@ export function createNativeGateway(options: NativeGatewayOptions) {
             },
             close(socket, code) {
               socket.data.connection.abort();
-              socket.data.metrics.closed(code);
               sockets.delete(socket);
               clearTimeout(socket.data.expiry);
+              if (socket.data.viewer) {
+                clearInterval(socket.data.viewerCheck);
+                socket.data.viewer.close();
+                return;
+              }
+              socket.data.metrics.closed(code);
               if (socket.data.peer) handler.close(socket.data.peer);
             },
           },

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { Result } from "better-result";
 import { z } from "zod";
 import { McpRegistry } from "../../core/src/mcp/registry";
-import { bindMcpToolToSession } from "../../core/src/mcp/session-context";
+import { bindMcpToolToSession, hashMcpSession } from "../../core/src/mcp/session-context";
 
 async function docker(args: string[], env = process.env) {
   const child = Bun.spawn(["docker", ...args], { env, stdout: "pipe", stderr: "pipe" });
@@ -29,11 +29,18 @@ async function ready(url: string) {
   throw new Error("Gateway readiness deadline exceeded");
 }
 
-async function authenticateViewer(viewerUrl: string, password: string) {
+async function authenticateViewer(
+  viewerUrl: string,
+  password: string,
+  headers?: Record<string, string>,
+) {
   const url = new URL(viewerUrl);
   url.protocol = "ws:";
-  url.pathname = "/websockify";
-  const socket = new WebSocket(url, "binary");
+  if (!headers) url.pathname = "/websockify";
+  const Socket = WebSocket as typeof WebSocket & {
+    new (url: URL, options: Bun.WebSocketOptions): WebSocket;
+  };
+  const socket = headers ? new Socket(url, { headers }) : new WebSocket(url, "binary");
   socket.binaryType = "arraybuffer";
   let bytes = Buffer.alloc(0);
   let notify = () => {};
@@ -199,6 +206,27 @@ test.skipIf(process.env.LILAC_COMPUTER_DOCKER_TEST !== "1")(
       expect(a.viewer_url !== b.viewer_url).toBe(true);
       expect(a.viewer_password !== b.viewer_password).toBe(true);
       await authenticateViewer(a.viewer_url, a.viewer_password);
+      const relayUrl = `http://${address}/viewer/socket?generation=${a.generation}`;
+      const relayHeaders = {
+        authorization: `Bearer ${secret}`,
+        "x-lilac-session-hash": hashMcpSession("session-A"),
+      };
+      expect((await fetch(relayUrl)).status).toBe(401);
+      expect(
+        (
+          await fetch(relayUrl, {
+            headers: { ...relayHeaders, "x-lilac-session-hash": hashMcpSession("session-B") },
+          })
+        ).status,
+      ).toBe(404);
+      expect(
+        (
+          await fetch(`http://${address}/viewer/socket?generation=${randomUUID()}`, {
+            headers: relayHeaders,
+          })
+        ).status,
+      ).toBe(404);
+      await authenticateViewer(relayUrl, a.viewer_password, relayHeaders);
       const before = await call("session-A", "execute", {
         code: 'answer = 40\ndisplay(await cua("get_desktop_state", session="lilac"))',
       });

@@ -9,8 +9,17 @@ export function decodeComputerState(value: unknown) {
   return parsed.success ? parsed.data.state : null;
 }
 
+const commandSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("lilac-computer-connect"), password: z.string().min(1).max(256) }),
+  z.object({ type: z.literal("lilac-computer-input"), enabled: z.boolean() }),
+]);
+export function decodeComputerCommand(event: MessageEvent<unknown>) {
+  const parsed = commandSchema.safeParse(event.data);
+  return parsed.success ? parsed.data : null;
+}
+
 export function computerFrameUrl(url: string, parentOrigin: string) {
-  const target = new URL(url);
+  const target = new URL(url, parentOrigin);
   target.searchParams.set("parentOrigin", parentOrigin);
   return target.href;
 }

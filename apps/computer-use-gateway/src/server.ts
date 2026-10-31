@@ -47,7 +47,7 @@ function metadata<T extends Record<string, string | number | boolean>>(
   });
 }
 
-function authorized(request: Request, secret: string) {
+export function authorized(request: Request, secret: string) {
   const supplied = Buffer.from(request.headers.get("authorization") ?? "");
   const expected = Buffer.from(`Bearer ${secret}`);
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);

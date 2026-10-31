@@ -1342,7 +1342,19 @@ describe("McpRegistry startup and discovery", () => {
     await registry.init();
     expect(transportInput).toMatchObject({ transport: "http", authProvider: provider });
     expect(registry.list()[0]).toMatchObject({ status: "available" });
+    expect((await registry.getHttpConnection("auth")).unwrap()).toEqual({
+      url: "https://example.invalid/mcp",
+      headers: { authorization: "Bearer expired-access-token" },
+    });
+    const panic = new Panic({ message: "Credential provider invariant" });
+    let reads = 0;
+    provider.tokens = async () => {
+      if (++reads === 2) throw panic;
+      return tokens;
+    };
+    await expect(registry.getHttpConnection("auth")).rejects.toBe(panic);
     await registry.shutdown();
+    expect((await registry.getHttpConnection("auth")).unwrap()).toBeNull();
   });
 
   it("collects complete large manifests and publishes immutable rich catalog records", async () => {
