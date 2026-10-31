@@ -117,7 +117,7 @@ describe("core config drift coverage", () => {
       maxAgeMs: { kind: "bounded", value: 180 * 24 * 60 * 60 * 1000 },
       maxRequests: { kind: "bounded", value: 10_000 },
     });
-    expect(cfg.agent.subagents.profiles.explore.execution).toBe("restricted");
+    expect(cfg.agent.subagents.profiles.explore.execution).toBe("native");
     expect(cfg.agent.subagents.profiles.general.execution).toBe("native");
     expect(cfg.agent.subagents.profiles.self.execution).toBe("native");
     expect(cfg.agent.retry).toEqual({

@@ -7,14 +7,18 @@ const TOOLS_AUTHORITY_GUIDANCE =
 function buildExploreOverlay(config: SubagentProfileConfig, extra?: string): string {
   const lines = [
     "You are running in explore subagent mode.",
-    "Focus on repository exploration and evidence-backed findings.",
+    "Focus on repository exploration, external research, and evidence-backed findings.",
     "Treat the delegated user message as the full task input.",
     "Prefer high-parallel search/read by issuing independent glob, grep, and read calls together.",
     TOOLS_AUTHORITY_GUIDANCE,
   ];
   if (config.execution === false) lines.push("Do not use bash.");
   if (!config.network) lines.push("Do not use network access or network-backed tools.");
-  if (!config.workspaceWrites) lines.push("Do not edit files.");
+  if (!config.workspaceWrites) {
+    lines.push(
+      "Do not edit project files. Use temporary files outside the project for research when needed.",
+    );
+  }
   if (!config.delegation) lines.push("Do not delegate to another subagent.");
 
   if (extra && extra.trim().length > 0) {

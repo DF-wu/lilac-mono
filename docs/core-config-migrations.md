@@ -294,7 +294,9 @@ Default changes from v1:
 - Subagent idle timeouts derive from the primary agent timeout as `floor(2/3)`, with a `1000ms` minimum.
   This produces `600000` for the default `900000ms` primary timeout. Frozen v1 legacy timeout fields are
   ignored.
-- The built-in `explore` profile includes restricted Bash; `general` and `self` use native Bash. Frozen v1
+- The built-in `explore`, `general`, and `self` profiles use native Bash on trusted surfaces.
+  Explicit `execution: restricted` overrides retain virtual Bash; remove the override or set
+  `execution: native` to use installed host commands. Restricted surfaces still use virtual Bash. Frozen v1
   profiles retain their historical no-Bash explore and native-Bash general/self behavior.
 
 ## Native deployment settings move to the database

@@ -19,7 +19,7 @@ describe("coreConfigSchema agent.subagents", () => {
       },
       network: true,
       workspaceWrites: false,
-      execution: "restricted",
+      execution: "native",
       delegation: false,
     });
     expect(parsed.agent.subagents.profiles.general).toMatchObject({

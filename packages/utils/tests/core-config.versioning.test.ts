@@ -125,7 +125,7 @@ describe("core config versioning", () => {
       "fuzzy_search",
       "batch",
     ]);
-    expect(parsed.agent.subagents.profiles.explore.execution).toBe("restricted");
+    expect(parsed.agent.subagents.profiles.explore.execution).toBe("native");
     expect(parsed.agent.subagents.profiles.general.execution).toBe("native");
     expect(parsed.agent.subagents.profiles.self.execution).toBe("native");
     expect(parsed.tools.inspect.model).toBe("google/gemini-3.5-flash");
@@ -547,7 +547,7 @@ describe("core config versioning", () => {
       enabled: true,
       maxDepth: 2,
       profiles: {
-        explore: { modelSlot: "main", execution: "restricted", workspaceWrites: false },
+        explore: { modelSlot: "main", execution: "native", workspaceWrites: false },
         general: { modelSlot: "main", execution: "native", workspaceWrites: true },
         self: {
           modelSlot: "main",

@@ -379,7 +379,7 @@ agent:
         # native uses trusted host Bash unless the surface is restricted.
         network: true
         workspaceWrites: false
-        execution: restricted
+        execution: native
         delegation: false
         # Optional direct model override. Can be provider/model or an alias from models.def.
         # model: "openrouter/openai/gpt-4o"

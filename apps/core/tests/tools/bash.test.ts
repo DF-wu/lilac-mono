@@ -608,7 +608,8 @@ rmdir "$media_dir"`,
     );
     const config = parseCoreConfigV2ToUniversal({ configVersion: 2 });
     const cases = [
-      { profile: "explore" as const, safetyMode: "trusted" as const, expected: "1" },
+      { profile: "explore" as const, safetyMode: "trusted" as const, expected: "native" },
+      { profile: "explore" as const, safetyMode: "restricted" as const, expected: "1" },
       { profile: "general" as const, safetyMode: "trusted" as const, expected: "native" },
       { profile: "general" as const, safetyMode: "restricted" as const, expected: "1" },
     ];

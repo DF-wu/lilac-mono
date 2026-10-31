@@ -144,7 +144,7 @@ const EXPLORE_PROFILE_DEFAULT: SubagentProfileConfig = {
   },
   network: true,
   workspaceWrites: false,
-  execution: "restricted",
+  execution: "native",
   delegation: false,
 };
 

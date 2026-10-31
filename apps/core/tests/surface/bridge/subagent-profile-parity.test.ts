@@ -82,7 +82,9 @@ describe("native subagent profile prompt parity", () => {
         profileConfig: restricted,
       });
       expect(prompt).toContain("Do not use network access or network-backed tools.");
-      expect(prompt).toContain("Do not edit files.");
+      expect(prompt).toContain(
+        profile === "explore" ? "Do not edit project files." : "Do not edit files.",
+      );
     });
   }
 

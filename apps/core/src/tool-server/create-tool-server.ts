@@ -1634,9 +1634,6 @@ export function createToolServer(options: ToolServerOptions) {
           return output.match<() => ServerToolResult>({
             ok: (result) => () => result,
             err: (error) => () => {
-              if (error._tag === "ToolPluginHookError") {
-                reportFatalToolCallDefect(safePluginExceptionCause(error.cause));
-              }
               if (body.callableId !== "mcp.add") {
                 logPluginError("level2.call", error, {
                   toolId: capturedToolId,
@@ -1730,7 +1727,6 @@ export function createToolServer(options: ToolServerOptions) {
       const normalizedValue = normalizeSuccessfulToolValue(completedOutcome.value);
       const outputDefect = normalizedValue.match({ ok: () => null, err: (error) => error });
       if (outputDefect) {
-        reportFatalToolCallDefect(outputDefect);
         logger.error("tool plugin operation failed", {
           operation: "level2.call",
           toolId: capturedToolId,
