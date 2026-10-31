@@ -10,10 +10,12 @@ import type { ComputerLifecycle } from "./lifecycle";
 const execution = `Run Python in the provisioned desktop with top-level await. The runtime provides cua, cua_tools, and display without imports or client setup.
 
 Start:
-1. Call provision and wait for success before executing code. Tool discovery alone does not establish that a desktop exists. Provisioning initializes a driver session named "lilac" with desktop capture; use that name where a command requires session.
+1. Call provision and wait for success before executing code. Tool discovery alone does not establish that a desktop exists. Provisioning initializes a driver session named "lilac" with capture_scope="desktop"; pass session="lilac" on every command that accepts session.
 2. On first use, list commands with print(await cua_tools()) and inspect the desktop with display(await cua("get_desktop_state", session="lilac")). Read the returned state before choosing actions.
 3. Before using an unfamiliar command, read its argument schema with print(await cua_tools(name)), for example print(await cua_tools("click")). Call it with await cua(name, **arguments) using the discovered schema.
 4. Check each result's is_error before continuing dependent actions. After a short action sequence, inspect the desktop again and verify the intended change. Use coordinates from the returned screenshot pixels. After user intervention, inspect again before resuming.
+
+Desktop input: For click, scroll, drag, move_cursor, type_text, press_key, and hotkey, explicitly pass scope="desktop" alongside session="lilac". These commands default to window scope, which this session rejects. Click the intended field using screenshot coordinates before typing, then use await cua("type_text", session="lilac", scope="desktop", text="Hello"). Desktop keyboard input goes to the focused application; omit window-target arguments such as pid, window_id, and element_index. A window_scope_disabled error means the action used window scope; retry with scope="desktop" after checking its schema. Keep the provisioned session's capture scope unchanged.
 
 Output: cua returns a ToolResult with text, images, structured_json, and is_error. display(result) emits its text and screenshots; display(image_bytes, mime_type="image/png") emits raw image bytes. Use print for text and schemas.
 

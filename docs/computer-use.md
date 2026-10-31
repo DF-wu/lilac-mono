@@ -188,6 +188,20 @@ client setup. `display(result)` emits its text and images; `display(image_bytes,
 mime_type="image/png")` emits raw image bytes. Coordinates use the actual returned screenshot pixels;
 there is no implicit scaling. Application launch inherits the desktop user's display and D-Bus setup.
 
+Pass `session="lilac"` on every command that accepts it. Input commands such as `click`, `scroll`,
+`drag`, `move_cursor`, `type_text`, `press_key`, and `hotkey` also need `scope="desktop"`; their
+default window scope is rejected by this desktop session. Click the intended field first, then type:
+
+```python
+result = await cua("type_text", session="lilac", scope="desktop", text="Hello")
+if result.is_error:
+    display(result)
+```
+
+Desktop keyboard input goes to the focused application. Omit window-target arguments such as `pid`,
+`window_id`, and `element_index`. If an action returns `window_scope_disabled`, inspect its schema and
+pass `scope="desktop"`. Keep the provisioned session's capture scope unchanged.
+
 Each execute result includes current viewer metadata as text while the desktop survives, including
 Python-error results. Passwords appear only in provision results and stay separate from viewer URLs.
 The password is eight random base64url characters because the current VNC authentication mechanism
