@@ -18,7 +18,7 @@ package.json  # fork:footprint script and scripts/fork lint, format, and typeche
 .gitignore  # ignores local agent state directories
 .oxfmtrc.json  # ignores local agent state directories
 Dockerfile  # container identity variants (CONTAINER_USER/UID build args)
-compose.yaml  # container identity variants and the native surface port
+compose.yaml  # container identity variants, native surface port and optional native Discord webhook forwarding
 docker/direct-entrypoint.sh  # container identity variants and legacy blob migration
 docker/verify-image.sh  # verifies the container identity variants
 __tests__/docker-build-script.test.ts  # covers the container identity variants
@@ -47,7 +47,7 @@ MIGRATIONS.md  # documents fork v2 config keys (surface.telegram) and the remove
 docs/core-config-migrations.md  # documents fork v2 config keys
 docs/heartbeat.md  # clarifies that the fork's Telegram surface is not a heartbeat default destination
 packages/utils/builtin-skills/heartbeat/references/setup.md  # keeps heartbeat setup aligned with the default destination schema in the Telegram fork
-docs/docker-deployment.md  # documents the container identity variants
+docs/docker-deployment.md  # documents container identity variants and optional native Discord recording setup
 packages/utils/builtin-skills/image-generation/SKILL.md  # catalog row for the openaiCompatible provider recipe
 packages/utils/builtin-skills/workflow-authoring/SKILL.md  # documents Telegram workflow targets
 packages/utils/builtin-skills/workflow-authoring/REFERENCE.md  # documents Telegram workflow targets

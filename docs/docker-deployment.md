@@ -34,6 +34,16 @@ docker compose logs -f lilac
 
 `bun run docker:verify` runs `tools --operator --list` inside the container. This checks that the root CLI can load the generated token and that Core received the matching hash. Compose readiness uses Core's `/readyz` endpoint. The generic `mem_limit` and `pids_limit` settings bound the whole container and can be adjusted with `LILAC_CONTAINER_MEMORY_LIMIT` and `LILAC_CONTAINER_PIDS_LIMIT`.
 
+## Optional Native Conversation Recording
+
+This fork can record new native human messages and visible assistant text/ready attachments to an
+owner-provisioned Discord webhook. Set `LILAC_NATIVE_DISCORD_WEBHOOK_URL` in the protected `.env` used
+by source Compose; `compose.yaml` forwards it with an empty default. Installer deployments already
+load additional keys from their protected `secrets.env`. The feature works with any image user and is
+disabled when the value is empty or unset. See [recording setup and delivery guarantees](native-discord-mirror.md)
+for applying environment changes, source exclusions and restart limits. Never print resolved Compose
+configuration containing real credentials.
+
 ## Operator Token
 
 The root entrypoint creates a fresh random operator token each time the container starts. It stores the token at `/run/lilac/operator-token` as `root:root` mode `0600`, exports only its SHA-256 hash to Core, and then replaces itself with Core under the account recorded in the image's root-owned identity file. The token is therefore available to explicit root operator commands but is not readable by Core, agents, or other unprivileged service processes.
