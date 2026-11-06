@@ -11,7 +11,11 @@ import {
   ToolPluginManager,
   type Level1ToolSpec,
 } from "@stanley2058/lilac-plugin-runtime";
-import { createLogger, parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
+import {
+  createLogger,
+  parseCoreConfigV2ToUniversal,
+  parseCoreConfigV3ToUniversal,
+} from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError } from "better-result";
 
 import {
@@ -699,8 +703,7 @@ describe("createToolServer", () => {
         },
       });
       expect(calls).toBe(1);
-      expect(reported).toHaveLength(1);
-      expect(reported[0]?.message).toBe("Plugin tool output violated the JSON wire contract");
+      expect(reported).toHaveLength(0);
       expect(
         `${JSON.stringify(body)}\n${chunks.join("\n")}\n${reported[0]?.message}`,
       ).not.toContain(secret);
@@ -1143,7 +1146,7 @@ describe("createToolServer", () => {
         platform: "discord",
         principal: null,
         authenticatedOrigin: null,
-        profile: "general",
+        profile: "full",
         canonicalCwd: "/workspace",
         safetyMode: "trusted",
         expiresAt: Date.now() + 60_000,
@@ -1183,12 +1186,12 @@ describe("createToolServer", () => {
         getLevel2ContributionInfo: () =>
           new Map([[tool, { pluginId: "profile-plugin", source: "builtin" as const }]]),
       };
-      const config = parseCoreConfigV2ToUniversal({
-        configVersion: 2,
+      const config = parseCoreConfigV3ToUniversal({
+        configVersion: 3,
         agent: {
           subagents: {
-            profiles: {
-              general: {
+            permissions: {
+              full: {
                 level2: {
                   callables: ["profile.allowed"],
                   plugins: ["profile-plugin"],
@@ -2043,9 +2046,9 @@ describe("createToolServer", () => {
             input: [],
           },
           {
-            callableId: "attachment.download",
-            name: "Attachment Download",
-            description: "Attachment download",
+            callableId: "resource.materialize",
+            name: "Resource Materialize",
+            description: "Resource materialize",
             shortInput: [],
             input: [],
           },
@@ -2150,9 +2153,9 @@ describe("createToolServer", () => {
           hidden: undefined,
         },
         {
-          callableId: "attachment.download",
-          name: "Attachment Download",
-          description: "Attachment download",
+          callableId: "resource.materialize",
+          name: "Resource Materialize",
+          description: "Resource materialize",
           shortInput: [],
           primaryPositional: undefined,
           hidden: undefined,
@@ -3155,6 +3158,49 @@ describe("createToolServer", () => {
     }
   });
 
+  it("contains a browser TypeError and accepts the next tool call", async () => {
+    const reported: Error[] = [];
+    let calls = 0;
+    const tool: ServerTool = {
+      id: "browser-failure",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          { callableId: "browser.call", name: "Browser", description: "Browser", shortInput: [] },
+        ];
+      },
+      async call() {
+        calls += 1;
+        if (calls === 1) throw new TypeError("Attempted to assign to readonly property.");
+        return Result.ok({ recovered: true });
+      },
+    };
+    const server = createToolServer({
+      tools: [tool],
+      reportFatalToolCallDefect: (defect) => reported.push(defect),
+    });
+    await server.init();
+    try {
+      const call = () =>
+        server.app.handle(
+          new Request("http://localhost/call", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ callableId: "browser.call", input: {} }),
+          }),
+        );
+      expect(await (await call()).json()).toMatchObject({
+        status: "error",
+        error: { kind: "internal", code: "plugin_call_failed" },
+      });
+      expect(await (await call()).json()).toEqual({ status: "ok", value: { recovered: true } });
+      expect(reported).toEqual([]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("reports an immediate Level 2 Panic to the fatal supervisor", async () => {
     const panic = new Panic({ message: "immediate tool invariant" });
     const observed = Promise.withResolvers<unknown>();
@@ -3323,7 +3369,7 @@ describe("createToolServer", () => {
         toolCallTimeouts: { defaultTimeoutMs: 10 },
         reportFatalToolCallDefect: (fatalDefect) => {
           reported.push(fatalDefect);
-          if (reported.length === 2) observed.resolve(reported);
+          if (reported.length === 1) observed.resolve(reported);
         },
       });
       await server.init();
@@ -3347,10 +3393,7 @@ describe("createToolServer", () => {
           retryable: true,
         },
       });
-      expect((await observed.promise).map((error) => error.message)).toEqual([
-        "expected plugin cancellation failure",
-        defect.message,
-      ]);
+      expect((await observed.promise).map((error) => error.message)).toEqual([defect.message]);
     } finally {
       try {
         await server?.stop();
@@ -3540,8 +3583,7 @@ describe("createToolServer", () => {
           retryable: false,
         },
       });
-      expect(reported).toHaveLength(1);
-      expect(reported[0]?.message).toBe("sync boom");
+      expect(reported).toHaveLength(0);
 
       jest.advanceTimersByTime(31);
 
@@ -3621,8 +3663,7 @@ describe("createToolServer", () => {
         retryable: false,
       },
     });
-    expect(reported).toHaveLength(1);
-    expect(reported[0]?.message).toBe("External tagged error");
+    expect(reported).toHaveLength(0);
     expect(`${JSON.stringify(body)}\n${chunks.join("\n")}`).not.toContain(secret);
     await server.stop();
   });
@@ -3871,7 +3912,7 @@ describe("createToolServer", () => {
       expect(logged).not.toContain("MCP runtime failed");
       expect(logged).not.toContain("mcp.add has invalid input");
       expect(logged).not.toContain("?code=");
-      expect(reported).toHaveLength(1);
+      expect(reported).toHaveLength(0);
       const observableOutput = `${logged}\n${reported[0]?.message}\n${JSON.stringify({ validationResult, runtimeResult, defectResult })}`;
       for (const secret of Object.values(secrets)) expect(observableOutput).not.toContain(secret);
     } finally {
@@ -3936,7 +3977,7 @@ describe("createToolServer", () => {
         retryable: false,
       },
     });
-    expect(reported).toHaveLength(1);
+    expect(reported).toHaveLength(0);
 
     await server.stop();
   });

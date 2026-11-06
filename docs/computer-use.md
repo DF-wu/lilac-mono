@@ -188,6 +188,20 @@ client setup. `display(result)` emits its text and images; `display(image_bytes,
 mime_type="image/png")` emits raw image bytes. Coordinates use the actual returned screenshot pixels;
 there is no implicit scaling. Application launch inherits the desktop user's display and D-Bus setup.
 
+Pass `session="lilac"` on every command that accepts it. Input commands such as `click`, `scroll`,
+`drag`, `move_cursor`, `type_text`, `press_key`, and `hotkey` also need `scope="desktop"`; their
+default window scope is rejected by this desktop session. Click the intended field first, then type:
+
+```python
+result = await cua("type_text", session="lilac", scope="desktop", text="Hello")
+if result.is_error:
+    display(result)
+```
+
+Desktop keyboard input goes to the focused application. Omit window-target arguments such as `pid`,
+`window_id`, and `element_index`. If an action returns `window_scope_disabled`, inspect its schema and
+pass `scope="desktop"`. Keep the provisioned session's capture scope unchanged.
+
 Each execute result includes current viewer metadata as text while the desktop survives, including
 Python-error results. Passwords appear only in provision results and stay separate from viewer URLs.
 The password is eight random base64url characters because the current VNC authentication mechanism
@@ -284,9 +298,25 @@ server ID can vary. The native viewer polls the gateway's `viewer` tool without 
 refreshing desktop expiry. Termination or expiry removes the panel. Viewer passwords remain in memory
 and are sent to the runner frame through origin-checked messages, never URL parameters.
 
-The browser must be able to reach the configured viewer host and port. HTTPS native installations
-need HTTPS/WSS viewer access through the deployment's TLS proxy. The proxy must allow the native
-site to embed `/lilac-viewer.html` and forward `/websockify` upgrades.
+The native browser loads Core's bundled `/computer.html` viewer and connects to a separate
+`/api/computer/socket` WebSocket on the same origin. Existing HTTPS installations use WSS through
+their ordinary Core reverse proxy. No per-desktop DNS, TLS proxy, or browser access to runner ports
+is required. The proxy must forward WebSocket upgrades for `/api/computer/socket`, as it does for
+`/api/socket`.
+
+Core authenticates the socket, requires thread edit access, and connects to the configured HTTP MCP
+gateway's `/viewer/socket` endpoint using its resolved credentials and trusted session hash. The
+gateway checks the desktop generation and relays raw VNC bytes through `docker exec` into runner
+loopback. This works across Docker bridge networks and loopback-only published port bindings.
+VNC passwords stay in memory; they are never placed in URLs. Desktop traffic bypasses chat RPC and
+has bounded transport buffers. Logout, authorization expiry, lost thread access, desktop expiry,
+termination, and either side disconnecting close the relay. Active chat reauthentication refreshes
+viewer authentication for the same session. Viewing does not extend desktop lifetime.
+
+Direct viewer links returned by `provision` still use `RENDERED_HOST` and published ports. Those links
+retain the browser reachability and HTTPS proxy requirements described under Gateway settings.
+Deploy the updated Core/web and gateway together, then reload open web clients. Existing runners
+already have the Python and VNC components required by the relay and do not need replacement.
 
 For an isolated real-desktop browser check, build with `bun run docker:build:computer-use`, then run
 `bun apps/core/tests/surface/native/computer-browser-fixture.ts` and `bun --cwd=apps/web run dev`. Use the ordinary

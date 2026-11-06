@@ -156,6 +156,8 @@ export function createNativeOutputPublisher(options: {
     input: Omit<Extract<NativeOutputPayload, { type: "activity" }>, "type" | "position">,
   ): void {
     if (settled) return;
+    // Native agent runtimes can execute tools before returning the enclosing model call.
+    if (input.kind === "tool" && input.state === "start") stepEnd("tool-calls");
     currentStepId = input.stepId;
     const key = JSON.stringify([input.stepId, input.activityId]);
     const knownPosition = activityPositions.get(key);
@@ -230,6 +232,12 @@ export function createNativeOutputPublisher(options: {
   }
 
   return {
+    model: (
+      spec: string,
+      reasoning?: Extract<NativeOutputPayload, { type: "model" }>["reasoning"],
+    ) => {
+      if (!settled) emit({ type: "model", spec, reasoning });
+    },
     hasPendingText,
     currentStepId: () => currentStepId,
     resource,

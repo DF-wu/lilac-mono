@@ -99,18 +99,22 @@ describe("activity presentation", () => {
     expect(formatDuration(125_000)).toBe("2m 5s");
     expect(formatDuration(3_720_000)).toBe("1h 2m");
   });
-  it("shows a web row for commands that start with a tools web call", () => {
-    const search = tool('bash tools web.search "rain; Kyoto" && cat ~/notes/a.md');
+  it.each(["", "web."])("shows a web row for tools %s calls", (prefix) => {
+    const search = tool(`bash tools ${prefix}search "rain; Kyoto" && cat ~/notes/a.md`);
     expect(activityRowKind(search)).toBe("web");
     expect(activityRowTitle(search)).toBe("rain; Kyoto");
     expect(liveActivityLabel(search)).toBe("rain; Kyoto");
     const fetch = tool(
-      "bash bash -lc 'tools web.fetch --url=https://example.com/a; tools web.search b'",
+      `bash bash -lc 'tools ${prefix}fetch --url=https://example.com/a; tools ${prefix}search b'`,
     );
     expect(activityRowKind(fetch)).toBe("web");
     expect(activityRowTitle(fetch)).toBe("https://example.com/a");
-    expect(activityRowKind(tool("bash cat a; tools web.search b"))).toBe("command");
+    expect(activityRowKind(tool(`bash cat a; tools ${prefix}search b`))).toBe("command");
     expect(activityRowKind(tool("bash tools resource.read x"))).toBe("command");
+    expect(activityRowKind(tool("bash tools search_files x"))).toBe("command");
+    expect(activityRowTitle(tool(`bash tools ${prefix}fetch 'https://example.com/a'`))).toBe(
+      "https://example.com/a",
+    );
     expect(activityGroupSummary([search, fetch])).toBe("Searched the web 2 times");
   });
   it("titles first-level tools from their native JSON arguments", () => {
@@ -148,6 +152,10 @@ describe("activity presentation", () => {
       "explore",
     );
     expect(subagentLabelProfile(tool("subagent (general; 1/2 done)"))).toBe("general");
+    expect(
+      subagentLabelProfile(tool('subagent_delegate {"permissions":"offline","task":"x"}')),
+    ).toBe("offline");
+    expect(subagentLabelProfile(tool("subagent (restricted; scout; 0/1 done)"))).toBe("restricted");
     expect(subagentLabelProfile(tool("bash ls"))).toBeUndefined();
   });
   it("decodes long arguments from the detail when Core truncated the label", () => {

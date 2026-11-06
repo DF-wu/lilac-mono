@@ -67,10 +67,10 @@ curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" \
 ## 3. Configure
 
 The Telegram section lives in `core-config.yaml` and requires
-**`configVersion: 2`** — the v1 input shape is frozen and cannot describe it.
+**`configVersion: 2` or `3`**. The v1 input shape is frozen and cannot describe it.
 
 ```yaml
-configVersion: 2
+configVersion: 3
 
 surface:
   telegram:

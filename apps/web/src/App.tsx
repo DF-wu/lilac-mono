@@ -608,6 +608,7 @@ function Workspace(props: AppProps) {
           title: creation.title,
           autoTitle: creation.autoTitle,
           modelId: creation.modelId,
+          reasoning: creation.reasoning,
         }),
       (error) => changeLocalDraft(id, (draft) => ({ ...draft, sending: false, error })),
     );
@@ -768,7 +769,10 @@ function Workspace(props: AppProps) {
     });
     setNextCursor(page.nextCursor);
   }
-  async function update(id: string, change: { title?: string; archived?: boolean }) {
+  async function update(
+    id: string,
+    change: { title?: string; archived?: boolean; regenerateTitle?: true },
+  ) {
     if (id.startsWith("draft:")) {
       changeLocalDraft(id, (draft) => ({ ...draft, title: change.title ?? draft.title }));
       setRename(undefined);
@@ -844,6 +848,10 @@ function Workspace(props: AppProps) {
   const renameSidebarThread = useEventCallback((id: string, title: string) =>
     setRename({ id, title }),
   );
+  const regenerateSidebarTitle = useEventCallback((id: string) => {
+    toast.add({ title: "Regenerating title", type: "info" });
+    void update(id, { regenerateTitle: true });
+  });
   const archiveSidebarThread = useEventCallback(
     (id: string, archived: boolean) => void update(id, { archived }),
   );
@@ -1148,6 +1156,7 @@ function Workspace(props: AppProps) {
                                     onThread={upsert}
                                     onSelect={select}
                                     onRename={renameSidebarThread}
+                                    onRegenerateTitle={regenerateSidebarTitle}
                                     onArchive={archiveSidebarThread}
                                     onDelete={setConfirmDelete}
                                     onDiscardDraft={discardDraft}
@@ -1186,6 +1195,7 @@ function Workspace(props: AppProps) {
                                       external={external}
                                       onSelect={select}
                                       onRename={renameSidebarThread}
+                                      onRegenerateTitle={regenerateSidebarTitle}
                                       onArchive={archiveSidebarThread}
                                       onDelete={setConfirmDelete}
                                       onDiscardDraft={discardDraft}

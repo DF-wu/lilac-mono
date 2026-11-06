@@ -17,6 +17,7 @@ function fixture(autoTitle = true) {
   store
     .initializeDeployment({
       titleModel: "fast",
+      transport: "auto",
       outputStreaming: "paragraph",
       dmContextGapMs: 7_200_000,
       dmTimestampGapMs: 1_800_000,
@@ -382,5 +383,126 @@ test("shutdown preserves a model Panic and reports its original identity", async
   expect(c.fatal[0]).toBe(defect);
   expect(c.warnings).toEqual([]);
   expect(f.store.getThreadRecord(f.thread.id).unwrap().title).toBe("First line");
+  f.store.close();
+});
+
+test("child task title generation preserves explicit titles and survives completion", () => {
+  const f = fixture();
+  f.store.settleInput(f.input.inputId, "admitted").unwrap();
+  const child = f.store
+    .ensureAgentStream({
+      parentThreadId: f.thread.id,
+      parentRequestId: f.store.getInput(f.input.inputId).unwrap().requestId,
+      runId: "child",
+      requestId: "request",
+      messages: [],
+      state: "running",
+      startedAt: 1,
+      titlePrompt: "Check migration compatibility across versions",
+    })
+    .unwrap();
+  const job = f.store.getTitleGeneration(child.id).unwrap()!;
+  expect(job.user).toBe("Check migration compatibility across versions");
+  f.store
+    .settleTitleGeneration(child.id, job, {
+      title: "Check migration compatibility",
+      needsRefinement: false,
+    })
+    .unwrap();
+  for (const spec of ["codex/gpt-6-astra", "openai/gpt-6-astra"]) {
+    f.store
+      .projectTurn(child.id, child.historyGeneration, spec, child.turnId, (slot) =>
+        Result.ok({
+          slot,
+          changes: [],
+          model: { spec, reasoning: "high" },
+        }),
+      )
+      .unwrap();
+  }
+  const titled = f.store.findAgentStream("child").unwrap()!;
+  expect(titled.model).toBe("openai/gpt-6-astra");
+  expect(titled.reasoning).toBe("high");
+  f.store.settleAgentStream(titled, "complete").unwrap();
+  expect(f.store.findAgentStream("child").unwrap()?.taskTitle).toBe(
+    "Check migration compatibility",
+  );
+  const explicit = f.store
+    .ensureAgentStream({
+      parentThreadId: f.thread.id,
+      parentRequestId: f.store.getInput(f.input.inputId).unwrap().requestId,
+      runId: "explicit",
+      requestId: "explicit-request",
+      messages: [],
+      state: "running",
+      startedAt: 1,
+      taskTitle: "Review config",
+      titlePrompt: "Something else",
+    })
+    .unwrap();
+  expect(f.store.getTitleGeneration(explicit.id).unwrap()).toBeNull();
+});
+
+function regenerationFixture() {
+  const f = fixture(false);
+  complete(f, "Opening answer");
+  const later = f.store
+    .acceptInput("owner", {
+      threadId: f.thread.id,
+      commandId: "later",
+      historyGeneration: 0,
+      text: "Now help me deploy it",
+      mode: "prompt",
+      skillIds: [],
+      attachmentIds: [],
+    })
+    .unwrap();
+  f.store.settleInput(f.input.inputId, "admitted").unwrap();
+  f.store.markInputCompleted(f.input.inputId).unwrap();
+  const turnId = f.store.prepareInput(later.inputId).unwrap()?.turnId;
+  complete({ ...f, input: { ...later, turnId } }, "Deployment answer");
+  return { f, c: controlled(f) };
+}
+
+test("regenerating a title summarizes the whole conversation", async () => {
+  const { f, c } = regenerationFixture();
+  const pending = c.service.regenerate(f.thread.id);
+  const input = await c.first.promise;
+  expect(input.conversation).toEqual([
+    { role: "user", text: "First line\nExplain the problem" },
+    { role: "assistant", text: "Opening answer" },
+    { role: "user", text: "Now help me deploy it" },
+    { role: "assistant", text: "Deployment answer" },
+  ]);
+  c.firstResult.resolve(Result.ok({ title: "Deploying the fix", needsRefinement: false }));
+  (await pending).unwrap();
+  expect(f.store.getThreadRecord(f.thread.id).unwrap().title).toBe("Deploying the fix");
+  await c.service.stop();
+  f.store.close();
+});
+
+test("a manual rename during regeneration keeps the manual title", async () => {
+  const { f, c } = regenerationFixture();
+  const pending = c.service.regenerate(f.thread.id);
+  await c.first.promise;
+  f.store
+    .updateThread("owner", { threadId: f.thread.id, commandId: "rename", title: "Manual" })
+    .unwrap();
+  c.firstResult.resolve(Result.ok({ title: "Generated", needsRefinement: false }));
+  expect((await pending).isErr()).toBe(true);
+  expect(f.store.getThreadRecord(f.thread.id).unwrap().title).toBe("Manual");
+  await c.service.stop();
+  f.store.close();
+});
+
+test("regenerating a title requires a message", async () => {
+  const f = fixture(false);
+  const empty = f.store
+    .createThread("owner", { commandId: "empty", title: "Empty", autoTitle: false })
+    .unwrap();
+  const c = controlled(f);
+  expect((await c.service.regenerate(empty.id)).isErr()).toBe(true);
+  expect(c.calls).toHaveLength(0);
+  await c.service.stop();
   f.store.close();
 });

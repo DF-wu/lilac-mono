@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/websocket";
+import { RPCLink as HttpRPCLink } from "@orpc/client/fetch";
 import type { ContractRouterClient } from "@orpc/contract";
 import { nativeContract } from "@stanley2058/lilac-client-protocol";
 import { exportSPKI, generateKeyPair, SignJWT } from "jose";
@@ -15,6 +16,7 @@ import { createNativeGateway, type NativeGatewayOptions } from "./gateway";
 import { nativeRpcValue, type NativeRpcServices } from "./rpc";
 import { nativeFailure } from "./errors";
 import { createNativeMetrics, type NativeMetricSink } from "./metrics";
+import { BinaryRelay } from "@stanley2058/lilac-utils/binary-relay";
 
 const cleanup: (() => void | Promise<void>)[] = [];
 afterEach(async () => {
@@ -33,7 +35,11 @@ const checkpoint = {
   cursor: "n_0_1",
 };
 
-async function fixture(webRoot?: string, resources?: NativeGatewayOptions["resources"]) {
+async function fixture(
+  webRoot?: string,
+  resources?: NativeGatewayOptions["resources"],
+  computer?: NativeGatewayOptions["computer"],
+) {
   const measurements: { event: string; fields: Parameters<NativeMetricSink>[1] }[] = [];
   const metrics = createNativeMetrics((event, fields) => measurements.push({ event, fields }));
   const fatalErrors: Error[] = [];
@@ -105,6 +111,7 @@ async function fixture(webRoot?: string, resources?: NativeGatewayOptions["resou
     },
   } as unknown as NativeRpcServices;
   const gateway = createNativeGateway({
+    computer,
     metrics,
     hostname: "127.0.0.1",
     port: 0,
@@ -130,6 +137,7 @@ async function fixture(webRoot?: string, resources?: NativeGatewayOptions["resou
   return {
     url,
     token,
+    auth,
     gateway,
     services,
     fatalErrors,
@@ -151,6 +159,93 @@ function connect(url: string, token: string) {
   );
   return { socket, client };
 }
+
+test("computer lane authenticates separately, carries binary frames, and closes on logout", async () => {
+  const received = Promise.withResolvers<number[]>();
+  const disconnected = Promise.withResolvers<void>();
+  let calls = 0;
+  const current = await fixture(undefined, undefined, {
+    async connect(actor, thread, generation, _signal, authenticated) {
+      calls++;
+      expect(actor).toBe(user.id);
+      expect(thread).toBe("desktop-thread");
+      expect(generation).toBe("936ea9b5-eae1-4c79-97af-c56fd48b2c8c");
+      const relay = new BinaryRelay(
+        async (bytes) => {
+          received.resolve([...bytes]);
+        },
+        () => disconnected.resolve(),
+        authenticated,
+      );
+      relay.push(new Uint8Array([82, 70, 66]));
+      return Result.ok(relay);
+    },
+  });
+  const endpoint = new URL(
+    "api/computer/socket?threadId=desktop-thread&generation=936ea9b5-eae1-4c79-97af-c56fd48b2c8c",
+    current.url,
+  );
+  await expectSocketRejected(endpoint);
+  await expectSocketRejected(endpoint, {
+    authorization: `Bearer ${current.token}`,
+    origin: "https://other.example",
+  });
+  expect(calls).toBe(0);
+  endpoint.protocol = "ws:";
+  const socket = new (WebSocket as unknown as {
+    new (url: URL, options: { headers: Record<string, string> }): WebSocket;
+  })(endpoint, { headers: { authorization: `Bearer ${current.token}` } });
+  cleanup.push(() => socket.close());
+  socket.binaryType = "arraybuffer";
+  const greeting = Promise.withResolvers<number[]>();
+  socket.addEventListener("message", (event) => greeting.resolve([...new Uint8Array(event.data)]));
+  expect(await greeting.promise).toEqual([82, 70, 66]);
+  socket.send(new Uint8Array([7, 8]));
+  expect(await received.promise).toEqual([7, 8]);
+  const logout = await fetch(new URL("api/auth/logout", current.url), {
+    method: "POST",
+    headers: { authorization: `Bearer ${current.token}` },
+  });
+  expect(logout.status).toBe(200);
+  await disconnected.promise;
+  expect(calls).toBe(1);
+  expect(current.fatalErrors).toEqual([]);
+});
+
+test("computer lane reserves capacity during handshakes and releases failed upgrades", async () => {
+  const admitted = Promise.withResolvers<void>();
+  const proceed = Promise.withResolvers<void>();
+  let calls = 0;
+  const current = await fixture(undefined, undefined, {
+    async connect() {
+      if (++calls === 64) admitted.resolve();
+      await proceed.promise;
+      return Result.ok(
+        new BinaryRelay(
+          async () => {},
+          () => {},
+        ),
+      );
+    },
+  });
+  const url = new URL(
+    "api/computer/socket?threadId=t&generation=936ea9b5-eae1-4c79-97af-c56fd48b2c8c",
+    current.url,
+  );
+  const headers = { authorization: `Bearer ${current.token}` };
+  const pending = Array.from({ length: 64 }, () => fetch(url, { headers }));
+  try {
+    await admitted.promise;
+    expect((await fetch(url, { headers })).status).toBe(503);
+    expect(calls).toBe(64);
+  } finally {
+    proceed.resolve();
+  }
+  const responses = await Promise.all(pending);
+  expect(responses.every((response) => response.status === 426)).toBe(true);
+  expect((await fetch(url, { headers })).status).toBe(426);
+  expect(calls).toBe(65);
+});
 
 async function expectSocketRejected(url: URL, headers: Record<string, string> = {}) {
   const endpoint = new URL(url);
@@ -758,4 +853,123 @@ test("real oRPC frames produce redacted replay and bootstrap measurements", asyn
   expect(replay?.commitToSocketEnqueueMs).toBeGreaterThanOrEqual(0);
   expect(replay?.bytes).toBeGreaterThan(0);
   expect(JSON.stringify(measurements)).not.toContain(token);
+});
+
+function connectHttp(url: string, token: string) {
+  return createORPCClient<ContractRouterClient<typeof nativeContract>>(
+    new HttpRPCLink({
+      url: new URL("api/rpc", url),
+      headers: { authorization: `Bearer ${token}` },
+    }),
+  );
+}
+
+test("HTTP RPC uses the same auth, domain errors and SSE replay as WebSocket", async () => {
+  const f = await fixture();
+  const client = connectHttp(f.url, f.token);
+  expect(await client.bootstrap.get({})).toMatchObject({ viewer: user });
+  await expect(client.threads.sync({ threadId: "private-other" })).rejects.toMatchObject({
+    code: "FORBIDDEN",
+  });
+  const events = [];
+  for await (const event of await client.threads.watch({ threadId: "thread" })) events.push(event);
+  expect(events.map((event) => event.kind)).toEqual(["replay", "hydration"]);
+  const endpoint = new URL("api/rpc/bootstrap/get", f.url);
+  const unauthorized = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "http://localhost" },
+    body: '{"json":{}}',
+  });
+  expect(unauthorized.status).toBe(401);
+  const foreign = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${f.token}`,
+      origin: "https://other.example",
+    },
+    body: '{"json":{}}',
+  });
+  expect(foreign.status).toBe(403);
+  const getMutation = await fetch(new URL("api/rpc/connection/logout", f.url), {
+    headers: { authorization: `Bearer ${f.token}` },
+  });
+  expect(getMutation.status).toBe(405);
+  expect(f.fatalErrors).toEqual([]);
+});
+
+for (const ending of ["cancel", "logout", "shutdown"] as const) {
+  test(`HTTP SSE ${ending} releases an idle server subscription`, async () => {
+    const f = await fixture();
+    const watching = Promise.withResolvers<void>();
+    const released = Promise.withResolvers<void>();
+    f.services.threads.watch = (_principal, _input, signal) =>
+      Result.ok(
+        (async function* () {
+          yield { kind: "replay" as const, reply: { kind: "unchanged" as const, checkpoint } };
+          watching.resolve();
+          await new Promise<void>((resolve) => {
+            if (signal?.aborted) return resolve();
+            signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+          released.resolve();
+        })(),
+      );
+    const client = connectHttp(f.url, f.token);
+    const abort = new AbortController();
+    const stream = await client.threads.watch({ threadId: "thread" }, { signal: abort.signal });
+    expect((await stream.next()).value).toMatchObject({ kind: "replay" });
+    await watching.promise;
+    if (ending === "cancel") abort.abort();
+    if (ending === "logout") expect(await client.connection.logout({})).toEqual({ ok: true });
+    if (ending === "shutdown") await f.gateway.stop();
+    await released.promise;
+    if (ending === "cancel")
+      await expect(stream.return()).rejects.toHaveProperty("name", "AbortError");
+    else await stream.return();
+    expect(f.fatalErrors).toEqual([]);
+  });
+}
+
+test("HTTP SSE expires an idle authenticated stream", async () => {
+  const f = await fixture();
+  const authenticate = f.auth.authenticate.bind(f.auth);
+  const auth = spyOn(f.auth, "authenticate").mockImplementation(async (request, context) =>
+    (await authenticate(request, context)).map((principal) => ({
+      ...principal,
+      expiresAt: Date.now() / 1000 + 60,
+    })),
+  );
+  cleanup.push(() => auth.mockRestore());
+  const checkSession = spyOn(f.auth, "checkSession").mockReturnValue(Result.ok());
+  cleanup.push(() => checkSession.mockRestore());
+  const originalTimeout = globalThis.setTimeout;
+  let expire: (() => void) | undefined;
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(
+    Object.assign((...args: Parameters<typeof setTimeout>) => {
+      const [callback, delay, ...values] = args;
+      if (delay && delay > 59_000 && delay <= 60_000) expire = () => callback(...values);
+      return originalTimeout(...args);
+    }, originalTimeout),
+  );
+  cleanup.push(() => timer.mockRestore());
+  const released = Promise.withResolvers<void>();
+  f.services.threads.watch = (_principal, _input, signal) =>
+    Result.ok(
+      (async function* () {
+        yield { kind: "replay" as const, reply: { kind: "unchanged" as const, checkpoint } };
+        await new Promise<void>((resolve) => {
+          if (signal?.aborted) return resolve();
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        released.resolve();
+      })(),
+    );
+  const stream = await connectHttp(f.url, f.token).threads.watch({ threadId: "thread" });
+  await stream.next();
+  expect(expire).toBeDefined();
+  expire!();
+  await released.promise;
+  expect((await stream.next()).done).toBe(true);
+  expect(f.fatalErrors).toEqual([]);
 });

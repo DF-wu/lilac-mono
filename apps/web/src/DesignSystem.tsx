@@ -1,9 +1,11 @@
+import { ModelSelectorDemo } from "./components/ModelSelectorDemo";
 import {
   CopySessionIdMenuItem,
   CopySessionIdContextMenuItem,
 } from "./components/CopySessionIdMenuItem";
 import { ContextMessage, NextContextStart, TimestampSeparator } from "./components/RecentContext";
 import { DirectThreadCard } from "./components/DirectThreadCard";
+import type { ComputerGeometry } from "./computer-viewer";
 import { ComputerViewer } from "./components/ComputerViewer";
 import computerDemoUrl from "./assets/computer-demo.html?url";
 import { AgentAvatar } from "./components/AgentAvatar";
@@ -40,7 +42,7 @@ import { RightPanelTabs } from "./components/FileViewer";
 import { FileSource } from "./components/FileSource";
 import { Link, useLocation } from "@tanstack/react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Archive,
   ArrowLeft,
@@ -336,6 +338,24 @@ const messageFixtures: DisplayMessage[] = [
         },
       },
       { type: "data-activity", id: "gallery-search", data: toolActivities.nearby.settled },
+      {
+        type: "data-activity",
+        id: "gallery-cli-search",
+        data: {
+          kind: "tool",
+          label: 'bash tools search "Kyoto bookstore opening hours"',
+          state: "complete",
+        },
+      },
+      {
+        type: "data-activity",
+        id: "gallery-cli-fetch",
+        data: {
+          kind: "tool",
+          label: "bash tools fetch 'https://example.com/bookstore'",
+          state: "complete",
+        },
+      },
       {
         type: "text",
         text: "The café opens earlier than the bookstore, so that order works well.",
@@ -876,7 +896,7 @@ function Messages() {
         </Specimen>
         <Specimen title="Agent avatars">
           <div className="ds-row flex items-center flex-wrap gap-4">
-            {(["general", "explore", "self"] as const).map((profile) => (
+            {(["full", "restricted", "self"] as const).map((profile) => (
               <div key={profile} className="flex items-center gap-2">
                 <AgentAvatar profile={profile} displayName={`${profile} agent`} size="lg" />
                 <span className="text-sm capitalize">{profile}</span>
@@ -1006,6 +1026,7 @@ const composerCatalog: DisplayCatalog = {
 function ComposerSpecimen() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(false);
+  const [typeToFocus, setTypeToFocus] = useState(false);
   const [text, setText] = useState(
     "Help me turn these **notes** into a weekend plan with $agent-browser.\n\nCompare [the discussion](/?ref=discord%3Aweekend). Keep Sunday free.\nhttps://example.com/weekend",
   );
@@ -1014,7 +1035,8 @@ function ComposerSpecimen() {
   const [attachments, setAttachments] = useState<Attachment[]>(() => [
     {
       key: "gallery-notes",
-      file: new File(["A quiet weekend"], "notes.txt", { type: "text/plain" }),
+      file: new File([], "lilac.svg", { type: "image/svg+xml" }),
+      preview: logo,
       reservation: Promise.resolve("gallery-notes"),
       state: "ready",
       progress: 1,
@@ -1024,9 +1046,16 @@ function ComposerSpecimen() {
     <Section
       id="composer"
       title="Composer"
-      description="Try the formatting toolbar, Markdown shortcuts, multiline input, and /tarot arguments."
+      description="Enable Type anywhere, then click outside the editor and start typing. Try the formatting toolbar, Markdown shortcuts, multiline input, and /tarot arguments."
     >
       <div className="ds-row flex items-center flex-wrap gap-2">
+        <Button
+          variant="secondary"
+          aria-pressed={typeToFocus}
+          onClick={() => setTypeToFocus((value) => !value)}
+        >
+          Type anywhere
+        </Button>
         <Button variant="secondary" onClick={() => setDisabled((value) => !value)}>
           {disabled ? "Enable editor" : "Disable editor"}
         </Button>
@@ -1037,6 +1066,9 @@ function ComposerSpecimen() {
           Missing attachment
         </Button>
       </div>
+      <Specimen title="Models">
+        <ModelSelectorDemo />
+      </Specimen>
       <div className="ds-composer my-4">
         <FloatingChatMenu
           sidebarOpen={sidebarOpen}
@@ -1050,6 +1082,7 @@ function ComposerSpecimen() {
           onDelete={() => toast.add({ title: "Delete selected", type: "info" })}
         />
         <Composer
+          typeToFocus={typeToFocus}
           text={text}
           onText={setText}
           attachments={attachments}
@@ -1728,6 +1761,7 @@ function Layout() {
   );
 }
 function ComputerDemo() {
+  const geometry = useRef<ComputerGeometry | undefined>(undefined);
   const [open, setOpen] = useState(false);
   return (
     <Section id="computer" title="Computer viewer">
@@ -1736,6 +1770,10 @@ function ComputerDemo() {
       </Button>
       {open ? (
         <ComputerViewer
+          savedGeometry={geometry.current}
+          onGeometryChange={(value) => {
+            geometry.current = value;
+          }}
           desktop={{
             generation: "demo",
             url: new URL(computerDemoUrl, location.origin).href,
@@ -1845,6 +1883,7 @@ export default function DesignSystem() {
               <Section id="deployment" title="Deployment settings">
                 <DeploymentSettingsForm
                   value={{
+                    transport: "auto",
                     titleModel: "fast",
                     outputStreaming: "complete",
                     dmContextGapMs: 7_200_000,
@@ -1930,7 +1969,7 @@ export default function DesignSystem() {
                     />
                   </Specimen>
                   <Markdown text={richText} />
-                  <Specimen title="Table with long descriptions">
+                  <Specimen title="Table with Markdown and CSV copy">
                     <Markdown text={tableExample} />
                   </Specimen>
                   <Specimen title="Table in a wrapped preview">

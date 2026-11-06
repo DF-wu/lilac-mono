@@ -12,13 +12,13 @@ Current behavior is authoritative in production source, wire schemas, persisted 
 - `DEVELOPMENT.md` covers source setup, development commands, builds, and checks.
 - `PROJECT.md` is the durable current-system and ownership guide.
 - `AGENTS.md` defines repository-wide working constraints.
-- `packages/utils/config-templates/core-config.example.yaml` documents current Core configuration, and
+- `docs/core-config.md` explains schema-backed Core configuration documentation, and
   `docs/core-config-migrations.md` records manual version upgrades.
 - `MIGRATIONS.md` records persisted-data, wire, and protocol transitions.
 - `scripts/architecture/README.md` explains the permanent architecture gate and exact registrations.
 - `plan/README.md` identifies active implementation plans. Plans describe intended work, not current behavior until the code ships.
-- Component documentation owns operational detail. In particular, see the self-documenting
-  `packages/utils/config-templates/core-config.example.yaml`, `docs/core-config-migrations.md`,
+- Component documentation owns operational detail. In particular, see
+  `docs/core-config.md`, `docs/core-config-migrations.md`,
   `docs/claude-code.md`, `docs/skill-authoring.md`, `docs/docker-deployment.md`, and `PLUGIN_AUTHORING.md`.
 
 `ref/` is vendored upstream reference material and is read-only unless a task explicitly says otherwise.
@@ -29,8 +29,8 @@ Current behavior is authoritative in production source, wire schemas, persisted 
 
 Core is the Redis-backed multi-surface runtime in `apps/core`.
 
-Current Core configuration is documented in
-`packages/utils/config-templates/core-config.example.yaml`; manual version upgrades are in
+Current Core configuration uses schema-backed editor documentation described in
+`docs/core-config.md`; manual version upgrades are in
 `docs/core-config-migrations.md`.
 
 1. Authenticated Discord and Telegram ingress publish normalized adapter events to the typed bus. Verified GitHub webhooks can create request messages directly.
@@ -57,6 +57,12 @@ model. Runners receive neither its Docker socket nor bearer secret.
 
 See [computer-use deployment and operation](docs/computer-use.md) for image builds, optional Compose,
 limits, agent instructions, verification, and deferred work. The default Core deployment is unchanged.
+
+Native web serves a bundled noVNC viewer from Core and uses a separate authenticated binary WebSocket
+lane. Core checks thread edit authority and forwards to the configured gateway with its credentials
+and canonical session hash. The gateway binds the connection to the current desktop generation and
+uses Docker exec to relay runner-loopback VNC. Native viewing needs no browser access to runner ports
+or per-desktop DNS/TLS routing. Direct provision links retain their existing published-port contract.
 
 ## Workspace Ownership
 
@@ -88,6 +94,11 @@ Native surface ownership is in `apps/core/src/surface/native`: `store.ts` owns n
 resources, search, semantic output projection and the HTTP/WebSocket gateway. The surface uses
 starter-owned authority and a separate user directory, with `lilac` as its service user. The web app
 uses the shared client and a principal-scoped IndexedDB cache. See [native setup](docs/native-surface.md).
+
+Native web and TUI share the deployment transport policy: Auto tries WebSocket and falls back to
+HTTP RPC with SSE subscriptions after a failed upgrade or handshake deadline. Forced WebSocket and
+HTTP+SSE modes are available under Deployment settings. Both reuse the same router and replay
+checkpoints. Policy changes resync connected clients; the computer viewer retains its binary socket.
 
 Native input receipts and upload readiness commit before the existing request-delivery coordinator
 admits execution. Stable delivery identities bridge these stores; the native surface does not own a
@@ -221,8 +232,7 @@ Request capabilities bind request context, cwd, profile, callable authority, and
 
 Core ingress resources use opaque `resource://r1_<128-bit-id>` capabilities. The shared Core resource
 module validates and resolves them for provider media, Level 1 `read` and `grep`, Level 2
-`resource.materialize` and `attachment.add_files`, and the hidden deprecated `attachment.download`
-compatibility callable.
+`resource.materialize` and `attachment.add_files`.
 `resource.materialize` writes an ordered selection into the invoking `tools` CLI process cwd without
 overwriting existing files. The server keeps the capability-authorized cwd separate from that
 invocation cwd, and restricted requests can materialize only under their private `/tmp` mapping. Text
@@ -246,7 +256,7 @@ Core has one current programmatic workflow runtime, `lilac-workflow-js-v4`, unde
 
 - Definitions are JavaScript files in `<project>/.lilac/workflows` or `${DATA_DIR}/workflows`. The request capability's server-authorized cwd selects the project; a shell's later `cd` does not change that selection.
 - A run is pinned to immutable source, input-schema, resource-policy, project, and runtime identity. Durable triggers pin that revision and origin when created and later fire without another human review.
-- Workflow programs orchestrate; native subagent profiles authorize. `agent()` requires `explore`, `general`, or `self` plus optional cwd, model, reasoning, and label. The selected profile owns Level 1 tools/plugins, Level 2 callables/plugins, Bash mode, writes, network behavior, and delegation exactly as it does for direct subagents.
+- Workflow programs orchestrate; subagent permission profiles authorize. `agent()` requires a `profile` naming a configured permission profile (`agent.subagents.permissions`, with built-in `full` and `restricted`) plus optional cwd, model, reasoning, and label. The selected profile owns Level 1 tools/plugins, Level 2 callables/plugins, Bash mode, writes, network behavior, and delegation exactly as it does for direct subagents. Retired role names resolve as `explore` to `restricted` and `general` or `self` to `full`.
 - Agent cwd is free-form, absolute or relative to the invocation project, and may address any path available to the service UID. Native Bash remains host-authority execution.
 - The immutable resource policy bounds agent concurrency and count, nesting, allowed wait kinds, and per-operation idle time; separate limits bound source, input, operation output, and final result sizes.
 - The deterministic program child is a plain `bun --smol` subprocess with deterministic-global lockdown and an NDJSON host protocol. It is not an OS security sandbox. The host owns cancellation, operation-idle, output-size, and protocol limits. A workflow has no total wall-time limit.

@@ -6,7 +6,7 @@ import {
   canonicalJsonStringify,
   hashCanonicalMessagesV1,
   hashExecutionScopeV1,
-  preparePlainTextReplayForTarget,
+  prepareContextHandoff,
   type HistoryProviderState,
   type PrepareModelCall,
 } from "@stanley2058/lilac-agent";
@@ -157,7 +157,7 @@ export function prepareCoreNamedHistoryView(input: {
     historicalMessageCount = input.canonicalMessages.length;
   }
   return [
-    ...preparePlainTextReplayForTarget(input.canonicalMessages.slice(0, historicalMessageCount), {
+    ...prepareContextHandoff(input.canonicalMessages.slice(0, historicalMessageCount), {
       providerFamily: input.targetFamily,
       modelSpecifier: input.modelSpecifier,
       maxToolInputChars: TEXT_REPLAY_TOOL_INPUT_CHARS,

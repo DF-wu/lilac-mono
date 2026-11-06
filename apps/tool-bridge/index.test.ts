@@ -3,13 +3,10 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-test("standalone bridge passes lazy configuration to content.inspect", async () => {
+test("standalone bridge supplies current configuration through its runtime callback", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "tool-bridge-config-"));
   const configPath = path.join(directory, "core-config.yaml");
-  await writeFile(
-    configPath,
-    "configVersion: 2\ntools:\n  inspect:\n    model: google/gemini-2.5-flash\n",
-  );
+  await writeFile(configPath, "configVersion: 3\nworkflows:\n  maxActiveRuns: 2\n");
   const child = Bun.spawn(
     [
       process.execPath,
@@ -19,35 +16,29 @@ test("standalone bridge passes lazy configuration to content.inspect", async () 
 import { expect, mock } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import * as core from "@stanley2058/lilac-core";
-import { getCoreConfig, providers } from "@stanley2058/lilac-utils";
+import { getCoreConfig } from "@stanley2058/lilac-utils";
 
-const selectedModels = [];
-Object.assign(providers, {
-  vercel: (model) => {
-    selectedModels.push(model);
-    throw new Error("stop before network request");
-  },
-});
-
+const createPluginManager = core.createCoreToolPluginManager;
+let loadConfig;
 mock.module("@stanley2058/lilac-core", () => ({
   ...core,
+  createCoreToolPluginManager: (params) => {
+    loadConfig = params.runtime.getConfig;
+    expect(loadConfig).toBeFunction();
+    return createPluginManager(params);
+  },
   createToolServer: ({ pluginManager }) => ({
     async init() {
       expect((await pluginManager.init()).isOk()).toBe(true);
     },
     async start() {
-      const tool = pluginManager.getLevel2Tools().find((tool) => tool.id === "content.inspect");
-      expect(tool).toBeDefined();
-      await tool.call("content.inspect", { text: "inspect me" });
-      expect(selectedModels).toEqual(["google/gemini-2.5-flash"]);
-
+      expect((await loadConfig()).workflows.maxActiveRuns).toBe(2);
       await writeFile(
         ${JSON.stringify(configPath)},
-        "configVersion: 2\\ntools:\\n  inspect:\\n    model: google/gemini-2.5-pro\\n",
+        "configVersion: 3\\nworkflows:\\n  maxActiveRuns: 3\\n",
       );
       await getCoreConfig({ forceReload: true });
-      await tool.call("content.inspect", { text: "inspect updated configuration" });
-      expect(selectedModels).toEqual(["google/gemini-2.5-flash", "google/gemini-2.5-pro"]);
+      expect((await loadConfig()).workflows.maxActiveRuns).toBe(3);
       expect((await pluginManager.destroy()).isOk()).toBe(true);
       console.log("bridge configuration regression passed");
     },

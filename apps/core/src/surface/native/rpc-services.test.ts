@@ -37,6 +37,18 @@ function fixture(
   const store = new NativeStore(db);
   store.initialize().unwrap();
   store
+    .initializeDeployment({
+      transport: "auto",
+      titleModel: "fast",
+      outputStreaming: "paragraph",
+      dmContextGapMs: 7_200_000,
+      dmTimestampGapMs: 1_800_000,
+      oldMessageSelectionMaxAgeMs: null,
+      storageRetentionMaxAgeMs: null,
+      crossThreadSend: { triggerRun: false },
+    })
+    .unwrap();
+  store
     .upsertUser({
       id: "owner",
       providerId: "owner_provider",
@@ -832,4 +844,46 @@ test("catalog changes refresh settled counts without sending settled records", a
   ).toEqual(["dm"]);
   controller.abort();
   await stream.return();
+});
+
+test("thread titles and archive state remain editable after the selected model is removed", async () => {
+  using state = fixture();
+  state.store
+    .updateThread("owner", {
+      threadId: state.thread.id,
+      commandId: "select",
+      modelId: "configured",
+    })
+    .unwrap();
+  state.removeModel();
+  const changed = (
+    await state.services.threads.update(principal, {
+      threadId: state.thread.id,
+      expectedRevision: state.store.getThreadRecord(state.thread.id).unwrap().revision,
+      title: "Renamed",
+      archived: true,
+    })
+  ).unwrap();
+  expect(changed.title).toBe("Renamed");
+  expect(changed.archived).toBe(true);
+});
+
+test("title regeneration rejects stale revisions and other thread changes", async () => {
+  using state = fixture();
+  const update = (input: { expectedRevision: number; archived?: boolean }) =>
+    state.services.threads.update(principal, {
+      threadId: state.thread.id,
+      regenerateTitle: true,
+      ...input,
+    });
+  const revision = state.store.getThreadRecord(state.thread.id).unwrap().revision;
+  const message = async (input: { expectedRevision: number; archived?: boolean }) =>
+    (await update(input)).match({ ok: () => "ok", err: (error) => error.message });
+  expect(await message({ expectedRevision: revision, archived: true })).toBe(
+    "Regenerate the title without other thread changes",
+  );
+  expect(await message({ expectedRevision: revision + 1 })).toBe(
+    "Thread changed before this update",
+  );
+  expect(state.store.getThreadRecord(state.thread.id).unwrap().archived).toBe(false);
 });

@@ -182,20 +182,28 @@ describe("core config versioning", () => {
     });
     expect(parsed.tools.fsBackend).toBe("node-rg");
     expect(parsed.tools.web.fetch.mode).toBe("auto");
-    expect(parsed.tools.inspect.model).toBe("google/gemini-3-flash");
+    expect(parsed.tools).not.toHaveProperty("inspect");
     expect(parsed.tools.editFile.hashline).toBe(false);
-    expect(parsed.agent.subagents.profiles.explore.level1.tools).toEqual([
+    expect(parsed.agent.subagents.permissions.restricted.level1.tools).toEqual([
       "read",
       "glob",
       "grep",
       "fuzzy_search",
       "batch",
     ]);
-    expect(parsed.agent.subagents.profiles.explore.execution).toBe(false);
-    expect(parsed.agent.subagents.profiles.general.execution).toBe("native");
-    expect(parsed.agent.subagents.profiles.self.execution).toBe("native");
+    expect(parsed.agent.subagents.permissions.restricted.execution).toBe(false);
+    expect(parsed.agent.subagents.permissions.full.execution).toBe("native");
     expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);
     expect(parsed.workflows.maxActiveRuns).toBe(64);
+  });
+
+  it("parses explicit v3 configs with v2 defaults outside subagents", async () => {
+    const parsed = await parseCoreConfig({ configVersion: 3 });
+
+    expect(parsed.configVersion).toBe(3);
+    expect(parsed.tools.fsBackend).toBe("fff");
+    expect(parsed.agent.retry.enabled).toBe(true);
+    expect(Object.keys(parsed.agent.subagents.permissions).sort()).toEqual(["full", "restricted"]);
   });
 
   it("parses explicit v2 configs with v2 defaults", async () => {
@@ -203,7 +211,7 @@ describe("core config versioning", () => {
 
     expect(parsed.configVersion).toBe(2);
     expect(parsed.tools.fsBackend).toBe("fff");
-    expect(parsed.agent.subagents.profiles.explore.level1.tools).toEqual([
+    expect(parsed.agent.subagents.permissions.restricted.level1.tools).toEqual([
       "bash",
       "read",
       "glob",
@@ -211,10 +219,9 @@ describe("core config versioning", () => {
       "fuzzy_search",
       "batch",
     ]);
-    expect(parsed.agent.subagents.profiles.explore.execution).toBe("restricted");
-    expect(parsed.agent.subagents.profiles.general.execution).toBe("native");
-    expect(parsed.agent.subagents.profiles.self.execution).toBe("native");
-    expect(parsed.tools.inspect.model).toBe("google/gemini-3.5-flash");
+    expect(parsed.agent.subagents.permissions.restricted.execution).toBe("native");
+    expect(parsed.agent.subagents.permissions.full.execution).toBe("native");
+    expect(parsed.tools).not.toHaveProperty("inspect");
     expect(parsed.tools.editFile.hashline).toBe(true);
     expect(parsed.surface.discord.outputMode).toBe("preview");
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("plain");
@@ -400,7 +407,6 @@ describe("core config versioning", () => {
     expect(parsed.models.def["gpt-5.5"]?.reasoning).toBe("high");
     expect(parsed.models.main.reasoning).toBe("medium");
     expect(parsed.models.fast.reasoning).toBe("none");
-    expect(parsed.agent.subagents.profiles.explore.reasoning).toBe("minimal");
   });
 
   it("parses flat v2 fallback chains without normalizing order or duplicates", () => {
@@ -445,7 +451,6 @@ describe("core config versioning", () => {
     expect(parsed.models.def.primary?.fallback).toEqual(repeatedFallback);
     expect(parsed.models.main.fallback).toEqual(repeatedFallback);
     expect(parsed.models.fast.fallback).toEqual(repeatedFallback);
-    expect(parsed.agent.subagents.profiles.explore.fallback).toEqual(repeatedFallback);
   });
 
   it("keeps fallback out of the frozen v1 input shape", () => {
@@ -655,7 +660,7 @@ describe("core config versioning", () => {
     });
 
     expect(parsed.tools.fsBackend).toBe("node-rg");
-    expect(parsed.tools.inspect.model).toBe("google/gemini-3-pro");
+    expect(parsed.tools).not.toHaveProperty("inspect");
     expect(parsed.tools.editFile.hashline).toBe(false);
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("embed");
     expect(parsed.surface.discord.outputPreviewModeFinalText).toBe("reply-chain");
@@ -669,15 +674,9 @@ describe("core config versioning", () => {
     expect(parsed.agent.subagents).toMatchObject({
       enabled: true,
       maxDepth: 2,
-      profiles: {
-        explore: { modelSlot: "main", execution: "restricted", workspaceWrites: false },
-        general: { modelSlot: "main", execution: "native", workspaceWrites: true },
-        self: {
-          modelSlot: "main",
-          execution: "native",
-          workspaceWrites: true,
-          delegation: true,
-        },
+      permissions: {
+        restricted: { execution: "native", workspaceWrites: false, delegation: false },
+        full: { execution: "native", workspaceWrites: true, delegation: true },
       },
     });
     expect("idleTimeoutMs" in parsed.agent.subagents).toBe(false);
@@ -716,7 +715,7 @@ describe("core config versioning", () => {
     });
 
     expect(parsed.tools.fsBackend).toBe("fff");
-    expect(parsed.tools.inspect.model).toBe("google/gemini-3-flash");
+    expect(parsed.tools).not.toHaveProperty("inspect");
     expect(parsed.tools.editFile.hashline).toBe(true);
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("plain");
     expect(parsed.surface.discord.outputPreviewModeFinalText).toBe("reply-chain");
@@ -739,11 +738,31 @@ describe("core config versioning", () => {
   });
 
   it("rejects unsupported config versions", async () => {
-    expect(() => readCoreConfigVersion({ configVersion: 3 })).toThrow(
-      "Unsupported core config version: 3",
+    expect(() => readCoreConfigVersion({ configVersion: 4 })).toThrow(
+      "Unsupported core config version: 4",
     );
-    await expect(parseCoreConfig({ configVersion: 3 })).rejects.toThrow(
-      "Unsupported core config version: 3",
+    await expect(parseCoreConfig({ configVersion: 4 })).rejects.toThrow(
+      "Unsupported core config version: 4",
     );
   });
+});
+
+it("v3 accepts max effort in model defaults, aliases and fallback chains while v2 stays frozen", () => {
+  const models = {
+    main: {
+      model: "opus",
+      reasoning: "max",
+      fallback: [{ model: "anthropic/claude-opus", reasoning: "max" }],
+    },
+    fast: { model: "opus", reasoning: "max" },
+    def: {
+      opus: {
+        model: "claude-code/opus",
+        reasoning: "max",
+        fallback: [{ model: "anthropic/claude-opus", reasoning: "max" }],
+      },
+    },
+  };
+  expect(parseCoreConfigResult({ configVersion: 3, models }).isOk()).toBe(true);
+  expect(parseCoreConfigResult({ configVersion: 2, models }).isErr()).toBe(true);
 });

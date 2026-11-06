@@ -1,3 +1,4 @@
+import { modelReasoningSchema, modelCatalogPageSchema } from "./domain";
 import { nativeQuestionSchema } from "./questions.ts";
 import { conversationReferenceSchema } from "./references.ts";
 import type { InferContractRouterInputs, InferContractRouterOutputs } from "@orpc/contract";
@@ -17,6 +18,7 @@ import {
 } from "./replay.ts";
 import {
   nativeDeploymentSettingsSchema,
+  nativeTransportSchema,
   nativeDeploymentDocumentSchema,
   subagentSummarySchema,
   catalogReplySchema,
@@ -97,6 +99,7 @@ export const bootstrapInputSchema = z.strictObject({
 });
 export const bootstrapReplySchema = z.strictObject({
   installationId: identitySchema,
+  transport: nativeTransportSchema.optional(),
   viewer: nativeUserSchema,
   threads: threadListSchema,
   catalog: catalogReplySchema,
@@ -216,7 +219,7 @@ export const nativeContract = {
         desktop: z
           .strictObject({
             generation: z.string().min(1).max(128),
-            url: z.url().max(8192),
+            url: z.union([z.url().max(8192), z.string().startsWith("/computer.html?").max(8192)]),
             password: z.string().min(1).max(256),
             expiresAt: z.string().max(64),
           })
@@ -298,6 +301,7 @@ export const nativeContract = {
           title: z.string().max(512),
           autoTitle: z.boolean().optional(),
           modelId: catalogIdentifierSchema.optional(),
+          reasoning: modelReasoningSchema.optional(),
         }),
       )
       .output(nativeThreadSchema),
@@ -307,7 +311,9 @@ export const nativeContract = {
           expectedRevision: revisionSchema,
           title: z.string().max(512).optional(),
           archived: z.boolean().optional(),
+          regenerateTitle: z.literal(true).optional(),
           modelId: catalogIdentifierSchema.optional(),
+          reasoning: modelReasoningSchema.optional(),
         }),
       )
       .output(nativeThreadSchema),
@@ -416,6 +422,22 @@ export const nativeContract = {
       .output(successSchema),
   },
   catalogs: {
+    models: procedure
+      .input(
+        z.strictObject({
+          provider: z.string().optional(),
+          search: z.string().max(256).optional(),
+          cursor: z.string().optional(),
+          ids: z.array(catalogIdentifierSchema).max(100).optional(),
+        }),
+      )
+      .output(modelCatalogPageSchema),
+    favorites: procedure
+      .input(z.strictObject({}))
+      .output(z.array(catalogIdentifierSchema).max(100)),
+    favorite: procedure
+      .input(z.strictObject({ modelId: catalogIdentifierSchema, favorite: z.boolean() }))
+      .output(z.array(catalogIdentifierSchema).max(100)),
     get: procedure
       .input(z.strictObject({ revision: identitySchema.optional() }))
       .output(catalogReplySchema),

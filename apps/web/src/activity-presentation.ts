@@ -42,6 +42,7 @@ const toolArgsSchema = z.object({
   query: z.string().optional(),
   cwd: z.string().optional(),
   profile: z.string().optional(),
+  permissions: z.string().optional(),
   task: z.string().optional(),
 });
 type ToolArgs = z.infer<typeof toolArgsSchema>;
@@ -91,7 +92,10 @@ export function activityRowKind(part: ActivityPart): ActivityRowKind {
   if (part.data.kind !== "tool") return part.data.kind;
   const { name } = parseToolLabel(part.data.label);
   const known = toolKinds[name];
-  if (known === "command" && toolsCall(part)?.callable.startsWith("web.")) return "web";
+  if (known === "command") {
+    const callable = toolsCall(part)?.callable;
+    if (callable === "fetch" || callable === "search" || callable?.startsWith("web.")) return "web";
+  }
   if (known) return known;
   return /(^|[._])(web|fetch|browse|url)([._]|$)/i.test(name) ? "web" : "tool";
 }
@@ -109,12 +113,14 @@ function toolCallArgs(part: ActivityPart): { name: string; args: ToolArgs | unde
 }
 
 export function subagentLabelProfile(part: ActivityPart): string | undefined {
-  const legacy = /^subagent(?:_delegate)? \((explore|general|self)(?:;|\))/.exec(
+  const labeled = /^subagent(?:_delegate)? \(([a-z][a-z0-9_-]*)(?:[;,]|\))/.exec(
     part.data.label,
   )?.[1];
-  if (legacy) return legacy;
+  if (labeled) return labeled;
   const { name, args } = toolCallArgs(part);
-  return name === "subagent_delegate" ? args?.profile : undefined;
+  if (name !== "subagent_delegate") return undefined;
+  // Calls recorded before permission profiles name the role in `profile`.
+  return args?.permissions ?? args?.profile;
 }
 
 /** Thinking only has something to show once its reasoning text arrives. */

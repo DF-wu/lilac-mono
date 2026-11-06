@@ -19,7 +19,7 @@ import { normalizeModelMessagesToolCallIds } from "../../tool-call-id-normalizat
 import { executeAiSdkModelCall } from "./model-call";
 import type { AiSdkPiAgentOptions, ModelCallRuntime, PrepareModelCall } from "./support";
 
-export class AiSdkAgentAdapter<TOOLS extends ToolSet = ToolSet> implements AgentAdapter<
+export class ModelCallAgentAdapter<TOOLS extends ToolSet = ToolSet> implements AgentAdapter<
   AgentExecutionHost<TOOLS>
 > {
   private model: LanguageModel;
@@ -28,7 +28,10 @@ export class AiSdkAgentAdapter<TOOLS extends ToolSet = ToolSet> implements Agent
   private download: DownloadFunction | undefined;
   private readonly sendTools: boolean;
   private readonly maxRetries: number | undefined;
-  constructor(options: AiSdkPiAgentOptions<TOOLS>) {
+  constructor(
+    options: AiSdkPiAgentOptions<TOOLS>,
+    private readonly executeModelCall: typeof executeAiSdkModelCall = executeAiSdkModelCall,
+  ) {
     this.model = options.model;
     this.modelSpecifier = options.modelSpecifier;
     this.prepareModelCall = options.prepareModelCall;
@@ -191,7 +194,7 @@ export class AiSdkAgentAdapter<TOOLS extends ToolSet = ToolSet> implements Agent
           const state = host.readState();
           host.recordModelView(messages, prepared.step);
           phase = "model-call";
-          const turn = await executeAiSdkModelCall({
+          const turn = await this.executeModelCall({
             model: runtime.model,
             system: prepared.system,
             messages,
@@ -266,3 +269,7 @@ export class AiSdkAgentAdapter<TOOLS extends ToolSet = ToolSet> implements Agent
     }
   }
 }
+
+export class AiSdkAgentAdapter<
+  TOOLS extends ToolSet = ToolSet,
+> extends ModelCallAgentAdapter<TOOLS> {}

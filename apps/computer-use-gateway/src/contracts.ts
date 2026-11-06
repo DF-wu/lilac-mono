@@ -166,3 +166,8 @@ export function decodeSessionHeader(value: string | null) {
   const parsed = sessionSchema.safeParse(value);
   return parsed.success ? parsed.data : null;
 }
+
+export function decodeViewerGeneration(value: string | null) {
+  const parsed = z.uuid().safeParse(value);
+  return parsed.success ? parsed.data : null;
+}

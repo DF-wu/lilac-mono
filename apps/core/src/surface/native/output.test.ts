@@ -76,7 +76,7 @@ describe("native semantic output", () => {
       label: "Search",
     });
     await publisher.captureBarrier();
-    expect(events.map((event) => event.payload.type)).toEqual(["activity"]);
+    expect(events.map((event) => event.payload.type)).toEqual(["text", "activity"]);
     publisher.textStart({ partId: "final", stepId: "step", phase: "final_answer" });
     publisher.textDelta("final", "Answer");
     publisher.textEnd("final");
@@ -129,6 +129,23 @@ describe("native semantic output", () => {
     expect(new Set(events.map((event) => event.eventId)).size).toBe(events.length);
     expect(events[0]?.attemptId).toBe("attempt-1");
     expect(events[1]?.attemptId).toBe("attempt-2");
+  });
+
+  test("publishes complete intermediate text at tool start before the enclosing turn ends", async () => {
+    const { events, publisher } = fixture("complete");
+    publisher.textStart({ partId: "intro", stepId: "step" });
+    publisher.textDelta("intro", "I will inspect the files.");
+    publisher.textEnd("intro");
+    await publisher.captureBarrier();
+    expect(events).toEqual([]);
+    publisher.activity({ activityId: "read", stepId: "step", kind: "tool", state: "start" });
+    await publisher.captureBarrier();
+    expect(events.map((event) => event.payload.type)).toEqual(["text", "activity"]);
+    expect(texts(events).map((part) => part.text)).toEqual(["I will inspect the files."]);
+    publisher.textStart({ partId: "answer", stepId: "step" });
+    publisher.textDelta("answer", "Done.");
+    await publisher.terminal("complete");
+    expect(texts(events).map((part) => part.text)).toEqual(["I will inspect the files.", "Done."]);
   });
 
   test("activity and compaction states keep stable position without reasoning content", async () => {

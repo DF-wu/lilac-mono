@@ -149,17 +149,17 @@ makes that visible to the conversation model. Tavily, Exa, and Firecrawl fill
 
 ## Configuration
 
-The fork-owned `packages/utils/core-config/openai-web-search.ts` defines the v2
+The fork-owned `packages/utils/core-config/openai-web-search.ts` defines the v2/v3
 provider extension and tuning schema. The runtime parser and generated editor
-schema accept the same provider enum, including the legacy singular
-`extract.provider` and `search.provider` aliases. V1 retains its original enum
-without `openai`; existing v2 defaults and configuration need no migration.
+schema accept the same provider enum. V2 also accepts the legacy singular
+`extract.provider` and `search.provider` aliases; v3 requires `extract.providers`. V1 retains its
+original enum without `openai`; existing v2 defaults and configuration need no migration.
 
-Requires `configVersion: 2`. Frozen v1 configurations cannot select this
+Requires `configVersion: 2` or `3`. Frozen v1 configurations cannot select this
 provider.
 
 ```yaml
-configVersion: 2
+configVersion: 3
 
 tools:
   web:

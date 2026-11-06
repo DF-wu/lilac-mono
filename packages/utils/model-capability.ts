@@ -1,6 +1,14 @@
 import type { LanguageModelUsage } from "ai";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
-import { z } from "zod";
+import {
+  decodeModelsDevRegistry,
+  type ModelsDevRegistry,
+  type ModelsDevProvider,
+  type ModelsDevModel,
+} from "./model-catalog-schema";
+import { modelCatalogCache } from "./model-catalog-cache";
+import { claudeAliasTarget } from "./model-catalog-family";
+export { decodeModelsDevRegistry } from "./model-catalog-schema";
 
 import { capturePromiseResult, captureResultOutcome, isPanic } from "./runtime-utils";
 
@@ -60,7 +68,9 @@ export type ModelCapabilityOverride = {
   /** Optional base model capability to inherit from (provider/model). */
   inherit?: ModelSpecifier;
   /** Optional partial cost patch merged onto inherited/base cost. */
-  cost?: Partial<ModelCost>;
+  cost?: Omit<Partial<ModelCost>, "context_over_200k"> & {
+    context_over_200k?: Partial<NonNullable<ModelCost["context_over_200k"]>>;
+  };
   /** Optional partial limit patch merged onto inherited/base limits. */
   limit?: {
     context?: number;
@@ -96,62 +106,6 @@ const DEFAULT_PROVIDER_ALIASES = {
   // Claude Agent SDK models use Anthropic's model catalog and limits.
   "claude-code": "anthropic",
 } as const satisfies Record<string, string>;
-
-const modelModalitySchema = z.enum(["text", "image", "audio", "video", "pdf"]);
-const modelCostSchema = z.object({
-  input: z.number(),
-  output: z.number(),
-  cache_read: z.number().optional(),
-  cache_write: z.number().optional(),
-  input_audio: z.number().optional(),
-  output_audio: z.number().optional(),
-  context_over_200k: z
-    .object({
-      input: z.number(),
-      output: z.number(),
-      cache_read: z.number().optional(),
-      cache_write: z.number().optional(),
-    })
-    .optional(),
-});
-const modelLimitsSchema = z.object({ context: z.number(), output: z.number() });
-const modelsDevModelSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  family: z.string().optional(),
-  attachment: z.boolean().optional(),
-  reasoning: z.boolean().optional(),
-  tool_call: z.boolean().optional(),
-  temperature: z.boolean().optional(),
-  knowledge: z.string().optional(),
-  release_date: z.string().optional(),
-  last_updated: z.string().optional(),
-  modalities: z.object({
-    input: z.array(modelModalitySchema),
-    output: z.array(modelModalitySchema),
-  }),
-  open_weights: z.boolean().optional(),
-  cost: modelCostSchema.optional(),
-  limit: modelLimitsSchema,
-});
-const modelsDevProviderSchema = z.object({
-  id: z.string(),
-  env: z.array(z.string()).optional(),
-  npm: z.string(),
-  name: z.string(),
-  doc: z.string().optional(),
-  models: z.record(z.string(), modelsDevModelSchema),
-});
-const modelsDevRegistrySchema = z.record(z.string(), modelsDevProviderSchema);
-
-type ModelsDevRegistry = z.output<typeof modelsDevRegistrySchema>;
-type ModelsDevProvider = z.output<typeof modelsDevProviderSchema>;
-type ModelsDevModel = z.output<typeof modelsDevModelSchema>;
-
-export function decodeModelsDevRegistry(value: unknown): ModelsDevRegistry | undefined {
-  const parsed = modelsDevRegistrySchema.safeParse(value);
-  return parsed.success ? parsed.data : undefined;
-}
 
 type RegistryLookupResult = {
   providerEntry: ModelsDevProvider;
@@ -380,6 +334,9 @@ export class ModelCapability {
   private async loadRegistryResult(
     signal?: AbortSignal,
   ): Promise<ResultType<ModelsDevRegistry, ModelCapabilityResolutionFailed>> {
+    if (this.fetchFn === fetch && this.apiUrl === "https://models.dev/api.json") {
+      return Result.ok(await modelCatalogCache.read());
+    }
     if (!this.registryPromise) {
       this.registryPromise = (async () => {
         const fetched = await capturePromiseResult(() => this.fetchFn(this.apiUrl, { signal }));
@@ -465,7 +422,7 @@ export class ModelCapability {
   private mergeCostPatchResult(params: {
     spec: string;
     baseCost: ModelCost | undefined;
-    patch: Partial<ModelCost> | undefined;
+    patch: ModelCapabilityOverride["cost"];
   }): ResultType<ModelCost | undefined, ModelCapabilityResolutionFailed> {
     if (!params.patch) {
       return Result.ok(this.cloneCost(params.baseCost));
@@ -477,27 +434,23 @@ export class ModelCapability {
       return Result.err(
         new ModelCapabilityResolutionFailed({
           spec: params.spec,
-          message: `Invalid capability override '${params.spec}': cost patch requires cost.input and cost.output (directly or via inherit).`,
+          message: `Invalid capability override '${params.spec}': cost patch requires cost.input and cost.output (directly, from upstream, or via inherit).`,
         }),
       );
     }
 
-    let contextOver200k: ModelCost["context_over_200k"];
-    if (params.patch.context_over_200k !== undefined) {
-      contextOver200k = {
-        input: params.patch.context_over_200k.input,
-        output: params.patch.context_over_200k.output,
-        cache_read: params.patch.context_over_200k.cache_read,
-        cache_write: params.patch.context_over_200k.cache_write,
-      };
-    } else if (params.baseCost?.context_over_200k) {
-      contextOver200k = {
-        input: params.baseCost.context_over_200k.input,
-        output: params.baseCost.context_over_200k.output,
-        cache_read: params.baseCost.context_over_200k.cache_read,
-        cache_write: params.baseCost.context_over_200k.cache_write,
-      };
-    }
+    const mergedTier = this.mergeContextOver200kCostPatchResult({
+      spec: params.spec,
+      base: params.baseCost?.context_over_200k,
+      patch: params.patch.context_over_200k,
+    });
+    const contextOver200k = mergedTier.match<
+      ModelCost["context_over_200k"] | ModelCapabilityResolutionFailed
+    >({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (ModelCapabilityResolutionFailed.is(contextOver200k)) return Result.err(contextOver200k);
 
     return Result.ok({
       input: mergedInput,
@@ -507,6 +460,31 @@ export class ModelCapability {
       input_audio: params.patch.input_audio ?? params.baseCost?.input_audio,
       output_audio: params.patch.output_audio ?? params.baseCost?.output_audio,
       context_over_200k: contextOver200k,
+    });
+  }
+
+  private mergeContextOver200kCostPatchResult(params: {
+    spec: string;
+    base: ModelCost["context_over_200k"];
+    patch: Partial<NonNullable<ModelCost["context_over_200k"]>> | undefined;
+  }): ResultType<ModelCost["context_over_200k"], ModelCapabilityResolutionFailed> {
+    if (!params.patch) return Result.ok(params.base ? { ...params.base } : undefined);
+
+    const input = params.patch.input ?? params.base?.input;
+    const output = params.patch.output ?? params.base?.output;
+    if (input === undefined || output === undefined) {
+      return Result.err(
+        new ModelCapabilityResolutionFailed({
+          spec: params.spec,
+          message: `Invalid capability override '${params.spec}': context_over_200k patch requires input and output (directly, from upstream, or via inherit).`,
+        }),
+      );
+    }
+    return Result.ok({
+      input,
+      output,
+      cache_read: params.patch.cache_read ?? params.base?.cache_read,
+      cache_write: params.patch.cache_write ?? params.base?.cache_write,
     });
   }
 
@@ -573,7 +551,10 @@ export class ModelCapability {
     const lookedUp = this.lookupWithFallback({
       registry,
       provider,
-      model: parsedSpec.model,
+      model:
+        parsedSpec.provider === "claude-code"
+          ? (claudeAliasTarget(registry, parsedSpec.model) ?? parsedSpec.model)
+          : parsedSpec.model,
     });
 
     if (!lookedUp) {
@@ -646,6 +627,13 @@ export class ModelCapability {
     }
 
     let base: ModelCapabilityInfo | null = null;
+    if (!override.inherit) {
+      const upstream = await this.resolveFromRegistryResult(spec, { signal: options.signal });
+      base = upstream.match({
+        ok: (value) => value,
+        err: () => null,
+      });
+    }
     if (override.inherit) {
       const inherited = await this.resolveWithOverridesResult(override.inherit, {
         signal: options.signal,
@@ -669,7 +657,7 @@ export class ModelCapability {
       return Result.err(
         new ModelCapabilityResolutionFailed({
           spec,
-          message: `Invalid capability override '${spec}': limit.context is required (directly or via inherit).`,
+          message: `Invalid capability override '${spec}': limit.context is required (directly, from upstream, or via inherit).`,
         }),
       );
     }

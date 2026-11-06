@@ -7,6 +7,8 @@ import type { McpRegistryApi } from "../../mcp/registry-types";
 import { bindMcpToolToSession } from "../../mcp/session-context";
 import { nativeFailure } from "./errors";
 import type { NativeStore } from "./store";
+import { connectBinaryWebSocket } from "@stanley2058/lilac-utils/binary-relay";
+import { hashMcpSession, LILAC_SESSION_HEADER } from "../../mcp/session-context";
 
 const viewerSchema = z.object({
   isError: z.literal(false).optional(),
@@ -24,6 +26,13 @@ const viewerSchema = z.object({
     }),
   ]),
 });
+
+export function decodeNativeViewerRequest(url: URL) {
+  const parsed = z
+    .object({ threadId: z.string().min(1).max(128), generation: z.uuid() })
+    .safeParse(Object.fromEntries(url.searchParams));
+  return parsed.success ? parsed.data : null;
+}
 
 export function decodeComputerViewer(
   value: unknown,
@@ -55,7 +64,10 @@ export function decodeComputerViewer(
 export class NativeComputer {
   constructor(
     private readonly store: Pick<NativeStore, "authorizeThread">,
-    private readonly registry: Pick<McpRegistryApi, "getCatalogServers" | "getTools">,
+    private readonly registry: Pick<
+      McpRegistryApi,
+      "getCatalogServers" | "getTools" | "getHttpConnection"
+    >,
   ) {}
 
   read(actorId: string, input: { threadId: string }, signal?: AbortSignal) {
@@ -94,7 +106,52 @@ export class NativeComputer {
         rethrowPanic(output.error.cause);
         return Result.err(new Error("Computer viewer is unavailable"));
       }
-      return decodeComputerViewer(output.value);
+      return decodeComputerViewer(output.value).map(({ desktop }) => {
+        if (!desktop) return { desktop: null };
+        const query = new URLSearchParams({
+          threadId: input.threadId,
+          generation: desktop.generation,
+        });
+        return { desktop: { ...desktop, url: `/computer.html?${query}` } };
+      });
+    }, this);
+  }
+
+  connect(
+    actorId: string,
+    threadId: string,
+    generation: string,
+    signal: AbortSignal,
+    authenticated: () => boolean,
+  ) {
+    return Result.gen(async function* (this: NativeComputer) {
+      yield* this.store.authorizeThread(actorId, threadId, true);
+      const server = this.registry
+        .getCatalogServers()
+        .find((item) => item.serverInfo.name === "lilac-computer-use");
+      if (!server || !this.registry.getHttpConnection)
+        return Result.err(nativeFailure("not-found", "Computer gateway unavailable"));
+      const connection = yield* Result.await(this.registry.getHttpConnection(server.serverId));
+      if (!connection)
+        return Result.err(nativeFailure("not-found", "Computer gateway unavailable"));
+      const url = new URL("/viewer/socket", connection.url);
+      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      url.searchParams.set("generation", generation);
+      const headers = new Headers(connection.headers);
+      headers.set(LILAC_SESSION_HEADER, hashMcpSession(`native:${threadId}`));
+      const relay = yield* Result.await(
+        connectBinaryWebSocket(
+          url.href,
+          Object.fromEntries(headers),
+          signal,
+          () =>
+            authenticated() &&
+            this.store
+              .authorizeThread(actorId, threadId, true)
+              .match({ ok: () => true, err: () => false }),
+        ),
+      );
+      return Result.ok(relay);
     }, this);
   }
 }

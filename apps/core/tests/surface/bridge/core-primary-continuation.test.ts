@@ -1,3 +1,4 @@
+import { openAIRequestCodec } from "@stanley2058/lilac-agent/adapters/openai-responses/input";
 import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -609,10 +610,8 @@ describe("Core primary Claude continuation", () => {
       targetFamily: "claude-code",
       modelSpecifier: "claude-code/sonnet",
     });
-    expect(
-      prepared.slice(0, historical.length).every((message) => typeof message.content === "string"),
-    ).toBe(true);
-    expect(prepared.slice(historical.length)).toEqual([...firstCurrent, ...secondCurrent]);
+    expect(prepared.slice(0, 1).every((message) => typeof message.content === "string")).toBe(true);
+    expect(prepared.slice(1)).toEqual([...firstCurrent, ...secondCurrent]);
 
     const historicalSuffix = prepareCorePrimaryHistoryView({
       canonicalMessages: historical.slice(1),
@@ -877,6 +876,24 @@ describe("Core primary Claude continuation", () => {
       },
       syntheticSegment("second", secondCurrent),
     ]);
+    const returnedFromApi: CorePrimaryLineageV2 = {
+      ...secondManifest,
+      segments: secondManifest.segments.map((segment) => ({
+        ...segment,
+        atoms: segment.atoms.map((atom) =>
+          atom.kind === "request" ? { ...atom, providerFamily: "ai-sdk" as const } : atom,
+        ),
+      })),
+    };
+    expect(
+      selectCorePrimaryClaudePrefix({
+        lineage: returnedFromApi,
+        canonicalMessages: [...firstInput, ...outputMessages, ...secondCurrent],
+        binding: clean,
+        executionScopeHash: "scope",
+        executionCwd: "/workspace",
+      }),
+    ).toEqual({ mode: "fresh", reason: "fresh-only" });
     const secondInput = [...firstInput, ...outputMessages, ...secondCurrent];
     const secondRuntime = createCorePrimaryClaudeRuntime({
       store,
@@ -1069,5 +1086,133 @@ describe("Core primary Claude continuation", () => {
     expect(diagnostics.some((entry) => entry.event === "canonical-publication-failed")).toBe(false);
     await runtime.retireAtRunEnd();
     store.close();
+  });
+});
+
+describe("primary handoffs without Discord lineage", () => {
+  it.each(["claude-code", "ai-sdk"] as const)(
+    "hands off text-only history from %s",
+    (lastFamily) => {
+      const messages: ModelMessage[] = [
+        { role: "user", content: "Remember the task" },
+        { role: "assistant", content: "We are fixing the provider" },
+        { role: "user", content: "Continue" },
+      ];
+      const input = {
+        canonicalMessages: messages,
+        lineage: undefined,
+        replayHistoricalPrefix: false,
+        sourceProviderState: { lastFamily, containsCrossFamilyTurns: false },
+        modelSpecifier: "test/model",
+      };
+      const targetFamily = lastFamily === "claude-code" ? "ai-sdk" : "claude-code";
+      const projected = prepareCorePrimaryHistoryView({ ...input, targetFamily });
+      expect(projected[0]?.content).toContain("[Conversation handoff]");
+      expect(projected.slice(1)).toEqual(messages.slice(-1));
+      expect(prepareCorePrimaryHistoryView({ ...input, targetFamily: lastFamily })).toEqual(
+        messages,
+      );
+    },
+  );
+
+  it.each([false, true])(
+    "makes retained Claude tool history portable after compaction=%s",
+    async (compacted) => {
+      const foreign: ModelMessage[] = [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "computer",
+              toolName: "mcp_computer_use_execute",
+              input: { code: "inspect screen" },
+              providerExecuted: true,
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "computer",
+              toolName: "mcp_computer_use_execute",
+              output: { type: "text", value: "screen capture ".repeat(1000) },
+            },
+          ],
+        },
+        { role: "assistant", content: "Inspected the screen." },
+      ];
+      const current: ModelMessage[] = [
+        { role: "user", content: "What context did you receive?" },
+        {
+          role: "assistant",
+          content: [{ type: "tool-call", toolCallId: "current", toolName: "read", input: {} }],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "current",
+              toolName: "read",
+              output: { type: "text", value: "current result" },
+            },
+          ],
+        },
+      ];
+      const messages: ModelMessage[] = [
+        {
+          role: "user",
+          content: compacted ? "Earlier conversation summary" : "Old computer task ".repeat(1000),
+        },
+        ...foreign,
+        ...current,
+      ];
+      const original = structuredClone(messages);
+      expect((await openAIRequestCodec.messages(messages)).status).toBe("error");
+      const projected = prepareCorePrimaryHistoryView({
+        canonicalMessages: messages,
+        lineage: undefined,
+        replayHistoricalPrefix: false,
+        targetFamily: "ai-sdk",
+        modelSpecifier: "codex/gpt-6-astra",
+      });
+      expect(projected[0]?.content).toContain("[Conversation handoff]");
+      expect(projected.slice(1)).toEqual(current);
+      expect((await openAIRequestCodec.messages(projected)).status).toBe("ok");
+      expect(messages).toEqual(original);
+    },
+  );
+
+  it("preserves same-family API tool history without a handoff", () => {
+    const messages: ModelMessage[] = [
+      {
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: "read", toolName: "read", input: {} }],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "read",
+            toolName: "read",
+            output: { type: "text", value: "read result" },
+          },
+        ],
+      },
+      { role: "user", content: "Continue" },
+    ];
+    expect(
+      prepareCorePrimaryHistoryView({
+        canonicalMessages: messages,
+        lineage: undefined,
+        replayHistoricalPrefix: false,
+        targetFamily: "ai-sdk",
+        modelSpecifier: "codex/gpt-6-astra",
+      }),
+    ).toEqual(messages);
   });
 });
