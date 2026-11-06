@@ -396,4 +396,110 @@ describe("workflow trigger scheduler", () => {
       rmSync(file, { force: true });
     }
   });
+
+  it("does not fire a scheduled workflow after its Telegram target is revoked", async () => {
+    const file = join(
+      tmpdir(),
+      `workflow-scheduler-revoked-telegram-${crypto.randomUUID()}.sqlite`,
+    );
+    const store = new DurableWorkflowStore(file);
+    const raw = new CapturingRawBus();
+    const bus = createLilacBus(raw);
+    const progressCards: WorkflowProgressCardService = {
+      resolveTarget: (platform) => (platform === "telegram" ? "telegram" : null),
+      ensureInitialCard: async () => {
+        throw new Error("must not create a card for a revoked target");
+      },
+      requestProjection: () => {},
+      isTargetAuthorized: async () => false,
+    };
+    try {
+      createRevision(store);
+      store.createTrigger({
+        ...trigger(),
+        origin: { ...trigger().origin, client: "telegram", sessionId: "-100123" },
+        progressTarget: {
+          platform: "telegram",
+          channelId: "-100123",
+          replyToMessageId: "7",
+        },
+      });
+      const scheduler = new WorkflowTriggerScheduler({
+        bus,
+        store,
+        progressCards,
+        now: () => 100,
+      });
+
+      await scheduler.tick();
+
+      expect(workflowStoreValue(store.getTrigger("trigger-1"))).toMatchObject({
+        state: "active",
+        nextFireAt: 100,
+        lastFireAt: null,
+        lastRunId: null,
+        claimedBy: null,
+      });
+      expect(workflowStoreValue(store.listRuns())).toHaveLength(0);
+      expect(raw.messages).toHaveLength(0);
+    } finally {
+      await bus.close();
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
+
+  it("rechecks Telegram target authorization after claiming and before firing", async () => {
+    const file = join(
+      tmpdir(),
+      `workflow-scheduler-telegram-fire-race-${crypto.randomUUID()}.sqlite`,
+    );
+    const store = new DurableWorkflowStore(file);
+    const raw = new CapturingRawBus();
+    const bus = createLilacBus(raw);
+    let authorizationChecks = 0;
+    const progressCards: WorkflowProgressCardService = {
+      resolveTarget: (platform) => (platform === "telegram" ? "telegram" : null),
+      ensureInitialCard: async () => {
+        throw new Error("must not create a card for a revoked target");
+      },
+      requestProjection: () => {},
+      isTargetAuthorized: async () => ++authorizationChecks === 1,
+    };
+    try {
+      createRevision(store);
+      store.createTrigger({
+        ...trigger(),
+        origin: { ...trigger().origin, client: "telegram", sessionId: "-100123" },
+        progressTarget: {
+          platform: "telegram",
+          channelId: "-100123",
+          replyToMessageId: "7",
+        },
+      });
+      const scheduler = new WorkflowTriggerScheduler({
+        bus,
+        store,
+        progressCards,
+        now: () => 100,
+      });
+
+      await scheduler.tick();
+
+      expect(authorizationChecks).toBe(2);
+      expect(workflowStoreValue(store.getTrigger("trigger-1"))).toMatchObject({
+        state: "active",
+        nextFireAt: 100,
+        lastRunId: null,
+        claimedBy: null,
+        claimedAt: null,
+      });
+      expect(workflowStoreValue(store.listRuns())).toHaveLength(0);
+      expect(raw.messages).toHaveLength(0);
+    } finally {
+      await bus.close();
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
 });

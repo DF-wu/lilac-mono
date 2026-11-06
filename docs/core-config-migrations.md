@@ -209,3 +209,45 @@ memory; consult schema hover for the complete current field reference.
 
 Version-specific defaults belong to their parser. Optional fields do not require a config rewrite;
 newer fields must be removed before using an older parser that rejects them.
+
+## Retained fork settings in v2 and v3
+
+`surface.telegram` and `tools.web.openai` remain available in both v2 and v3. V1 stays frozen:
+it cannot enable Telegram or select the OpenAI search provider. Keep existing v2 values when moving
+to v3; the permission-profile and retired-field conversions above still apply.
+
+```yaml
+configVersion: 3
+surface:
+  telegram:
+    enabled: true
+    token: replace-with-private-bot-token
+    allowedChatIds: ["-1001234567890"]
+    inboundMedia:
+      maxBytesPerAttachment: 5MiB
+      maxBytesPerRequest: 10MiB
+tools:
+  web:
+    extract:
+      providers: [tavily, openai]
+    openai:
+      model: openai/gpt-5-mini
+      searchContextSize: medium
+```
+
+Telegram is disabled by default; an empty chat allowlist denies all chats. `allowedUserIds` adds an
+optional sender restriction. `tokenEnv` remains rejected: copy its secret to the private `token`
+field. Inbound photo/document delivery defaults to enabled with the budgets above; disable
+`inboundMedia.enabled` for caption-only routing. See [Telegram setup](telegram-surface.md) for
+streaming, menus, restart boundaries, and the full field reference.
+
+The OpenAI provider is search-only. `web.extract` skips it, so retain an extraction-capable provider
+when page extraction is needed. `tools.web.openai.model` supports `openai/<model>` and
+`openai-compatible/<model>` with the corresponding environment credentials; legacy bare model IDs
+use OpenAI. See [hosted search](web-search-openai.md).
+
+`tools.generate` image routing remains removed. Delete leftover blocks; they log an unknown-key
+warning and have no effect. `generate.image` uses upstream's script interface. Set
+`OPENAI_COMPATIBLE_BASE_URL` (and `OPENAI_COMPATIBLE_API_KEY` when needed) to expose
+`providers.openaiCompatible`; put former route model IDs in the script. See
+[compatible image scripts](generate-image-openai-compatible.md).

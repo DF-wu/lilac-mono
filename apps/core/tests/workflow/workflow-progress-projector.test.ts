@@ -29,6 +29,8 @@ import { createDiscordWorkflowProgressPort } from "../../src/surface/discord/dis
 import { discordSurfaceProtocol } from "../../src/surface/discord/discord-surface-protocol";
 import { createGithubWorkflowProgressPort } from "../../src/surface/github/github-runtime-descriptor";
 import { githubSurfaceProtocol } from "../../src/surface/github/github-surface-protocol";
+import { SurfaceRefInvalid, type SurfaceProtocolRouting } from "../../src/surface/protocol";
+import { workflowProgressOperationFailure } from "../../src/surface/runtime-descriptor";
 import type {
   RegisteredSurfacePlatform,
   RegisteredSurfaceWorkflowProgressRegistration,
@@ -52,6 +54,56 @@ import { WorkflowProgressProjector } from "../../src/workflow/workflow-progress-
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 
+const telegramSurfaceProtocol: SurfaceProtocolRouting<"telegram"> = {
+  platform: "telegram",
+  displayName: "Telegram",
+  ownsRequestId: (requestId) => requestId.startsWith("telegram:"),
+  refs: {
+    createSessionRef: (channelId) => ({ platform: "telegram", channelId }),
+    createMessageRef: (sessionRef, messageId) => ({ ...sessionRef, messageId }),
+    resolveRequestMessageRef: ({ requestId, sessionRef }) => {
+      const prefix = `telegram:${sessionRef.channelId}:`;
+      return requestId.startsWith(prefix)
+        ? {
+            kind: "target",
+            ref: {
+              platform: "telegram",
+              channelId: sessionRef.channelId,
+              messageId: requestId.slice(prefix.length),
+            },
+          }
+        : { kind: "none" };
+    },
+    decodeMessageRef: ({ ref, expectedSessionId }) => {
+      if (ref.platform !== "telegram") {
+        return Result.err(
+          new SurfaceRefInvalid({
+            reason: "platform-mismatch",
+            expectedPlatform: "telegram",
+            expectedSessionId,
+            message: `Expected a Telegram message reference, received '${ref.platform}'`,
+          }),
+        );
+      }
+      if (ref.channelId !== expectedSessionId) {
+        return Result.err(
+          new SurfaceRefInvalid({
+            reason: "session-mismatch",
+            expectedPlatform: "telegram",
+            expectedSessionId,
+            message: `Telegram message reference belongs to session '${ref.channelId}'`,
+          }),
+        );
+      }
+      return Result.ok({
+        platform: "telegram",
+        channelId: ref.channelId,
+        messageId: ref.messageId,
+      });
+    },
+  },
+};
+
 const TEST_SURFACE_PROTOCOL_RESOLVER: SurfaceProtocolResolver = {
   resolve: (platform) => {
     switch (platform) {
@@ -59,6 +111,8 @@ const TEST_SURFACE_PROTOCOL_RESOLVER: SurfaceProtocolResolver = {
         return { platform, protocol: discordSurfaceProtocol };
       case "github":
         return { platform, protocol: githubSurfaceProtocol };
+      case "telegram":
+        return { platform, protocol: telegramSurfaceProtocol };
       default:
         return null;
     }
@@ -140,8 +194,10 @@ class CapturingRawBus implements RawBus {
 class ProjectionAdapter extends SurfaceAdapterTestBase {
   readonly contents: ContentOpts[] = [];
   readonly messages = new Map<string, SurfaceMessage>();
+  readonly removedRemoteMessageIds = new Set<string>();
   sends = 0;
   edits = 0;
+  editAttempts = 0;
   reads = 0;
   failNextSend = false;
   failNextRead = false;
@@ -151,7 +207,7 @@ class ProjectionAdapter extends SurfaceAdapterTestBase {
   editOperationFailure: SurfaceOperationError | null = null;
   sendRejection: { readonly value: unknown } | null = null;
   editFailure: Error | null = null;
-  constructor(readonly platform: "discord" | "github" = "discord") {
+  constructor(readonly platform: "discord" | "github" | "telegram" = "discord") {
     super();
   }
   async connect() {}
@@ -217,10 +273,11 @@ class ProjectionAdapter extends SurfaceAdapterTestBase {
     }
     this.sends += 1;
     this.contents.push(content);
-    const ref: MsgRef =
-      this.platform === "discord"
-        ? { platform: "discord", channelId: session.channelId, messageId: `card-${this.sends}` }
-        : { platform: "github", channelId: session.channelId, messageId: `card-${this.sends}` };
+    const ref: MsgRef = {
+      platform: this.platform,
+      channelId: session.channelId,
+      messageId: `card-${this.sends}`,
+    };
     this.messages.set(ref.messageId, {
       ref,
       session,
@@ -228,6 +285,7 @@ class ProjectionAdapter extends SurfaceAdapterTestBase {
       text: content.text ?? "",
       ts: Date.now(),
     });
+    this.removedRemoteMessageIds.delete(ref.messageId);
     return Result.ok(ref);
   }
   async readMsg(ref: MsgRef) {
@@ -242,12 +300,17 @@ class ProjectionAdapter extends SurfaceAdapterTestBase {
         }),
       );
     }
-    return Result.ok(this.messages.get(ref.messageId) ?? null);
+    return Result.ok(
+      this.removedRemoteMessageIds.has(ref.messageId)
+        ? null
+        : (this.messages.get(ref.messageId) ?? null),
+    );
   }
   async listMsg(_session: SessionRef, _opts?: LimitOpts) {
     return Result.ok([...this.messages.values()]);
   }
   async editMsg(ref: MsgRef, content: ContentOpts) {
+    this.editAttempts += 1;
     if (this.editOperationFailure) return Result.err(this.editOperationFailure);
     if (this.editFailure) {
       if (Panic.is(this.editFailure)) throw this.editFailure;
@@ -261,6 +324,17 @@ class ProjectionAdapter extends SurfaceAdapterTestBase {
     }
     if (this.failNextEditNotFound) {
       this.failNextEditNotFound = false;
+      this.removedRemoteMessageIds.add(ref.messageId);
+      this.messages.delete(ref.messageId);
+      return Result.err(
+        new SurfaceMessageNotFound({
+          platform: this.platform,
+          operation: "edit-message",
+          message: "missing",
+        }),
+      );
+    }
+    if (this.removedRemoteMessageIds.has(ref.messageId)) {
       this.messages.delete(ref.messageId);
       return Result.err(
         new SurfaceMessageNotFound({
@@ -285,8 +359,13 @@ class ProjectionAdapter extends SurfaceAdapterTestBase {
     return Result.ok(undefined);
   }
   async deleteMsg(ref: MsgRef) {
+    this.removedRemoteMessageIds.add(ref.messageId);
     this.messages.delete(ref.messageId);
     return Result.ok(undefined);
+  }
+
+  removeRemoteMessage(messageId: string): void {
+    this.removedRemoteMessageIds.add(messageId);
   }
   async getReplyContext() {
     return Result.ok([]);
@@ -362,6 +441,82 @@ class ReconciliationFailureStore extends DurableWorkflowStore {
     return super.listRunsNeedingProjectionReconciliation(options);
   }
 }
+
+function createTelegramWorkflowProgressPort(
+  adapter: ProjectionAdapter,
+): SurfaceWorkflowProgressPort<"telegram"> {
+  return {
+    configurationRevision: "telegram-workflow-progress-test-v1",
+    checkMessage: async (target) => {
+      const checked = await adapter.readMsg({
+        platform: "telegram",
+        channelId: target.channelId,
+        messageId: target.messageId,
+      });
+      if (checked.status === "ok") return Result.ok(checked.value ? "found" : "missing");
+      return Result.err({
+        kind: "failed",
+        error: workflowProgressOperationFailure("check-message", checked.error),
+      });
+    },
+    send: async (input) => {
+      const sent = await adapter.sendMsg(
+        { platform: "telegram", channelId: input.channelId },
+        input.content,
+        input.replyToMessageId
+          ? {
+              replyTo: {
+                platform: "telegram",
+                channelId: input.channelId,
+                messageId: input.replyToMessageId,
+              },
+              silent: input.silent,
+            }
+          : { silent: input.silent },
+      );
+      if (sent.status === "ok") {
+        if (sent.value.platform !== "telegram") {
+          return Result.err({
+            kind: "failed",
+            error: workflowProgressOperationFailure(
+              "send",
+              new SurfaceOperationUnsupported({
+                platform: "telegram",
+                operation: "send-message",
+                message: "Telegram test adapter returned a cross-platform reference",
+              }),
+            ),
+          });
+        }
+        return Result.ok(sent.value);
+      }
+      if (
+        sent.error._tag === "SurfaceOperationPartiallyCompleted" &&
+        sent.error.created.platform === "telegram"
+      ) {
+        return Result.err({ kind: "created", ref: sent.error.created });
+      }
+      return Result.err({
+        kind: "failed",
+        error: workflowProgressOperationFailure("send", sent.error),
+      });
+    },
+    edit: async (target, content) => {
+      const edited = await adapter.editMsg(
+        { platform: "telegram", channelId: target.channelId, messageId: target.messageId },
+        content,
+      );
+      if (edited.status === "ok") return Result.ok(undefined);
+      return edited.error._tag === "SurfaceMessageNotFound"
+        ? Result.err({ kind: "not-found" })
+        : Result.err({
+            kind: "failed",
+            error: workflowProgressOperationFailure("edit", edited.error),
+          });
+    },
+  };
+}
+
 function projectionPorts(
   adapter: ProjectionAdapter,
 ): Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressRegistration> {
@@ -372,11 +527,17 @@ function projectionPorts(
       protocol: discordSurfaceProtocol,
       port: createDiscordWorkflowProgressPort(adapter),
     });
-  } else {
+  } else if (adapter.platform === "github") {
     ports.set("github", {
       platform: "github",
       protocol: githubSurfaceProtocol,
       port: createGithubWorkflowProgressPort(adapter),
+    });
+  } else {
+    ports.set("telegram", {
+      platform: "telegram",
+      protocol: telegramSurfaceProtocol,
+      port: createTelegramWorkflowProgressPort(adapter),
     });
   }
   return ports;
@@ -400,9 +561,12 @@ function createInvocation(
     runId = "run-1",
   }: {
     readonly hasProgressTarget?: boolean;
-    readonly platform?: "discord" | "github";
+    readonly platform?: "discord" | "github" | "telegram";
     readonly targetChannelId?: string;
-    readonly origin?: { readonly platform: "discord" | "github"; readonly sessionId: string };
+    readonly origin?: {
+      readonly platform: "discord" | "github" | "telegram";
+      readonly sessionId: string;
+    };
     readonly runId?: string;
   } = {},
 ): void {
@@ -545,6 +709,235 @@ class FakeProjectionScheduler {
   }
 }
 describe("WorkflowProgressProjector", () => {
+  it("projects Telegram cards with consumable workflow actions", async () => {
+    const dbPath = tempDbPath("workflow-telegram-controls");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter("telegram");
+    const bus = createLilacBus(new CapturingRawBus());
+    const projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      ports: projectionPorts(adapter),
+      subscriptionId: "telegram-controls",
+      now: () => 20,
+    });
+    try {
+      createInvocation(store, { platform: "telegram" });
+      const messageRef = await projector.ensureInitialCard("run-1");
+      expect(messageRef.platform).toBe("telegram");
+      expect(adapter.contents.at(-1)?.actions?.map((action) => action.label)).toEqual([
+        "Pause",
+        "Cancel",
+      ]);
+      expect(
+        appliedSurfaceActionStatus(
+          store.applySurfaceAction({
+            tokenSha256: sha256(actionToken(adapter, "Pause")),
+            platform: "telegram",
+            userId: "user-1",
+            messageRef,
+            now: 21,
+          }),
+        ),
+      ).toBe("applied");
+      await projector.ensureInitialCard("run-1");
+      expect(adapter.edits).toBe(1);
+      expect(adapter.sends).toBe(1);
+      expect(adapter.contents.at(-1)?.actions?.map((action) => action.label)).toEqual([
+        "Resume",
+        "Cancel",
+      ]);
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("rechecks Telegram target authorization before every send or edit", async () => {
+    const dbPath = tempDbPath("workflow-telegram-revoked-target");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter("telegram");
+    const bus = createLilacBus(new CapturingRawBus());
+    let authorized = true;
+    const projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      ports: projectionPorts(adapter),
+      subscriptionId: "telegram-revoked-target",
+      now: () => 20,
+      isTargetAuthorized: () => authorized,
+    });
+    try {
+      createInvocation(store, { platform: "telegram" });
+      await projector.ensureInitialCard("run-1");
+      authorized = false;
+
+      await expect(projector.ensureInitialCard("run-1")).rejects.toThrow(
+        "Workflow progress target is no longer authorized",
+      );
+      expect(adapter.sends).toBe(1);
+      expect(adapter.editAttempts).toBe(0);
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("rechecks Telegram target authorization immediately before sending", async () => {
+    const dbPath = tempDbPath("workflow-telegram-send-race");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter("telegram");
+    const bus = createLilacBus(new CapturingRawBus());
+    let checks = 0;
+    const projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      ports: projectionPorts(adapter),
+      subscriptionId: "telegram-send-race",
+      now: () => 20,
+      isTargetAuthorized: () => ++checks === 1,
+    });
+    try {
+      createInvocation(store, { platform: "telegram" });
+      await expect(projector.ensureInitialCard("run-1")).rejects.toThrow(
+        "Workflow progress target is no longer authorized",
+      );
+      expect(checks).toBe(2);
+      expect(adapter.sends).toBe(0);
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("rechecks Telegram target authorization immediately before editing", async () => {
+    const dbPath = tempDbPath("workflow-telegram-edit-race");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter("telegram");
+    const bus = createLilacBus(new CapturingRawBus());
+    let checks = 0;
+    const projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      ports: projectionPorts(adapter),
+      subscriptionId: "telegram-edit-race",
+      now: () => 20,
+      isTargetAuthorized: () => ++checks !== 4,
+    });
+    try {
+      createInvocation(store, { platform: "telegram" });
+      const messageRef = await projector.ensureInitialCard("run-1");
+      store.applySurfaceAction({
+        tokenSha256: sha256(actionToken(adapter, "Pause")),
+        platform: "telegram",
+        userId: "user-1",
+        messageRef,
+        now: 21,
+      });
+
+      await expect(projector.ensureInitialCard("run-1")).rejects.toThrow(
+        "Workflow progress target is no longer authorized",
+      );
+      expect(checks).toBe(4);
+      expect(adapter.editAttempts).toBe(0);
+      expect(adapter.sends).toBe(1);
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("rechecks authorization before recreating a missing Telegram edit target", async () => {
+    const dbPath = tempDbPath("workflow-telegram-fallback-send-race");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter("telegram");
+    const bus = createLilacBus(new CapturingRawBus());
+    let checks = 0;
+    let now = 20;
+    const projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      ports: projectionPorts(adapter),
+      subscriptionId: "telegram-fallback-send-race",
+      now: () => now,
+      isTargetAuthorized: () => ++checks !== 5,
+    });
+    try {
+      createInvocation(store, { platform: "telegram" });
+      const messageRef = await projector.ensureInitialCard("run-1");
+      store.applySurfaceAction({
+        tokenSha256: sha256(actionToken(adapter, "Pause")),
+        platform: "telegram",
+        userId: "user-1",
+        messageRef,
+        now: 21,
+      });
+      adapter.failNextEditNotFound = true;
+
+      await projector.reconcile();
+      expect(checks).toBe(4);
+      now = 1_020;
+      await projector.reconcile();
+      expect(checks).toBe(5);
+      expect(adapter.editAttempts).toBe(1);
+      expect(adapter.sends).toBe(1);
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
+  it("remotely probes an unchanged Telegram card and immediately recreates it when deleted", async () => {
+    const dbPath = tempDbPath("workflow-telegram-remote-reconcile");
+    const store = new DurableWorkflowStore(dbPath);
+    const adapter = new ProjectionAdapter("telegram");
+    const bus = createLilacBus(new CapturingRawBus());
+    const projector = createWorkflowProgressProjectorForTest({
+      bus,
+      store,
+      ports: projectionPorts(adapter),
+      subscriptionId: "telegram-remote-reconcile",
+      now: () => 20,
+    });
+    try {
+      createInvocation(store, { platform: "telegram" });
+      const firstRef = await projector.ensureInitialCard("run-1");
+      adapter.removeRemoteMessage(firstRef.messageId);
+
+      await projector.reconcile();
+
+      expect(adapter.reads).toBe(1);
+      expect(adapter.editAttempts).toBe(0);
+      expect(adapter.edits).toBe(0);
+      expect(adapter.sends).toBe(2);
+      expect(workflowStoreValue(store.getSurfaceBinding("run-1"))).toMatchObject({
+        messageRef: {
+          platform: "telegram",
+          channelId: "channel-1",
+          messageId: "card-2",
+        },
+        lastError: null,
+        retryCount: 0,
+        nextAttemptAt: null,
+      });
+    } finally {
+      await projector.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  });
+
   it("ignores event projection for a null target and rejects explicit card creation", async () => {
     const dbPath = tempDbPath("workflow-null-target");
     const store = new DurableWorkflowStore(dbPath);
