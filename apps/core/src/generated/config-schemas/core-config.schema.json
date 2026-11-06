@@ -37,11 +37,7 @@
                       "items": { "type": "string", "enum": ["tavily", "exa", "firecrawl"] },
                       "markdownDescription": "Non-empty ordered extraction-provider list: tavily, exa, or firecrawl. Duplicate entries are removed. Default: [tavily]. Configure the selected providers' credentials in the environment."
                     },
-                    "provider": {
-                      "$schema": "http://json-schema.org/draft-07/schema#",
-                      "type": "string",
-                      "enum": ["tavily", "exa", "firecrawl"]
-                    }
+                    "provider": { "type": "string", "enum": ["tavily", "exa", "firecrawl"] }
                   },
                   "additionalProperties": false,
                   "markdownDescription": "Provider-backed web extraction settings. Configure the ordered provider list under providers."
@@ -73,11 +69,7 @@
                       "items": { "type": "string", "enum": ["tavily", "exa", "firecrawl"] },
                       "markdownDescription": "Non-empty ordered extraction-provider list: tavily, exa, or firecrawl. Duplicate entries are removed. Default: [tavily]. Configure the selected providers' credentials in the environment."
                     },
-                    "provider": {
-                      "$schema": "http://json-schema.org/draft-07/schema#",
-                      "type": "string",
-                      "enum": ["tavily", "exa", "firecrawl"]
-                    }
+                    "provider": { "type": "string", "enum": ["tavily", "exa", "firecrawl"] }
                   },
                   "additionalProperties": false,
                   "markdownDescription": "Provider-backed web extraction settings. Configure the ordered provider list under providers."
@@ -1303,24 +1295,26 @@
               "type": "object",
               "properties": {
                 "extract": {
-                  "description": "Provider-backed web extraction settings. Configure the ordered provider list under providers.",
+                  "description": "Ordered web search and extraction providers. The openai provider supports search only.",
                   "type": "object",
                   "properties": {
                     "providers": {
-                      "description": "Non-empty ordered extraction-provider list: tavily, exa, or firecrawl. Duplicate entries are removed. Default: [tavily]. Configure the selected providers' credentials in the environment.",
+                      "description": "Ordered search/extraction providers, deduplicated in order. Default: [tavily]. openai is search-only and skipped for extraction.",
                       "minItems": 1,
                       "type": "array",
-                      "items": { "type": "string", "enum": ["tavily", "exa", "firecrawl"] },
-                      "markdownDescription": "Non-empty ordered extraction-provider list: tavily, exa, or firecrawl. Duplicate entries are removed. Default: [tavily]. Configure the selected providers' credentials in the environment."
+                      "items": {
+                        "type": "string",
+                        "enum": ["tavily", "exa", "firecrawl", "openai"]
+                      },
+                      "markdownDescription": "Ordered search/extraction providers, deduplicated in order. Default: [tavily]. openai is search-only and skipped for extraction."
                     },
                     "provider": {
-                      "$schema": "http://json-schema.org/draft-07/schema#",
                       "type": "string",
-                      "enum": ["tavily", "exa", "firecrawl"]
+                      "enum": ["tavily", "exa", "firecrawl", "openai"]
                     }
                   },
                   "additionalProperties": false,
-                  "markdownDescription": "Provider-backed web extraction settings. Configure the ordered provider list under providers."
+                  "markdownDescription": "Ordered web search and extraction providers. The openai provider supports search only."
                 },
                 "fetch": {
                   "default": { "mode": "auto" },
@@ -1365,25 +1359,49 @@
                   "additionalProperties": false,
                   "markdownDescription": "Optional independent process-local concurrency and queue limits for Firecrawl fetch and search calls. Omit to leave these optional limits unconfigured."
                 },
-                "search": {
-                  "description": "Provider-backed web extraction settings. Configure the ordered provider list under providers.",
+                "openai": {
+                  "description": "OpenAI Responses hosted web search settings; used only when openai is listed in extract.providers.",
                   "type": "object",
                   "properties": {
-                    "providers": {
-                      "description": "Non-empty ordered extraction-provider list: tavily, exa, or firecrawl. Duplicate entries are removed. Default: [tavily]. Configure the selected providers' credentials in the environment.",
-                      "minItems": 1,
-                      "type": "array",
-                      "items": { "type": "string", "enum": ["tavily", "exa", "firecrawl"] },
-                      "markdownDescription": "Non-empty ordered extraction-provider list: tavily, exa, or firecrawl. Duplicate entries are removed. Default: [tavily]. Configure the selected providers' credentials in the environment."
-                    },
-                    "provider": {
-                      "$schema": "http://json-schema.org/draft-07/schema#",
+                    "model": {
+                      "default": "openai/gpt-5-mini",
+                      "description": "Hosted-search provider/model. Default: openai/gpt-5-mini. Supports openai and openai-compatible; legacy bare IDs use openai.",
                       "type": "string",
-                      "enum": ["tavily", "exa", "firecrawl"]
+                      "minLength": 1,
+                      "markdownDescription": "Hosted-search provider/model. Default: openai/gpt-5-mini. Supports openai and openai-compatible; legacy bare IDs use openai."
+                    },
+                    "searchContextSize": {
+                      "default": "medium",
+                      "description": "Hosted web search context size: low, medium, or high. Default: medium.",
+                      "type": "string",
+                      "enum": ["low", "medium", "high"],
+                      "markdownDescription": "Hosted web search context size: low, medium, or high. Default: medium."
                     }
                   },
                   "additionalProperties": false,
-                  "markdownDescription": "Provider-backed web extraction settings. Configure the ordered provider list under providers."
+                  "markdownDescription": "OpenAI Responses hosted web search settings; used only when openai is listed in extract.providers."
+                },
+                "search": {
+                  "description": "Ordered web search and extraction providers. The openai provider supports search only.",
+                  "type": "object",
+                  "properties": {
+                    "providers": {
+                      "description": "Ordered search/extraction providers, deduplicated in order. Default: [tavily]. openai is search-only and skipped for extraction.",
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": ["tavily", "exa", "firecrawl", "openai"]
+                      },
+                      "markdownDescription": "Ordered search/extraction providers, deduplicated in order. Default: [tavily]. openai is search-only and skipped for extraction."
+                    },
+                    "provider": {
+                      "type": "string",
+                      "enum": ["tavily", "exa", "firecrawl", "openai"]
+                    }
+                  },
+                  "additionalProperties": false,
+                  "markdownDescription": "Ordered web search and extraction providers. The openai provider supports search only."
                 }
               },
               "additionalProperties": false,
@@ -2622,6 +2640,281 @@
               },
               "additionalProperties": false,
               "markdownDescription": "Discord credentials, ingress allowlists, attachment caching, and output rendering."
+            },
+            "telegram": {
+              "description": "Telegram bot, chat/user allowlists, local history, and streamed output. Disabled by default.",
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "description": "Enable Telegram long polling. Default: false. Configure a token and allowedChatIds before enabling.",
+                  "type": "boolean",
+                  "markdownDescription": "Enable Telegram long polling. Default: false. Configure a token and allowedChatIds before enabling."
+                },
+                "token": {
+                  "description": "Bot API token. Keep core-config.yaml private; changing this value requires restart.",
+                  "type": "string",
+                  "minLength": 1,
+                  "markdownDescription": "Bot API token. Keep core-config.yaml private; changing this value requires restart."
+                },
+                "tokenEnv": { "not": {} },
+                "botName": {
+                  "default": "lilac",
+                  "description": "Bot name for mention routing and prompt attribution, without spaces. Default: lilac.",
+                  "type": "string",
+                  "minLength": 1,
+                  "markdownDescription": "Bot name for mention routing and prompt attribution, without spaces. Default: lilac."
+                },
+                "botUsername": {
+                  "description": "Bot username without @. Omit to resolve it through getMe on connection.",
+                  "type": "string",
+                  "minLength": 1,
+                  "markdownDescription": "Bot username without @. Omit to resolve it through getMe on connection."
+                },
+                "allowedChatIds": {
+                  "default": [],
+                  "description": "Allowed chat IDs as strings. Empty denies all chats, including conversation-memory reads.",
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 },
+                  "markdownDescription": "Allowed chat IDs as strings. Empty denies all chats, including conversation-memory reads."
+                },
+                "allowedUserIds": {
+                  "default": [],
+                  "description": "Allowed sender IDs as strings. Empty imposes no user restriction; chat admission still applies.",
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 },
+                  "markdownDescription": "Allowed sender IDs as strings. Empty imposes no user restriction; chat admission still applies."
+                },
+                "dbPath": {
+                  "description": "Local Telegram history database path. Omit for DATA_DIR/telegram-surface.db. Requires restart.",
+                  "type": "string",
+                  "minLength": 1,
+                  "markdownDescription": "Local Telegram history database path. Omit for DATA_DIR/telegram-surface.db. Requires restart."
+                },
+                "apiRoot": {
+                  "description": "Bot API root URL. Omit for https://api.telegram.org; supports self-hosted Bot API servers. Requires restart.",
+                  "type": "string",
+                  "format": "uri",
+                  "markdownDescription": "Bot API root URL. Omit for https://api.telegram.org; supports self-hosted Bot API servers. Requires restart."
+                },
+                "outputMode": {
+                  "default": "preview",
+                  "description": "Streamed output mode. Default: preview, which removes partial messages on cancellation; inline retains them.",
+                  "type": "string",
+                  "enum": ["inline", "preview"],
+                  "markdownDescription": "Streamed output mode. Default: preview, which removes partial messages on cancellation; inline retains them."
+                },
+                "parseMode": {
+                  "default": "html",
+                  "description": "Telegram output formatting. Default: html; plain disables HTML formatting.",
+                  "type": "string",
+                  "enum": ["html", "plain"],
+                  "markdownDescription": "Telegram output formatting. Default: html; plain disables HTML formatting."
+                },
+                "streamEditIntervalMs": {
+                  "default": 1500,
+                  "description": "Minimum gap between streamed message edits, in integer milliseconds from 500 to 60000. Default: 1500.",
+                  "type": "integer",
+                  "minimum": 500,
+                  "maximum": 60000,
+                  "markdownDescription": "Minimum gap between streamed message edits, in integer milliseconds from 500 to 60000. Default: 1500."
+                },
+                "outputNotification": {
+                  "default": true,
+                  "description": "Enable Telegram message notifications. Default: true.",
+                  "type": "boolean",
+                  "markdownDescription": "Enable Telegram message notifications. Default: true."
+                },
+                "workingIndicators": {
+                  "default": [
+                    "Alchemizing",
+                    "Aromatizing",
+                    "Assembling",
+                    "Bleeping",
+                    "Blooming",
+                    "Blooping",
+                    "Blossoming",
+                    "Bouqueting",
+                    "Brainstorming",
+                    "Bubbling",
+                    "Calibrating",
+                    "Carbonating",
+                    "Cascading",
+                    "Catalyzing",
+                    "Compiling",
+                    "Composing",
+                    "Crystallizing",
+                    "Daydreaming",
+                    "Dazzling",
+                    "Decanting",
+                    "Deducing",
+                    "Defragmenting",
+                    "Distilling",
+                    "Doodling",
+                    "Effervescing",
+                    "Embroidering",
+                    "Extrapolating",
+                    "Fascinating",
+                    "Fathoming",
+                    "Fermenting",
+                    "Fiddling",
+                    "Finessing",
+                    "Fizzing",
+                    "Flourishing",
+                    "Formulating",
+                    "Gallivanting",
+                    "Gesticulating",
+                    "Glimmering",
+                    "Harmonizing",
+                    "Humming",
+                    "Illuminating",
+                    "Infusing",
+                    "Investigating",
+                    "Juggling",
+                    "Lavenderizing",
+                    "Materializing",
+                    "Meandering",
+                    "Nebulizing",
+                    "Orchestrating",
+                    "Origami-ing",
+                    "Parsing",
+                    "Perambulating",
+                    "Perfuming",
+                    "Permutating",
+                    "Petalling",
+                    "Philosophizing",
+                    "Photosynthesizing",
+                    "Phytomerizing",
+                    "Ping-ponging",
+                    "Pinging",
+                    "Pirouetting",
+                    "Plucking",
+                    "Polishing",
+                    "Pollinating",
+                    "Pruning",
+                    "Radiating",
+                    "Recalibrating",
+                    "Resonating",
+                    "Reverberating",
+                    "Rummaging",
+                    "Sashaying",
+                    "Scenting",
+                    "Scrutinizing",
+                    "Shimmering",
+                    "Sifting",
+                    "Sparkling",
+                    "Spiraling",
+                    "Sprinkling",
+                    "Sprouting",
+                    "Steeping",
+                    "Sublimating",
+                    "Synchronizing",
+                    "Tessellating",
+                    "Tiptoeing",
+                    "Tuning",
+                    "Twiddling",
+                    "Twinkling",
+                    "Unscrambling",
+                    "Waltzing",
+                    "Weaving",
+                    "Whispering",
+                    "Whittling",
+                    "Whizzing",
+                    "Zesting"
+                  ],
+                  "description": "Non-empty status phrases displayed while working. Omit for the built-in phrases.",
+                  "minItems": 1,
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 },
+                  "markdownDescription": "Non-empty status phrases displayed while working. Omit for the built-in phrases."
+                },
+                "commandMenu": {
+                  "default": true,
+                  "description": "Register custom commands with Telegram setMyCommands on connection. Default: true.",
+                  "type": "boolean",
+                  "markdownDescription": "Register custom commands with Telegram setMyCommands on connection. Default: true."
+                },
+                "markdownTableRender": {
+                  "default": {
+                    "enabled": true,
+                    "style": "unicode",
+                    "maxWidth": 50,
+                    "fallbackMode": "list"
+                  },
+                  "description": "Telegram text table rendering and wide-table fallback.",
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "default": true,
+                      "description": "Render Markdown tables as text. Default: true.",
+                      "type": "boolean",
+                      "markdownDescription": "Render Markdown tables as text. Default: true."
+                    },
+                    "style": {
+                      "default": "unicode",
+                      "description": "Text table border style. Default: unicode; Telegram does not support image tables.",
+                      "type": "string",
+                      "enum": ["unicode", "ascii"],
+                      "markdownDescription": "Text table border style. Default: unicode; Telegram does not support image tables."
+                    },
+                    "maxWidth": {
+                      "default": 50,
+                      "description": "Maximum rendered table width in characters, from 40 to 240. Default: 50.",
+                      "type": "integer",
+                      "minimum": 40,
+                      "maximum": 240,
+                      "markdownDescription": "Maximum rendered table width in characters, from 40 to 240. Default: 50."
+                    },
+                    "fallbackMode": {
+                      "default": "list",
+                      "description": "Wide-table fallback: list or unchanged Markdown. Default: list.",
+                      "type": "string",
+                      "enum": ["list", "passthrough"],
+                      "markdownDescription": "Wide-table fallback: list or unchanged Markdown. Default: list."
+                    }
+                  },
+                  "additionalProperties": false,
+                  "markdownDescription": "Telegram text table rendering and wide-table fallback."
+                },
+                "inboundMedia": {
+                  "description": "Inbound Telegram photo/document delivery budgets; unsupported media remains metadata.",
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "default": true,
+                      "description": "Deliver inbound photos/documents to the model. Default: true; false retains caption text only.",
+                      "type": "boolean",
+                      "markdownDescription": "Deliver inbound photos/documents to the model. Default: true; false retains caption text only."
+                    },
+                    "maxBytesPerAttachment": {
+                      "description": "Decoded-byte limit per attachment. Default: 5MiB. Accepts positive bytes or B, KB, MB, GB, KiB, MiB, GiB; oversized media becomes metadata.",
+                      "anyOf": [
+                        { "type": "integer", "exclusiveMinimum": 0, "maximum": 9007199254740991 },
+                        {
+                          "type": "string",
+                          "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?(B|KB|MB|GB|KiB|MiB|GiB)$"
+                        }
+                      ],
+                      "markdownDescription": "Decoded-byte limit per attachment. Default: 5MiB. Accepts positive bytes or B, KB, MB, GB, KiB, MiB, GiB; oversized media becomes metadata."
+                    },
+                    "maxBytesPerRequest": {
+                      "description": "Decoded-byte budget across one request. Default: 10MiB. Accepts positive bytes or B, KB, MB, GB, KiB, MiB, GiB.",
+                      "anyOf": [
+                        { "type": "integer", "exclusiveMinimum": 0, "maximum": 9007199254740991 },
+                        {
+                          "type": "string",
+                          "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?(B|KB|MB|GB|KiB|MiB|GiB)$"
+                        }
+                      ],
+                      "markdownDescription": "Decoded-byte budget across one request. Default: 10MiB. Accepts positive bytes or B, KB, MB, GB, KiB, MiB, GiB."
+                    }
+                  },
+                  "additionalProperties": false,
+                  "markdownDescription": "Inbound Telegram photo/document delivery budgets; unsupported media remains metadata."
+                }
+              },
+              "additionalProperties": false,
+              "markdownDescription": "Telegram bot, chat/user allowlists, local history, and streamed output. Disabled by default."
             },
             "heartbeat": {
               "description": "Autonomous heartbeat lane. Disabled by default; configure its model through `surface.router.sessionModes.__heartbeat__.model`.",
@@ -4156,11 +4449,14 @@
                   "type": "object",
                   "properties": {
                     "providers": {
-                      "description": "Non-empty ordered extraction-provider list: tavily, exa, or firecrawl. Duplicate entries are removed. Default: [tavily]. Configure the selected providers' credentials in the environment.",
+                      "description": "Ordered search/extraction providers, deduplicated in order. Default: [tavily]. openai is search-only and skipped for extraction.",
                       "minItems": 1,
                       "type": "array",
-                      "items": { "type": "string", "enum": ["tavily", "exa", "firecrawl"] },
-                      "markdownDescription": "Non-empty ordered extraction-provider list: tavily, exa, or firecrawl. Duplicate entries are removed. Default: [tavily]. Configure the selected providers' credentials in the environment."
+                      "items": {
+                        "type": "string",
+                        "enum": ["tavily", "exa", "firecrawl", "openai"]
+                      },
+                      "markdownDescription": "Ordered search/extraction providers, deduplicated in order. Default: [tavily]. openai is search-only and skipped for extraction."
                     },
                     "provider": { "not": {} }
                   },
@@ -4209,6 +4505,28 @@
                   },
                   "additionalProperties": false,
                   "markdownDescription": "Optional independent process-local concurrency and queue limits for Firecrawl fetch and search calls. Omit to leave these optional limits unconfigured."
+                },
+                "openai": {
+                  "description": "OpenAI Responses hosted web search settings; used only when openai is listed in extract.providers.",
+                  "type": "object",
+                  "properties": {
+                    "model": {
+                      "default": "openai/gpt-5-mini",
+                      "description": "Hosted-search provider/model. Default: openai/gpt-5-mini. Supports openai and openai-compatible; legacy bare IDs use openai.",
+                      "type": "string",
+                      "minLength": 1,
+                      "markdownDescription": "Hosted-search provider/model. Default: openai/gpt-5-mini. Supports openai and openai-compatible; legacy bare IDs use openai."
+                    },
+                    "searchContextSize": {
+                      "default": "medium",
+                      "description": "Hosted web search context size: low, medium, or high. Default: medium.",
+                      "type": "string",
+                      "enum": ["low", "medium", "high"],
+                      "markdownDescription": "Hosted web search context size: low, medium, or high. Default: medium."
+                    }
+                  },
+                  "additionalProperties": false,
+                  "markdownDescription": "OpenAI Responses hosted web search settings; used only when openai is listed in extract.providers."
                 },
                 "search": { "not": {} }
               },
@@ -5216,6 +5534,281 @@
               },
               "additionalProperties": false,
               "markdownDescription": "Discord credentials, ingress allowlists, attachment caching, and output rendering."
+            },
+            "telegram": {
+              "description": "Telegram bot, chat/user allowlists, local history, and streamed output. Disabled by default.",
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "description": "Enable Telegram long polling. Default: false. Configure a token and allowedChatIds before enabling.",
+                  "type": "boolean",
+                  "markdownDescription": "Enable Telegram long polling. Default: false. Configure a token and allowedChatIds before enabling."
+                },
+                "token": {
+                  "description": "Bot API token. Keep core-config.yaml private; changing this value requires restart.",
+                  "type": "string",
+                  "minLength": 1,
+                  "markdownDescription": "Bot API token. Keep core-config.yaml private; changing this value requires restart."
+                },
+                "tokenEnv": { "not": {} },
+                "botName": {
+                  "default": "lilac",
+                  "description": "Bot name for mention routing and prompt attribution, without spaces. Default: lilac.",
+                  "type": "string",
+                  "minLength": 1,
+                  "markdownDescription": "Bot name for mention routing and prompt attribution, without spaces. Default: lilac."
+                },
+                "botUsername": {
+                  "description": "Bot username without @. Omit to resolve it through getMe on connection.",
+                  "type": "string",
+                  "minLength": 1,
+                  "markdownDescription": "Bot username without @. Omit to resolve it through getMe on connection."
+                },
+                "allowedChatIds": {
+                  "default": [],
+                  "description": "Allowed chat IDs as strings. Empty denies all chats, including conversation-memory reads.",
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 },
+                  "markdownDescription": "Allowed chat IDs as strings. Empty denies all chats, including conversation-memory reads."
+                },
+                "allowedUserIds": {
+                  "default": [],
+                  "description": "Allowed sender IDs as strings. Empty imposes no user restriction; chat admission still applies.",
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 },
+                  "markdownDescription": "Allowed sender IDs as strings. Empty imposes no user restriction; chat admission still applies."
+                },
+                "dbPath": {
+                  "description": "Local Telegram history database path. Omit for DATA_DIR/telegram-surface.db. Requires restart.",
+                  "type": "string",
+                  "minLength": 1,
+                  "markdownDescription": "Local Telegram history database path. Omit for DATA_DIR/telegram-surface.db. Requires restart."
+                },
+                "apiRoot": {
+                  "description": "Bot API root URL. Omit for https://api.telegram.org; supports self-hosted Bot API servers. Requires restart.",
+                  "type": "string",
+                  "format": "uri",
+                  "markdownDescription": "Bot API root URL. Omit for https://api.telegram.org; supports self-hosted Bot API servers. Requires restart."
+                },
+                "outputMode": {
+                  "default": "preview",
+                  "description": "Streamed output mode. Default: preview, which removes partial messages on cancellation; inline retains them.",
+                  "type": "string",
+                  "enum": ["inline", "preview"],
+                  "markdownDescription": "Streamed output mode. Default: preview, which removes partial messages on cancellation; inline retains them."
+                },
+                "parseMode": {
+                  "default": "html",
+                  "description": "Telegram output formatting. Default: html; plain disables HTML formatting.",
+                  "type": "string",
+                  "enum": ["html", "plain"],
+                  "markdownDescription": "Telegram output formatting. Default: html; plain disables HTML formatting."
+                },
+                "streamEditIntervalMs": {
+                  "default": 1500,
+                  "description": "Minimum gap between streamed message edits, in integer milliseconds from 500 to 60000. Default: 1500.",
+                  "type": "integer",
+                  "minimum": 500,
+                  "maximum": 60000,
+                  "markdownDescription": "Minimum gap between streamed message edits, in integer milliseconds from 500 to 60000. Default: 1500."
+                },
+                "outputNotification": {
+                  "default": true,
+                  "description": "Enable Telegram message notifications. Default: true.",
+                  "type": "boolean",
+                  "markdownDescription": "Enable Telegram message notifications. Default: true."
+                },
+                "workingIndicators": {
+                  "default": [
+                    "Alchemizing",
+                    "Aromatizing",
+                    "Assembling",
+                    "Bleeping",
+                    "Blooming",
+                    "Blooping",
+                    "Blossoming",
+                    "Bouqueting",
+                    "Brainstorming",
+                    "Bubbling",
+                    "Calibrating",
+                    "Carbonating",
+                    "Cascading",
+                    "Catalyzing",
+                    "Compiling",
+                    "Composing",
+                    "Crystallizing",
+                    "Daydreaming",
+                    "Dazzling",
+                    "Decanting",
+                    "Deducing",
+                    "Defragmenting",
+                    "Distilling",
+                    "Doodling",
+                    "Effervescing",
+                    "Embroidering",
+                    "Extrapolating",
+                    "Fascinating",
+                    "Fathoming",
+                    "Fermenting",
+                    "Fiddling",
+                    "Finessing",
+                    "Fizzing",
+                    "Flourishing",
+                    "Formulating",
+                    "Gallivanting",
+                    "Gesticulating",
+                    "Glimmering",
+                    "Harmonizing",
+                    "Humming",
+                    "Illuminating",
+                    "Infusing",
+                    "Investigating",
+                    "Juggling",
+                    "Lavenderizing",
+                    "Materializing",
+                    "Meandering",
+                    "Nebulizing",
+                    "Orchestrating",
+                    "Origami-ing",
+                    "Parsing",
+                    "Perambulating",
+                    "Perfuming",
+                    "Permutating",
+                    "Petalling",
+                    "Philosophizing",
+                    "Photosynthesizing",
+                    "Phytomerizing",
+                    "Ping-ponging",
+                    "Pinging",
+                    "Pirouetting",
+                    "Plucking",
+                    "Polishing",
+                    "Pollinating",
+                    "Pruning",
+                    "Radiating",
+                    "Recalibrating",
+                    "Resonating",
+                    "Reverberating",
+                    "Rummaging",
+                    "Sashaying",
+                    "Scenting",
+                    "Scrutinizing",
+                    "Shimmering",
+                    "Sifting",
+                    "Sparkling",
+                    "Spiraling",
+                    "Sprinkling",
+                    "Sprouting",
+                    "Steeping",
+                    "Sublimating",
+                    "Synchronizing",
+                    "Tessellating",
+                    "Tiptoeing",
+                    "Tuning",
+                    "Twiddling",
+                    "Twinkling",
+                    "Unscrambling",
+                    "Waltzing",
+                    "Weaving",
+                    "Whispering",
+                    "Whittling",
+                    "Whizzing",
+                    "Zesting"
+                  ],
+                  "description": "Non-empty status phrases displayed while working. Omit for the built-in phrases.",
+                  "minItems": 1,
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 },
+                  "markdownDescription": "Non-empty status phrases displayed while working. Omit for the built-in phrases."
+                },
+                "commandMenu": {
+                  "default": true,
+                  "description": "Register custom commands with Telegram setMyCommands on connection. Default: true.",
+                  "type": "boolean",
+                  "markdownDescription": "Register custom commands with Telegram setMyCommands on connection. Default: true."
+                },
+                "markdownTableRender": {
+                  "default": {
+                    "enabled": true,
+                    "style": "unicode",
+                    "maxWidth": 50,
+                    "fallbackMode": "list"
+                  },
+                  "description": "Telegram text table rendering and wide-table fallback.",
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "default": true,
+                      "description": "Render Markdown tables as text. Default: true.",
+                      "type": "boolean",
+                      "markdownDescription": "Render Markdown tables as text. Default: true."
+                    },
+                    "style": {
+                      "default": "unicode",
+                      "description": "Text table border style. Default: unicode; Telegram does not support image tables.",
+                      "type": "string",
+                      "enum": ["unicode", "ascii"],
+                      "markdownDescription": "Text table border style. Default: unicode; Telegram does not support image tables."
+                    },
+                    "maxWidth": {
+                      "default": 50,
+                      "description": "Maximum rendered table width in characters, from 40 to 240. Default: 50.",
+                      "type": "integer",
+                      "minimum": 40,
+                      "maximum": 240,
+                      "markdownDescription": "Maximum rendered table width in characters, from 40 to 240. Default: 50."
+                    },
+                    "fallbackMode": {
+                      "default": "list",
+                      "description": "Wide-table fallback: list or unchanged Markdown. Default: list.",
+                      "type": "string",
+                      "enum": ["list", "passthrough"],
+                      "markdownDescription": "Wide-table fallback: list or unchanged Markdown. Default: list."
+                    }
+                  },
+                  "additionalProperties": false,
+                  "markdownDescription": "Telegram text table rendering and wide-table fallback."
+                },
+                "inboundMedia": {
+                  "description": "Inbound Telegram photo/document delivery budgets; unsupported media remains metadata.",
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "default": true,
+                      "description": "Deliver inbound photos/documents to the model. Default: true; false retains caption text only.",
+                      "type": "boolean",
+                      "markdownDescription": "Deliver inbound photos/documents to the model. Default: true; false retains caption text only."
+                    },
+                    "maxBytesPerAttachment": {
+                      "description": "Decoded-byte limit per attachment. Default: 5MiB. Accepts positive bytes or B, KB, MB, GB, KiB, MiB, GiB; oversized media becomes metadata.",
+                      "anyOf": [
+                        { "type": "integer", "exclusiveMinimum": 0, "maximum": 9007199254740991 },
+                        {
+                          "type": "string",
+                          "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?(B|KB|MB|GB|KiB|MiB|GiB)$"
+                        }
+                      ],
+                      "markdownDescription": "Decoded-byte limit per attachment. Default: 5MiB. Accepts positive bytes or B, KB, MB, GB, KiB, MiB, GiB; oversized media becomes metadata."
+                    },
+                    "maxBytesPerRequest": {
+                      "description": "Decoded-byte budget across one request. Default: 10MiB. Accepts positive bytes or B, KB, MB, GB, KiB, MiB, GiB.",
+                      "anyOf": [
+                        { "type": "integer", "exclusiveMinimum": 0, "maximum": 9007199254740991 },
+                        {
+                          "type": "string",
+                          "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?(B|KB|MB|GB|KiB|MiB|GiB)$"
+                        }
+                      ],
+                      "markdownDescription": "Decoded-byte budget across one request. Default: 10MiB. Accepts positive bytes or B, KB, MB, GB, KiB, MiB, GiB."
+                    }
+                  },
+                  "additionalProperties": false,
+                  "markdownDescription": "Inbound Telegram photo/document delivery budgets; unsupported media remains metadata."
+                }
+              },
+              "additionalProperties": false,
+              "markdownDescription": "Telegram bot, chat/user allowlists, local history, and streamed output. Disabled by default."
             },
             "heartbeat": {
               "description": "Autonomous heartbeat lane. Disabled by default; configure its model through `surface.router.sessionModes.__heartbeat__.model`.",

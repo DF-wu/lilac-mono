@@ -83,6 +83,25 @@ test("Core schemas accept both versions, friendly units, and legacy web inputs",
     { configVersion: 2, tools: { web: { firecrawl: { queueTtl: "2s" } } } },
     { configVersion: 2, tools: { web: { search: { provider: "exa" } } } },
     { configVersion: 1, tools: { web: { extract: { provider: "exa" } } } },
+    {
+      configVersion: 2,
+      surface: {
+        telegram: {
+          enabled: true,
+          allowedChatIds: ["-100123"],
+          inboundMedia: { enabled: true, maxBytesPerRequest: "4MiB" },
+        },
+      },
+    },
+    {
+      configVersion: 2,
+      tools: {
+        web: {
+          extract: { providers: ["openai"] },
+          openai: { model: "openai/gpt-5-mini", searchContextSize: "high" },
+        },
+      },
+    },
     { configVersion: 2, plugins: { config: { test: { arbitrary: [1, true, null] } } } },
     { configVersion: 3 },
     {
@@ -107,6 +126,21 @@ test("Core schemas accept both versions, friendly units, and legacy web inputs",
 });
 
 test("Core editor diagnostics reject wrong versions, fields, types, and units", () => {
+  const leftoverImageConfig = {
+    configVersion: 2,
+    tools: {
+      generate: {
+        image: {
+          provider: "openai-compatible",
+          models: ["nanobanana-2"],
+          routes: { "nanobanana-2": "openai/gpt-image-2" },
+        },
+      },
+    },
+  };
+  expect(validateCore(leftoverImageConfig), JSON.stringify(validateCore.errors)).toBe(false);
+  expect(parseCoreConfigResult(leftoverImageConfig).isOk()).toBe(true);
+
   for (const input of [
     { configVersion: 4 },
     { configVersion: "2" },
@@ -121,6 +155,19 @@ test("Core editor diagnostics reject wrong versions, fields, types, and units", 
     { configVersion: 2, tools: { web: { firecrawl: { maxConcurrency: "two" } } } },
   ])
     expect(validateCore(input), JSON.stringify(input)).toBe(false);
+});
+
+test("Core editor web provider aliases use the selected config version's provider enum", () => {
+  for (const section of ["extract", "search"]) {
+    for (const selection of [{ provider: "openai" }, { providers: ["openai"] }]) {
+      for (const configVersion of [1, 2]) {
+        const input = { configVersion, tools: { web: { [section]: selection } } };
+        const accepted = configVersion === 2;
+        expect(parseCoreConfigResult(input).isOk()).toBe(accepted);
+        expect(validateCore(input), JSON.stringify(validateCore.errors)).toBe(accepted);
+      }
+    }
+  }
 });
 
 test("MCP schema validates transport-specific fields and credential source shapes", () => {

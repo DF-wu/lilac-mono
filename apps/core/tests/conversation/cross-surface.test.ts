@@ -609,7 +609,8 @@ test("attachment-only native and Discord messages feed identical bytes to summar
   expect(surfaces.sort()).toEqual(["discord", "native"]);
 });
 
-test("worker searches preserve cross-surface results and observe concurrent native deletion", async () => {
+test("worker searches with an empty Telegram allowlist preserve Discord/native recall and native deletion", async () => {
+  expect(cfg.surface.telegram.allowedChatIds).toEqual([]);
   const item = createNative();
   createDiscord();
   await service.runSummarization({ now: Date.now() });
@@ -646,6 +647,13 @@ test("worker searches preserve cross-surface results and observe concurrent nati
       })
     ).unwrap();
     expect(actual.results).toEqual(expected.results);
+    expect(actual.results.map((hit) => hit.surface).sort()).toEqual(["discord", "native"]);
+    for (const mode of ["lexical", "semantic"] as const) {
+      const results = (
+        await workerService.search({ query: "deployment", mode, queryAboutness: aboutness })
+      ).unwrap().results;
+      expect(results.map((hit) => hit.surface).sort()).toEqual(["discord", "native"]);
+    }
     duringEmbedding = () => removeThread(item);
     const after = (
       await workerService.search({

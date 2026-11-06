@@ -232,7 +232,7 @@ export class ModelCallAgentAdapter<TOOLS extends ToolSet = ToolSet> implements A
           phase = "post-model";
           await host.commitTurn(turn);
           usage(`${attemptId}:${prepared.step}`, turn.totalUsage);
-          const hasLocalTools = turn.finishReason === "tool-calls" && turn.toolCalls.length > 0;
+          const hasLocalTools = turn.finishReason !== "length" && turn.toolCalls.length > 0;
           const hasCompletedToolExchange =
             turn.finishReason === "tool-calls" &&
             turn.newMessages.some(
