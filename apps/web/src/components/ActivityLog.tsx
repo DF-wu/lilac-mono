@@ -1,3 +1,4 @@
+import { ProviderIcon } from "./ProviderIcon";
 import {
   createContext,
   useCallback,
@@ -117,11 +118,15 @@ function Label({ children, live }: { children: ReactNode; live?: boolean }) {
 export function subagentActivity(
   part: ActivityPart,
   agents: ReadonlyMap<string, SubagentSummary>,
-): (Pick<SubagentSummary, "profile" | "title" | "state"> & { id?: string }) | undefined {
+):
+  | (Pick<SubagentSummary, "profile" | "title" | "state" | "taskTitle" | "model" | "reasoning"> & {
+      id?: string;
+    })
+  | undefined {
   const agent = agents.get(part.id);
   if (agent) return agent;
   const profile = subagentLabelProfile(part);
-  if (profile !== "explore" && profile !== "general" && profile !== "self") return;
+  if (!profile) return;
   const current = part.data.label
     .split("\n")
     .findLast((line) => line.includes("> "))
@@ -274,7 +279,10 @@ function SubagentItem({
         className={`subagent-activity ${triggerClass}`}
         onClick={() => open(agent.id ?? part.id)}
       >
-        <span aria-hidden="true" className="flex size-6 shrink-0 items-center justify-center">
+        <span
+          aria-hidden="true"
+          className="flex size-6 shrink-0 items-center justify-center [&>[data-slot=avatar]]:size-5"
+        >
           <AgentAvatar
             decorative
             profile={agent.profile}
@@ -282,9 +290,25 @@ function SubagentItem({
             size="sm"
           />
         </span>
+        <span className="max-w-[45%] shrink-0 truncate text-foreground">
+          {agent.taskTitle ?? subagentProfileName(agent.profile)}
+        </span>
         <Label live={requestActive !== false && agent.state === "running"}>
-          {subagentProfileName(agent.profile)} - {agent.title}
+          {agent.state === "failed" ? (
+            <span className="text-danger">{agent.title}</span>
+          ) : (
+            agent.title
+          )}
         </Label>
+        {agent.model ? (
+          <span
+            title={`${agent.model} · ${agent.profile}${agent.reasoning ? ` · ${agent.reasoning}` : ""}`}
+            className="flex max-w-40 shrink-0 items-center gap-1 text-xs"
+          >
+            <ProviderIcon provider={agent.model.split("/")[0] ?? ""} className="size-3.5" />
+            <span className="truncate">{agent.model.split("/").slice(1).join("/")}</span>
+          </span>
+        ) : null}
         <RowTime at={times.get(part.id)} />
         <Chevron open={false} />
       </button>

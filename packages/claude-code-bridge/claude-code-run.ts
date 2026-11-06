@@ -10,7 +10,7 @@ import {
   type MessageInjector,
   type SpawnedProcess,
   type SpawnOptions,
-} from "ai-sdk-provider-claude-code";
+} from "@stanley2058/lilac-utils/claude-sdk";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { spawn } from "node:child_process";
 import { z } from "zod";
@@ -288,6 +288,7 @@ export type ClaudeCodeRunControl = {
 };
 
 export type MaterializedClaudeCodeRun = {
+  executeCall?: typeof import("./claude-sdk-call").executeClaudeSdkCall;
   agentModel: LanguageModel;
   /** Internal in-place candidate continuation model for persistent attempts. */
   continuationModel?: LanguageModel;
@@ -856,7 +857,7 @@ export async function materializeClaudeCodeRunResult(options: {
     pendingContextCapture = capture;
   };
 
-  const observeSdkMessage = (message: object) => {
+  const observeSdkMessage = async (message: object) => {
     const projected = projectClaudeSdkMessage(message);
     switch (projected.kind) {
       case "init":
@@ -904,9 +905,12 @@ export async function materializeClaudeCodeRunResult(options: {
       })();
       pendingObservabilityCallbacks.add(pending);
     }
+    if (projected.kind === "success-result") await waitForObservability();
   };
 
-  const stopHook = async (...args: unknown[]): Promise<unknown> => {
+  const stopHook = async (
+    ...args: unknown[]
+  ): Promise<import("@anthropic-ai/claude-agent-sdk").HookJSONOutput> => {
     const parsed = resultOutcome(decodeClaudeStopHookInput(args));
     if (!parsed.ok) {
       recordCallbackError(parsed.error.message, true);

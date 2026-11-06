@@ -159,7 +159,7 @@ Core requires `REDIS_URL` and a valid model configuration. Set `DISCORD_TOKEN` w
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
 | Native   | `surface.native.enabled: true`, installation ID, local or Clerk authentication, and provider credentials                                          | Disabled by default; authenticated owner access only                                             | [`docs/native-surface.md`](./docs/native-surface.md)                                     |
 | Discord  | `DISCORD_TOKEN`; configure `allowedChannelIds` or `allowedGuildIds`                                                                               | Ignores all Discord traffic when both allowlists are empty                                       | [`core-config.example.yaml`](./packages/utils/config-templates/core-config.example.yaml) |
-| Telegram | `configVersion: 2`, `enabled: true`, `token`, `allowedChatIds`                                                                                    | Disabled by default; ignores all chats when the chat allowlist is empty                          | [`docs/telegram-surface.md`](./docs/telegram-surface.md)                                 |
+| Telegram | `configVersion: 2` or `3`, `enabled: true`, `token`, `allowedChatIds`                                                                                    | Disabled by default; ignores all chats when the chat allowlist is empty                          | [`docs/telegram-surface.md`](./docs/telegram-surface.md)                                 |
 | GitHub   | GitHub App auth, `GITHUB_WEBHOOK_SECRET`, and an HTTPS/reverse proxy reachable by GitHub; a user token is an optional preferred outbound identity | The surface does not start without the GitHub App secret; returns `401` for an invalid signature | [`docs/github-reply-permalinks.md`](./docs/github-reply-permalinks.md)                   |
 
 The GitHub webhook listens on port `8787` and path `/github/webhook` by default. Stock Compose does not forward or expose the GitHub webhook environment and port, so production deployments must provide the reverse proxy, environment, and network wiring themselves.
@@ -328,7 +328,7 @@ See [`AGENTS.md`](./AGENTS.md) for each workspace's build, test, and typecheck c
 ## Documentation
 
 - [`PROJECT.md`](./PROJECT.md): durable architecture, terminology, ownership, and where-to-change guide
-- [`core-config.example.yaml`](./packages/utils/config-templates/core-config.example.yaml): current Core configuration reference
+- [`docs/core-config.md`](./docs/core-config.md): schema-backed editor documentation and the minimal v3 starter configuration
 - [`docs/core-config-migrations.md`](./docs/core-config-migrations.md): manual Core config upgrades
 - [`plan/README.md`](./plan/README.md): active implementation plans
 - [`MIGRATIONS.md`](./MIGRATIONS.md): persisted-data, wire, and protocol migrations

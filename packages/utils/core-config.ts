@@ -30,6 +30,14 @@ import {
   parseCoreConfigV2ToUniversal,
   CoreConfigV2Invalid,
 } from "./core-config/v2";
+import {
+  coreConfigInputSchemaV3,
+  decodeCoreConfigV3,
+  decodeCoreConfigV3ToUniversal,
+  parseCoreConfigV3,
+  parseCoreConfigV3ToUniversal,
+  CoreConfigV3Invalid,
+} from "./core-config/v3";
 import { formatCoreConfigKeyPath } from "./core-config/unknown-keys";
 import {
   CoreConfigMustBeObject,
@@ -65,6 +73,11 @@ export {
   parseCoreConfigV1ToUniversal,
   parseCoreConfigV2,
   parseCoreConfigV2ToUniversal,
+  coreConfigInputSchemaV3,
+  decodeCoreConfigV3,
+  decodeCoreConfigV3ToUniversal,
+  parseCoreConfigV3,
+  parseCoreConfigV3ToUniversal,
 };
 export {
   DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS,
@@ -105,7 +118,7 @@ export type {
   RouterSessionConfigScope,
   RetentionLimit,
   SubagentExecution,
-  SubagentProfileConfig,
+  SubagentPermissionProfileConfig,
   UniversalCoreConfig,
 } from "./core-config/types";
 
@@ -252,7 +265,11 @@ export function parseCoreConfigResult(
   options?: CoreConfigParseOptions,
 ): ResultType<
   CoreConfig,
-  CoreConfigVersionInvalid | CoreConfigMustBeObject | CoreConfigV1Invalid | CoreConfigV2Invalid
+  | CoreConfigVersionInvalid
+  | CoreConfigMustBeObject
+  | CoreConfigV1Invalid
+  | CoreConfigV2Invalid
+  | CoreConfigV3Invalid
 > {
   return parseCoreConfigValueResult(raw, {
     onUnknownKey:
@@ -281,7 +298,8 @@ export async function parseCoreConfig(
           | CoreConfigVersionInvalid
           | CoreConfigMustBeObject
           | CoreConfigV1Invalid
-          | CoreConfigV2Invalid;
+          | CoreConfigV2Invalid
+          | CoreConfigV3Invalid;
       }
   >({
     ok: (value) => ({ value }),
@@ -296,11 +314,13 @@ function projectLegacyCoreConfigFailure(
     | CoreConfigVersionInvalid
     | CoreConfigMustBeObject
     | CoreConfigV1Invalid
-    | CoreConfigV2Invalid,
+    | CoreConfigV2Invalid
+    | CoreConfigV3Invalid,
 ): Error {
   switch (error._tag) {
     case "CoreConfigV1Invalid":
     case "CoreConfigV2Invalid":
+    case "CoreConfigV3Invalid":
       return error.cause;
     case "CoreConfigVersionInvalid":
     case "CoreConfigMustBeObject":
@@ -377,6 +397,7 @@ export async function getCoreConfig(options?: {
     | CoreConfigMustBeObject
     | CoreConfigV1Invalid
     | CoreConfigV2Invalid
+    | CoreConfigV3Invalid
   >({
     ok: (value) => value,
     err: (error) => error,

@@ -4,10 +4,16 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { nativeDeploymentSettingsSchema } from "@stanley2058/lilac-client-protocol";
+import {
+  parseCoreConfigV2ToUniversal,
+  parseCoreConfigV3ToUniversal,
+} from "@stanley2058/lilac-utils";
+import { decodeNativeRecord } from "../../../src/surface/native/codec";
 import { NativeStore } from "../../../src/surface/native/store";
 import { createNativeIntegrationFixture } from "./integration-fixture";
 
 const initial = {
+  transport: "auto" as const,
   titleModel: "main",
   outputStreaming: "complete" as const,
   dmContextGapMs: 7_200_000,
@@ -140,5 +146,88 @@ test("stored deployment settings drop the legacy DM context age", () => {
     });
   } finally {
     store.close();
+  }
+});
+
+function deploymentFromConfig(
+  native: ReturnType<typeof parseCoreConfigV3ToUniversal>["surface"]["native"],
+) {
+  return nativeDeploymentSettingsSchema.parse({
+    titleModel: native.titleModel,
+    outputStreaming: native.outputStreaming,
+    oldMessageSelectionMaxAgeMs: native.oldMessageSelectionMaxAgeMs,
+    storageRetentionMaxAgeMs: native.storageRetentionMaxAgeMs,
+    crossThreadSend: native.crossThreadSend,
+    dmContextGapMs: 7_200_000,
+    dmTimestampGapMs: 1_800_000,
+  });
+}
+
+test("switching from v2 native YAML settings to v3 defaults preserves the deployment record", () => {
+  const store = new NativeStore(new Database(":memory:"));
+  try {
+    store.initialize().unwrap();
+    const v2 = parseCoreConfigV2ToUniversal({
+      configVersion: 2,
+      surface: { native: initial },
+    });
+    const v2Settings = deploymentFromConfig(v2.surface.native);
+    store.initializeDeployment(v2Settings).unwrap();
+    const imported = store.getDeployment().unwrap();
+    const v3 = parseCoreConfigV3ToUniversal({ configVersion: 3 });
+    const freshSettings = deploymentFromConfig(v3.surface.native);
+    expect(freshSettings.titleModel).toBe("fast");
+    expect(freshSettings.outputStreaming).toBe("paragraph");
+    expect(freshSettings.crossThreadSend.triggerRun).toBe(true);
+    store.initializeDeployment(freshSettings).unwrap();
+    expect(store.getDeployment().unwrap()).toEqual(imported);
+    expect(imported.settings.titleModel).toBe("main");
+    expect(imported.settings.outputStreaming).toBe("complete");
+    expect(imported.settings.crossThreadSend.triggerRun).toBe(false);
+  } finally {
+    store.close();
+  }
+});
+
+test("existing deployment records default to auto without rewriting and reject unknown transports", () => {
+  const { transport: _transport, ...settings } = initial;
+  const row = {
+    format_version: 1,
+    data_json: JSON.stringify({ kind: "deployment", value: { settings, revision: 7 } }),
+  };
+  const decoded = decodeNativeRecord(row).unwrap();
+  expect(decoded.value).toMatchObject({
+    kind: "deployment",
+    value: { settings: { transport: "auto" }, revision: 7 },
+  });
+  expect(JSON.parse(row.data_json).value.settings.transport).toBeUndefined();
+  expect(nativeDeploymentSettingsSchema.safeParse({ ...initial, transport: "poll" }).success).toBe(
+    false,
+  );
+});
+
+test("deployment transport changes notify connected readers through bootstrap resync", async () => {
+  const fixture = await createNativeIntegrationFixture();
+  const controller = new AbortController();
+  try {
+    const { client } = fixture.connect();
+    const initial = await client.bootstrap.get({});
+    const document = await client.config.readDeployment({});
+    const stream = await client.bootstrap.watch(
+      { cursor: initial.catalogCursor },
+      { signal: controller.signal },
+    );
+    const next = stream.next();
+    await client.config.setDeployment({
+      settings: { ...document.settings, transport: "http-sse" },
+      expectedRevision: document.revision,
+    });
+    expect((await next).value).toMatchObject({ kind: "resync" });
+    expect((await client.bootstrap.get({})).transport).toBe("http-sse");
+    controller.abort();
+    await stream.return();
+  } finally {
+    controller.abort();
+    await fixture.close();
   }
 });

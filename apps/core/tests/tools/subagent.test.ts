@@ -2,6 +2,11 @@ import { describe, expect, it } from "bun:test";
 import { asSchema } from "ai";
 import { Panic } from "better-result";
 
+import {
+  parseCoreConfigV2ToUniversal,
+  parseCoreConfigV3ToUniversal,
+} from "@stanley2058/lilac-utils";
+
 import { BUILTIN_SURFACE_PROTOCOLS } from "../../src/surface/builtin-surface-protocols";
 import { subagentTools, type SubagentDelegationRegistration } from "../../src/tools/subagent";
 
@@ -29,9 +34,16 @@ async function resolveExecuteResult<T>(value: T | PromiseLike<T> | AsyncIterable
   return await value;
 }
 
+const TEST_CONFIG = parseCoreConfigV3ToUniversal({
+  configVersion: 3,
+  agent: { subagents: { permissions: { offline: { network: false } } } },
+});
+
 describe("subagent_delegate tool", () => {
   it("documents selectable model aliases and appends delegation guidance", () => {
     const tools = subagentTools({
+      runProfile: "primary",
+      config: { ...TEST_CONFIG, configVersion: 2 },
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       delegatePromptOverlay: "Escalate critical reviews to a stronger model.",
@@ -140,6 +152,8 @@ describe("subagent_delegate tool", () => {
 
   it("omits the model field when no aliases are selectable", async () => {
     const tools = subagentTools({
+      runProfile: "primary",
+      config: { ...TEST_CONFIG, configVersion: 2 },
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       modelPresets: {
@@ -163,7 +177,7 @@ describe("subagent_delegate tool", () => {
       resolveExecuteResult(
         tools.subagent_delegate.execute!(
           {
-            profile: "explore",
+            permissions: "restricted",
             task: "Try a hidden model",
             mode: "deferred",
             model: "manual",
@@ -185,7 +199,7 @@ describe("subagent_delegate tool", () => {
       resolveExecuteResult(
         tools.subagent_delegate.execute!(
           {
-            profile: "explore",
+            permissions: "restricted",
             task: "Try a reasoning override",
             mode: "deferred",
             reasoning: "high",
@@ -213,6 +227,8 @@ describe("subagent_delegate tool", () => {
         >
       | undefined;
     const tools = subagentTools({
+      runProfile: "primary",
+      config: { ...TEST_CONFIG, configVersion: 2 },
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       modelPresets: {
@@ -238,7 +254,7 @@ describe("subagent_delegate tool", () => {
     await resolveExecuteResult(
       tools.subagent_delegate.execute!(
         {
-          profile: "explore",
+          permissions: "restricted",
           task: "Map auth flow",
           mode: "deferred",
           model: "scout",
@@ -270,7 +286,7 @@ describe("subagent_delegate tool", () => {
     await expect(
       resolveExecuteResult(
         tools.subagent_delegate.execute!(
-          { profile: "explore", task: "Try manual", mode: "deferred", model: "manual" },
+          { permissions: "restricted", task: "Try manual", mode: "deferred", model: "manual" },
           {
             toolCallId: "tool-manual-model",
             messages: [],
@@ -296,6 +312,8 @@ describe("subagent_delegate tool", () => {
     }> = [];
 
     const tools = subagentTools({
+      runProfile: "primary",
+      config: TEST_CONFIG,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async (registration) => {
@@ -316,7 +334,7 @@ describe("subagent_delegate tool", () => {
 
     const res = await resolveExecuteResult(
       tools.subagent_delegate.execute!(
-        { profile: "explore", task: "Map auth flow", mode: "deferred" },
+        { permissions: "restricted", task: "Map auth flow", mode: "deferred" },
         {
           toolCallId: "tool-deferred-1",
           messages: [],
@@ -335,8 +353,8 @@ describe("subagent_delegate tool", () => {
       mode: "deferred",
       status: "accepted",
       workflowRunId: "run:deferred-1",
-      profile: "explore",
-      sessionName: expect.stringMatching(/^explore-[0-9a-f]{8}$/u),
+      permissions: "restricted",
+      sessionName: expect.stringMatching(/^restricted-[0-9a-f]{8}$/u),
     });
     expect(launches).toEqual([
       {
@@ -354,6 +372,8 @@ describe("subagent_delegate tool", () => {
       [];
 
     const tools = subagentTools({
+      runProfile: "primary",
+      config: TEST_CONFIG,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async (registration) => {
@@ -371,7 +391,7 @@ describe("subagent_delegate tool", () => {
     });
 
     const inputWithLegacySessionId = {
-      profile: "explore" as const,
+      permissions: "restricted",
       task: "Map auth flow",
       mode: "deferred" as const,
       sessionId: "sub:dummy",
@@ -391,7 +411,7 @@ describe("subagent_delegate tool", () => {
     );
 
     expect(res.status).toBe("accepted");
-    expect(res.sessionName).toMatch(/^explore-[0-9a-f]{8}$/u);
+    expect(res.sessionName).toMatch(/^restricted-[0-9a-f]{8}$/u);
     expect(launches).toEqual([
       {
         sessionName: res.sessionName,
@@ -403,6 +423,8 @@ describe("subagent_delegate tool", () => {
 
   it("delegates to child request and returns child final text", async () => {
     const tools = subagentTools({
+      runProfile: "primary",
+      config: TEST_CONFIG,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async () => ({
@@ -415,7 +437,7 @@ describe("subagent_delegate tool", () => {
     const res = await resolveExecuteResult(
       tools.subagent_delegate.execute!(
         {
-          profile: "explore",
+          permissions: "restricted",
           task: "Map auth flow",
           mode: "sync",
         },
@@ -437,8 +459,8 @@ describe("subagent_delegate tool", () => {
     expect(res.ok).toBe(true);
     expect(res.status).toBe("resolved");
     expect(res.workflowRunId).toBe("run:sync-result");
-    expect(res.profile).toBe("explore");
-    expect(res.sessionName).toMatch(/^explore-[0-9a-f]{8}$/u);
+    expect(res.permissions).toBe("restricted");
+    expect(res.sessionName).toMatch(/^restricted-[0-9a-f]{8}$/u);
     expect(res.finalText).toBe("hello world");
     expect(res).not.toHaveProperty("childRequestId");
     expect(res).not.toHaveProperty("childSessionId");
@@ -449,6 +471,8 @@ describe("subagent_delegate tool", () => {
   it("preserves exact Panic identity from child completion", async () => {
     const panic = new Panic({ message: "subagent completion invariant failed" });
     const tools = subagentTools({
+      runProfile: "primary",
+      config: TEST_CONFIG,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async () => ({
@@ -461,7 +485,7 @@ describe("subagent_delegate tool", () => {
     await expect(
       resolveExecuteResult(
         tools.subagent_delegate.execute!(
-          { profile: "explore", task: "Fail exactly", mode: "sync" },
+          { permissions: "restricted", task: "Fail exactly", mode: "sync" },
           {
             toolCallId: "tool-panic",
             messages: [],
@@ -481,6 +505,8 @@ describe("subagent_delegate tool", () => {
     let cancelQueued = false;
 
     const tools = subagentTools({
+      runProfile: "primary",
+      config: TEST_CONFIG,
       idleTimeoutMs: 30,
       maxDepth: 1,
       onDelegate: async () => {
@@ -499,7 +525,7 @@ describe("subagent_delegate tool", () => {
 
     const res = await resolveExecuteResult(
       tools.subagent_delegate.execute!(
-        { profile: "explore", task: "Wait forever", mode: "sync" },
+        { permissions: "restricted", task: "Wait forever", mode: "sync" },
         {
           toolCallId: "tool-idle-timeout",
           messages: [],
@@ -520,8 +546,10 @@ describe("subagent_delegate tool", () => {
     expect(cancelQueued).toBe(true);
   });
 
-  it("supports general and self delegation profiles", async () => {
+  it("supports full and restricted permission profiles", async () => {
     const tools = subagentTools({
+      runProfile: "primary",
+      config: TEST_CONFIG,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async (registration) => {
@@ -539,13 +567,13 @@ describe("subagent_delegate tool", () => {
 
     const seenProfiles: string[] = [];
 
-    const profiles = ["general", "self"] as const;
+    const profiles = ["full", "restricted"] as const;
 
     for (const profile of profiles) {
       const res = await resolveExecuteResult(
         tools.subagent_delegate.execute!(
           {
-            profile,
+            permissions: profile,
             task: "Do delegated work",
             mode: "sync",
           },
@@ -566,11 +594,11 @@ describe("subagent_delegate tool", () => {
       if (res.mode !== "sync") throw new Error("expected sync subagent result");
       expect(res.ok).toBe(true);
       expect(res.status).toBe("resolved");
-      expect(res.profile).toBe(profile);
+      expect(res.permissions).toBe(profile);
       expect(res.finalText).toBe(`done:${profile}`);
     }
 
-    expect(seenProfiles).toEqual(["general", "self"]);
+    expect(seenProfiles).toEqual(["full", "restricted"]);
   });
 
   it.each(Object.values(BUILTIN_SURFACE_PROTOCOLS).map((protocol) => protocol.platform))(
@@ -578,6 +606,8 @@ describe("subagent_delegate tool", () => {
     async (platform) => {
       let origin: unknown;
       const tools = subagentTools({
+        runProfile: "primary",
+        config: TEST_CONFIG,
         idleTimeoutMs: 2_000,
         maxDepth: 1,
         onDelegate: async (registration) => {
@@ -592,7 +622,7 @@ describe("subagent_delegate tool", () => {
 
       await resolveExecuteResult(
         tools.subagent_delegate.execute!(
-          { profile: "explore", task: "Inspect origin", mode: "deferred" },
+          { permissions: "restricted", task: "Inspect origin", mode: "deferred" },
           {
             toolCallId: `tool-${platform}-origin`,
             messages: [],
@@ -619,6 +649,8 @@ describe("subagent_delegate tool", () => {
     "rejects unsupported initiator platform %s",
     async (platform) => {
       const tools = subagentTools({
+        runProfile: "primary",
+        config: TEST_CONFIG,
         idleTimeoutMs: 2_000,
         maxDepth: 1,
         onDelegate: async () => ({
@@ -631,7 +663,7 @@ describe("subagent_delegate tool", () => {
       await expect(
         resolveExecuteResult(
           tools.subagent_delegate.execute!(
-            { profile: "explore", task: "Inspect origin", mode: "deferred" },
+            { permissions: "restricted", task: "Inspect origin", mode: "deferred" },
             {
               toolCallId: `tool-${platform}-origin`,
               messages: [],
@@ -651,6 +683,8 @@ describe("subagent_delegate tool", () => {
 
   it("derives child session id from sessionName for continuation", async () => {
     const tools = subagentTools({
+      runProfile: "primary",
+      config: TEST_CONFIG,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async (registration) => {
@@ -672,7 +706,7 @@ describe("subagent_delegate tool", () => {
     const res = await resolveExecuteResult(
       tools.subagent_delegate.execute!(
         {
-          profile: "explore",
+          permissions: "restricted",
           task: "Continue prior work",
           mode: "sync",
           sessionName,
@@ -699,6 +733,8 @@ describe("subagent_delegate tool", () => {
   it("makes a generated child name reusable for stable continuation", async () => {
     const launches: Array<{ sessionName: string; childSessionId: string; stable: true }> = [];
     const tools = subagentTools({
+      runProfile: "primary",
+      config: TEST_CONFIG,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async (registration) => {
@@ -717,7 +753,7 @@ describe("subagent_delegate tool", () => {
 
     const generated = await resolveExecuteResult(
       tools.subagent_delegate.execute!(
-        { profile: "explore", task: "One-off utility run", mode: "deferred" },
+        { permissions: "restricted", task: "One-off utility run", mode: "deferred" },
         {
           toolCallId: "tool-generated-fresh-only",
           messages: [],
@@ -734,7 +770,7 @@ describe("subagent_delegate tool", () => {
     await resolveExecuteResult(
       tools.subagent_delegate.execute!(
         {
-          profile: "explore",
+          permissions: "restricted",
           task: "Continue the utility run",
           mode: "deferred",
           sessionName: generated.sessionName,
@@ -768,6 +804,8 @@ describe("subagent_delegate tool", () => {
 
   it("rejects invalid continuation session names", async () => {
     const tools = subagentTools({
+      runProfile: "primary",
+      config: TEST_CONFIG,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
     });
@@ -775,7 +813,7 @@ describe("subagent_delegate tool", () => {
     await expect(
       tools.subagent_delegate.execute!(
         {
-          profile: "explore",
+          permissions: "restricted",
           task: "Continue prior work",
           mode: "deferred",
           sessionName: "../someone-else",
@@ -796,13 +834,15 @@ describe("subagent_delegate tool", () => {
 
   it("rejects delegation when depth limit is reached", async () => {
     const tools = subagentTools({
+      runProfile: "primary",
+      config: TEST_CONFIG,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
     });
 
     await expect(
       tools.subagent_delegate.execute!(
-        { profile: "explore", task: "Map auth flow", mode: "deferred" },
+        { permissions: "restricted", task: "Map auth flow", mode: "deferred" },
         {
           toolCallId: "tool-2",
           messages: [],
@@ -817,107 +857,178 @@ describe("subagent_delegate tool", () => {
     ).rejects.toThrow(/depth limit reached/i);
   });
 
-  it("rejects delegation from explore and general runs", async () => {
-    const tools = subagentTools({
-      idleTimeoutMs: 2_000,
-      maxDepth: 2,
-    });
+  it("lists only profiles within the delegating run's authority", () => {
+    const schemaFor = (runProfile: string) => {
+      const delegate = subagentTools({
+        idleTimeoutMs: 2_000,
+        maxDepth: 2,
+        runProfile,
+        config: TEST_CONFIG,
+      }).subagent_delegate as unknown as { inputSchema: unknown };
+      return asSchema(delegate.inputSchema as never).jsonSchema as unknown as {
+        properties?: { permissions?: { enum?: string[]; description?: string } };
+      };
+    };
 
-    await expect(
-      tools.subagent_delegate.execute!(
-        { profile: "explore", task: "Map auth flow", mode: "deferred" },
-        {
-          toolCallId: "tool-no-nest-explore",
-          messages: [],
-          context: {
-            requestId: "r:no-nest-explore",
-            sessionId: "s:no-nest-explore",
-            requestClient: "discord",
-            subagentDepth: 1,
-            subagentProfile: "explore",
-          },
-        },
-      ),
-    ).rejects.toThrow(/disabled in explore subagent runs/i);
-
-    await expect(
-      tools.subagent_delegate.execute!(
-        { profile: "general", task: "Fix lint", mode: "deferred" },
-        {
-          toolCallId: "tool-no-nest-general",
-          messages: [],
-          context: {
-            requestId: "r:no-nest-general",
-            sessionId: "s:no-nest-general",
-            requestClient: "discord",
-            subagentDepth: 1,
-            subagentProfile: "general",
-          },
-        },
-      ),
-    ).rejects.toThrow(/disabled in general subagent runs/i);
+    const primary = schemaFor("primary");
+    expect(primary.properties?.permissions?.enum).toEqual(["full", "restricted", "offline"]);
+    expect(primary.properties?.permissions?.description).toContain("When omitted, full applies.");
+    expect(primary.properties?.permissions?.description).toContain(
+      "- restricted: no workspace writes, network, native bash, cannot delegate",
+    );
+    expect(schemaFor("restricted").properties?.permissions?.enum).toEqual([
+      "restricted",
+      "offline",
+    ]);
+    expect(schemaFor("offline").properties?.permissions?.enum).toEqual(["offline"]);
   });
 
-  it("rejects self->self recursion but allows self->explore at depth 1", async () => {
+  it("rejects permission profiles outside the delegating run's authority", async () => {
+    const registrations: string[] = [];
     const tools = subagentTools({
       idleTimeoutMs: 2_000,
       maxDepth: 2,
-      onDelegate: async () => ({
-        runId: "run:self-explore",
-        completion: Promise.resolve({ status: "resolved", finalText: "self->explore ok" }),
-        cancel: async () => {},
-      }),
+      runProfile: "restricted",
+      config: TEST_CONFIG,
+      onDelegate: async (registration) => {
+        registrations.push(registration.profile);
+        return {
+          runId: `run:${registration.profile}`,
+          completion: Promise.resolve({ status: "resolved", finalText: "ok" }),
+          cancel: async () => {},
+        };
+      },
     });
+    const context = {
+      requestId: "r:narrow",
+      sessionId: "s:narrow",
+      requestClient: "discord",
+      subagentDepth: 1,
+      subagentProfile: "restricted",
+    };
 
     await expect(
       tools.subagent_delegate.execute!(
-        { profile: "self", task: "Spawn self again", mode: "deferred" },
-        {
-          toolCallId: "tool-self-self",
-          messages: [],
-          context: {
-            requestId: "r:self-self",
-            sessionId: "s:self-self",
-            requestClient: "discord",
-            subagentDepth: 1,
-            subagentProfile: "self",
-          },
-        },
+        { permissions: "full", task: "Fix lint", mode: "deferred" },
+        { toolCallId: "tool-widen", messages: [], context },
       ),
-    ).rejects.toThrow(/cannot delegate to self profile/i);
+    ).rejects.toThrow(/not within this run's authority/i);
 
-    const res = await resolveExecuteResult(
+    const offline = await resolveExecuteResult(
       tools.subagent_delegate.execute!(
-        {
-          profile: "explore",
-          task: "Map auth flow",
-          mode: "sync",
-        },
-        {
-          toolCallId: "tool-self-explore",
-          messages: [],
-          context: {
-            requestId: "r:self-explore",
-            sessionId: "s:self-explore",
-            requestClient: "discord",
-            subagentDepth: 1,
-            subagentProfile: "self",
-          },
-        },
+        { permissions: "offline", task: "Read docs", mode: "deferred" },
+        { toolCallId: "tool-narrow", messages: [], context },
       ),
     );
+    expect(offline).toMatchObject({ status: "accepted", permissions: "offline" });
 
-    expect(res.mode).toBe("sync");
-    if (res.mode !== "sync") throw new Error("expected sync subagent result");
-    expect(res.status).toBe("resolved");
-    expect(res.finalText).toBe("self->explore ok");
-    expect(res.profile).toBe("explore");
+    const inherited = await resolveExecuteResult(
+      tools.subagent_delegate.execute!(
+        { task: "Map auth flow", mode: "deferred" },
+        { toolCallId: "tool-inherit", messages: [], context },
+      ),
+    );
+    expect(inherited).toMatchObject({ status: "accepted", permissions: "restricted" });
+    expect(registrations).toEqual(["offline", "restricted"]);
+  });
+
+  it("keeps the frozen-version restricted default for primary and legacy nested runs", async () => {
+    const legacyConfig = parseCoreConfigV2ToUniversal({ configVersion: 2 });
+    const registrations: string[] = [];
+    const onDelegate = async (registration: { profile: string }) => {
+      registrations.push(registration.profile);
+      return {
+        runId: `run:${registrations.length}`,
+        completion: Promise.resolve({ status: "resolved" as const, finalText: "ok" }),
+        cancel: async () => {},
+      };
+    };
+    for (const [runProfile, depth] of [
+      ["primary", 0],
+      ["self", 1],
+    ] as const) {
+      const tools = subagentTools({
+        idleTimeoutMs: 2_000,
+        maxDepth: 2,
+        runProfile,
+        config: legacyConfig,
+        onDelegate,
+      });
+      await resolveExecuteResult(
+        tools.subagent_delegate.execute!(
+          { task: "Map auth flow", mode: "deferred" },
+          {
+            toolCallId: `tool-legacy-${runProfile}`,
+            messages: [],
+            context: {
+              requestId: `r:legacy-${runProfile}`,
+              sessionId: `s:legacy-${runProfile}`,
+              requestClient: "discord",
+              subagentDepth: depth,
+              ...(runProfile === "primary" ? {} : { subagentProfile: runProfile }),
+            },
+          },
+        ),
+      );
+    }
+    expect(registrations).toEqual(["restricted", "restricted"]);
+  });
+
+  it("defaults primary delegation to full and resolves legacy parent names", async () => {
+    const onDelegate = async () => ({
+      runId: "run:default",
+      completion: Promise.resolve({ status: "resolved" as const, finalText: "ok" }),
+      cancel: async () => {},
+    });
+    const context = {
+      requestId: "r:default",
+      sessionId: "s:default",
+      requestClient: "discord",
+      subagentDepth: 0,
+    };
+    const primary = subagentTools({
+      idleTimeoutMs: 2_000,
+      maxDepth: 2,
+      runProfile: "primary",
+      config: TEST_CONFIG,
+      onDelegate,
+    });
+    expect(
+      await resolveExecuteResult(
+        primary.subagent_delegate.execute!(
+          { task: "Do work", mode: "deferred" },
+          { toolCallId: "tool-default", messages: [], context },
+        ),
+      ),
+    ).toMatchObject({ permissions: "full" });
+
+    const legacySelf = subagentTools({
+      idleTimeoutMs: 2_000,
+      maxDepth: 2,
+      runProfile: "self",
+      config: TEST_CONFIG,
+      onDelegate,
+    });
+    expect(
+      await resolveExecuteResult(
+        legacySelf.subagent_delegate.execute!(
+          { task: "Do work", mode: "deferred" },
+          {
+            toolCallId: "tool-legacy",
+            messages: [],
+            context: { ...context, subagentDepth: 1, subagentProfile: "self" },
+          },
+        ),
+      ),
+    ).toMatchObject({ permissions: "full" });
   });
 
   it("ignores legacy caller timeouts and uses the configured idle timeout", async () => {
     let capturedIdleTimeoutMs: number | undefined;
 
     const tools = subagentTools({
+      runProfile: "primary",
+      config: TEST_CONFIG,
       idleTimeoutMs: 2_000,
       maxDepth: 1,
       onDelegate: async (registration) => {
@@ -931,7 +1042,7 @@ describe("subagent_delegate tool", () => {
     });
 
     const inputWithLegacyTimeout = {
-      profile: "explore" as const,
+      permissions: "restricted",
       task: "Map auth flow",
       mode: "deferred" as const,
       timeoutMs: 999_999,
@@ -953,4 +1064,52 @@ describe("subagent_delegate tool", () => {
     expect(capturedIdleTimeoutMs).toBe(2_000);
     expect(res.status).toBe("accepted");
   });
+});
+
+it("v3 delegates configured aliases without agentCanSelect and preserves the task title", async () => {
+  const config = parseCoreConfigV3ToUniversal({
+    configVersion: 3,
+    models: {
+      catalog: { providers: { openai: "enabled" } },
+      def: { manual: { model: "openai/private-model", agentCanSelect: false } },
+    },
+  });
+  let selected: { modelOverride?: string; title?: string } | undefined;
+  const tools = subagentTools({
+    config,
+    runProfile: "primary",
+    idleTimeoutMs: 2000,
+    maxDepth: 1,
+    onDelegate: async (registration) => {
+      selected = registration;
+      return {
+        runId: "catalog-delegation",
+        completion: Promise.resolve({ status: "resolved", finalText: "" }),
+        cancel: async () => {},
+      };
+    },
+  });
+  await resolveExecuteResult(
+    tools.subagent_delegate.execute!(
+      {
+        permissions: "restricted",
+        task: "Inspect compatibility",
+        title: "Check compatibility",
+        model: "manual",
+        mode: "deferred",
+      },
+      {
+        toolCallId: "catalog-delegation",
+        messages: [],
+        context: {
+          requestId: "catalog-parent",
+          sessionId: "catalog-session",
+          requestClient: "native",
+          subagentDepth: 0,
+        },
+      },
+    ),
+  );
+  expect(selected?.modelOverride).toBe("manual");
+  expect(selected?.title).toBe("Check compatibility");
 });

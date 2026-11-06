@@ -13,6 +13,15 @@ test("embedded viewer URL carries only the parent origin", () => {
   expect([...url.searchParams.keys()]).toEqual(["parentOrigin"]);
   expect(url.hash).toBe("");
 });
+test("Core viewer uses the app origin and keeps desktop routing without credentials", () => {
+  const url = new URL(
+    computerFrameUrl("/computer.html?threadId=t&generation=g", "https://native.example"),
+  );
+  expect(url.origin).toBe("https://native.example");
+  expect(url.searchParams.get("threadId")).toBe("t");
+  expect(url.searchParams.get("generation")).toBe("g");
+  expect(url.searchParams.has("password")).toBe(false);
+});
 test("viewer rejects unrelated and invalid frame messages", () => {
   expect(decodeComputerState({ type: "lilac-computer-state", state: "connected" })).toBe(
     "connected",

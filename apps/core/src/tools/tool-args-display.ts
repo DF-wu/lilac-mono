@@ -69,7 +69,11 @@ const localApplyPatchArgsSchema = z.object({
 });
 
 const subagentDelegateArgsSchema = z.object({
-  profile: z.enum(["explore", "general", "self"]).optional(),
+  title: z.string().optional(),
+  // Transcripts recorded before permission profiles carry `profile`.
+  profile: z.string().optional(),
+  permissions: z.string().optional(),
+  model: z.string().optional(),
   task: z.string().min(1),
   timeoutMs: z.number().optional(),
 });
@@ -238,10 +242,15 @@ export const formatFuzzySearchToolArgs: ToolArgsFormatter = (args) => {
 export const formatSubagentDelegateToolArgs: ToolArgsFormatter = (args) => {
   const parsed = safeValidateSync(subagentDelegateArgsSchema, args);
   if (!isRecord(parsed) || typeof parsed["task"] !== "string") return "";
-  const task = parsed["task"].replace(/\s+/g, " ").trim();
+  const task = (typeof parsed["title"] === "string" ? parsed["title"] : parsed["task"])
+    .replace(/\s+/g, " ")
+    .trim();
   if (!task) return "";
-  const profile = typeof parsed["profile"] === "string" ? parsed["profile"] : "explore";
-  return " " + truncateEnd(`(${profile}) ${task}`, DISPLAY_MAX_LEN);
+  const labels = [parsed["permissions"] ?? parsed["profile"], parsed["model"]].filter(
+    (label): label is string => typeof label === "string" && label.length > 0,
+  );
+  const prefix = labels.length > 0 ? `(${labels.join(", ")}) ` : "";
+  return " " + truncateEnd(`${prefix}${task}`, DISPLAY_MAX_LEN);
 };
 
 export const formatApplyPatchToolArgs: ToolArgsFormatter = (args) => {

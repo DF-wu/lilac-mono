@@ -2,6 +2,17 @@ import { z } from "zod";
 import { identitySchema, revisionSchema, runIdentitySchema } from "./replay.ts";
 import { citationInputFits } from "./assistant-citations.ts";
 
+export const modelReasoningSchema = z.enum([
+  "provider-default",
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+export type ModelReasoning = z.infer<typeof modelReasoningSchema>;
 export const catalogIdentifierSchema = z.string().min(1).max(512);
 
 export const toolModeSchema = z.enum(["restricted", "full"]);
@@ -33,6 +44,7 @@ export const nativeThreadSchema = z.strictObject({
   revision: revisionSchema,
   capabilities: threadCapabilitiesSchema,
   modelId: catalogIdentifierSchema.optional(),
+  reasoning: modelReasoningSchema.optional(),
   preview: z
     .strictObject({ role: z.enum(["user", "assistant"]), text: z.string().min(1).max(512) })
     .optional(),
@@ -60,6 +72,21 @@ export const modelChoiceSchema = z.strictObject({
   id: catalogIdentifierSchema,
   label: z.string().min(1).max(256),
   description: z.string().max(1024).optional(),
+});
+export const catalogModelSchema = modelChoiceSchema.extend({
+  provider: z.string(),
+  model: z.string(),
+  alias: z.string().optional(),
+  family: z.string().optional(),
+  legacy: z.boolean(),
+  reasoning: z.array(modelReasoningSchema),
+  defaultReasoning: modelReasoningSchema.optional(),
+});
+export type CatalogModelChoice = z.infer<typeof catalogModelSchema>;
+export const modelCatalogPageSchema = z.strictObject({
+  providers: z.array(z.string()),
+  models: z.array(catalogModelSchema).max(100),
+  nextCursor: z.string().optional(),
 });
 export const skillChoiceSchema = z.strictObject({
   id: catalogIdentifierSchema,
@@ -122,6 +149,7 @@ export const nativeInputSchema = z
     attachmentIds: z.array(identitySchema).max(32),
     skillIds: z.array(catalogIdentifierSchema).max(32),
     modelId: catalogIdentifierSchema.optional(),
+    reasoning: modelReasoningSchema.optional(),
     command: z
       .strictObject({ id: catalogIdentifierSchema, arguments: z.string().max(65_536) })
       .optional(),
@@ -250,10 +278,14 @@ export const resourcePreviewSchema = z.strictObject({
 export type ResourcePreview = z.infer<typeof resourcePreviewSchema>;
 
 export const subagentSummarySchema = z.strictObject({
+  taskTitle: z.string().max(80).optional(),
+  model: z.string().max(512).optional(),
+  reasoning: modelReasoningSchema.optional(),
   id: runIdentitySchema,
   activityId: identitySchema,
   turnId: identitySchema,
-  profile: z.enum(["explore", "general", "self"]),
+  /** Name of the subagent permission profile. */
+  profile: z.string().min(1).max(64),
   name: z.string().max(256),
   title: z.string().max(256),
   state: z.enum(["running", "complete", "failed", "canceled"]),
@@ -265,7 +297,11 @@ export const workingIndicatorsSchema = z.array(z.string().trim().min(1)).min(1);
 
 export const DEFAULT_DM_CONTEXT_GAP_MS = 7_200_000;
 export const DEFAULT_DM_TIMESTAMP_GAP_MS = 1_800_000;
+export const nativeTransportSchema = z.enum(["auto", "websocket", "http-sse"]);
+export type NativeTransport = z.infer<typeof nativeTransportSchema>;
+
 export const nativeDeploymentSettingsSchema = z.strictObject({
+  transport: nativeTransportSchema.default("auto"),
   titleModel: z.string().trim().min(1),
   outputStreaming: z.enum(["paragraph", "complete"]),
   dmContextGapMs: z.number().int().positive().default(DEFAULT_DM_CONTEXT_GAP_MS),

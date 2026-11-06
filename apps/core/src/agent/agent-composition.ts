@@ -13,6 +13,7 @@ import type {
   AiSdkPiAgentOptions,
   AiSdkPiAgent,
   TransformMessagesContext,
+  HistoryProviderState,
 } from "@stanley2058/lilac-agent";
 import {
   AgentExternalHostFailed,
@@ -171,6 +172,7 @@ export function createCoreAgentComposition(input: {
   readonly transcriptStore: TranscriptStore | undefined;
   readonly sourceMessages: readonly ModelMessage[];
   readonly sourceTranscript: TranscriptSnapshot | null;
+  readonly sourceProviderState?: HistoryProviderState;
   readonly getCurrentTurnMessages: () => readonly ModelMessage[];
   readonly onReplayFallback: (error: Error) => void;
   readonly onUtilityModelFailure: Parameters<
@@ -178,6 +180,7 @@ export function createCoreAgentComposition(input: {
   >[0]["onFailure"];
 }) {
   const runtime = input.claude.namedRuntime ?? input.claude.primaryRuntime;
+  const externalToolRuntime = input.claude.run !== null || runtime !== null;
   const disabledReplayKeys = new Set<string>();
   let activeReplayKey: string | null = null;
   const configuredReplayKey = () => {
@@ -233,6 +236,7 @@ export function createCoreAgentComposition(input: {
       return prepareCorePrimaryHistoryView({
         canonicalMessages: messages,
         lineage,
+        sourceProviderState: input.sourceProviderState,
         replayHistoricalPrefix: shouldReplayCorePrimaryHistory({
           lineage,
           historicalEnd: lineage?.currentCanonicalStart ?? 0,
@@ -282,17 +286,15 @@ export function createCoreAgentComposition(input: {
     | "serverCompaction"
     | "serverCompactionEnabled"
   > = {
-    summaryModel:
-      input.getBinding().resolved.provider === "claude-code"
-        ? () =>
-            resolveCoreClaudeCompactionSummaryModel({
-              run: input.claude.run ?? runtime?.currentRun() ?? null,
-              fallback: () => input.getBinding().resolved.model,
-              onFailure: input.onUtilityModelFailure,
-            })
-        : "current",
-    thresholdInputSource:
-      input.getBinding().resolved.provider === "claude-code" ? "transcript-estimate" : "usage",
+    summaryModel: externalToolRuntime
+      ? () =>
+          resolveCoreClaudeCompactionSummaryModel({
+            run: input.claude.run ?? runtime?.currentRun() ?? null,
+            fallback: () => input.getBinding().resolved.model,
+            onFailure: input.onUtilityModelFailure,
+          })
+      : "current",
+    thresholdInputSource: externalToolRuntime ? "transcript-estimate" : "usage",
     inputEstimateFloor: runtime ? (estimate) => runtime.inputEstimateFloor(estimate) : undefined,
     decorateRequestPayload: (payload) => {
       const requestPayload =
@@ -355,13 +357,11 @@ export function createCoreAgentComposition(input: {
         diagnosticContext: input.diagnosticContext,
       }),
     ...(host.hasModelFallback || runtime ? { streamTextMaxRetries: 0 } : {}),
-    beforeStep:
-      input.getBinding().resolved.provider === "claude-code" ? undefined : host.refreshTools,
-    sendToolsToModel: input.getBinding().resolved.provider !== "claude-code",
+    beforeStep: externalToolRuntime ? undefined : host.refreshTools,
+    sendToolsToModel: !externalToolRuntime,
   });
   const initializeTools = (agent: AiSdkPiAgent<ToolSet>, toolset: BuiltLevel1Toolset) => {
-    if (input.getBinding().resolved.provider === "claude-code")
-      applyCompleteLevel1Tools(agent, toolset);
+    if (externalToolRuntime) applyCompleteLevel1Tools(agent, toolset);
   };
   const retireForRetry = async () => {
     await runtime?.retireForRetry();

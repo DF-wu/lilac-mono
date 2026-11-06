@@ -110,10 +110,24 @@ const byteSizeSchema = z.preprocess(parseFriendlyByteSize, z.number().int().posi
 
 const telegramMarkdownTableRenderSchema = z
   .object({
-    enabled: z.boolean().default(true),
-    style: z.enum(["unicode", "ascii"]).default("unicode"),
-    maxWidth: z.number().int().min(40).max(240).default(50),
-    fallbackMode: z.enum(["list", "passthrough"]).default("list"),
+    enabled: z.boolean().default(true).describe("Render Markdown tables as text. Default: true."),
+    style: z
+      .enum(["unicode", "ascii"])
+      .default("unicode")
+      .describe(
+        "Text table border style. Default: unicode; Telegram does not support image tables.",
+      ),
+    maxWidth: z
+      .number()
+      .int()
+      .min(40)
+      .max(240)
+      .default(50)
+      .describe("Maximum rendered table width in characters, from 40 to 240. Default: 50."),
+    fallbackMode: z
+      .enum(["list", "passthrough"])
+      .default("list")
+      .describe("Wide-table fallback: list or unchanged Markdown. Default: list."),
   })
   .default({
     enabled: true,
@@ -125,8 +139,20 @@ const telegramMarkdownTableRenderSchema = z
 /** v2 input schema for `surface.telegram`. The v1 input shape is frozen and has no Telegram key. */
 export const telegramSurfaceSchema = z
   .object({
-    enabled: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.enabled),
-    token: z.string().trim().min(1).optional(),
+    enabled: z
+      .boolean()
+      .default(TELEGRAM_SURFACE_DEFAULTS.enabled)
+      .describe(
+        "Enable Telegram long polling. Default: false. Configure a token and allowedChatIds before enabling.",
+      ),
+    token: z
+      .string()
+      .trim()
+      .min(1)
+      .optional()
+      .describe(
+        "Bot API token. Keep core-config.yaml private; changing this value requires restart.",
+      ),
     tokenEnv: z
       .never({
         error:
@@ -137,20 +163,53 @@ export const telegramSurfaceSchema = z
       .string()
       .min(1)
       .refine((s) => !/\s/u.test(s), "botName must not contain spaces")
-      .default(TELEGRAM_SURFACE_DEFAULTS.botName),
+      .default(TELEGRAM_SURFACE_DEFAULTS.botName)
+      .describe(
+        "Bot name for mention routing and prompt attribution, without spaces. Default: lilac.",
+      ),
     botUsername: z
       .string()
       .min(1)
       .refine((s) => !s.startsWith("@"), "botUsername must not include a leading '@'")
-      .optional(),
+      .optional()
+      .describe("Bot username without @. Omit to resolve it through getMe on connection."),
     // Lazy defaults: a literal default is evaluated once at schema construction
     // and would then be shared (and mutable) across every parsed config.
-    allowedChatIds: z.array(z.string().min(1)).default(() => []),
-    allowedUserIds: z.array(z.string().min(1)).default(() => []),
-    dbPath: z.string().min(1).optional(),
-    apiRoot: z.url().optional(),
-    outputMode: z.enum(["inline", "preview"]).default(TELEGRAM_SURFACE_DEFAULTS.outputMode),
-    parseMode: z.enum(["html", "plain"]).default(TELEGRAM_SURFACE_DEFAULTS.parseMode),
+    allowedChatIds: z
+      .array(z.string().min(1))
+      .default(() => [])
+      .describe(
+        "Allowed chat IDs as strings. Empty denies all chats, including conversation-memory reads.",
+      ),
+    allowedUserIds: z
+      .array(z.string().min(1))
+      .default(() => [])
+      .describe(
+        "Allowed sender IDs as strings. Empty imposes no user restriction; chat admission still applies.",
+      ),
+    dbPath: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Local Telegram history database path. Omit for DATA_DIR/telegram-surface.db. Requires restart.",
+      ),
+    apiRoot: z
+      .url()
+      .optional()
+      .describe(
+        "Bot API root URL. Omit for https://api.telegram.org; supports self-hosted Bot API servers. Requires restart.",
+      ),
+    outputMode: z
+      .enum(["inline", "preview"])
+      .default(TELEGRAM_SURFACE_DEFAULTS.outputMode)
+      .describe(
+        "Streamed output mode. Default: preview, which removes partial messages on cancellation; inline retains them.",
+      ),
+    parseMode: z
+      .enum(["html", "plain"])
+      .default(TELEGRAM_SURFACE_DEFAULTS.parseMode)
+      .describe("Telegram output formatting. Default: html; plain disables HTML formatting."),
     // Telegram throttles edits at roughly one per second per chat; going below
     // this reliably trips 429 retry_after responses during streaming.
     streamEditIntervalMs: z
@@ -158,24 +217,50 @@ export const telegramSurfaceSchema = z
       .int()
       .min(500)
       .max(60_000)
-      .default(TELEGRAM_SURFACE_DEFAULTS.streamEditIntervalMs),
-    outputNotification: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.outputNotification),
+      .default(TELEGRAM_SURFACE_DEFAULTS.streamEditIntervalMs)
+      .describe(
+        "Minimum gap between streamed message edits, in integer milliseconds from 500 to 60000. Default: 1500.",
+      ),
+    outputNotification: z
+      .boolean()
+      .default(TELEGRAM_SURFACE_DEFAULTS.outputNotification)
+      .describe("Enable Telegram message notifications. Default: true."),
     workingIndicators: z
       .array(z.string().trim().min(1))
       .min(1)
-      .default(() => cloneDefaultWorkingIndicators()),
-    commandMenu: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.commandMenu),
-    markdownTableRender: telegramMarkdownTableRenderSchema,
+      .default(() => cloneDefaultWorkingIndicators())
+      .describe("Non-empty status phrases displayed while working. Omit for the built-in phrases."),
+    commandMenu: z
+      .boolean()
+      .default(TELEGRAM_SURFACE_DEFAULTS.commandMenu)
+      .describe(
+        "Register custom commands with Telegram setMyCommands on connection. Default: true.",
+      ),
+    markdownTableRender: telegramMarkdownTableRenderSchema.describe(
+      "Telegram text table rendering and wide-table fallback.",
+    ),
     inboundMedia: z
       .object({
-        enabled: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.inboundMedia.enabled),
-        maxBytesPerAttachment: byteSizeSchema.default(
-          TELEGRAM_SURFACE_DEFAULTS.inboundMedia.maxBytesPerAttachment,
-        ),
-        maxBytesPerRequest: byteSizeSchema.default(
-          TELEGRAM_SURFACE_DEFAULTS.inboundMedia.maxBytesPerRequest,
-        ),
+        enabled: z
+          .boolean()
+          .default(TELEGRAM_SURFACE_DEFAULTS.inboundMedia.enabled)
+          .describe(
+            "Deliver inbound photos/documents to the model. Default: true; false retains caption text only.",
+          ),
+        maxBytesPerAttachment: byteSizeSchema
+          .default(TELEGRAM_SURFACE_DEFAULTS.inboundMedia.maxBytesPerAttachment)
+          .describe(
+            "Decoded-byte limit per attachment. Default: 5MiB. Accepts positive bytes or B, KB, MB, GB, KiB, MiB, GiB; oversized media becomes metadata.",
+          ),
+        maxBytesPerRequest: byteSizeSchema
+          .default(TELEGRAM_SURFACE_DEFAULTS.inboundMedia.maxBytesPerRequest)
+          .describe(
+            "Decoded-byte budget across one request. Default: 10MiB. Accepts positive bytes or B, KB, MB, GB, KiB, MiB, GiB.",
+          ),
       })
-      .default(() => ({ ...TELEGRAM_SURFACE_DEFAULTS.inboundMedia })),
+      .default(() => ({ ...TELEGRAM_SURFACE_DEFAULTS.inboundMedia }))
+      .describe(
+        "Inbound Telegram photo/document delivery budgets; unsupported media remains metadata.",
+      ),
   })
   .default(() => cloneDefaultTelegramSurface());

@@ -7,9 +7,7 @@ import {
   getBuildInfo,
   isPanic,
   isRecord,
-  isNativeSubagentProfile,
   type CoreConfig,
-  type NativeSubagentProfile,
 } from "@stanley2058/lilac-utils";
 import {
   invokeLevel2Call,
@@ -339,7 +337,8 @@ function parseRequestContext(headers: ToolRequestHeaders): RequestContext {
     controlCapability: headers.controlCapability,
     currentTurnUserId: headers.currentTurnUserId,
     subagentProfile: (() => {
-      return isNativeSubagentProfile(headers.subagentProfile) ? headers.subagentProfile : undefined;
+      const profile = headers.subagentProfile?.trim();
+      return profile && profile !== "primary" ? profile : undefined;
     })(),
     safetyMode: headers.safetyMode === "restricted" ? "restricted" : undefined,
   };
@@ -376,11 +375,9 @@ const RESTRICTED_LEVEL2_ALLOWED = new Set([
   "discovery.search",
   "generate.video",
   "attachment.add_files",
-  "attachment.download",
   "resource.materialize",
   "skills.list",
   "skills.read",
-  "content.inspect",
   "surface.help",
   "surface.sessions.listParticipants",
   "surface.messages.list",
@@ -473,7 +470,7 @@ export type ToolServerOptions = {
     principal: SurfacePrincipal | null;
     authenticatedOrigin: AuthenticatedSurfaceOrigin | null;
     allowedCallables: readonly string[] | null;
-    profile: "primary" | NativeSubagentProfile;
+    profile: string;
     canonicalCwd: string;
     safetyMode: SafetyMode;
   } | null;
@@ -1653,9 +1650,6 @@ export function createToolServer(options: ToolServerOptions) {
           return output.match<() => ServerToolResult>({
             ok: (result) => () => result,
             err: (error) => () => {
-              if (error._tag === "ToolPluginHookError") {
-                reportFatalToolCallDefect(safePluginExceptionCause(error.cause));
-              }
               if (body.callableId !== "mcp.add") {
                 logPluginError("level2.call", error, {
                   toolId: capturedToolId,
@@ -1749,7 +1743,6 @@ export function createToolServer(options: ToolServerOptions) {
       const normalizedValue = normalizeSuccessfulToolValue(completedOutcome.value);
       const outputDefect = normalizedValue.match({ ok: () => null, err: (error) => error });
       if (outputDefect) {
-        reportFatalToolCallDefect(outputDefect);
         logger.error("tool plugin operation failed", {
           operation: "level2.call",
           toolId: capturedToolId,

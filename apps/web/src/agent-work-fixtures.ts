@@ -941,8 +941,12 @@ agentWorkStages.unshift({
 });
 
 const demoSubagentSamples = {
-  demo_subagent_weather: { profile: "explore", name: "Weather and riverside", sample: "weather" },
-  demo_subagent_museum: { profile: "general", name: "Museum visit", sample: "museum" },
+  demo_subagent_weather: {
+    profile: "restricted",
+    name: "Weather and riverside",
+    sample: "weather",
+  },
+  demo_subagent_museum: { profile: "full", name: "Museum visit", sample: "museum" },
 } as const;
 
 function demoSubagentSample(id: string) {
@@ -969,6 +973,9 @@ export function demoSubagents(slot: ReadyTurnSlot): SubagentSummary[] {
           activityId: part.id,
           turnId: slot.turnId,
           profile: sample.profile,
+          taskTitle:
+            sample.name === "Weather and riverside" ? "Check the weather" : "Check museum options",
+          model: sample.profile === "restricted" ? "codex/gpt-6-luna" : "claude-code/opus",
           name: sample.name,
           state: part.data.state,
           title: running ? title : "Completed",

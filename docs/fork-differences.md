@@ -4,13 +4,14 @@ Language: [`English (primary / canonical)`](./fork-differences.md) · [`Traditio
 
 This document describes the current differences between [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) and [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono).
 
-The comparison baseline is upstream commit [`4f7eedb8`](https://github.com/stanley2058/lilac-mono/commit/4f7eedb80dece58c79369b62210574ea869bbae6), integrated through fork PR [#92](https://github.com/DF-wu/lilac-mono/pull/92). The fork retains the following feature and operational changes on top of it.
+The comparison baseline is upstream commit [`473656e5`](https://github.com/stanley2058/lilac-mono/commit/473656e5b51907033c64c8a7a06a6a14ac93902e), integrated in the candidate for fork PR [#95](https://github.com/DF-wu/lilac-mono/pull/95). The fork retains the following feature and operational changes on top of it.
 
 > [!IMPORTANT]
 > This is a maintenance document, not a permanent compatibility commitment. After an upstream sync, differences that have been accepted upstream or no longer exist must be removed from this table or reclassified.
 
 The [2026-10-22 maintenance review](./fork-review-2026-10-22.md) records which extensions remain
-necessary, the integration defects corrected against this baseline, and the retired watchdog patch.
+necessary, the integration defects corrected against its baseline, and the retired watchdog patch.
+The [PR #95 integration report](./fork-integration-pr95.md) records the later v3 migration and validation.
 
 ## Inherited Native Chat and Heartbeat Updates
 
@@ -96,7 +97,7 @@ Every pull request this fork has opened against upstream, as of 2026-10-06. Merg
 
 ## Compatibility and Security Boundaries
 
-This fork retains the main upstream architecture and config migration policy, but new features may require `configVersion: 2`. Greenfield changes may be breaking changes; read [`../MIGRATIONS.md`](../MIGRATIONS.md) before upgrading.
+This fork retains the main upstream architecture and config migration policy, but Telegram and OpenAI search settings support `configVersion: 2` and `3`; v1 remains frozen. Greenfield changes may be breaking changes; read [`../MIGRATIONS.md`](../MIGRATIONS.md) before upgrading.
 
 The following mechanisms are guardrails or trusted execution, not hostile-code sandboxes:
 

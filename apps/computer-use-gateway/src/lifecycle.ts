@@ -120,6 +120,23 @@ export class ComputerLifecycle {
     });
   }
 
+  viewerContainer(session: string, generation: string) {
+    return this.store.list().andThen((records) => {
+      const record = records.find(
+        (item) => item.session === session && item.generation === generation,
+      );
+      if (
+        !this.ready ||
+        !record ||
+        record.state !== "ready" ||
+        !record.containerId ||
+        record.expiresAt <= this.now()
+      )
+        return Result.err(failure("not_provisioned", "Desktop is unavailable"));
+      return Result.ok(record.containerId);
+    });
+  }
+
   provision(session: string, idleSeconds?: number, signal?: AbortSignal) {
     return this.serial(session, () => this.provisionLocked(session, idleSeconds, signal));
   }

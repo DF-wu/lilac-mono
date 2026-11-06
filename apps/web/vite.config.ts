@@ -19,5 +19,14 @@ export default defineConfig({
       "/api": { target: process.env.LILAC_WEB_BACKEND_URL ?? "http://127.0.0.1:8789", ws: true },
     },
   },
-  build: { target: "es2022", manifest: true },
+  build: {
+    target: "es2022",
+    manifest: true,
+    rollupOptions: {
+      input: {
+        main: fileURLToPath(new URL("./index.html", import.meta.url)),
+        computer: fileURLToPath(new URL("./computer.html", import.meta.url)),
+      },
+    },
+  },
 });

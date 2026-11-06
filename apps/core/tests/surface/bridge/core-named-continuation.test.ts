@@ -1008,7 +1008,7 @@ describe("Core named Claude continuation", () => {
     });
     expect(replay.at(-1)).toEqual(current);
     expect(replay.some((message) => message.role === "tool")).toBe(false);
-    expect(JSON.stringify(replay)).toContain("<historical-tool-activity>");
+    expect(JSON.stringify(replay)).toContain("[Conversation handoff]");
     expect(JSON.stringify(replay)).not.toContain('"type":"tool-call"');
   });
 
@@ -1055,7 +1055,7 @@ describe("Core named Claude continuation", () => {
 
     expect(replay.at(-1)).toEqual(current);
     expect(replay.some((message) => message.role === "tool")).toBe(false);
-    expect(JSON.stringify(replay)).toContain("<historical-tool-activity>");
+    expect(JSON.stringify(replay)).toContain("[Conversation handoff]");
     expect(JSON.stringify(replay)).not.toContain('"type":"tool-call"');
   });
 });

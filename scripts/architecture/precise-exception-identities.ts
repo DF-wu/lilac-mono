@@ -648,6 +648,7 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ["src/tool-result-output-normalizer.ts", "serializeOutput", "signal"],
   ],
   "packages/utils": [
+    ["claude-sdk.ts", "signalClaudeUtilityFailure", "signal"],
     ["agent-prompts.ts", "exists", "signal"],
     ["agent-prompts.ts", "loadPromptTemplateState", "signal"],
     ["agent-prompts.ts", "parsePromptTemplateState", "signal"],
@@ -679,6 +680,7 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ["core-config/telegram-runtime.ts", "adaptTelegramTokenResultToHost", "signal"],
     ["core-config/v1.ts", "parseCoreConfigV1ToUniversal", "signal"],
     ["core-config/v2.ts", "parseCoreConfigV2ToUniversal", "signal"],
+    ["core-config/v3.ts", "parseCoreConfigV3ToUniversal", "signal"],
     ["custom-commands.ts", "decodeCustomCommandResult", "signal"],
     ["custom-commands.ts", "discoverCustomCommands", "signal"],
     ["custom-commands.ts", "pathExists", "signal"],

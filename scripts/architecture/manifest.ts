@@ -820,6 +820,11 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         module: "core-config/v2.ts",
         exportName: "decodeCoreConfigV2ToUniversal",
       },
+      { module: "core-config/v3.ts", exportName: "decodeCoreConfigV3" },
+      {
+        module: "core-config/v3.ts",
+        exportName: "decodeCoreConfigV3ToUniversal",
+      },
       { module: "find-root.ts", exportName: "hasWorkspacesFieldResult" },
       { module: "find-root.ts", exportName: "findWorkspaceRootResult" },
       {
@@ -953,24 +958,10 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     identity: { module: "src/tool-server/create-tool-server.ts", exportName },
     category: "request" as const,
   })),
-  ...[
-    "normalizeAttachmentAddFilesInput",
-    "asBuffer",
-    "downloadToBuffer",
-    "Attachment.callDownload",
-    "collectUserResourceUris",
-    "collectUserBlobAttachments",
-  ].map((exportName) => ({
+  ...["normalizeAttachmentAddFilesInput"].map((exportName) => ({
     identity: { module: "src/tool-server/tools/attachment.ts", exportName },
     category: "plugin" as const,
   })),
-  {
-    identity: {
-      module: "src/tool-server/tools/content-inspect.ts",
-      exportName: "inferContentInspectType",
-    },
-    category: "request",
-  },
   {
     identity: {
       module: "src/tool-server/tools/programmatic-workflow.ts",
@@ -1010,11 +1001,6 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     ["src/tool-server/tools/attachment.ts", "Attachment.callAddFiles"],
     ["src/tool-server/tools/codex.ts", "observeCodexLogin"],
     ["src/tool-server/tools/codex.ts", "Codex.runCallable"],
-    ["src/tool-server/tools/content-inspect.ts", "contentInspectExternalFailure"],
-    ["src/tool-server/tools/content-inspect.ts", "ContentInspect.inspect"],
-    ["src/tool-server/tools/content-inspect.ts", "inspectContent"],
-    ["src/tool-server/tools/content-inspect.ts", "loadInspectSource"],
-    ["src/tool-server/tools/content-inspect.ts", "readInspectResponseBytes"],
     ["src/tool-server/tools/conversation-thread.ts", "conversationThreadFailure"],
     ["src/tool-server/tools/generate.ts", "readImageDataFromPath"],
     ["src/tool-server/tools/generate.ts", "buildVideoGenerationPrompt"],
@@ -1040,7 +1026,6 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     ["src/tool-server/tools/surface.ts", "Surface.callActivitiesRecentAgentWrites"],
     ["src/tool-server/tools/surface.ts", "Surface.callMessagesList"],
     ["src/tool-server/tools/surface.ts", "Surface.callMessagesRead"],
-    ["src/tool-server/tools/surface.ts", "Surface.callMessagesSearch"],
     ["src/tool-server/tools/web.ts", "webFailure"],
   ].map(([module, exportName]) => ({
     identity: { module: module!, exportName: exportName! },
@@ -1394,6 +1379,7 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         "applyAdjacentToolPart",
         "lowerAssistantExchange",
         "preparePlainTextReplayForTarget",
+        "prepareContextHandoff",
       ].map((exportName) => ({
         identity: { module: "session-continuation.ts", exportName },
         category: "projection" as const,
@@ -1845,6 +1831,14 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
   [
     "packages/claude-code-bridge",
     [
+      {
+        identity: { module: "claude-sdk-call.ts", exportName: "executeClaudeSdkCall.receive" },
+        category: "plugin",
+      },
+      ...["decodeClaudeToolContent", "restoreClaudeToolOutput"].map((exportName) => ({
+        identity: { module: "claude-sdk-call.ts", exportName },
+        category: "plugin" as const,
+      })),
       ...[
         "decodeClaudeNativeSessionStart",
         "decodeClaudeContextUsage",
@@ -2106,10 +2100,12 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: { module: "codex-oauth.ts", exportName },
         category: "projection" as const,
       })),
-      ...["readCoreConfigVersionResult", "parseCoreConfigResult"].map((exportName) => ({
-        identity: { module: "core-config/parse.ts", exportName },
-        category: "request" as const,
-      })),
+      ...["readCoreConfigVersionResult", "parseCoreConfigResult", "decodeVersionedCoreConfig"].map(
+        (exportName) => ({
+          identity: { module: "core-config/parse.ts", exportName },
+          category: "request" as const,
+        }),
+      ),
       ...["readCoreConfigVersion", "parseCoreConfigResult", "parseCoreConfig", "getCoreConfig"].map(
         (exportName) => ({
           identity: { module: "core-config.ts", exportName },
@@ -2134,6 +2130,11 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         ["core-config/v2.ts", "coreConfigV2ToUniversal"],
         ["core-config/v2.ts", "decodeCoreConfigV2ToUniversal"],
         ["core-config/v2.ts", "parseCoreConfigV2ToUniversal"],
+        ["core-config/v2.ts", "coreConfigV2ShapeToUniversal"],
+        ["core-config/v3.ts", "decodeCoreConfigV3"],
+        ["core-config/v3.ts", "parseCoreConfigV3"],
+        ["core-config/v3.ts", "decodeCoreConfigV3ToUniversal"],
+        ["core-config/v3.ts", "parseCoreConfigV3ToUniversal"],
       ].map(([module, exportName]) => ({
         identity: { module, exportName },
         category: "request" as const,
@@ -2149,9 +2150,13 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: { module: "core-config/v1.ts", exportName },
         category: "projection" as const,
       })),
+      ...["ModelCatalogCache.refresh", "ModelCatalogCache.initialize"].map((exportName) => ({
+        identity: { module: "model-catalog-cache.ts", exportName },
+        category: "wire" as const,
+      })),
       {
         identity: {
-          module: "model-capability.ts",
+          module: "model-catalog-schema.ts",
           exportName: "decodeModelsDevRegistry",
         },
         category: "wire",
@@ -3783,12 +3788,23 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               },
               category: "wire" as const,
             },
+            {
+              identity: {
+                module: "src/surface/native/computer.ts",
+                exportName: "decodeNativeViewerRequest",
+              },
+              category: "request" as const,
+            },
           ]
         : []),
       ...(root === "apps/web"
         ? [
             {
               identity: { module: "src/computer-viewer.ts", exportName: "decodeComputerState" },
+              category: "wire" as const,
+            },
+            {
+              identity: { module: "src/computer-viewer.ts", exportName: "decodeComputerCommand" },
               category: "wire" as const,
             },
           ]
@@ -4075,6 +4091,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             },
             {
               identity: { module: "src/contracts.ts", exportName: "decodeSessionHeader" },
+              category: "request" as const,
+            },
+            {
+              identity: { module: "src/contracts.ts", exportName: "decodeViewerGeneration" },
               category: "request" as const,
             },
             {
@@ -5200,9 +5220,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             },
             ...[
               ["src/tool-server/tools/attachment.ts", "Attachment.call"],
-              ["src/tool-server/tools/attachment.ts", "downloadLegacyBlobToBuffer"],
               ["src/tool-server/tools/codex.ts", "Codex.call"],
-              ["src/tool-server/tools/content-inspect.ts", "ContentInspect.call"],
               ["src/tool-server/tools/conversation-thread.ts", "ConversationThread.call"],
               ["src/tool-server/tools/discovery.ts", "Discovery.call"],
               ["src/tool-server/tools/generate.ts", "Generate.call"],
@@ -5563,7 +5581,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "81bf00a7c0d571f6e3aa1fbe16f373d59f21f5144231fa72da752cc3eff5917b";
+  "ca5099472f8af8c7b079f412daaca1eb61a755c8396a3d6fced2cbd9468d9010";
 
 export const architectureManifest = {
   version: 1,

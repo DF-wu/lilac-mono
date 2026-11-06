@@ -7,6 +7,7 @@ import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import {
   parseCoreConfigV1ToUniversal,
   parseCoreConfigV2ToUniversal,
+  parseCoreConfigV3ToUniversal,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
 import { Panic, Result } from "better-result";
@@ -110,7 +111,6 @@ function getToolDescription(tools: Record<string, unknown>, name: string): strin
 
 const EXPECTED_STABLE_LEVEL2_CALLABLE_IDS = [
   "attachment.add_files",
-  "attachment.download",
   "codex.login",
   "codex.logout",
   "codex.status",
@@ -118,7 +118,6 @@ const EXPECTED_STABLE_LEVEL2_CALLABLE_IDS = [
   "conversation.thread.read",
   "conversation.thread.runSummarization",
   "conversation.thread.search",
-  "content.inspect",
   "discovery.search",
   "fetch",
   "onboarding.all",
@@ -146,7 +145,6 @@ const EXPECTED_STABLE_LEVEL2_CALLABLE_IDS = [
   "surface.messages.edit",
   "surface.messages.list",
   "surface.messages.read",
-  "surface.messages.search",
   "surface.messages.send",
   "surface.reactions.add",
   "surface.reactions.list",
@@ -174,6 +172,11 @@ const OPTIONAL_DYNAMIC_LEVEL2_CALLABLE_IDS = new Set(["generate.image", "generat
 
 function testConfig(input: unknown): CoreConfig {
   const cfg = parseCoreConfigV1ToUniversal(input);
+  return { ...cfg, agent: { ...cfg.agent, systemPrompt: "(test)" } };
+}
+
+function testConfigV3(input: unknown): CoreConfig {
+  const cfg = parseCoreConfigV3ToUniversal(input);
   return { ...cfg, agent: { ...cfg.agent, systemPrompt: "(test)" } };
 }
 
@@ -330,13 +333,13 @@ describe("core tool plugin manager", () => {
         ...baseCfg.agent,
         subagents: {
           ...baseCfg.agent.subagents,
-          profiles: {
-            ...baseCfg.agent.subagents.profiles,
-            explore: {
-              ...baseCfg.agent.subagents.profiles.explore,
+          permissions: {
+            ...baseCfg.agent.subagents.permissions,
+            restricted: {
+              ...baseCfg.agent.subagents.permissions.restricted,
               level1: {
-                ...baseCfg.agent.subagents.profiles.explore.level1,
-                tools: ["bash", ...baseCfg.agent.subagents.profiles.explore.level1.tools],
+                ...baseCfg.agent.subagents.permissions.restricted.level1,
+                tools: ["bash", ...baseCfg.agent.subagents.permissions.restricted.level1.tools],
               },
               execution: "restricted",
             },
@@ -407,38 +410,32 @@ describe("core tool plugin manager", () => {
       "subagent_delegate",
     ]);
 
-    const exploreTools = await manager.buildLevel1Toolset({
+    const restrictedTools = await manager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "restricted",
+      editingToolMode: "none",
+      subagentDepth: 1,
+      subagentConfig: cfg.agent.subagents!,
+    });
+    expect([...restrictedTools.specs.keys()].sort()).toEqual(["bash", "glob", "grep", "read"]);
+
+    const legacyExploreTools = await manager.buildLevel1Toolset({
       cwd: dataDir,
       runProfile: "explore",
       editingToolMode: "none",
       subagentDepth: 1,
       subagentConfig: cfg.agent.subagents!,
     });
-    expect([...exploreTools.specs.keys()].sort()).toEqual(["bash", "glob", "grep", "read"]);
+    expect([...legacyExploreTools.specs.keys()].sort()).toEqual(["bash", "glob", "grep", "read"]);
 
-    const generalTools = await manager.buildLevel1Toolset({
+    const fullTools = await manager.buildLevel1Toolset({
       cwd: dataDir,
-      runProfile: "general",
+      runProfile: "full",
       editingToolMode: "apply_patch",
       subagentDepth: 1,
       subagentConfig: cfg.agent.subagents!,
     });
-    expect(Object.keys(generalTools.tools).sort()).toEqual([
-      "bash",
-      "glob",
-      "grep",
-      "patch",
-      "read",
-    ]);
-
-    const selfTools = await manager.buildLevel1Toolset({
-      cwd: dataDir,
-      runProfile: "self",
-      editingToolMode: "apply_patch",
-      subagentDepth: 1,
-      subagentConfig: cfg.agent.subagents!,
-    });
-    expect(Object.keys(selfTools.tools).sort()).toEqual([
+    expect(Object.keys(fullTools.tools).sort()).toEqual([
       "bash",
       "glob",
       "grep",
@@ -446,6 +443,15 @@ describe("core tool plugin manager", () => {
       "read",
       "subagent_delegate",
     ]);
+
+    const unknownTools = await manager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "removed-profile",
+      editingToolMode: "apply_patch",
+      subagentDepth: 1,
+      subagentConfig: cfg.agent.subagents!,
+    });
+    expect(Object.keys(unknownTools.tools)).toEqual([]);
   });
 
   it("omits Bash when a profile disables execution", async () => {
@@ -560,16 +566,16 @@ describe("core tool plugin manager", () => {
   it("gates URL reads with the web.fetch native-profile authority", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
-    const cfg = testConfigV2({
-      configVersion: 2,
+    const cfg = testConfigV3({
+      configVersion: 3,
       agent: {
         subagents: {
-          profiles: {
-            explore: {
+          permissions: {
+            restricted: {
               network: true,
               level2: { plugins: ["web"], callables: ["search"] },
             },
-            general: { network: false },
+            offline: { network: false, level2: { plugins: ["*"], callables: ["*"] } },
           },
         },
       },
@@ -585,7 +591,7 @@ describe("core tool plugin manager", () => {
     });
     await manager.init();
 
-    const build = (runProfile: "primary" | "explore" | "general") =>
+    const build = (runProfile: "primary" | "restricted" | "offline") =>
       manager.buildLevel1Toolset({
         cwd: dataDir,
         runProfile,
@@ -603,8 +609,8 @@ describe("core tool plugin manager", () => {
       });
 
     const primary = await build("primary");
-    const missingFetch = await build("explore");
-    const networkDisabled = await build("general");
+    const missingFetch = await build("restricted");
+    const networkDisabled = await build("offline");
 
     expect(getToolDescription(primary.tools, "read")).toContain("direct HTTP(S) URL");
     expect(getToolDescription(missingFetch.tools, "read")).not.toContain("HTTP(S)");
@@ -707,7 +713,7 @@ describe("core tool plugin manager", () => {
 
     const delegationResult = await resolveExecuteResult(
       getExecutableTool(executableTools, "subagent_delegate").execute(
-        { profile: "explore", task: "Check metadata", mode: "deferred" },
+        { permissions: "restricted", task: "Check metadata", mode: "deferred" },
         { context: requestContext, toolCallId: "delegate-metadata", messages: [] },
       ),
     );
@@ -1228,10 +1234,10 @@ export default {
         ...base.agent,
         subagents: {
           ...base.agent.subagents,
-          profiles: {
-            ...base.agent.subagents.profiles,
-            general: {
-              ...base.agent.subagents.profiles.general,
+          permissions: {
+            ...base.agent.subagents.permissions,
+            full: {
+              ...base.agent.subagents.permissions.full,
               level1: {
                 plugins: ["mcp:allowed"],
                 tools: ["raw_allowed", "mcp_allowed_model_raw"],
@@ -1288,7 +1294,7 @@ export default {
       dataDir,
     });
     await manager.init();
-    const build = (runProfile: "primary" | "general") =>
+    const build = (runProfile: "primary" | "full") =>
       manager.buildLevel1Toolset({
         cwd: dataDir,
         runProfile,
@@ -1307,7 +1313,7 @@ export default {
     const primary = await build("primary");
     expect(primary.catalog.filter((entry) => entry.source === "mcp")).toHaveLength(4);
 
-    const general = await build("general");
+    const general = await build("full");
     expect(
       general.catalog
         .filter((entry) => entry.source === "mcp")
@@ -1353,7 +1359,7 @@ export default {
       dataDir,
     });
     await manager.init();
-    const build = (runProfile: "primary" | "general" | "self" | "explore") =>
+    const build = (runProfile: "primary" | "full" | "restricted") =>
       manager.buildLevel1Toolset({
         cwd: dataDir,
         runProfile,
@@ -1384,9 +1390,9 @@ export default {
         config = mcpConfig([{ ...stdioDefinition("docs"), allowSubagents }]);
         expect((await registry.reload("docs")).status).toBe("ok");
         expect(registry.getCatalogServers()[0]?.allowSubagents).toBe(allowSubagents);
-        for (const profile of ["primary", "general", "self", "explore"] as const) {
+        for (const profile of ["primary", "full", "restricted"] as const) {
           const toolset = await build(profile);
-          const allowed = profile === "primary" || (allowSubagents && profile !== "explore");
+          const allowed = profile === "primary" || (allowSubagents && profile !== "restricted");
           expect(toolset.catalog.some((tool) => tool.stableId === entry.stableId)).toBe(allowed);
           expect(toolset.tools[entry.modelName] !== undefined).toBe(allowed);
           expect(toolset.catalogMetadata[entry.modelName] !== undefined).toBe(allowed);
@@ -1535,12 +1541,12 @@ export default {
               ...base.agent,
               subagents: {
                 ...base.agent.subagents,
-                profiles: {
-                  ...base.agent.subagents.profiles,
-                  general: {
-                    ...base.agent.subagents.profiles.general,
+                permissions: {
+                  ...base.agent.subagents.permissions,
+                  full: {
+                    ...base.agent.subagents.permissions.full,
                     level1: {
-                      ...base.agent.subagents.profiles.general.level1,
+                      ...base.agent.subagents.permissions.full.level1,
                       plugins: enabled ? ["profile-fixture"] : [],
                     },
                   },
@@ -1565,7 +1571,7 @@ export default {
       (
         await denied.buildLevel1Toolset({
           cwd: dataDir,
-          runProfile: "general",
+          runProfile: "full",
           editingToolMode: "none",
           subagentDepth: 1,
           subagentConfig: base.agent.subagents!,
@@ -1581,7 +1587,7 @@ export default {
       (
         await enabled.buildLevel1Toolset({
           cwd: dataDir,
-          runProfile: "general",
+          runProfile: "full",
           editingToolMode: "none",
           subagentDepth: 1,
           subagentConfig: base.agent.subagents!,
@@ -1591,7 +1597,7 @@ export default {
     ).toBe(true);
     const direct = await enabled.buildLevel1Toolset({
       cwd: dataDir,
-      runProfile: "general",
+      runProfile: "full",
       editingToolMode: "none",
       subagentDepth: 1,
       subagentConfig: base.agent.subagents,

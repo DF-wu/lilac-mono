@@ -1,3 +1,4 @@
+import type { ModelReasoningEffort } from "@stanley2058/lilac-utils";
 import { NativeQuestions } from "./questions";
 import { reconcileNativeDeferredSends, subscribeNativeDeferredSends } from "./deferred-sends";
 import { NativePush } from "./push";
@@ -119,6 +120,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   const { store, database, auth: publicAuth, clerk, login } = options.installation;
   const legacy = options.getConfig().surface.native;
   const deploymentInitialized = store.initializeDeployment({
+    transport: "auto",
     titleModel: legacy.titleModel,
     outputStreaming: legacy.outputStreaming,
     dmContextGapMs: DEFAULT_DM_CONTEXT_GAP_MS,
@@ -248,12 +250,13 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       }),
     );
   };
-  const resolveModel = (modelId?: string) => {
+  const resolveModel = (modelId?: string, reasoning?: ModelReasoningEffort) => {
     const cfg = options.getConfig();
     return resolveAgentRunModelResult({
       cfg,
       runProfile: "primary",
       requestModelOverride: modelId,
+      reasoningOverride: reasoning,
     }).map((plan) => toDurableResolvedModelPlan(plan, cfg.agent.reasoningDisplay));
   };
   const push = new NativePush(database, store);
@@ -313,10 +316,12 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     live: options.runner,
     streamingMode: () => deployment().outputStreaming,
   });
+  const computer = new NativeComputer(store, options.mcpRegistry);
   const services = createNativeRpcServices({
+    titles,
     questions,
     push,
-    computer: new NativeComputer(store, options.mcpRegistry),
+    computer,
     references,
     files: liveFiles,
     subagents,
@@ -335,6 +340,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     ...(clerk ? { lookupUser: clerk.lookupUser, profileProvider: clerk } : {}),
   });
   const gateway = createNativeGateway({
+    computer,
     metrics,
     reportFatalError: options.reportFatalError,
     hostname: nativeConfig.host,
@@ -536,6 +542,11 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
               (slot, projection) =>
                 Result.gen(function* () {
                   const event = message.data;
+                  if (event.payload.type === "model")
+                    return Result.ok({
+                      ...projectNativeOutput(slot, event, projection),
+                      model: event.payload,
+                    });
                   if (event.payload.type === "resource") {
                     const thread = yield* store.getDisplayThread(event.threadId);
                     yield* store.publishUpload(thread.starterId, event.payload.resourceId);

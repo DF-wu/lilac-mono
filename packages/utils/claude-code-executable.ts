@@ -1,4 +1,4 @@
-import type { ClaudeCodeSettings } from "ai-sdk-provider-claude-code";
+import type { ClaudeCodeSettings } from "./claude-sdk";
 
 let resolvedClaudeExecutable: string | null | undefined;
 
