@@ -3,6 +3,8 @@
 This optional DF-wu fork feature records new native user-surface messages to one owner-provisioned
 Discord incoming webhook. It is disabled by default. It does not use an agent transcript, expose a
 configuration API, add a UI, or change any stored or wire format.
+It works with any configured image user and native authentication provider; no deployment identity
+or named account is required.
 
 ## Activation
 
@@ -14,11 +16,31 @@ configuration API, add a UI, or change any stored or wire format.
    Docker. A host variable alone is insufficient if the container does not receive it. The accepted URL
    is HTTPS on `discord.com`, under `/api/webhooks/<id>/<token>` or
    `/api/v10/webhooks/<id>/<token>`, without query parameters, fragments or URL credentials.
-3. On a separately authorized future Core start, native ingress activates recording. No historical
+3. On the next Core start, native ingress activates recording. No historical
    scan or backfill runs. Unset the variable to disable recording on the next start. Invalid values
    disable recording with a generic warning that contains no URL.
 
-This change does not provision secrets, modify deployments, restart Core, or send a verification post.
+### Container and source setup
+
+- **Source Compose (`compose.yaml`):** set `LILAC_NATIVE_DISCORD_WEBHOOK_URL` in the protected `.env`
+  beside the Compose file, or supply it through the shell/deployment environment. Stock Compose forwards
+  this variable into Core with an empty default; `.env.example` includes the optional key. Keep `.env`
+  private (`chmod 600 .env`). Apply changed values by recreating the Core container; restarting an
+  existing container alone does not reload Compose environment settings.
+- **Guided installer:** set the same key in the installation's protected `secrets.env` (mode `0600`).
+  The generated Core service already loads that file through `env_file`, including additional keys;
+  no installer prompt or `core-config.yaml` entry is needed. Recreate the Core container from that
+  installation directory after changing it. An explicit value under Compose `environment` overrides
+  `env_file`, so remove any stale override when using this path.
+- **Other Docker entrypoints:** explicitly pass the key to the Core container through your existing
+  protected environment file or secret workflow. The image entrypoint preserves it while dropping to
+  the configured service user. Image tag, container username and UID do not select this feature.
+- **Direct source runs:** provide the key in the Core process environment using the normal protected
+  environment workflow.
+
+Keep the key empty or unset to leave recording disabled. Use an image/build containing this fork
+feature. Do not print a resolved Compose configuration with real credentials during validation.
+These instructions do not provision secrets, restart Core, or send a verification post automatically.
 Forum/media channels and a `thread_id` destination are not supported in this first version.
 
 ## Content and source boundary
