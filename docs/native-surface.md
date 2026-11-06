@@ -4,6 +4,9 @@ The native surface runs inside Core. It owns `native-surface.db` independently o
 the web app, authenticated HTTP bootstrap, file endpoints and one typed oRPC WebSocket. A native
 thread is a session. Messages start work without a mention or active-channel mode.
 
+The DF fork can optionally [record new native user-surface messages to Discord](native-discord-mirror.md)
+using an owner-provisioned webhook. Recording is disabled by default and does not backfill history.
+
 ## Local setup
 
 Build the web assets with `bun run build:web`. Enable the surface in an existing version-2

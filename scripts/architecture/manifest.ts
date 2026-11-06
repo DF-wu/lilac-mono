@@ -1416,6 +1416,13 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
     "apps/core",
     [
       ...CORE_TOOL_SERVER_BOUNDARY_DECODERS,
+      {
+        identity: {
+          module: "src/surface/native/discord-mirror-webhook.ts",
+          exportName: "decodeDiscordMirrorReply",
+        },
+        category: "wire" as const,
+      },
       ...CORE_FINAL_BOUNDARY_IDENTITIES.map(([module, exportName]) => ({
         identity: { module, exportName },
         category: "projection" as const,
