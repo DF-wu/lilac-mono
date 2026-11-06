@@ -25,6 +25,11 @@ __tests__/docker-build-script.test.ts  # covers the container identity variants
 bun.lock  # grammY (Telegram Bot API) dependency
 apps/core/tests/tools/bash.test.ts  # probes stdin with readSync to distinguish EBADF from EOF across cat implementations
 
+# --- Native visible-message recording
+apps/core/src/surface/native/runtime.ts  # composes the opt-in fork-owned Discord recorder at native ingress and shutdown
+apps/core/src/surface/native/store.ts  # exposes bounded committed-display notifications after native persistence
+docs/native-surface.md  # links the fork-only recorder setup and delivery guarantees
+
 # --- OpenAI web.search provider (staged for an upstream contribution; remove once accepted)
 apps/core/src/tool-server/tools/web-search.ts  # exports OpenAIWebSearchProvider
 apps/core/src/tool-server/tools/web-search/default-web-search-providers.ts  # registers the openai provider
