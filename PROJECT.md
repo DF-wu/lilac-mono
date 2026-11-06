@@ -157,6 +157,13 @@ consumers are installed before Telegram starts polling or replaying its ingress 
 router subscription termination withdraws readiness and reports a fatal runtime failure; normal
 shutdown stops supervision with the router.
 
+Discord conversation materialization is reactive. Startup, worker recovery, and configuration reload
+leave inactive channels untouched. The first channel activity after startup or invalidation repairs
+its topology; later content-only edits can invalidate summaries without rebuilding membership.
+Successful Discord surface message reads and writes update the local search index before scheduling
+channel repair. Partial history reads never imply deletion of omitted messages. Repairs remain
+coalesced and serialized; interrupted or offline history can stay stale until later activity.
+
 With table rendering enabled and style `image`, Discord's preview/plain/flat final output renders top-level Markdown tables
 as 2× PNG attachments and starts a new message after each table. When image table rendering is enabled,
 the Discord adapter starts and warms one Chromium browser and page, serializes table renders on that

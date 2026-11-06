@@ -2819,7 +2819,7 @@ export async function createCoreRuntime(
         if (discordEnabled) await adapter.refreshCoreConfig();
         await refreshTelegramCoreConfig(telegramAdapter, logger);
         await toolServer?.reload();
-        conversationThreadMaterializer?.markAllDirty();
+        conversationThreadMaterializer?.invalidate();
       },
       err: (error) => async () => {
         if (isPanic(error)) throw error;
@@ -3806,6 +3806,7 @@ export async function createCoreRuntime(
           nativeConversationPlanner = conversationThreadToolService;
 
           pluginManager = createCoreToolPluginManager({
+            discordSearch: discordSearchService ?? undefined,
             runtime: {
               bus: durableBus,
               blobStore: activeBlobStore,

@@ -1,3 +1,5 @@
+import { CodeEditor } from "./components/CodeEditor";
+import { WorkspaceTreeView } from "./components/WorkspaceTree";
 import { ModelSelectorDemo } from "./components/ModelSelectorDemo";
 import {
   CopySessionIdMenuItem,
@@ -57,7 +59,11 @@ import {
   RefreshCw,
   Trash2,
 } from "lucide-react";
-import type { DisplayMessage, NativeThread } from "@stanley2058/lilac-client-protocol";
+import type {
+  DisplayMessage,
+  NativeDeploymentSettings,
+  NativeThread,
+} from "@stanley2058/lilac-client-protocol";
 import logo from "./assets/logo.svg";
 import motion from "./assets/design-system/motion.mp4";
 import tone from "./assets/design-system/tone.wav";
@@ -1149,8 +1155,23 @@ function FileTabsDemo() {
         onFocus={(id) => actions.focusTab("demo", id)}
         onClose={(id) => actions.closeTab("demo", id)}
         onAgents={() => actions.openAgents("demo")}
+        onFiles={() => actions.openFiles("demo")}
         renderTab={(tab) => {
           if (tab.type === "thread") return <ConversationBadge target={tab.target} />;
+          if (tab.type === "files")
+            return (
+              <WorkspaceTreeView
+                paths={editorDemoPaths}
+                root="/workspace"
+                onOpen={(path) =>
+                  actions.openFile("demo", {
+                    type: "path",
+                    path: `/workspace/${path}`,
+                    name: path.split("/").at(-1) ?? path,
+                  })
+                }
+              />
+            );
           return tab.type === "agents" ? (
             <div className="file-status grid place-content-center flex-1 p-4 text-sm text-muted-foreground">
               No subagents yet
@@ -1266,6 +1287,9 @@ function Attachments() {
             kind="text"
             text={{ status: "ready", text: markdownAttachment, truncated: false }}
           />
+        </Specimen>
+        <Specimen title="Workspace editor">
+          <WorkspaceEditorDemo />
         </Specimen>
         <Specimen title="Right panel tabs">
           <div className="flex flex-wrap gap-2 mb-3">
@@ -1881,19 +1905,7 @@ export default function DesignSystem() {
                 <NotificationSettingsDemo />
               </Section>
               <Section id="deployment" title="Deployment settings">
-                <DeploymentSettingsForm
-                  value={{
-                    transport: "auto",
-                    titleModel: "fast",
-                    outputStreaming: "complete",
-                    dmContextGapMs: 7_200_000,
-                    dmTimestampGapMs: 1_800_000,
-                    oldMessageSelectionMaxAgeMs: null,
-                    storageRetentionMaxAgeMs: null,
-                    crossThreadSend: { triggerRun: true },
-                  }}
-                  onSave={() => undefined}
-                />
+                <DeploymentSettingsDemo />
               </Section>
               <ComposerSpecimen />
               <Section
@@ -1997,6 +2009,20 @@ function KeybindingsDemo() {
   return <KeybindingsSettings store={store} />;
 }
 
+function DeploymentSettingsDemo() {
+  const [settings, setSettings] = useState<NativeDeploymentSettings>({
+    transport: "auto",
+    titleModel: "fast",
+    outputStreaming: "complete",
+    dmContextGapMs: 7_200_000,
+    dmTimestampGapMs: 1_800_000,
+    oldMessageSelectionMaxAgeMs: null,
+    storageRetentionMaxAgeMs: null,
+    crossThreadSend: { triggerRun: true },
+  });
+  return <DeploymentSettingsForm value={settings} onChange={setSettings} />;
+}
+
 function NotificationSettingsDemo() {
   const threadId = useLocation({ select: (location) => location.state.chatThreadId });
   const [sending, setSending] = useState(false);
@@ -2018,6 +2044,23 @@ function NotificationSettingsDemo() {
       <Button variant="outline" disabled={sending} onClick={() => void testNotification()}>
         <Bell /> Test notification
       </Button>
+    </div>
+  );
+}
+
+const editorDemoPaths = ["src/app.ts", "src/settings.yaml", "README.md"];
+function WorkspaceEditorDemo() {
+  const [text, setText] = useState(
+    '# YAML editor\nname: "Lilac"\nproviders: [firecrawl, exa]\nenabled: true\nretries: 3\nqueueTtl: 3s\n',
+  );
+  const [selected, setSelected] = useState("src/settings.yaml");
+  return (
+    <div className="flex flex-col h-96 min-h-0 bg-background text-foreground">
+      <div className="flex h-40 min-h-0">
+        <WorkspaceTreeView paths={editorDemoPaths} onOpen={setSelected} />
+      </div>
+      <div className="px-3 py-1 text-xs text-muted-foreground">{selected}</div>
+      <CodeEditor value={text} onChange={setText} language="yaml" label="Example YAML editor" />
     </div>
   );
 }
