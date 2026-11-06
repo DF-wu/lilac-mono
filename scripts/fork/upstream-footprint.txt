@@ -24,6 +24,7 @@ docker/verify-image.sh  # verifies the container identity variants
 __tests__/docker-build-script.test.ts  # covers the container identity variants
 bun.lock  # grammY (Telegram Bot API) dependency
 apps/core/tests/tools/bash.test.ts  # probes stdin with readSync to distinguish EBADF from EOF across cat implementations
+apps/core/tests/surface/native/resources-live.test.ts  # verifies exclusive concurrent saves without assuming asynchronous authorization order
 
 # --- Native visible-message recording
 apps/core/src/surface/native/runtime.ts  # composes the opt-in fork-owned Discord recorder at native ingress and shutdown
