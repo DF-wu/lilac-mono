@@ -371,7 +371,12 @@ test("competing saves against one revision let exactly one write land", async ()
       }),
     ),
   );
-  expect(results.filter((result) => result.isOk())).toHaveLength(1);
+  const saved = results.filter((result) => result.isOk());
+  const conflicts = results.filter((result) => result.isErr());
+  expect(saved).toHaveLength(1);
+  expect(conflicts).toHaveLength(1);
+  expect(conflicts[0]?.error).toMatchObject({ code: "conflict" });
+  expect(saved.map((result) => result.value.text)).toEqual([await readFile(file, "utf8")]);
   expect(await readFile(file, "utf8")).toBe(texts[results.findIndex((result) => result.isOk())]!);
   native.close();
 });
