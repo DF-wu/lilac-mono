@@ -3530,7 +3530,7 @@ export function commitLegacyTranscriptMigration(input: {
     database,
     input.stage[stagedTranscriptArtifacts],
   );
-  const closed = captureSqliteOperation(() => database.close());
+  const closed = captureSqliteOperation(() => database.close(false));
   if (closed.kind === "failure" && Panic.is(closed.cause)) preserveToolPanic(closed.cause);
   const appliedOutcome = applied.match<
     | { readonly kind: "applied" }

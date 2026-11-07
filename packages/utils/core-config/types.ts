@@ -1,3 +1,6 @@
+import type { OpenAIWebSearchConfig } from "./openai-web-search";
+import type { TelegramSurfaceConfig } from "./telegram-surface";
+
 export type JSONValue = null | string | number | boolean | Readonly<JSONObject> | JSONArray;
 export type JSONArray = readonly JSONValue[];
 export type JSONObject = {
@@ -181,7 +184,7 @@ export type UniversalCoreConfig = {
     fsBackend: "fff" | "node-rg";
     web: {
       extract: {
-        providers: Array<"tavily" | "exa" | "firecrawl">;
+        providers: Array<"tavily" | "exa" | "firecrawl" | "openai">;
       };
       fetch: {
         mode: "auto" | "fetch" | "browser" | "extract" | "provider-only";
@@ -190,6 +193,8 @@ export type UniversalCoreConfig = {
         maxConcurrency: number;
         queueTtlMs: number;
       };
+      /** Only meaningful when `extract.providers` includes `openai` (web.search only). */
+      openai?: OpenAIWebSearchConfig;
     };
     editFile: {
       hashline: boolean;
@@ -316,6 +321,8 @@ export type UniversalCoreConfig = {
         fallbackMode: "source" | "passthrough";
       };
     };
+
+    telegram: TelegramSurfaceConfig;
 
     heartbeat: {
       enabled: boolean;

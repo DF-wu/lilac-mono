@@ -46,7 +46,13 @@ import {
   type ConversationThreadSummaryWriteResult,
   type ConversationThreadSummarizationEligibility,
   type ConversationThreadSummarizationEligibilityReason,
+  conversationSurfaceOfThreadId,
+  conversationSurfaceOfThreadKind,
+  type ConversationSurface,
+  type ConversationThreadKind,
 } from "./thread-store";
+import { isTelegramChatAllowed } from "../surface/telegram/telegram-guards";
+import { tryParseTelegramSessionId } from "../surface/telegram/telegram-ids";
 import type {
   ConversationThreadEmbeddingAdapterResolver,
   ConversationThreadEmbeddingUsageEvent,
@@ -269,7 +275,7 @@ export type ConversationThreadSearchResult = {
     queryAboutnessError?: string;
   };
   results: Array<{
-    surface: "discord" | "native";
+    surface: ConversationSurface;
     threadId: string;
     title: string;
     brief: string;
@@ -295,7 +301,7 @@ export type ConversationThreadSearchResult = {
     queryAttribution?: ConversationThreadQueryAttribution[];
     aboutnessCoverage?: ConversationThreadAboutnessCoverage;
     session?: {
-      platform: "discord" | "native";
+      platform: ConversationSurface;
       channelId: string;
       guildId?: string;
       parentChannelId?: string;
@@ -346,7 +352,7 @@ type ConversationThreadSearchHitWithAttribution = ConversationThreadSearchHit & 
 
 export type ConversationThreadReadOutput = {
   thread: {
-    surface: "discord" | "native";
+    surface: ConversationSurface;
     threadId: string;
     title?: string;
     brief?: string;
@@ -362,7 +368,7 @@ export type ConversationThreadReadOutput = {
     importance?: "low" | "medium" | "high";
     importanceReasons?: string[];
     session: {
-      platform: "discord" | "native";
+      platform: ConversationSurface;
       channelId: string;
       guildId?: string;
       parentChannelId?: string;
@@ -471,11 +477,11 @@ export type ConversationThreadSummaryMessage = Omit<ConversationThreadMessage, "
 };
 
 export type ConversationThreadAttachmentHydrator = (input: {
-  refs: readonly { surface?: "discord" | "native"; channelId: string; messageId: string }[];
+  refs: readonly { surface?: ConversationSurface; channelId: string; messageId: string }[];
 }) => Promise<
   ResultType<
     Array<{
-      ref: { surface?: "discord" | "native"; channelId: string; messageId: string };
+      ref: { surface?: ConversationSurface; channelId: string; messageId: string };
       attachments: ConversationThreadSummaryAttachment[];
     }>,
     ConversationThreadOperationFailed
@@ -922,14 +928,14 @@ export async function buildThreadSummaryModelMessages(input: {
     const message = input.messages[index]!;
     content.push({ type: "text", text: formatMessageForSummary(message) });
     for (const attachment of message.attachments) {
-      if (message.surface === "native" && !attachment.data) {
+      if (message.surface !== undefined && message.surface !== "discord" && !attachment.data) {
         content.push({
           type: "text",
           text: attachmentMetadataText({
             filename: attachment.filename,
             mediaType: attachment.mimeType,
             size: attachment.size,
-            surface: "native",
+            surface: message.surface,
             reason: "content unavailable or exceeds attachment limits",
           }),
         });
@@ -966,7 +972,7 @@ export async function buildThreadSummaryModelMessages(input: {
 }
 
 function attachmentMetadataText(input: {
-  surface?: "discord" | "native";
+  surface?: ConversationSurface;
   reason?: string;
   filename?: string;
   mediaType?: string;
@@ -1523,9 +1529,43 @@ function shouldAllowDiscordThread(
   return !!input.guildId && allowedGuildIds.has(input.guildId);
 }
 
+/**
+ * Telegram threads are gated by the live chat allowlist; the session id's
+ * chat part is the key, so every topic of a chat follows the chat's access.
+ */
+function shouldAllowTelegramThread(cfg: CoreConfig, channelId: string): boolean {
+  const parsed = tryParseTelegramSessionId(channelId);
+  return parsed !== null && isTelegramChatAllowed({ cfg, chatId: parsed.chatId });
+}
+
+function shouldAllowThread(
+  cfg: CoreConfig,
+  thread: {
+    kind: ConversationThreadKind;
+    channelId: string;
+    parentChannelId?: string | null;
+    guildId?: string | null;
+  },
+): boolean {
+  switch (conversationSurfaceOfThreadKind(thread.kind)) {
+    case "native":
+      return true;
+    case "telegram":
+      return shouldAllowTelegramThread(cfg, thread.channelId);
+    case "discord":
+      return shouldAllowDiscordThread(cfg, thread);
+  }
+}
+
+function inferSessionSurface(sessionId: string | undefined): ConversationSurface | undefined {
+  if (!sessionId) return undefined;
+  const surface = conversationSurfaceOfThreadId(sessionId);
+  return surface === "discord" ? undefined : surface;
+}
+
 function buildSearchFilters(input: {
-  surface?: "discord" | "native";
-  participantSurface?: "discord" | "native";
+  surface?: ConversationSurface;
+  participantSurface?: ConversationSurface;
   sessionId?: string;
   participantId?: string;
   participantIdsAny?: readonly string[];
@@ -1533,7 +1573,7 @@ function buildSearchFilters(input: {
   afterTs?: number;
 }): ConversationThreadSearchFilters {
   return {
-    surface: input.surface ?? (input.sessionId?.startsWith("native:") ? "native" : undefined),
+    surface: input.surface ?? inferSessionSurface(input.sessionId),
     participantSurface: input.participantSurface,
     sessionId: input.sessionId?.trim() || undefined,
     participantId: input.participantId?.trim() || undefined,
@@ -1547,6 +1587,7 @@ function buildSearchAllowlist(cfg: CoreConfig): ConversationThreadSearchAllowlis
   return {
     channelIds: cfg.surface.discord.allowedChannelIds,
     guildIds: cfg.surface.discord.allowedGuildIds,
+    telegramChatIds: cfg.surface.telegram.allowedChatIds,
   };
 }
 
@@ -2002,8 +2043,8 @@ export class ConversationThreadService {
   }
 
   async search(input: {
-    surface?: "discord" | "native";
-    participantSurface?: "discord" | "native";
+    surface?: ConversationSurface;
+    participantSurface?: ConversationSurface;
     query: string | readonly string[];
     limit?: number;
     sessionId?: string;
@@ -2068,7 +2109,12 @@ export class ConversationThreadService {
           mode,
           candidateCount: recalled.length,
         });
-    const current = await this.searchStore({ type: "current", hits: recalled, filters, allowlist });
+    const current = await this.searchStore({
+      type: "current",
+      hits: recalled,
+      filters,
+      allowlist: buildSearchAllowlist(await this.params.getConfig()),
+    });
     const currentError = resultErrorOrNull(current);
     if (currentError) return Result.err(currentError);
     const currentIds = new Set(selectResultValue(current).map((hit) => hit.threadId));
@@ -2136,7 +2182,7 @@ export class ConversationThreadService {
     text: string;
     limit: number;
     semanticFallback: boolean;
-    participantSurface?: "discord" | "native";
+    participantSurface?: ConversationSurface;
     participantIdsAny?: readonly string[];
     excludeThreadIds?: readonly string[];
     autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
@@ -2171,8 +2217,8 @@ export class ConversationThreadService {
     const semanticError = resultErrorOrNull(semanticResult);
     if (semanticError) return Result.err(semanticError);
     const [currentLexical, semanticHits] = await Promise.all([
-      this.filterCurrentAutoInjectHits(cfg, selectResultValue(lexical), filters),
-      this.filterCurrentAutoInjectHits(cfg, selectResultValue(semanticResult), filters),
+      this.filterCurrentAutoInjectHits(selectResultValue(lexical), filters),
+      this.filterCurrentAutoInjectHits(selectResultValue(semanticResult), filters),
     ]);
     const lexicalHits = currentLexical.slice(0, input.limit);
     if (semanticHits.length === 0) {
@@ -2244,7 +2290,6 @@ export class ConversationThreadService {
   }
 
   private async filterCurrentAutoInjectHits(
-    cfg: CoreConfig,
     hits: readonly ConversationThreadSearchHit[],
     filters?: ConversationThreadSearchFilters,
   ): Promise<ConversationThreadSearchHit[]> {
@@ -2252,7 +2297,7 @@ export class ConversationThreadService {
       type: "current",
       hits,
       filters,
-      allowlist: buildSearchAllowlist(cfg),
+      allowlist: buildSearchAllowlist(await this.params.getConfig()),
     });
     return selectResultValue(current);
   }
@@ -2280,7 +2325,7 @@ export class ConversationThreadService {
     const cfg = await this.params.getConfig();
     const offset = Math.max(0, Math.floor(input.offset ?? 0));
     const limit = Math.min(200, Math.max(1, Math.floor(input.limit ?? DEFAULT_READ_LIMIT)));
-    this.params.store.refreshNativeThreads();
+    this.params.store.refreshSourceThreads();
     const result = this.params.store.readThread(input.threadId, offset, limit);
     return result.andThen((value) => {
       if (!value) {
@@ -2292,8 +2337,8 @@ export class ConversationThreadService {
         );
       }
       if (
-        value.thread.kind !== "native_thread" &&
-        !shouldAllowDiscordThread(cfg, {
+        !shouldAllowThread(cfg, {
+          kind: value.thread.kind,
           channelId: value.thread.channel_id,
           parentChannelId: value.thread.parent_channel_id,
           guildId: value.thread.guild_id,
@@ -2330,7 +2375,7 @@ export class ConversationThreadService {
           userName: message.userName,
           time: formatTime(message.ts),
           content:
-            value.thread.kind === "native_thread"
+            conversationSurfaceOfThreadKind(value.thread.kind) !== "discord"
               ? message.text
               : stripUserThreadContinueDirective({
                   message,
@@ -2346,7 +2391,7 @@ export class ConversationThreadService {
     threadIds: readonly string[];
   }): Promise<ResultType<ConversationThreadMetadataOutput, ConversationThreadMetadataError>> {
     const cfg = await this.params.getConfig();
-    this.params.store.refreshNativeThreads();
+    this.params.store.refreshSourceThreads();
     const threadIds = normalizeMetadataThreadIds(input);
     if (threadIds.length === 0) {
       return Result.err(
@@ -2367,8 +2412,8 @@ export class ConversationThreadService {
       }
 
       if (
-        thread.kind !== "native_thread" &&
-        !shouldAllowDiscordThread(cfg, {
+        !shouldAllowThread(cfg, {
+          kind: thread.kind,
           channelId: thread.channel_id,
           parentChannelId: thread.parent_channel_id,
           guildId: thread.guild_id,
@@ -2401,7 +2446,7 @@ export class ConversationThreadService {
   async runSummarization(
     input: ConversationThreadRunSummarizationInput = {},
   ): Promise<ConversationThreadRunSummarizationResult> {
-    this.params.store.refreshNativeThreads();
+    this.params.store.refreshSourceThreads();
     const jobId = input.jobId;
     const cfg = await this.params.getConfig();
     const refreshed = { channels: 0, threads: 0, messages: 0 };
@@ -2635,7 +2680,7 @@ export class ConversationThreadService {
                 if (hydrationError) return Result.err(hydrationError);
                 const hydratedMessages = hydrated.match({ ok: (value) => value, err: () => [] });
                 const summaryMessages =
-                  thread.kind === "native_thread"
+                  conversationSurfaceOfThreadKind(thread.kind) !== "discord"
                     ? hydratedMessages
                     : this.normalizeMessagesForSummarization(hydratedMessages, cfg);
                 this.logger.debug("thread summary generation started", {
@@ -2896,7 +2941,9 @@ export class ConversationThreadService {
     const refs = messages
       .filter((message) => message.attachments.length > 0)
       .map((message) => ({
-        ...(message.surface === "native" ? { surface: "native" as const } : {}),
+        ...(message.surface !== undefined && message.surface !== "discord"
+          ? { surface: message.surface }
+          : {}),
         channelId: message.channelId,
         messageId: message.messageId,
       }));
@@ -3153,8 +3200,8 @@ export class ConversationThreadService {
     const candidates = new Map<string, ConversationThreadSearchHit>();
     const add = (hit: ConversationThreadSearchHit) => {
       if (
-        hit.kind !== "native_thread" &&
-        !shouldAllowDiscordThread(input.cfg, {
+        !shouldAllowThread(input.cfg, {
+          kind: hit.kind,
           channelId: hit.channelId,
           parentChannelId: hit.parentChannelId,
           guildId: hit.guildId,
@@ -3364,7 +3411,7 @@ export class ConversationThreadService {
   private formatSearchHit(hit: ConversationThreadSearchHitWithAttribution, verbose: boolean) {
     return {
       threadId: hit.threadId,
-      surface: hit.kind === "native_thread" ? ("native" as const) : ("discord" as const),
+      surface: conversationSurfaceOfThreadKind(hit.kind),
       title: hit.title,
       brief: hit.brief,
       ...(verbose
@@ -3385,7 +3432,7 @@ export class ConversationThreadService {
             ...(hit.queryAttribution ? { queryAttribution: hit.queryAttribution } : {}),
             ...(hit.aboutnessCoverage ? { aboutnessCoverage: hit.aboutnessCoverage } : {}),
             session: {
-              platform: hit.kind === "native_thread" ? ("native" as const) : ("discord" as const),
+              platform: conversationSurfaceOfThreadKind(hit.kind),
               channelId: hit.channelId,
               guildId: hit.guildId,
               parentChannelId: hit.parentChannelId,
@@ -3410,7 +3457,7 @@ export class ConversationThreadService {
   }): ConversationThreadReadOutput["thread"] {
     return {
       threadId: input.thread.thread_id,
-      surface: input.thread.kind === "native_thread" ? "native" : "discord",
+      surface: conversationSurfaceOfThreadKind(input.thread.kind),
       ...(input.summary
         ? {
             title: input.summary.title,
@@ -3423,7 +3470,7 @@ export class ConversationThreadService {
           }
         : {}),
       session: {
-        platform: input.thread.kind === "native_thread" ? "native" : "discord",
+        platform: conversationSurfaceOfThreadKind(input.thread.kind),
         channelId: input.thread.channel_id,
         guildId: input.thread.guild_id ?? undefined,
         parentChannelId: input.thread.parent_channel_id ?? undefined,

@@ -47,12 +47,14 @@ type PlatformTriple = {
 const sessionRefs = {
   discord: discordMessage.session,
   github: githubMessage.session,
+  telegram: { platform: "telegram", channelId: "-1001:42" },
   native: { platform: "native", channelId: "thread-1" },
 } satisfies Record<RefPlatform, SessionRef>;
 
 const messageRefs = {
   discord: discordMessage.ref,
   github: githubMessage.ref,
+  telegram: { platform: "telegram", channelId: "-1001:42", messageId: "84" },
   native: { platform: "native", channelId: "thread-1", messageId: "message-1" },
 } satisfies Record<RefPlatform, MsgRef>;
 
@@ -70,6 +72,9 @@ function expectPlatformMismatchMatrix(project: (platforms: PlatformTriple) => un
   expectPanic(() => project({ event: "github", session: "discord", messageRef: "discord" }));
   expectPanic(() => project({ event: "discord", session: "github", messageRef: "discord" }));
   expectPanic(() => project({ event: "discord", session: "discord", messageRef: "github" }));
+  expectPanic(() => project({ event: "telegram", session: "discord", messageRef: "discord" }));
+  expectPanic(() => project({ event: "discord", session: "telegram", messageRef: "discord" }));
+  expectPanic(() => project({ event: "discord", session: "discord", messageRef: "telegram" }));
 }
 
 describe("adapter event bus projection", () => {

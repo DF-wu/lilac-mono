@@ -77,7 +77,7 @@ class FakeOutputStream {
   constructor(
     private readonly onFirstPush?: () => void,
     private readonly finalTextMode: SurfaceFinalTextMode = "continuation",
-    private readonly platform: "discord" | "github" | "native" = "discord",
+    private readonly platform: "discord" | "github" | "telegram" | "native" = "discord",
     private readonly terminalPartTypes: ReadonlySet<SurfaceOutputPart["type"]> = new Set(),
   ) {}
 
@@ -92,7 +92,7 @@ class FakeOutputStream {
     ) {
       return "terminal";
     }
-    return this.platform === "discord" && parts.length > 0 ? "visible" : "ignored";
+    return this.platform !== "github" && parts.length > 0 ? "visible" : "ignored";
   }
 
   async push(

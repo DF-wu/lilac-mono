@@ -28,6 +28,12 @@ import { RequestControlAuthority } from "../src/tool-server/request-control-auth
 import { requestInvocationCwd } from "../src/tool-server/request-invocation-cwd";
 import { decodeToolInput } from "../src/tool-server/validation-error-message";
 import type { AuthenticatedRequestProjection } from "../src/surface/authenticated-request";
+import type { SurfaceAdapter } from "../src/surface/adapter";
+import { BUILTIN_SURFACE_PROTOCOLS } from "../src/surface/builtin-surface-protocols";
+import { SurfaceRuntimeRegistry } from "../src/surface/runtime-descriptor";
+import type { MsgRef } from "../src/surface/types";
+import { Surface } from "../src/tool-server/tools/surface";
+import { SurfaceAdapterTestBase } from "./helpers/surface-adapter-test-base";
 
 const originalMemoryUsage = process.memoryUsage;
 const TEST_OPERATOR_TOKEN = "tool-server-test-operator";
@@ -874,6 +880,7 @@ describe("createToolServer", () => {
           kind: "primary",
           requestId,
           sessionId: workflowChild ? "workflow-child-session" : "origin-session",
+          originSessionId: `origin:${requestId}`,
           platform: workflowChild ? "unknown" : "discord",
           principal: { platform: "discord", userId: "user-1" },
           authenticatedOrigin: {
@@ -944,6 +951,7 @@ describe("createToolServer", () => {
         const headers = {
           "x-lilac-request-id": requestId,
           "x-lilac-session-id": workflowChild ? "workflow-child-session" : "origin-session",
+          "x-lilac-origin-session-id": "caller-controlled-origin",
           "x-lilac-request-client": workflowChild ? "unknown" : "discord",
           "x-lilac-cwd": "/selected/child/cwd",
           "x-lilac-control-capability": capability,
@@ -968,6 +976,7 @@ describe("createToolServer", () => {
         contexts.map(
           ({
             cwd,
+            originSessionId,
             subagentProfile,
             controlPolicy,
             requestInitiator,
@@ -976,6 +985,7 @@ describe("createToolServer", () => {
             safetyMode,
           }) => ({
             cwd,
+            originSessionId,
             subagentProfile,
             controlPolicy,
             requestInitiator,
@@ -987,6 +997,7 @@ describe("createToolServer", () => {
       ).toEqual([
         {
           cwd: "/selected/child/cwd",
+          originSessionId: "origin:sub:direct",
           subagentProfile: "general",
           controlPolicy: { kind: "primary", allowedCallables: null },
           requestInitiator: { platform: "discord", userId: "user-1" },
@@ -996,6 +1007,7 @@ describe("createToolServer", () => {
         },
         {
           cwd: "/selected/child/cwd",
+          originSessionId: "origin:wfr:workflow",
           subagentProfile: "general",
           controlPolicy: { kind: "primary", allowedCallables: null },
           requestInitiator: { platform: "discord", userId: "user-1" },
@@ -1004,6 +1016,118 @@ describe("createToolServer", () => {
           safetyMode: "trusted",
         },
       ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("scopes restricted Telegram workflow surface calls to the server-issued origin", async () => {
+    const authority = new RequestControlAuthority();
+    const requestId = "wfr:telegram-child";
+    const sessionId = "workflow:run-1:operation-1";
+    const originSessionId = "-100123:7";
+    const capability = authority.issue({
+      kind: "primary",
+      requestId,
+      sessionId,
+      originSessionId,
+      platform: "unknown",
+      principal: { platform: "telegram", userId: "user-7" },
+      authenticatedOrigin: {
+        platform: "telegram",
+        userId: "user-7",
+        sessionRef: { platform: "telegram", channelId: originSessionId },
+      },
+      allowedCallables: null,
+      profile: "general",
+      canonicalCwd: "/workspace",
+      safetyMode: "restricted",
+      expiresAt: Date.now() + 60_000,
+    });
+    const calls: RequestContext[] = [];
+    const tool: ServerTool = {
+      id: "telegram-origin-test",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "surface.messages.send",
+            name: "Send",
+            description: "Send",
+            shortInput: [],
+          },
+        ];
+      },
+      async call(_callableId, _input, options) {
+        if (options?.context) calls.push(options.context);
+        return Result.ok({ ok: true });
+      },
+    };
+    const server = createToolServer({
+      tools: [tool],
+      requestMessageCache: {
+        get: () => [{ role: "user", content: "cached" }],
+        getOrigin: () => ({
+          requestId,
+          requestClient: "unknown",
+          sessionId,
+          source: "internal-delegated",
+          authenticatedOrigin: {
+            platform: "telegram",
+            userId: "user-7",
+            sessionRef: { platform: "telegram", channelId: originSessionId },
+          },
+          authenticationMetadataKind: "origin",
+          verifiedIngress: false,
+        }),
+      },
+      authorizeControlRequest: (input) => authority.authorize(input),
+    });
+    const headers = {
+      "content-type": "application/json",
+      "x-lilac-request-id": requestId,
+      "x-lilac-session-id": sessionId,
+      "x-lilac-request-client": "unknown",
+      "x-lilac-cwd": "/workspace",
+      "x-lilac-control-capability": capability,
+    };
+    await server.init();
+    try {
+      const allowed = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            callableId: "surface.messages.send",
+            input: { sessionId: originSessionId, text: "allowed" },
+          }),
+        }),
+      );
+      expect(await allowed.json()).toMatchObject({ status: "ok", value: { ok: true } });
+      expect(calls[0]).toMatchObject({
+        requestInitiator: { platform: "telegram", userId: "user-7" },
+        requestInitiatorSessionId: originSessionId,
+      });
+
+      const blocked = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            callableId: "surface.messages.send",
+            input: { sessionId: "-100123:8", text: "blocked" },
+          }),
+        }),
+      );
+      expect(await blocked.json()).toMatchObject({
+        status: "error",
+        error: {
+          kind: "denied",
+          message: "Tool 'surface.messages.send' is not allowed in restricted public-session mode",
+        },
+      });
+      expect(calls).toHaveLength(1);
     } finally {
       await server.stop();
     }
@@ -3997,6 +4121,7 @@ describe("createToolServer", () => {
 
   it("invokes the unhealthy watchdog after repeated live failures", async () => {
     const unhealthySnapshots: ToolServerHealthSnapshot[] = [];
+    const unhealthy = Promise.withResolvers<ToolServerHealthSnapshot>();
     const server = createToolServer({
       tools: [],
       healthProvider: () => ({
@@ -4011,6 +4136,7 @@ describe("createToolServer", () => {
       }),
       onUnhealthy: async (snapshot) => {
         unhealthySnapshots.push(snapshot);
+        unhealthy.resolve(snapshot);
       },
       healthConfig: {
         watchdogIntervalMs: 10,
@@ -4021,17 +4147,21 @@ describe("createToolServer", () => {
     await server.init();
     await server.start(0);
 
-    // test-wait-justification: allows two real watchdog intervals to trigger the configured unhealthy callback
-    await Bun.sleep(40);
+    const snapshot = await Promise.race([
+      unhealthy.promise,
+      Bun.sleep(1_000).then(() => {
+        throw new Error("Watchdog did not report the unhealthy runtime");
+      }),
+    ]).finally(async () => {
+      await server.stop();
+    });
 
     expect(unhealthySnapshots).toHaveLength(1);
     expect(
-      unhealthySnapshots[0]?.checks.find(
+      snapshot.checks.find(
         (check: ToolServerHealthSnapshot["checks"][number]) => check.name === "runtime.redis",
       )?.ok,
     ).toBe(false);
-
-    await server.stop();
   });
 });
 
@@ -4084,3 +4214,152 @@ it("restricted native calls accept bare and canonical current-thread IDs only", 
     await server.stop();
   }
 });
+
+it.each([
+  ["raw current thread", { sessionId: "thread" }, "native", null],
+  ["canonical current thread", { sessionId: "native:thread" }, "native", null],
+  ["explicit native client", { client: "native", sessionId: "native:thread" }, "native", null],
+  ["default current thread", {}, "native", null],
+  ["other raw thread", { sessionId: "other" }, "native", "restricted_mode_denied"],
+  ["other canonical thread", { sessionId: "native:other" }, "native", "restricted_mode_denied"],
+  [
+    "canonical target on another client",
+    { client: "discord", sessionId: "native:thread" },
+    "native",
+    "restricted_mode_denied",
+  ],
+  ["mismatched request client", { sessionId: "thread" }, "discord", "authentication_failed"],
+] as const)(
+  "authenticated restricted native surface call: %s",
+  async (_name, input, requestClient, expectedErrorCode) => {
+    const requestId = "native:thread:message";
+    const sessionId = "native:thread";
+    const principal = { platform: "native" as const, userId: "native-user" };
+    const sessionRef = { platform: "native" as const, channelId: "thread" };
+    const messageRef = { ...sessionRef, messageId: "message" };
+    const authenticatedOrigin = { ...principal, sessionRef, messageRef };
+    const projection: AuthenticatedRequestProjection = {
+      requestId,
+      sessionId,
+      requestClient: "native",
+      source: "external",
+      platform: "native",
+      sessionRef,
+      messageRef,
+      authenticatedActor: principal,
+      authenticatedOrigin,
+      authenticationMetadataKind: "actor-origin",
+      verifiedIngress: true,
+      native: {
+        threadId: "thread",
+        authorUserId: principal.userId,
+        starterUserId: principal.userId,
+        turnId: "turn",
+        historyGeneration: 0,
+        inputId: "input",
+        requestId,
+        requestDeliveryId: "00000000-0000-4000-8000-000000000001",
+      },
+    };
+    const authority = new RequestControlAuthority();
+    const capability = authority.issue({
+      kind: "primary",
+      requestId,
+      sessionId,
+      platform: "native",
+      principal,
+      authenticatedOrigin,
+      allowedCallables: null,
+      profile: "primary",
+      canonicalCwd: "/workspace",
+      safetyMode: "restricted",
+      expiresAt: Date.now() + 60_000,
+    });
+    const reads: MsgRef[] = [];
+    const unexpectedOperation = async () => {
+      throw new Error("Unexpected native adapter operation");
+    };
+    const adapter: SurfaceAdapter = Object.assign(new SurfaceAdapterTestBase(), {
+      connect: unexpectedOperation,
+      disconnect: unexpectedOperation,
+      getSelf: unexpectedOperation,
+      listSessions: unexpectedOperation,
+      startOutput: unexpectedOperation,
+      sendMsg: unexpectedOperation,
+      readMsg: async (ref: MsgRef) => {
+        reads.push(ref);
+        return Result.ok({
+          ref,
+          session: sessionRef,
+          userId: principal.userId,
+          text: "hello",
+          ts: 0,
+        });
+      },
+      listMsg: unexpectedOperation,
+      editMsg: unexpectedOperation,
+      deleteMsg: unexpectedOperation,
+      getReplyContext: unexpectedOperation,
+      addReaction: unexpectedOperation,
+      removeReaction: unexpectedOperation,
+      listReactions: unexpectedOperation,
+      getUnRead: unexpectedOperation,
+      markRead: unexpectedOperation,
+    });
+    const registry = SurfaceRuntimeRegistry.create([
+      { protocol: BUILTIN_SURFACE_PROTOCOLS.native, adapter },
+    ]).unwrap();
+    const tool = new Surface({
+      adapterResolver: registry.adapterResolver(),
+      nativeAdapterForContext: () => Result.ok(adapter),
+      config: parseCoreConfigV2ToUniversal({ configVersion: 2 }),
+    });
+    const server = createToolServer({
+      tools: [tool],
+      requestMessageCache: {
+        get: (id) => (id === requestId ? [{ role: "user", content: "hello" }] : undefined),
+        getOrigin: (id) => (id === requestId ? projection : undefined),
+      },
+      authorizeControlRequest: (request) => authority.authorize(request),
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-lilac-request-id": requestId,
+            "x-lilac-session-id": sessionId,
+            "x-lilac-request-client": requestClient,
+            "x-lilac-control-capability": capability,
+            "x-lilac-cwd": "/workspace",
+          },
+          body: JSON.stringify({
+            callableId: "surface.messages.read",
+            input: { ...input, messageId: "message" },
+          }),
+        }),
+      );
+      const body = await response.json();
+      if (expectedErrorCode) {
+        expect(body).toMatchObject({
+          status: "error",
+          error: { kind: "denied", code: expectedErrorCode },
+        });
+        expect(reads).toEqual([]);
+        return;
+      }
+      expect(body).toMatchObject({
+        status: "ok",
+        value: {
+          meta: { session: { platform: "native", channelId: "thread" } },
+          message: { richText: "hello" },
+        },
+      });
+      expect(reads).toEqual([{ platform: "native", channelId: "thread", messageId: "message" }]);
+    } finally {
+      await server.stop();
+    }
+  },
+);

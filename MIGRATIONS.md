@@ -6,6 +6,27 @@ day-to-day behavior are in [Native surface](docs/native-surface.md). Git history
 of feature introductions. This file keeps the cutover steps and compatibility constraints that still
 matter when upgrading an older installation.
 
+## Automatic Transcript And Workflow Blob Migration
+
+The production Docker entrypoint coordinates the one-way Core transcript schema 5 and workflow
+schema 25 migration before starting the default Core command. When both databases are at those exact
+legacy versions, startup first writes an immutable backup to
+`${DATA_DIR}/.migration-backups/blob-storage-v5-v25` (normally
+`/data/.migration-backups/blob-storage-v5-v25` in Docker), then runs the blob-storage migration.
+
+Startup skips this compatibility migration when each database is either absent or within its supported
+post-migration version range. If either database is unsupported or only one database is at the expected
+legacy version, startup fails closed and requires an operator to inspect and migrate the deployment
+explicitly. Rollback after a successful migration
+requires restoring the generated backup and running a pre-migration image that expects schema 5/25.
+
+Set `LILAC_AUTO_MIGRATE_BLOB_STORAGE=0` only as an operator-controlled temporary opt-out when the
+migration will be run manually with `bun run migrate:blob-storage`. The Docker gate applies only to the
+image's exact default Core command; maintenance and diagnostic commands do not trigger it.
+The fork-owned `apps/core/scripts/startup-blob-storage-migration.ts` and
+`startup-blob-storage-backup.ts` implement this gate and backup. Running
+`apps/core/src/runtime/main.ts` directly, including through `startCoreRuntime`, does not run it.
+
 ## Plan the cutover
 
 1. Identify the installed build, config version, and database schema versions. Configuration,
@@ -126,7 +147,7 @@ readable; no stored-data or configuration version changes are needed.
 `generate.image` now accepts only `{ code: string }`, with JavaScript executed by Bun in the calling
 CLI's cwd and Core's inherited container environment. Replace calls using `prompt`, `model`, `size`,
 `aspectRatio`, `inputImages`, `maskImage`, or `outputDir` with scripts. The injected global `providers`
-maps configured `openai`, `openrouter`, and `xai` connections to `{ baseURL, apiKey? }`. Tool discovery
+maps configured `openai`, `openrouter`, and `xai` connections (plus the fork's `openaiCompatible` endpoint when configured) to `{ baseURL, apiKey? }`. Tool discovery
 advertises configured provider names; model choices and request examples live in the built-in
 `image-generation` skill.
 
@@ -179,6 +200,27 @@ so separate installations cannot share a worker with different metadata.
 Docker writes version metadata only in `/app/build/build-info.json` and links the tool
 metadata file to it. Local tool builds write their metadata beside the executables.
 Metadata changes no longer change the worker ID or require recompiling either executable.
+
+## Downstream Core Config Extensions
+
+Manual v1-to-v2 upgrades follow [`docs/core-config-migrations.md`](docs/core-config-migrations.md). The
+DF-wu fork adds these downstream-only v2/v3 contracts:
+
+- `surface.discord.outputPreviewPlainFinalStats` was removed. Discord preview plus plain final output
+  appends the stats footer whenever stats metadata is produced.
+- `surface.telegram` is disabled by default and requires `configVersion: 2` or `3` to enable or configure. Frozen
+  v1 configs receive the disabled universal fallback. Existing v2 configs using `tokenEnv` are rejected;
+  copy the secret to `token` in `core-config.yaml`. `allowedChatIds` fails closed, `streamEditIntervalMs`
+  defaults to `1500`, and `parseMode` defaults to `html`. See
+  [`docs/telegram-surface.md`](docs/telegram-surface.md).
+- `tools.generate` was removed together with the structured `generate.image` tool; the fork now uses
+  upstream's script runner. A leftover `tools.generate` block parses with an `unknown core-config key
+  ignored` warning and no effect. Scripts reach an OpenAI-compatible endpoint as
+  `providers.openaiCompatible` when `OPENAI_COMPATIBLE_BASE_URL` is set. See
+  [`docs/generate-image-openai-compatible.md`](docs/generate-image-openai-compatible.md).
+- `surface.telegram.inboundMedia` delivers inbound Telegram photos and documents to the model. It is
+  enabled by default with `maxBytesPerAttachment: 5MiB` and `maxBytesPerRequest: 10MiB`; set
+  `inboundMedia.enabled: false` to restore caption-only routing.
 
 ## Native deployment upgrade
 
@@ -517,6 +559,15 @@ apply. Native UI read and write permissions remain unchanged. Derived native sta
 its retained message content or history generation changes, including edits, rewinds, and deletion.
 Model selection, titles, archiving, and grant changes preserve existing summaries. Downgrading requires
 rebuilding the derived index for the older runtime; do not reuse cross-surface derived rows with an older binary.
+
+This fork additionally attaches `telegram-surface.db` as a conversation source when the Telegram
+surface is usable. Telegram sessions are projected into the same derived tables as `telegram_thread`
+rows with thread references `telegram:<sessionId>`, one thread per chat or forum topic, and are
+subject to `surface.telegram.allowedChatIds` on every read. Retained Telegram messages are unchanged;
+derived Telegram rows are rebuilt whenever a session's message count, latest timestamp, latest edit, or
+deletion count changes. Removing the Telegram surface leaves stale `telegram_thread` rows that the
+next materialization pass deletes. Downgrading to a runtime without the Telegram source requires the
+same derived-index rebuild as above.
 
 ## MCP and computer-use integration
 
