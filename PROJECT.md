@@ -130,6 +130,15 @@ client store, and web turn renderer. Child `agent-stream` records hold workflow 
 canonical parent request; they are excluded from the sidebar and inherit read access through verified
 workflow ancestry. Completed legacy children are projected from retained transcripts on first open.
 
+The web turn rail reads `threads.outline` in pages of 256 turns and `threads.outlinePreviews` for
+up to 16 hovered turns. DM outlines group turns into context windows with the same gap rule as
+session selection. A jump hydrates a deferred range with `aroundPosition`, which loads the target and
+leaves deferred ranges on both sides.
+
+`useReadingAnchor` keeps the content at the reading line in place while rows above it change height or
+a deferred range fills in. Rows within 1.5 viewports of the screen stay mounted so media settles
+before the reader reaches it.
+
 - `packages/coding-tools`: shared coding-tool schemas and implementations, patch/edit behavior, instruction discovery, and tool guardrails.
 - `packages/computer-use-runner`: pinned CUA desktop image, Chromium seccomp profile, persistent Python runtime, and runner checks.
 - `packages/event-bus`: event catalog, codecs, typed bus, delivery policy, dead letters, and Redis Streams transport.

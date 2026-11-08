@@ -3,6 +3,14 @@ import { Result } from "better-result";
 import type { DisplayMessage, NativeQuestion } from "@stanley2058/lilac-client-protocol";
 import type { SqliteTranscriptStore } from "../../../src/transcript/transcript-store";
 import { NativeStore } from "../../../src/surface/native/store";
+import {
+  directMessageHistory,
+  mediaReport,
+  novelDraft,
+  searchInvestigation,
+  tripPlanning,
+  type ScriptTurn,
+} from "./browser-seed-long";
 
 const richMarkdown = `# Native surface check
 
@@ -205,6 +213,7 @@ const HOUR_MS = 3_600_000;
 function seedDirectMessages(
   database: Database,
   transcript: SqliteTranscriptStore | undefined,
+  historyWindows?: number,
 ): string {
   let now = Date.now();
   const store = new NativeStore(database, () => now);
@@ -235,6 +244,12 @@ function seedDirectMessages(
     },
   ];
   let index = 0;
+  // Months of earlier windows give the timeline rail a long DM; only recent turns get transcripts.
+  for (const window of directMessageHistory(Date.now(), sessions[0]!.startedAt, historyWindows))
+    for (const turn of window) {
+      now = turn.at;
+      completedTurn(store, undefined, dm.id, index++, turn.text, turn.answer, false, now);
+    }
   for (const session of sessions)
     for (const [offset, [text, answer]] of session.turns.entries()) {
       now = session.startedAt + offset * 5 * 60_000;
@@ -243,11 +258,37 @@ function seedDirectMessages(
   return dm.id;
 }
 
+function seedScript(
+  store: NativeStore,
+  transcript: SqliteTranscriptStore | undefined,
+  commandId: string,
+  title: string,
+  turns: readonly ScriptTurn[],
+): string {
+  const thread = store.createThread("owner", { commandId, title }).unwrap();
+  for (const [index, turn] of turns.entries())
+    completedTurn(
+      store,
+      // Transcripts copy every earlier message, so only the recent tail gets one.
+      index >= turns.length - 10 ? transcript : undefined,
+      thread.id,
+      index,
+      turn.text,
+      turn.answer,
+      false,
+      turn.at,
+    );
+  return thread.id;
+}
+
 export function seedNativeBrowserFixture(
   store: NativeStore,
   options: {
     historyTurns?: number;
     sidebarThreads?: number;
+    /** Turns in the long scripted threads; the novel gets half. */
+    longTurns?: number;
+    dmWindows?: number;
     transcript?: SqliteTranscriptStore;
     database: Database;
   },
@@ -376,10 +417,46 @@ export function seedNativeBrowserFixture(
     })
     .unwrap();
   store.shareThread("owner", { threadId: rich.id, userId: "participant", grant: "read" }).unwrap();
-  const dm = seedDirectMessages(options.database, options.transcript);
+  const now = Date.now();
+  const search = seedScript(
+    store,
+    options.transcript,
+    "browser-search",
+    "Search latency investigation",
+    searchInvestigation(now, options.longTurns),
+  );
+  const novel = seedScript(
+    store,
+    options.transcript,
+    "browser-novel",
+    "Novel draft: The Lantern Keeper",
+    novelDraft(now, options.longTurns === undefined ? undefined : Math.ceil(options.longTurns / 2)),
+  );
+  const trip = seedScript(
+    store,
+    options.transcript,
+    "browser-trip",
+    "Lisbon trip",
+    tripPlanning(now),
+  );
+  const media = seedScript(
+    store,
+    options.transcript,
+    "browser-media",
+    "Reports with tables, images, and previews",
+    mediaReport(
+      now,
+      options.longTurns === undefined ? undefined : Math.ceil(options.longTurns / 5),
+    ),
+  );
+  const dm = seedDirectMessages(options.database, options.transcript, options.dmWindows);
   const questions = seedQuestionThread(store, options.transcript);
   return {
     dm,
+    search,
+    novel,
+    trip,
+    media,
     questions,
     rich: rich.id,
     history: long.id,

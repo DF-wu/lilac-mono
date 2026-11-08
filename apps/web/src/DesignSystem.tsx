@@ -76,6 +76,7 @@ import { AttachmentPreviewBody, ReadyAttachment } from "./components/ResourcePre
 import { MessageIdentityContext } from "./components/message-identity";
 import { toast } from "./components/ui/toast";
 import { showAppUpdateToast } from "./app-update-toast";
+import { closeConnectionNotice, showConnectionNotice } from "./use-connection-notice";
 import { IconButton, Modal, VirtualList } from "./components/ui";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
@@ -136,6 +137,7 @@ import "./design-system.css";
 import { Wordmark } from "./components/LilacMark";
 import { ConversationWelcome } from "./components/ConversationWelcome";
 import { MessageGroupingDemo } from "./components/MessageGroupingDemo";
+import { TimelineRailDemo } from "./components/TimelineRailDemo";
 import { CodeFallback } from "./components/CodeEditor";
 import {
   SkeletonCode,
@@ -887,6 +889,12 @@ function Messages() {
         </div>
         <Specimen title="Grouping and time gaps">
           <MessageGroupingDemo />
+        </Specimen>
+        <Specimen title="Turn rail">
+          <TimelineRailDemo />
+        </Specimen>
+        <Specimen title="Turn rail in a DM">
+          <TimelineRailDemo dm />
         </Specimen>
         <Specimen title="New conversation">
           <div className="grid grid-cols-1 workspace:grid-cols-2 gap-6">
@@ -1724,13 +1732,16 @@ function Overlays() {
           <Button
             variant="secondary"
             onClick={() =>
-              toast.add({
-                id: "connection-demo",
-                title: "Reconnecting…",
-                type: "info",
-                timeout: 0,
-                actionProps: { children: "Retry", onClick: () => toast.close("connection-demo") },
-              })
+              showConnectionNotice(
+                {
+                  reason: "Reconnecting…",
+                  retry: () =>
+                    new Promise((resolve) => setTimeout(resolve, 1_500)).then(() =>
+                      closeConnectionNotice("connection-demo"),
+                    ),
+                },
+                "connection-demo",
+              )
             }
           >
             Reconnecting
@@ -1738,14 +1749,24 @@ function Overlays() {
           <Button
             variant="secondary"
             onClick={() =>
-              toast.add({
-                title: "Could not connect",
-                description: "Check your connection and try again.",
-                type: "error",
-              })
+              showConnectionNotice(
+                {
+                  reason: "Could not connect to Lilac. Your drafts are saved on this device.",
+                  retry: () => new Promise((resolve) => setTimeout(resolve, 1_500)),
+                },
+                "connection-demo",
+              )
             }
           >
-            Connection error
+            Retry fails
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={() =>
+              showConnectionNotice({ reason: "This device is offline." }, "connection-demo")
+            }
+          >
+            Device offline
           </Button>
           <Button
             variant="secondary"

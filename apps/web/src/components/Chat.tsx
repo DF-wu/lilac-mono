@@ -19,6 +19,7 @@ import {
   queueOptions,
   refreshQueue as refreshQueueQuery,
   useNativeOnline,
+  queryNativeRPC,
 } from "../queries";
 import { MessageIdentityContext } from "./message-identity";
 import { ConversationWelcome } from "./ConversationWelcome";
@@ -79,8 +80,10 @@ import { Button } from "./ui/button";
 import { Composer } from "./Composer";
 import { ConversationStatus } from "./ConversationStatus";
 import { Timeline, ThinkingIndicator, useLatestReadableTurn } from "./Timeline";
+import type { OutlineSource } from "../timeline-outline";
 import { attempt, IconButton, Modal, VirtualList } from "./ui";
 import { toast } from "./ui/toast";
+import { isConnectionFailure } from "../connection-lifecycle";
 
 import { UploadProgressContext } from "../upload-context";
 
@@ -127,6 +130,24 @@ export function Chat(props: ChatProps) {
   const queries = useQueryClient();
   const identity = useContext(MessageIdentityContext);
   const online = useNativeOnline(client);
+  const hasThread = !!thread;
+  const outline = useMemo<OutlineSource | undefined>(() => {
+    if (local || !hasThread) return undefined;
+    return {
+      online,
+      page: (beforePosition, signal) =>
+        queryNativeRPC(client, (rpc) =>
+          rpc.threads.outline(
+            beforePosition === undefined ? { threadId } : { threadId, beforePosition },
+            { signal },
+          ),
+        ),
+      previews: (input, signal) =>
+        queryNativeRPC(client, (rpc) =>
+          rpc.threads.outlinePreviews({ threadId, ...input }, { signal }),
+        ),
+    };
+  }, [local, hasThread, online, client, threadId]);
   const pendingQuestions = useQuery({
     ...pendingQuestionsOptions(client, threadId),
     enabled: online && !local,
@@ -831,7 +852,8 @@ export function Chat(props: ChatProps) {
     async (question: NativeQuestion) => {
       const rpc = client.rpc;
       const target = questionReplyTarget(question);
-      if (!rpc || !target) return "Reconnect to dismiss";
+      if (!rpc) return "Connection unavailable";
+      if (!target) return "This question can't be dismissed";
       let failure: string | undefined;
       await attempt(
         () =>
@@ -843,6 +865,7 @@ export function Chat(props: ChatProps) {
           }),
         (message) => {
           failure = message;
+          if (isConnectionFailure(message)) void client.checkConnection();
         },
       );
       return failure;
@@ -951,8 +974,17 @@ export function Chat(props: ChatProps) {
     setHistoryError(undefined);
     if (local) props.onLocalChange(threadId, (current) => ({ ...current, error: undefined }));
   });
+  // Only the source holding this failure is cleared, so a lower-priority error can still appear.
+  const dropConnectionError = useEventCallback((message: string) => {
+    void client.checkConnection();
+    if (local && localThread?.error === message)
+      props.onLocalChange(threadId, (current) => ({ ...current, error: undefined }));
+    if (error === message) setError(undefined);
+    if (historyError === message) setHistoryError(undefined);
+  });
   useEffect(() => {
     if (!composerError) return;
+    if (isConnectionFailure(composerError)) return dropConnectionError(composerError);
     const id = `composer-error:${threadId}`;
     toast.add({
       id,
@@ -961,7 +993,7 @@ export function Chat(props: ChatProps) {
       onClose: () => dismissComposerError(threadId, composerError),
     });
     return () => toast.close(id);
-  }, [composerError, threadId, dismissComposerError]);
+  }, [composerError, threadId, dismissComposerError, dropConnectionError]);
   const composer = (
     <div className="chat-bottom w-full max-w-[var(--ui-chat-width)] my-0 mx-auto pt-2 px-6 pb-6 max-workspace:px-3 max-workspace:pb-3">
       {localThread?.creation && !pendingTurn ? (
@@ -1160,6 +1192,7 @@ export function Chat(props: ChatProps) {
                 onRewind={setRewindTarget}
                 rewindDisabled={active || thread?.kind === "dm"}
                 timestamps={thread?.kind === "dm"}
+                outline={outline}
                 onAction={onAction}
                 onReaction={onReaction}
                 questions={questionServices}
