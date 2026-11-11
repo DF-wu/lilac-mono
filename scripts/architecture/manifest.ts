@@ -384,6 +384,7 @@ export const BLOB_STORAGE_ARCHITECTURE_POLICY = {
   adapterFactoryExports: ["createLocalBlobStore", "createS3BlobStore"],
   adapterFactoryOwners: [
     { workspace: "apps/core", module: "src/runtime/create-core-blob-store" },
+    { workspace: "apps/core", module: "scripts/blob-benchmark-target" },
     { workspace: "apps/core", module: "scripts/blob-migration-target" },
   ],
   closeOwnerModules: [
@@ -394,7 +395,7 @@ export const BLOB_STORAGE_ARCHITECTURE_POLICY = {
   materializationModules: [
     {
       workspace: "apps/core",
-      module: "src/surface/bridge/bus-agent-runner/anthropic-fallback-media",
+      module: "src/agent/anthropic-fallback-media",
     },
     {
       workspace: "apps/core",
@@ -421,6 +422,7 @@ export const BLOB_STORAGE_ARCHITECTURE_POLICY = {
       workspace: "apps/core",
       module: "src/transcript/stored-message-materialization",
     },
+    { workspace: "apps/core", module: "scripts/blob-benchmark-target" },
     { workspace: "apps/core", module: "scripts/blob-migration-target" },
     { workspace: "apps/core", module: "scripts/bench-blob-storage" },
     {
@@ -1461,10 +1463,7 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         ["src/transcript/stored-message-materialization.ts", "decodeResourceReadCallForStorage"],
         ["src/transcript/stored-message-materialization.ts", "materializeStoredMessage"],
         ["src/transcript/transcript-store.ts", "parseNormalizedCanonicalMessages"],
-        [
-          "src/surface/bridge/bus-agent-runner/anthropic-fallback-cache-codec.ts",
-          "decodeAnthropicFallbackCacheRecord",
-        ],
+        ["src/agent/anthropic-fallback-cache-codec.ts", "decodeAnthropicFallbackCacheRecord"],
       ].map(([module, exportName]) => ({
         identity: { module: module!, exportName: exportName! },
         category: "persistence" as const,
@@ -1521,6 +1520,13 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         },
         category: "persistence" as const,
       })),
+      {
+        identity: {
+          module: "scripts/blob-benchmark-target.ts",
+          exportName: "decodeCoreConfig",
+        },
+        category: "persistence",
+      },
       {
         identity: {
           module: "scripts/blob-migration-target.ts",
@@ -1600,7 +1606,7 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
       },
       ...[
         [
-          "src/surface/bridge/bus-agent-runner/core-named-continuation.ts",
+          "src/agent/core-named-continuation.ts",
           "decodeStoredContinuationModelMessages",
           "persistence",
         ],
@@ -1792,6 +1798,13 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: {
           module: "redis-streams-bus.ts",
           exportName: "decodeRedisRangeResponse",
+        },
+        category: "wire",
+      },
+      {
+        identity: {
+          module: "redis-streams-bus.ts",
+          exportName: "decodeSubscriptionMaintenance",
         },
         category: "wire",
       },
@@ -2403,7 +2416,7 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
       })),
       {
         identity: {
-          module: "src/runtime/create-core-runtime.ts",
+          module: "src/runtime/core-runtime-cleanup.ts",
           exportName: "createCoreRuntimeCleanupSupervisor.runOutcome",
         },
         reason:
@@ -3043,12 +3056,12 @@ const CORE_LEGACY_WORKFLOW_BLOB_MIGRATION_PERSISTED_CONSUMER = {
 
 const CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC = {
   identity: {
-    module: "src/surface/bridge/bus-agent-runner/anthropic-fallback-cache-codec.ts",
+    module: "src/agent/anthropic-fallback-cache-codec.ts",
     exportName: "decodeAnthropicFallbackCacheRecord",
   },
   inputParameter: 0,
   fixtureCatalog: {
-    module: "src/surface/bridge/bus-agent-runner/anthropic-fallback-cache-codec.ts",
+    module: "src/agent/anthropic-fallback-cache-codec.ts",
     exportName: "anthropicFallbackCacheCodecCases",
   },
   provenance: ["current"],
@@ -3057,7 +3070,7 @@ const CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC = {
 
 const CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CONSUMER = {
   identity: {
-    module: "src/surface/bridge/bus-agent-runner/anthropic-fallback-media.ts",
+    module: "src/agent/anthropic-fallback-media.ts",
     exportName: "readAnthropicFallbackCacheIndex",
   },
   codecs: [CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC.identity],
@@ -3104,7 +3117,7 @@ const CORE_WORKFLOW_ROW_PERSISTED_CONSUMERS = [
   "decodeWorkflowArtifactRow",
 ].map(
   (exportName): PersistedStoreConsumerRegistration => ({
-    identity: { module: "src/workflow/durable-workflow-store.ts", exportName },
+    identity: { module: "src/workflow/workflow-store-rows.ts", exportName },
     codecs: [CORE_WORKFLOW_ROW_PERSISTED_CODEC.identity],
   }),
 );
@@ -3207,6 +3220,20 @@ const CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC = {
   legacyOutcome: "rejected",
 } as const satisfies PersistedCodecRegistration;
 
+const CORE_AGENT_RUN_CHECKPOINT_DELTA_PERSISTED_CODEC = {
+  identity: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "decodeAgentRunCheckpointDelta",
+  },
+  inputParameter: 0,
+  fixtureCatalog: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "agentRunCheckpointDeltaPayloadCodecCases",
+  },
+  provenance: ["current"],
+  legacyOutcome: "rejected",
+} as const satisfies PersistedCodecRegistration;
+
 const CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC = {
   identity: {
     module: "src/surface/bridge/agent-run-journal/index.ts",
@@ -3226,10 +3253,7 @@ const CORE_AGENT_RUN_JOURNAL_PERSISTED_CONSUMER = {
     module: "src/surface/bridge/agent-run-journal/index.ts",
     exportName: "SqliteAgentRunJournal.#decodeHead",
   },
-  codecs: [
-    CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC.identity,
-    CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC.identity,
-  ],
+  codecs: [CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC.identity],
 } as const satisfies PersistedStoreConsumerRegistration;
 
 const CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER = {
@@ -3240,33 +3264,29 @@ const CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER = {
   codecs: [CORE_AGENT_RUN_OPENED_PERSISTED_CODEC.identity],
 } as const satisfies PersistedStoreConsumerRegistration;
 
-const CORE_AGENT_RUN_PREVIOUS_CHECKPOINT_PERSISTED_CONSUMER = {
+const CORE_AGENT_RUN_CHECKPOINT_CHAIN_PERSISTED_CONSUMER = {
   identity: {
     module: "src/surface/bridge/agent-run-journal/index.ts",
-    exportName: "SqliteAgentRunJournal.#decodePreviousCheckpoint",
+    exportName: "SqliteAgentRunJournal.#decodeCheckpointChain",
   },
-  codecs: [CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC.identity],
+  codecs: [
+    CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC.identity,
+    CORE_AGENT_RUN_CHECKPOINT_DELTA_PERSISTED_CODEC.identity,
+  ],
 } as const satisfies PersistedStoreConsumerRegistration;
 
 const CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS = [
   {
     identity: {
       module: "src/surface/bridge/agent-run-journal/index.ts",
-      exportName: "validatedOpenedPayload",
+      exportName: "openedPayload",
     },
     codecs: [CORE_AGENT_RUN_OPENED_PERSISTED_CODEC.identity],
   },
   {
     identity: {
       module: "src/surface/bridge/agent-run-journal/index.ts",
-      exportName: "validatedCheckpointPayload",
-    },
-    codecs: [CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC.identity],
-  },
-  {
-    identity: {
-      module: "src/surface/bridge/agent-run-journal/index.ts",
-      exportName: "validatedTerminalPayload",
+      exportName: "terminalPayload",
     },
     codecs: [CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC.identity],
   },
@@ -3322,6 +3342,7 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
     exportName: "SqliteTranscriptStore.saveRequestTranscript",
   },
   ...[
+    "SqliteTranscriptStore.pruneRetentionAfterSave",
     "SqliteTranscriptStore.admitCoreSurfaceProjection",
     "SqliteTranscriptStore.saveCorePrimaryLineageManifest",
     "SqliteTranscriptStore.unlinkSurfaceMessage",
@@ -3566,7 +3587,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 },
                 { include: "src/workflow/workflow-persistence-codec.ts" },
                 { include: "src/workflow/workflow-artifact-store.ts" },
-                { include: "src/workflow/durable-workflow-store.ts" },
+                { include: "src/workflow/workflow-store-rows.ts" },
                 {
                   include: "scripts/legacy-graceful-restart-blob-migration.ts",
                 },
@@ -3673,6 +3694,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 CORE_RESOURCE_PERSISTED_CODEC,
                 CORE_AGENT_RUN_OPENED_PERSISTED_CODEC,
                 CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC,
+                CORE_AGENT_RUN_CHECKPOINT_DELTA_PERSISTED_CODEC,
                 CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC,
                 CORE_GRACEFUL_RESTART_PERSISTED_CODEC,
                 CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC,
@@ -3696,7 +3718,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                   CORE_RESOURCE_PERSISTED_CONSUMER,
                   CORE_AGENT_RUN_JOURNAL_PERSISTED_CONSUMER,
                   CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER,
-                  CORE_AGENT_RUN_PREVIOUS_CHECKPOINT_PERSISTED_CONSUMER,
+                  CORE_AGENT_RUN_CHECKPOINT_CHAIN_PERSISTED_CONSUMER,
                   ...CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS,
                   CORE_LEGACY_GRACEFUL_RESTART_PERSISTED_CONSUMER,
                   CORE_WORKFLOW_ARTIFACT_PERSISTED_CONSUMER,
@@ -3933,6 +3955,8 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             "decodeDraft",
             "decodeDraftRow",
             "localDraftId",
+            "decodeStoredBytes",
+            "decodeThreadUsage",
           ].map((exportName) => ({
             identity: { module: "src/cache.ts", exportName },
             category: "persistence" as const,
@@ -3964,6 +3988,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
         ? [
             {
               identity: { module: "src/client.ts", exportName: "captureFailure" },
+              category: "wire" as const,
+            },
+            {
+              identity: { module: "src/thread-store.ts", exportName: "decodeDisplayPartFragment" },
               category: "wire" as const,
             },
           ]
@@ -4229,6 +4257,13 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
         : []),
       ...(root === "apps/core"
         ? ([
+            {
+              identity: {
+                module: "src/workflow/workflow-call-input.ts",
+                exportName: "decodeWorkflowCallInput",
+              },
+              category: "projection" as const,
+            },
             ...[
               "decodeConversationThreadStringArray",
               "decodeConversationThreadImportance",
@@ -5178,10 +5213,11 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             CORE_RESOURCE_PERSISTED_CONSUMER.identity,
             CORE_AGENT_RUN_OPENED_PERSISTED_CODEC.identity,
             CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC.identity,
+            CORE_AGENT_RUN_CHECKPOINT_DELTA_PERSISTED_CODEC.identity,
             CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC.identity,
             CORE_AGENT_RUN_JOURNAL_PERSISTED_CONSUMER.identity,
             CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER.identity,
-            CORE_AGENT_RUN_PREVIOUS_CHECKPOINT_PERSISTED_CONSUMER.identity,
+            CORE_AGENT_RUN_CHECKPOINT_CHAIN_PERSISTED_CONSUMER.identity,
             ...CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS.map(({ identity }) => identity),
             CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity,
             CORE_LEGACY_GRACEFUL_RESTART_PERSISTED_CONSUMER.identity,
@@ -5602,7 +5638,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "24e25765b118c578f9263128b21eaea2442775ccdc480bd750aef65fc5272c1a";
+  "2df40af30e645752dbc9be8d07054ffdf9b143e414adb0f9bba914ea70345871";
 
 export const architectureManifest = {
   version: 1,

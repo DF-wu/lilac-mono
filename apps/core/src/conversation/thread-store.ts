@@ -1,5 +1,6 @@
 import {
   installNativeConversationSource,
+  readNativeConversationContentRevision,
   readNativeConversationThreads,
   readNativeConversationMessages,
   readNativeConversationAttachments,
@@ -313,7 +314,14 @@ type ThreadSemanticSearchRow = ThreadEntryRow & {
   semantic_score: number;
 };
 
-type NativeDmState = { revision: string; windows: string };
+type NativeDmState = { changeKey: string; windows: string };
+type NativeThreadState = { changeKey: string; hash: string };
+type NativeRefresh = {
+  /** States of the non-DM threads the scan checked. */
+  threadStates: Map<string, NativeThreadState>;
+  /** States of the DMs the scan rebuilt. */
+  dmStates: Map<string, NativeDmState>;
+};
 
 type FacetRow = {
   entry_ordinal: number;
@@ -844,6 +852,9 @@ export class ConversationThreadStore {
   // Reading a whole DM to recompute its windows is costly, so skip a DM whose source and indexed
   // windows both match what this store last built. Other store instances write the same windows.
   private readonly nativeDmStates = new Map<string, NativeDmState>();
+  // Reading every turn of a native thread on each native write is costly, so skip a thread whose
+  // change key and indexed hash both match this store's last check.
+  private readonly nativeThreadStates = new Map<string, NativeThreadState>();
   private readonly onPersistenceDiagnostic: (
     diagnostic: ConversationThreadPersistenceDiagnostic,
   ) => void;
@@ -884,6 +895,7 @@ export class ConversationThreadStore {
     this.hasNativeSource = true;
     this.nativeDataVersion = undefined;
     this.nativeDmStates.clear();
+    this.nativeThreadStates.clear();
   }
 
   attachTelegramSource(databasePath: string, botName?: string): void {
@@ -914,8 +926,10 @@ export class ConversationThreadStore {
       .get()?.data_version;
     if (version !== undefined && version === this.nativeDataVersion) return;
     const startedAt = performance.now();
-    const dmStates = this.db.transaction(() => this.materializeNativeThreads()).immediate();
-    for (const [threadId, state] of dmStates) this.nativeDmStates.set(threadId, state);
+    const refreshed = this.db.transaction(() => this.materializeNativeThreads()).immediate();
+    for (const [threadId, state] of refreshed.dmStates) this.nativeDmStates.set(threadId, state);
+    for (const [threadId, state] of refreshed.threadStates)
+      this.nativeThreadStates.set(threadId, state);
     // Remember the version from before the scan so a concurrent commit cannot be skipped.
     this.nativeDataVersion = version;
     threadStoreLogger.debug("conversation.thread.native_refresh", {
@@ -973,8 +987,8 @@ export class ConversationThreadStore {
     }
   }
 
-  /** Returns the state of every DM it rebuilt, to record once the transaction commits. */
-  private materializeNativeThreads(): Map<string, NativeDmState> {
+  /** Returns the thread and DM states it checked, to record once the transaction commits. */
+  private materializeNativeThreads(): NativeRefresh {
     const threads = selectResultValue(readNativeConversationThreads(this.db));
     const gapMs = selectResultValue(readNativeDmContextGapMs(this.db));
     const sourceIds = new Set(threads.map((thread) => thread.id));
@@ -989,16 +1003,24 @@ export class ConversationThreadStore {
     for (const threadId of this.nativeDmStates.keys()) {
       if (!sourceIds.has(threadId)) this.nativeDmStates.delete(threadId);
     }
-    const dmStates = new Map<string, NativeDmState>();
+    for (const threadId of this.nativeThreadStates.keys()) {
+      if (!sourceIds.has(threadId)) this.nativeThreadStates.delete(threadId);
+    }
+    const refreshed: NativeRefresh = { threadStates: new Map(), dmStates: new Map() };
     for (const thread of threads) {
       if (thread.dm === 1) {
         const state = this.materializeNativeDm(thread, gapMs);
-        if (state) dmStates.set(thread.id, state);
+        if (state) refreshed.dmStates.set(thread.id, state);
         continue;
       }
       const threadId = `native:${thread.id}`;
       const existing = this.getThread(threadId);
-      const hash = `native:${stableHash(thread.revision)}`;
+      const checked = this.nativeThreadStates.get(thread.id);
+      if (checked?.changeKey === thread.change_key && existing?.summary_input_hash === checked.hash)
+        continue;
+      const revision = readNativeConversationContentRevision(this.db, thread.id);
+      const hash = `native:${stableHash(revision)}`;
+      refreshed.threadStates.set(thread.id, { changeKey: thread.change_key, hash });
       if (existing?.summary_input_hash === hash) continue;
       // Rebuild changed native entries so removed text cannot survive in a previous summary.
       this.deleteThread(threadId);
@@ -1015,7 +1037,7 @@ export class ConversationThreadStore {
         [hash, thread.updated_at, thread.updated_at, threadId],
       );
     }
-    return dmStates;
+    return refreshed;
   }
 
   private readNativeDmWindowState(threadId: string): string {
@@ -1033,22 +1055,20 @@ export class ConversationThreadStore {
    * Returns null when the DM is unchanged since this store last built it.
    */
   private materializeNativeDm(
-    thread: { id: string; revision: string; updated_at: number },
+    thread: { id: string; change_key: string; updated_at: number },
     gapMs: number,
   ): NativeDmState | null {
-    const turns = selectResultValue(readNativeConversationTurnTimings(this.db, thread.id));
-    // Turn timing moves window boundaries without changing any message, so it is part of the source.
-    const revision = stableHash(
-      [
-        gapMs,
-        thread.revision,
-        ...turns.flatMap((turn) => [turn.created_at, turn.completed_at]),
-      ].join("\u001f"),
-    );
+    // Turn and input writes move the change key, which covers the turn timing that places window
+    // boundaries. Each window still compares its own message hash before it is rebuilt.
+    const changeKey = `${gapMs}\u001f${thread.change_key}`;
     const built = this.nativeDmStates.get(thread.id);
-    if (built?.revision === revision && built.windows === this.readNativeDmWindowState(thread.id)) {
+    if (
+      built?.changeKey === changeKey &&
+      built.windows === this.readNativeDmWindowState(thread.id)
+    ) {
       return null;
     }
+    const turns = selectResultValue(readNativeConversationTurnTimings(this.db, thread.id));
     const source = selectResultValue(readNativeConversationMessages(this.db, thread.id));
     const windows = splitNativeDmWindows(source, turns, gapMs).map((window) =>
       window.map((message) => nativeIndexedMessage(message, thread.updated_at)),
@@ -1077,7 +1097,7 @@ export class ConversationThreadStore {
       .all(thread.id)) {
       if (!windowIds.has(row.thread_id)) this.deleteThread(row.thread_id);
     }
-    return { revision, windows: this.readNativeDmWindowState(thread.id) };
+    return { changeKey, windows: this.readNativeDmWindowState(thread.id) };
   }
 
   close(): void {
@@ -1659,7 +1679,10 @@ export class ConversationThreadStore {
     if (!first || !last) return null;
 
     const now = Date.now();
-    const updatedAt = Math.max(...input.messages.map((message) => message.updated_ts));
+    const updatedAt = input.messages.reduce(
+      (latest, message) => Math.max(latest, message.updated_ts),
+      0,
+    );
     const inputHash = computeThreadInputHash(input.messages);
     const existing = this.getThread(input.threadId);
     const hashChanged = existing?.summary_input_hash !== inputHash;
@@ -1745,6 +1768,24 @@ export class ConversationThreadStore {
         null,
       ],
     );
+
+    const membership = this.db
+      .query<{ channel_id: string; message_id: string; ts: number }, [string]>(
+        "SELECT channel_id,message_id,ts FROM conversation_thread_messages WHERE thread_id=? ORDER BY ordinal",
+      )
+      .all(input.threadId);
+    if (
+      membership.length === input.messages.length &&
+      membership.every((row, index) => {
+        const message = input.messages[index]!;
+        return (
+          row.channel_id === message.channel_id &&
+          row.message_id === message.message_id &&
+          row.ts === message.ts
+        );
+      })
+    )
+      return input.threadId;
 
     this.db.run("DELETE FROM conversation_thread_messages WHERE thread_id = ?", [input.threadId]);
     for (let i = 0; i < input.messages.length; i++) {
@@ -1907,6 +1948,7 @@ export class ConversationThreadStore {
     }>;
 
     const surface = conversationSurfaceOfThreadId(threadId);
+    const attachments = this.listSourceMessageAttachments(surface, rows);
     return rows.map((row) => ({
       surface,
       channelId: row.channel_id,
@@ -1916,55 +1958,70 @@ export class ConversationThreadStore {
       userName: row.user_name ?? undefined,
       text: row.text,
       ts: row.ts,
-      attachments: this.listSourceMessageAttachments(surface, row.channel_id, row.message_id),
+      attachments: attachments.get(row.message_id) ?? [],
     }));
   }
 
   private listSourceMessageAttachments(
     surface: ConversationSurface,
-    channelId: string,
-    messageId: string,
-  ): DiscordIndexedAttachmentMeta[] {
+    messages: readonly { channel_id: string; message_id: string }[],
+  ): Map<string, DiscordIndexedAttachmentMeta[]> {
+    const first = messages[0];
+    if (!first) return new Map();
     switch (surface) {
       case "native":
-        return selectResultValue(readNativeConversationAttachments(this.db, channelId, messageId));
-      case "telegram":
         return selectResultValue(
-          readTelegramConversationAttachments(this.db, channelId, messageId),
+          readNativeConversationAttachments(
+            this.db,
+            first.channel_id,
+            messages.map((message) => message.message_id),
+          ),
+        );
+      case "telegram":
+        return new Map(
+          messages.map((message) => [
+            message.message_id,
+            selectResultValue(
+              readTelegramConversationAttachments(this.db, message.channel_id, message.message_id),
+            ),
+          ]),
         );
       case "discord":
-        return this.listMessageAttachments(channelId, messageId);
+        return this.listMessageAttachments(messages);
     }
   }
 
   private listMessageAttachments(
-    channelId: string,
-    messageId: string,
-  ): DiscordIndexedAttachmentMeta[] {
+    messages: readonly { channel_id: string; message_id: string }[],
+  ): Map<string, DiscordIndexedAttachmentMeta[]> {
+    const attachments = new Map<string, DiscordIndexedAttachmentMeta[]>();
+    if (messages.length === 0) return attachments;
     const rows = this.db
       .query<
         {
+          message_id: string;
           attachment_id: string | null;
           filename: string | null;
           mime_type: string | null;
           size: number | null;
         },
-        [string, string]
-      >(
-        `
-        SELECT attachment_id, filename, mime_type, size
-        FROM discord_search_message_attachments
-        WHERE channel_id = ? AND message_id = ?
-        ORDER BY ordinal ASC
-        `,
-      )
-      .all(channelId, messageId);
-    return rows.map((row) => ({
-      ...(row.attachment_id ? { id: row.attachment_id } : {}),
-      ...(row.filename ? { filename: row.filename } : {}),
-      ...(row.mime_type ? { mimeType: row.mime_type } : {}),
-      ...(row.size !== null ? { size: row.size } : {}),
-    }));
+        string[]
+      >(`
+      SELECT message_id,attachment_id,filename,mime_type,size FROM discord_search_message_attachments
+      WHERE channel_id=? AND message_id IN (${messages.map(() => "?").join(",")}) ORDER BY message_id,ordinal
+    `)
+      .all(messages[0]!.channel_id, ...messages.map((message) => message.message_id));
+    for (const row of rows) {
+      const values = attachments.get(row.message_id) ?? [];
+      values.push({
+        ...(row.attachment_id ? { id: row.attachment_id } : {}),
+        ...(row.filename ? { filename: row.filename } : {}),
+        ...(row.mime_type ? { mimeType: row.mime_type } : {}),
+        ...(row.size !== null ? { size: row.size } : {}),
+      });
+      attachments.set(row.message_id, values);
+    }
+    return attachments;
   }
 
   countThreadMessages(threadId: string): number {
