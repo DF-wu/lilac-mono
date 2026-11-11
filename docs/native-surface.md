@@ -50,6 +50,13 @@ ports 5173 and 8789 and starts there instead. `--clerk` uses Clerk authenticatio
 `apps/web/.env.local` and prints a single-use sign-in link; `--clerk-owner <user_id>` picks the owner
 when the Clerk instance has more than one user.
 
+The first browser-fixture launch generates a local database snapshot under
+`.cache/native-browser-fixture`. Later launches copy it into a fresh temporary directory and refresh
+relative timestamps. Dev-session changes never modify the snapshot. Changes to the seed, Core/shared
+source, dependency lockfile, or Bun version generate a new snapshot automatically. Remove
+`.cache/native-browser-fixture` to discard saved snapshots. Authentication and workflow views are
+initialized separately on each launch; the snapshots contain only generated chat data.
+
 To develop against a real Core installation, run `bun --cwd=apps/web run dev`. Vite proxies `/api` and
 WebSocket upgrades to `http://127.0.0.1:8789`; `LILAC_WEB_BACKEND_URL` overrides that development
 target. Add the development origin, normally `http://localhost:5173`, to `allowedOrigins`.
@@ -156,6 +163,10 @@ writing. Attachments appear as inline file chips. Drafts restored after reload r
 to be reattached or removed before sending. Sidebar rows show the starter and activity time; rename,
 archive and delete replace the timestamp on hover or focus. A completed indicator remains until the
 latest settled turn is visible in the foreground tab. Working and failed runs have separate states.
+
+Settling or archiving a conversation stops its background jobs without telling the agent, as deleting
+it does. Settling is a per-user preference, so it stops jobs only when that person has edit access.
+Moving a conversation back does not restart them.
 
 The thread's model selection applies to new full turns. Active runs retain their selected model.
 With config v3, the picker searches the available provider catalog and configured aliases. Favorites
@@ -363,7 +374,10 @@ participant filtering applies only within Discord when the request originates th
 Search supports lexical, semantic, and hybrid retrieval with shared ranking and `minScore` behavior.
 Use `surface: native` or `surface: discord` to restrict a search. Compact results, metadata, reads, and
 automatic recall include `surface`. Native conversation-memory IDs use `native:<threadId>` and can be
-passed directly to `conversation.thread.read`. Summarization maintenance uses the shared runner and
+passed directly to `conversation.thread.read`. The DM is indexed per context window as
+`native:<threadId>:<firstMessageId>`; its `native:<threadId>` ID reads the newest window. A thread
+that covers several subjects returns one result per subject, with `offset` marking where that
+subject starts in the thread. Summarization maintenance uses the shared runner and
 supports native IDs, dry runs, force, clear, and embedding refresh. Structured questions use the
 `question` tool and the [native question protocol](#structured-question-protocol).
 

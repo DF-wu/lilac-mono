@@ -255,7 +255,7 @@ async function runRequest(input: {
       },
     );
 
-    await runner.getActiveDrainOperation();
+    await runner.waitForIdle();
 
     // The delegation hook is what a `subagent_delegate` call would reach. The
     // model never gets that far here, so invoke it directly to read back the

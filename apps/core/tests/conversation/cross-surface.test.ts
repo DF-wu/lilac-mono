@@ -132,6 +132,37 @@ function createNative(userId = "alice", text = "deployment native") {
   native.markInputCompleted(receipt.inputId).unwrap();
   return { id: thread.id, ref: `native:${thread.id}`, turnId: receipt.turnId!, userId };
 }
+function sendNative(threadId: string, userId: string, text: string, runMs = 0) {
+  const receipt = native
+    .acceptInput(userId, {
+      threadId,
+      commandId: crypto.randomUUID(),
+      historyGeneration: 0,
+      mode: "prompt",
+      text,
+      attachmentIds: [],
+      skillIds: [],
+    })
+    .unwrap();
+  native.settleInput(receipt.inputId, "admitted").unwrap();
+  now += runMs;
+  native
+    .projectTurn(threadId, 0, crypto.randomUUID(), receipt.turnId!, (slot) =>
+      Result.ok({
+        slot: {
+          ...slot,
+          state: "complete",
+          messages: [
+            ...slot.messages,
+            { id: crypto.randomUUID(), role: "assistant", parts: [{ type: "text", text: "ok" }] },
+          ],
+        },
+        changes: [],
+      }),
+    )
+    .unwrap();
+  native.markInputCompleted(receipt.inputId).unwrap();
+}
 function createDiscord(channelId = "c1") {
   for (const [id, text] of [
     ["1", "deployment discord"],
@@ -235,6 +266,43 @@ test("a source commit only reloads messages for changed threads", async () => {
     expect(index.listMessages(changed.ref).at(-1)?.text).toBe("new deployment information");
   } finally {
     readMessages.mockRestore();
+  }
+});
+
+test("a refresh reads content only for threads that changed since the last check", async () => {
+  const quiet = createNative();
+  const renamed = createNative("bob");
+  await service.runSummarization({ now: Date.now() });
+  const quietSummary = index.getSummary(quiet.ref).unwrap();
+  const renamedSummary = index.getSummary(renamed.ref).unwrap();
+  const readContent = spyOn(nativeSource, "readNativeConversationContentRevision");
+  const contentReads = () => readContent.mock.calls.map((call) => call[1]);
+  try {
+    native
+      .updateThread("bob", { threadId: renamed.id, commandId: "rename", title: "renamed" })
+      .unwrap();
+    native.shareThread("owner", { threadId: renamed.id, userId: "alice", grant: "read" }).unwrap();
+    index.refreshNativeThreads();
+    expect(contentReads()).toEqual([renamed.id]);
+    expect(index.getSummary(renamed.ref).unwrap()).toEqual(renamedSummary);
+    readContent.mockClear();
+    native
+      .postMessage("bob", renamed.id, {
+        id: "edit",
+        role: "assistant",
+        parts: [{ type: "text", text: "new deployment information" }],
+      })
+      .unwrap();
+    index.refreshNativeThreads();
+    expect(contentReads()).toEqual([renamed.id]);
+    expect(index.getSummary(renamed.ref).unwrap()).toBeNull();
+    expect(index.getSummary(quiet.ref).unwrap()).toEqual(quietSummary);
+    readContent.mockClear();
+    const added = createNative();
+    index.refreshNativeThreads();
+    expect(contentReads()).toEqual([added.id]);
+  } finally {
+    readContent.mockRestore();
   }
 });
 
@@ -725,4 +793,176 @@ test("workers refresh changed native threads concurrently and reuse request elig
   } finally {
     pool.close();
   }
+});
+
+test("a thread with several subjects is recalled per entry and points at each start", async () => {
+  summarize = async () => [
+    { startOrdinal: 0, title: "deployment rollout", brief: "rollout plan", topics: ["deployment"] },
+    { startOrdinal: 1, title: "billing invoice", brief: "invoice dispute", topics: ["billing"] },
+    { startOrdinal: 99, title: "vacation plan", brief: "trip dates", topics: ["vacation"] },
+  ];
+  const ref = createDiscord();
+  await service.runSummarization({ now: Date.now() });
+  const search = async (query: string) =>
+    (await service.search({ query, mode: "lexical", verbose: true })).unwrap().results;
+
+  expect(await search("deployment")).toMatchObject([{ threadId: ref, entryId: ref }]);
+  expect((await search("deployment"))[0]).not.toHaveProperty("offset");
+  expect(await search("billing")).toMatchObject([
+    { threadId: ref, entryId: `${ref}#1`, offset: 1, title: "billing invoice" },
+  ]);
+  const [staleBilling] = index.search({ query: "billing" }).unwrap();
+  // An ordinal outside the transcript leaves the entry pointing at the thread start.
+  expect(await search("vacation")).toMatchObject([{ threadId: ref, entryId: `${ref}#2` }]);
+  expect((await search("vacation"))[0]).not.toHaveProperty("offset");
+  expect(await service.getAutoInjectRankingCorpusDocuments()).toHaveLength(3);
+  const semantic = (
+    await service.search({
+      query: "anything",
+      mode: "semantic",
+      verbose: true,
+      limit: 10,
+      queryAboutness: aboutness,
+    })
+  ).unwrap().results;
+  expect(semantic.map((hit) => hit.entryId).sort()).toEqual([ref, `${ref}#1`, `${ref}#2`]);
+
+  const metadata = (await service.metadata({ threadIds: [ref] })).unwrap().threads[0]!;
+  expect(metadata).toMatchObject({ threadId: ref, title: "deployment rollout" });
+  expect(metadata.entries).toEqual([
+    { title: "deployment rollout", brief: "rollout plan" },
+    { title: "billing invoice", brief: "invoice dispute", offset: 1 },
+    { title: "vacation plan", brief: "trip dates" },
+  ]);
+
+  summarize = async () => ({ title: "deployment rollout", brief: "rollout plan", topics: [] });
+  await service.runSummarization({ now: Date.now() + 2 * 3_600_000, force: true });
+  expect(await search("billing")).toEqual([]);
+  // A hit recalled before the re-summary names an entry that no longer exists.
+  expect(index.filterCurrentSearchHits({ hits: [staleBilling!] })).toEqual([]);
+  expect((await service.metadata({ threadIds: [ref] })).unwrap().threads[0]).not.toHaveProperty(
+    "entries",
+  );
+});
+
+test("a DM is indexed per context window and a closed window keeps its summary", async () => {
+  now = Date.now() - 10 * 3_600_000;
+  const dm = native.ensureDirectThread("alice").unwrap();
+  sendNative(dm.id, "alice", "deployment first");
+  now += 3 * 3_600_000;
+  sendNative(dm.id, "alice", "billing second");
+  const windows = () =>
+    index
+      .prepareSearch({})
+      .map((threadId) => index.getThread(threadId)!)
+      .sort((left, right) => left.start_ts - right.start_ts);
+
+  const [first, second] = windows().map((thread) => thread.thread_id);
+  expect(windows()).toHaveLength(2);
+  expect(first).toStartWith(`native:${dm.id}:`);
+  expect(windows().map((thread) => thread.message_count)).toEqual([2, 2]);
+
+  expect((await service.runSummarization({ now: Date.now() })).summarized).toBe(2);
+  const billing = (await service.search({ query: "billing", mode: "lexical" })).unwrap();
+  expect(billing.results.map((hit) => hit.threadId)).toEqual([second!]);
+  // The DM's own id is not an entry, so it reads as the newest window.
+  expect((await service.read({ threadId: `native:${dm.id}` })).unwrap().thread.threadId).toBe(
+    second!,
+  );
+
+  now += 60_000;
+  sendNative(dm.id, "alice", "billing follow-up");
+  expect(windows().map((thread) => thread.message_count)).toEqual([2, 4]);
+  expect(index.getSummary(first!).unwrap()).toMatchObject({ title: "deployment" });
+  expect(index.getSummary(second!).unwrap()).toBeNull();
+  expect((await service.runSummarization({ now: Date.now() })).summarized).toBe(1);
+});
+
+test("a DM window keeps a turn whole and survives a run longer than the gap", () => {
+  now = Date.now() - 10 * 3_600_000;
+  const dm = native.ensureDirectThread("alice").unwrap();
+  sendNative(dm.id, "alice", "deployment first", 3 * 3_600_000);
+  now += 60_000;
+  sendNative(dm.id, "alice", "deployment follow-up");
+
+  const windows = index.prepareSearch({}).map((threadId) => index.getThread(threadId)!);
+  expect(windows.map((thread) => thread.message_count)).toEqual([4]);
+});
+
+test("a DM is rebuilt when another store instance changed its indexed windows", () => {
+  now = Date.now() - 10 * 3_600_000;
+  const dm = native.ensureDirectThread("alice").unwrap();
+  sendNative(dm.id, "alice", "deployment first");
+  const [windowId] = index.prepareSearch({});
+  const other = new ConversationThreadStore(path.join(dir, "search.db"), {
+    nativeDbPath: path.join(dir, "native.db"),
+  });
+  try {
+    other.deleteThread(windowId!);
+    // An unrelated commit makes the store refresh while the DM source itself is unchanged.
+    createNative("bob");
+    index.refreshNativeThreads();
+    expect(index.getThread(windowId!)).not.toBeNull();
+  } finally {
+    other.close();
+  }
+});
+
+test("a turn without messages keeps the DM windows on both sides of it together", () => {
+  now = Date.now() - 10 * 3_600_000;
+  const dm = native.ensureDirectThread("alice").unwrap();
+  sendNative(dm.id, "alice", "deployment first");
+  now += 90 * 60_000;
+  const wake = native
+    .acceptInput("alice", {
+      threadId: dm.id,
+      commandId: `job-wake:${crypto.randomUUID()}`,
+      historyGeneration: 0,
+      mode: "prompt",
+      text: "wake",
+      attachmentIds: [],
+      skillIds: [],
+    })
+    .unwrap();
+  native.settleInput(wake.inputId, "admitted").unwrap();
+  native
+    .projectTurn(dm.id, 0, crypto.randomUUID(), wake.turnId!, (slot) =>
+      Result.ok({ slot: { ...slot, state: "complete", startedAt: now }, changes: [] }),
+    )
+    .unwrap();
+  native.markInputCompleted(wake.inputId).unwrap();
+  const windows = () =>
+    index.prepareSearch({}).map((threadId) => index.getThread(threadId)!.message_count);
+  expect(windows()).toEqual([2]);
+
+  // Each visible turn is within the gap of the wake, though they are three hours apart.
+  now += 90 * 60_000;
+  sendNative(dm.id, "alice", "deployment later");
+  expect(windows()).toEqual([4]);
+});
+
+test("a thread changed after its summary is reported stale", async () => {
+  const ref = createDiscord();
+  await service.runSummarization({ now: Date.now() });
+  const derivedState = async () =>
+    (await service.search({ query: "deployment", mode: "lexical", verbose: true })).unwrap()
+      .results[0]?.derivedState;
+  expect(await derivedState()).toEqual({ summarized: true, stale: false });
+
+  index.invalidateMaterializedMessages({ channelId: "c1", messageIds: ["1"] });
+  expect(index.getSummary(ref).unwrap()).not.toBeNull();
+  expect(await derivedState()).toEqual({ summarized: false, stale: true });
+});
+
+test("an index reset keeps the Discord rebuild pending across restarts until it completes", () => {
+  const reopen = () => {
+    const store = new ConversationThreadStore(path.join(dir, "search.db"));
+    const pending = store.isDiscordRebuildPending();
+    store.close();
+    return pending;
+  };
+  expect(index.isDiscordRebuildPending()).toBe(true);
+  expect(reopen()).toBe(true);
+  index.completeDiscordRebuild();
+  expect(reopen()).toBe(false);
 });

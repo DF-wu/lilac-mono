@@ -1,7 +1,9 @@
 import { Extension, Node, getSchema, type Editor, type JSONContent } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
-import { Slice, type Node as DocumentNode, type Schema } from "@tiptap/pm/model";
+import Heading from "@tiptap/extension-heading";
+import Paragraph from "@tiptap/extension-paragraph";
+import { Fragment, Slice, type Node as DocumentNode, type Schema } from "@tiptap/pm/model";
 import { EditorState, TextSelection, Plugin } from "@tiptap/pm/state";
 import type { EditorView } from "@tiptap/pm/view";
 import {
@@ -11,15 +13,22 @@ import {
   citationInputFits,
   type AssistantCitation,
 } from "@stanley2058/lilac-client-protocol";
-import { KEYS, NodeApi } from "platejs";
 import {
-  createComposerEditor,
-  composerMarkdown,
-  composerSubmissionMarkdown,
-  composerPlainText,
-} from "./composer-document";
+  BLOCKQUOTE,
+  CODE_BLOCK,
+  CODE_LINE,
+  PARAGRAPH,
+  RULE,
+  composerBlocksText,
+  nodeString,
+  readComposerBlocks,
+  writeComposerBlocks,
+  type ComposerBlock,
+  type ComposerNode,
+} from "./composer-markdown";
 import type { Attachment } from "../types";
 import { skillMentionPattern } from "./skill-mentions";
+import { isWorkflowRunId, splitWorkflowRunIds } from "../workflow-run-id";
 
 export const attachmentNode = Node.create({
   name: "composer_attachment",
@@ -47,6 +56,21 @@ export const referenceNode = Node.create({
     "span",
     { ...HTMLAttributes, "data-composer-reference": "", contenteditable: "false" },
     HTMLAttributes.url,
+  ],
+});
+/** Saves as the plain id, so the agent receives text it can use directly. */
+export const workflowRunNode = Node.create({
+  name: "composer_workflow_run",
+  group: "inline",
+  inline: true,
+  atom: true,
+  selectable: false,
+  addAttributes: () => ({ runId: { default: "" } }),
+  parseHTML: () => [{ tag: "span[data-composer-workflow-run]" }],
+  renderHTML: ({ HTMLAttributes }) => [
+    "span",
+    { ...HTMLAttributes, "data-composer-workflow-run": "", contenteditable: "false" },
+    HTMLAttributes.runId,
   ],
 });
 export const citationNode = Node.create({
@@ -110,6 +134,62 @@ export const skillNode = Node.create({
   ],
 });
 
+function insertedInlineNode(schema: Schema, text: string, origin: string) {
+  if (isWorkflowRunId(text)) return schema.nodes.composer_workflow_run!.create({ runId: text });
+  const target = parseReferenceHref(text, origin);
+  return target
+    ? schema.nodes.composer_reference!.create({ url: referenceHref(target) })
+    : undefined;
+}
+
+function positionInCode(state: EditorState, position: number) {
+  const resolved = state.doc.resolve(position);
+  const isCode = (mark: { type: { name: string } }) => mark.type.name === "code";
+  return (
+    resolved.parent.type.spec.code === true ||
+    resolved.marks().some(isCode) ||
+    (state.storedMarks?.some(isCode) ?? false)
+  );
+}
+
+/** A chip cannot sit inside code, and placing one there would split the surrounding code apart. */
+export function insertLiteralWorkflowRunIds(view: EditorView, text: string): boolean {
+  if (!positionInCode(view.state, view.state.selection.from)) return false;
+  if (!splitWorkflowRunIds(text).some((part) => part.runId)) return false;
+  view.dispatch(view.state.tr.insertText(text).scrollIntoView());
+  return true;
+}
+
+function chipWorkflowRunIdsInFragment(fragment: Fragment, schema: Schema): Fragment {
+  const nodes: DocumentNode[] = [];
+  fragment.forEach((node) => {
+    if (node.isText && !node.marks.some((mark) => mark.type.name === "code")) {
+      for (const part of splitWorkflowRunIds(node.text ?? ""))
+        nodes.push(
+          part.runId
+            ? schema.nodes.composer_workflow_run!.create({ runId: part.text }, null, node.marks)
+            : schema.text(part.text, node.marks),
+        );
+      return;
+    }
+    nodes.push(
+      node.isLeaf || node.type.spec.code
+        ? node
+        : node.copy(chipWorkflowRunIdsInFragment(node.content, schema)),
+    );
+  });
+  return Fragment.fromArray(nodes);
+}
+
+/** Rich-text pastes skip the plain-text reader, so their ids are converted here. */
+export function chipWorkflowRunIds(slice: Slice, schema: Schema): Slice {
+  return new Slice(
+    chipWorkflowRunIdsInFragment(slice.content, schema),
+    slice.openStart,
+    slice.openEnd,
+  );
+}
+
 export function insertEditorReference(
   view: EditorView,
   from: number,
@@ -117,9 +197,9 @@ export function insertEditorReference(
   text: string,
   origin: string,
 ): boolean {
-  const target = parseReferenceHref(text.trim(), origin);
-  if (!target) return false;
-  const node = view.state.schema.nodes.composer_reference!.create({ url: referenceHref(target) });
+  if (isWorkflowRunId(text.trim()) && positionInCode(view.state, from)) return false;
+  const node = insertedInlineNode(view.state.schema, text.trim(), origin);
+  if (!node) return false;
   const transaction = view.state.tr;
   if (transaction.selection.from !== from || transaction.selection.to !== to)
     transaction.setSelection(TextSelection.create(transaction.doc, from, to));
@@ -180,14 +260,20 @@ const horizontalRule = Node.create({
   renderHTML: () => ["hr"],
 });
 
+// Mod-Alt-0..6 belong to the thread shortcuts; the editor would otherwise consume them first.
+const noShortcuts = { addKeyboardShortcuts: () => ({}) };
+
 export const composerExtensions = [
   StarterKit.configure({
     link: false,
     underline: false,
     horizontalRule: false,
     trailingNode: false,
-    heading: { levels: [1, 2, 3, 4, 5, 6] },
+    heading: false,
+    paragraph: false,
   }),
+  Paragraph.extend(noShortcuts),
+  Heading.extend(noShortcuts).configure({ levels: [1, 2, 3, 4, 5, 6] }),
   indentation,
   horizontalRule,
 ];
@@ -195,31 +281,12 @@ export const composerSchema = getSchema([
   ...composerExtensions,
   attachmentNode,
   referenceNode,
+  workflowRunNode,
   skillNode,
   citationNode,
 ]);
 export { Placeholder };
 
-type ComposerLeaf = {
-  text: string;
-  bold?: boolean;
-  italic?: boolean;
-  strikethrough?: boolean;
-  code?: boolean;
-};
-type ComposerBlock = {
-  type: string;
-  children: ComposerNode[];
-  indent?: number;
-  listStyleType?: string;
-  listStart?: number;
-  checked?: boolean;
-  lang?: string;
-  attachmentKey?: string;
-  name?: string;
-  url?: string;
-};
-type ComposerNode = ComposerLeaf | ComposerBlock;
 const markKeys = ["bold", "italic", "strikethrough", "code"] as const;
 const marks = { bold: "bold", italic: "italic", strikethrough: "strike", code: "code" };
 function inline(nodes: ComposerNode[]): JSONContent[] {
@@ -230,7 +297,13 @@ function inline(nodes: ComposerNode[]): JSONContent[] {
         .split("\n")
         .flatMap<JSONContent>((text, index) => [
           ...(index ? [{ type: "hardBreak" }] : []),
-          ...(text ? [{ type: "text", text, marks: nodeMarks }] : []),
+          ...(node.code
+            ? [{ type: "text", text, marks: nodeMarks }].filter(() => text)
+            : splitWorkflowRunIds(text).map((part) =>
+                part.runId
+                  ? { type: workflowRunNode.name, attrs: { runId: part.text }, marks: nodeMarks }
+                  : { type: "text", text: part.text, marks: nodeMarks },
+              )),
         ]);
     }
     if (node.type === "composer_attachment")
@@ -245,15 +318,15 @@ function block(node: ComposerBlock): JSONContent {
   const attrs = {
     indent: typeof node.indent === "number" && !node.listStyleType ? node.indent : 0,
   };
-  if (node.type === KEYS.codeBlock) {
-    const text = node.children.map((child) => NodeApi.string(child)).join("\n");
+  if (node.type === CODE_BLOCK) {
+    const text = node.children.map(nodeString).join("\n");
     return {
       type: "codeBlock",
       attrs: { ...attrs, language: node.lang ?? null },
       content: text ? [{ type: "text", text }] : [],
     };
   }
-  if (node.type === KEYS.blockquote) {
+  if (node.type === BLOCKQUOTE) {
     const children = node.children.filter((child): child is ComposerBlock => !("text" in child));
     return {
       type: "blockquote",
@@ -269,7 +342,7 @@ function block(node: ComposerBlock): JSONContent {
       attrs: { ...attrs, level: Number(node.type.slice(1)) },
       content: inline(node.children),
     };
-  if (node.type === KEYS.hr) return { type: "horizontalRule" };
+  if (node.type === RULE) return { type: "horizontalRule" };
   return { type: "paragraph", attrs, content: inline(node.children) };
 }
 function blocks(nodes: ComposerBlock[]): JSONContent[] {
@@ -314,21 +387,21 @@ function blocks(nodes: ComposerBlock[]): JSONContent[] {
 }
 
 export function readComposerDocument(text: string, schema: Schema = composerSchema): DocumentNode {
-  return schema.nodeFromJSON({ type: "doc", content: blocks(createComposerEditor(text).children) });
+  return schema.nodeFromJSON({ type: "doc", content: blocks(readComposerBlocks(text)) });
+}
+function leafMarks(node: DocumentNode) {
+  return Object.fromEntries(
+    node.marks.map((mark) => [
+      mark.type.name === "strike" ? "strikethrough" : mark.type.name,
+      true,
+    ]),
+  );
 }
 function leaves(node: DocumentNode): ComposerNode[] {
   const result: ComposerNode[] = [];
   node.forEach((child) => {
     if (child.isText) {
-      result.push({
-        text: child.text ?? "",
-        ...Object.fromEntries(
-          child.marks.map((mark) => [
-            mark.type.name === "strike" ? "strikethrough" : mark.type.name,
-            true,
-          ]),
-        ),
-      });
+      result.push({ text: child.text ?? "", ...leafMarks(child) });
       return;
     }
     if (child.type.name === "hardBreak") {
@@ -337,6 +410,10 @@ function leaves(node: DocumentNode): ComposerNode[] {
     }
     if (child.type.name === "composer_skill") {
       result.push({ text: child.attrs.text });
+      return;
+    }
+    if (child.type.name === workflowRunNode.name) {
+      result.push({ text: child.attrs.runId, ...leafMarks(child) });
       return;
     }
     result.push({ type: child.type.name, ...child.attrs, children: [{ text: "" }] });
@@ -391,25 +468,24 @@ function plateBlocks(node: DocumentNode): ComposerBlock[] {
 }
 function plateBlock(node: DocumentNode): ComposerBlock {
   const name = node.type.name;
-  if (name === "horizontalRule") return { type: KEYS.hr, children: [{ text: "" }] };
+  if (name === "horizontalRule") return { type: RULE, children: [{ text: "" }] };
   if (name === "blockquote")
-    return { type: KEYS.blockquote, children: plateBlocks(node), indent: node.attrs.indent };
+    return { type: BLOCKQUOTE, children: plateBlocks(node), indent: node.attrs.indent };
   if (name === "codeBlock")
     return {
-      type: KEYS.codeBlock,
+      type: CODE_BLOCK,
       lang: node.attrs.language ?? undefined,
       children: node.textContent
         .split("\n")
-        .map((text) => ({ type: KEYS.codeLine, children: [{ text }] })),
+        .map((text) => ({ type: CODE_LINE, children: [{ text }] })),
       indent: node.attrs.indent,
     };
   return {
-    type: name === "heading" ? `h${node.attrs.level}` : KEYS.p,
+    type: name === "heading" ? `h${node.attrs.level}` : PARAGRAPH,
     children: leaves(node),
     indent: node.attrs.indent,
   };
 }
-const markdownCodec = createComposerEditor();
 const documentValues = new WeakMap<DocumentNode, ComposerBlock[]>();
 function codec(doc: DocumentNode) {
   let value = documentValues.get(doc);
@@ -417,16 +493,14 @@ function codec(doc: DocumentNode) {
     value = plateBlocks(doc);
     documentValues.set(doc, value);
   }
-  markdownCodec.children = value;
-  return markdownCodec;
+  return value;
 }
-// Keep the existing Markdown codec so saved drafts, resource links, and copied messages keep their syntax.
+/** Writes the draft Markdown, or with `references: false` the Markdown a send delivers. */
 export function writeComposerDocument(doc: DocumentNode, references = true): string {
-  const editor = codec(doc);
-  return references ? composerMarkdown(editor) : composerSubmissionMarkdown(editor);
+  return writeComposerBlocks(codec(doc), references);
 }
 export function composerText(doc: DocumentNode): string {
-  return composerPlainText(codec(doc));
+  return composerBlocksText(codec(doc));
 }
 export function composerCompletionPrefix(editor: Editor): string {
   const { empty, $from } = editor.state.selection;

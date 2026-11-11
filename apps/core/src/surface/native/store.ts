@@ -55,6 +55,7 @@ import {
   type NativeUser,
 } from "./codec";
 import { nativeUserDisplay } from "./identity";
+import { TURN_CREATED_AT, turnCompletedAtSql } from "./turn-timing";
 import { nativeFailure, type NativeStoreFailure } from "./errors";
 
 export type NativeStoreError = NativeStoreFailure | PersistedDataError;
@@ -107,12 +108,34 @@ function commandKey(actorId: string, commandId: string): string {
 
 function inputReceipt(input: NativeInputRecord): NativeInputReceipt {
   return {
+    commandId: input.commandId,
     inputId: input.id,
     messageId: input.messageId,
     turnId: input.turnId,
     state: input.state,
     runId: input.runId,
   };
+}
+
+/**
+ * A client picks the mode from its view of the run, which can be stale by the time the input
+ * arrives. The thread's actual run state decides instead of rejecting the input.
+ */
+function admittedInputMode(
+  input: Pick<NativeInput, "mode" | "command">,
+  activeRunId: string | undefined,
+  answeringActiveSync: boolean,
+): NativeInput["mode"] {
+  switch (true) {
+    case answeringActiveSync:
+      return "steer";
+    case !activeRunId:
+      return "prompt";
+    case input.mode === "prompt" || !!input.command:
+      return "followup";
+    default:
+      return input.mode;
+  }
 }
 
 function nativeTextParts(text: string): DisplayMessage["parts"] {
@@ -140,15 +163,21 @@ function nullableAuthority<T>(result: NativeStoreResult<T>): NativeStoreResult<T
   });
 }
 
-// Turn timing shared by DM context selection and the outline, so both split windows identically.
 const TURN_POSTED = "json_extract(t.data_json,'$.value.messages[0].id')=t.id";
-const TURN_CREATED_AT = `COALESCE((SELECT MIN(json_extract(m.value,'$.metadata.createdAt')) FROM json_each(t.data_json,'$.value.messages') m),json_extract(t.data_json,'$.value.startedAt'))`;
-const TURN_COMPLETED_AT = `MAX(COALESCE(json_extract(t.data_json,'$.value.settledAt'),0),
-  COALESCE((SELECT MAX(json_extract(i.data_json,'$.value.completedAt')) FROM native_records i WHERE i.kind='input' AND i.thread_id=t.thread_id AND i.position=t.position),0),
-  COALESCE((SELECT MAX(json_extract(m.value,'$.metadata.createdAt')) FROM json_each(t.data_json,'$.value.messages') m),0))`;
+const TURN_COMPLETED_AT = turnCompletedAtSql();
+
+/** An input with this command ID prefix runs its turn without a visible message. */
+export const NATIVE_JOB_WAKE_COMMAND_PREFIX = "job-wake:";
+const TURN_VISIBLE = "json_array_length(data_json,'$.value.messages')>0";
 
 const CANONICAL_INPUT_FILTER =
   "json_extract(i.data_json,'$.value.completedAt') IS NOT NULL AND json_extract(i.data_json,'$.value.mode')!='steer' AND json_extract(i.data_json,'$.value.state') IN ('admitted','canceled') AND EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.id=json_extract(i.data_json,'$.value.turnId'))";
+
+function notificationBody(thread: NativeThread, preview: string) {
+  if (thread.displayStatus === "error") return "Run failed";
+  if (thread.displayStatus === "input" || thread.waitingOn === "input") return "Needs your input";
+  return preview || "Response finished";
+}
 
 export class NativeStore {
   private readonly displayListeners = new Set<(commit: NativeDisplayCommit) => void>();
@@ -161,6 +190,9 @@ export class NativeStore {
   private readonly listeners = new Set<(threadId: string) => void>();
   private readonly pendingNotifications = new Set<string>();
   private notificationScheduled = false;
+  // Runner and workflow state: both are re-reported after a restart, so neither is persisted.
+  private readonly waitingRuns = new Map<string, string>();
+  private readonly activeWorkflows = new Map<string, Set<string>>();
   constructor(
     private readonly db: Database,
     private readonly now: () => number = Date.now,
@@ -221,6 +253,23 @@ export class NativeStore {
     this.notify(threadId);
   }
 
+  setRunWaiting(threadId: string, runId: string, waiting: boolean): void {
+    if (waiting === (this.waitingRuns.get(threadId) === runId)) return;
+    if (waiting) this.waitingRuns.set(threadId, runId);
+    else this.waitingRuns.delete(threadId);
+    this.notify(threadId);
+  }
+
+  setWorkflowActive(threadId: string, runId: string, active: boolean): void {
+    const runs = this.activeWorkflows.get(threadId) ?? new Set<string>();
+    if (active === runs.has(runId)) return;
+    if (active) runs.add(runId);
+    else runs.delete(runId);
+    if (runs.size) this.activeWorkflows.set(threadId, runs);
+    else this.activeWorkflows.delete(threadId);
+    this.notify(threadId);
+  }
+
   private notify(threadId: string): void {
     this.pendingNotifications.add(threadId);
     if (this.notificationScheduled) return;
@@ -267,6 +316,18 @@ export class NativeStore {
         CREATE TABLE IF NOT EXISTS native_push_subscriptions (endpoint TEXT PRIMARY KEY,user_id TEXT NOT NULL,p256dh TEXT NOT NULL,auth TEXT NOT NULL,completion INTEGER NOT NULL,failure INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS native_model_favorites (user_id TEXT NOT NULL,model_id TEXT NOT NULL,PRIMARY KEY(user_id,model_id));
         PRAGMA user_version = 7;`);
+      this.db.run(`
+        CREATE TEMP TABLE IF NOT EXISTS native_pending_questions (turn_id TEXT NOT NULL,thread_id TEXT NOT NULL,respondent_id TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(thread_id,respondent_id,generation,turn_id));
+        DELETE FROM native_pending_questions;
+        INSERT INTO native_pending_questions SELECT DISTINCT r.id,r.thread_id,json_extract(p.value,'$.data.respondentId'),json_extract(p.value,'$.data.historyGeneration') FROM native_records r,json_each(r.data_json,'$.value.messages') m,json_each(m.value,'$.parts') p WHERE r.kind='turn' AND instr(r.data_json,'"data-question"')>0 AND json_extract(p.value,'$.type')='data-question' AND json_extract(p.value,'$.data.view.state')='pending';
+        CREATE TEMP TRIGGER IF NOT EXISTS native_questions_insert AFTER INSERT ON main.native_records WHEN new.kind='turn' BEGIN
+          INSERT OR IGNORE INTO native_pending_questions SELECT DISTINCT r.id,r.thread_id,json_extract(p.value,'$.data.respondentId'),json_extract(p.value,'$.data.historyGeneration') FROM native_records r,json_each(r.data_json,'$.value.messages') m,json_each(m.value,'$.parts') p WHERE r.kind='turn' AND r.id=new.id AND instr(r.data_json,'"data-question"')>0 AND json_extract(p.value,'$.type')='data-question' AND json_extract(p.value,'$.data.view.state')='pending'; END;
+        CREATE TEMP TRIGGER IF NOT EXISTS native_questions_update AFTER UPDATE ON main.native_records WHEN new.kind='turn' BEGIN
+          DELETE FROM native_pending_questions WHERE turn_id=old.id;
+          INSERT OR IGNORE INTO native_pending_questions SELECT DISTINCT r.id,r.thread_id,json_extract(p.value,'$.data.respondentId'),json_extract(p.value,'$.data.historyGeneration') FROM native_records r,json_each(r.data_json,'$.value.messages') m,json_each(m.value,'$.parts') p WHERE r.kind='turn' AND r.id=new.id AND instr(r.data_json,'"data-question"')>0 AND json_extract(p.value,'$.type')='data-question' AND json_extract(p.value,'$.data.view.state')='pending'; END;
+        CREATE TEMP TRIGGER IF NOT EXISTS native_questions_delete AFTER DELETE ON main.native_records WHEN old.kind='turn' BEGIN
+          DELETE FROM native_pending_questions WHERE turn_id=old.id; END;
+      `);
       return Result.ok(undefined);
     });
   }
@@ -724,29 +785,38 @@ export class NativeStore {
   private displayStatus(
     user: NativeUser,
     thread: NativeThreadRecord,
-  ): NativeStoreResult<Pick<NativeThread, "displayStatus" | "workingSince">> {
+  ): NativeStoreResult<Pick<NativeThread, "displayStatus" | "workingSince" | "waitingOn">> {
     // The sidebar needs turn state and the read frontier, never transcript bodies.
     const row = this.db
       .query<
         NativePersistedRow & { last_message_index: number; first_created_at: number | null },
         [string]
       >(
-        `SELECT format_version,json_object('kind','turn','value',json_set(json_extract(data_json,'$.value'),'$.messages',json('[]'))) AS data_json,json_array_length(data_json,'$.value.messages')-1 AS last_message_index,json_extract(data_json,'$.value.messages[0].metadata.createdAt') AS first_created_at FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 1`,
+        `SELECT format_version,json_object('kind','turn','value',json_set(json_extract(data_json,'$.value'),'$.messages',json('[]'))) AS data_json,json_array_length(data_json,'$.value.messages')-1 AS last_message_index,json_extract(data_json,'$.value.messages[0].metadata.createdAt') AS first_created_at FROM native_records WHERE kind='turn' AND thread_id=? AND ${TURN_VISIBLE} ORDER BY position DESC LIMIT 1`,
       )
       .get(thread.id);
     if (!row) return Result.ok({ displayStatus: thread.activeRunId ? "working" : "idle" });
     const db = this.db;
+    // A wake's run stays out of the sidebar until the agent writes something.
+    const runIsVisible =
+      this.db
+        .query<{ visible: number }, [string]>(
+          `SELECT ${TURN_VISIBLE} AS visible FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 1`,
+        )
+        .get(thread.id)?.visible === 1;
+    const awaitsAnswer = this.awaitsAnswer(user.id, thread);
     // A run that is still going stays "working" so push and browser notifications see one run end.
-    const awaitsAnswer = !thread.activeRunId && this.awaitsAnswer(user.id, thread);
+    const waitingOn = this.waitingOn(thread, awaitsAnswer);
     return Result.gen(function* () {
       const { value: record } = yield* decodeNativeRecord(row);
       if (record.kind !== "turn")
         return Result.err(nativeFailure("invalid", "Thread display projection is not a turn"));
       const turn = record.value;
-      if (thread.activeRunId || turn.state === "running")
+      if ((thread.activeRunId && runIsVisible) || turn.state === "running")
         return Result.ok({
           displayStatus: "working" as const,
           workingSince: turn.startedAt ?? row.first_created_at ?? undefined,
+          ...(waitingOn ? { waitingOn } : {}),
         });
       if (awaitsAnswer) return Result.ok({ displayStatus: "input" as const });
       if (turn.state === "failed") return Result.ok({ displayStatus: "error" as const });
@@ -764,12 +834,17 @@ export class NativeStore {
     });
   }
 
+  private waitingOn(thread: NativeThreadRecord, awaitsAnswer: boolean): NativeThread["waitingOn"] {
+    if (!thread.activeRunId) return undefined;
+    if (awaitsAnswer) return "input";
+    return this.waitingRuns.get(thread.id) === thread.activeRunId ? "other" : undefined;
+  }
+
   /** A question in the current history still waits for this user's answer. */
   private awaitsAnswer(userId: string, thread: NativeThreadRecord): boolean {
-    // instr skips JSON parsing for turns that never asked a question.
     return !!this.db
       .query<{ found: number }, [string, string, number]>(
-        "SELECT 1 AS found FROM native_records r WHERE r.kind='turn' AND r.thread_id=? AND instr(r.data_json,'\"data-question\"')>0 AND EXISTS(SELECT 1 FROM json_each(r.data_json,'$.value.messages') m, json_each(m.value,'$.parts') p WHERE json_extract(p.value,'$.type')='data-question' AND json_extract(p.value,'$.data.view.state')='pending' AND json_extract(p.value,'$.data.respondentId')=? AND json_extract(p.value,'$.data.historyGeneration')=?) LIMIT 1",
+        "SELECT 1 AS found FROM native_pending_questions WHERE thread_id=? AND respondent_id=? AND generation=? LIMIT 1",
       )
       .get(thread.id, userId, thread.historyGeneration);
   }
@@ -795,6 +870,7 @@ export class NativeStore {
         starterDisplayName: starter.displayName,
         starterAvatarUrl: nativeUserDisplay(starter).avatarUrl,
         ...status,
+        ...(this.activeWorkflows.has(thread.id) ? { hasActiveWorkflow: true as const } : {}),
         archived: thread.archived,
         updatedAt: thread.updatedAt,
         revision: thread.revision,
@@ -834,7 +910,7 @@ export class NativeStore {
       const thread = yield* this.authorizeThread(actorId, threadId);
       const row = this.db
         .query<{ turn_id: string; input_id: string | null }, [string]>(
-          "SELECT id AS turn_id,json_extract(data_json,'$.value.messages[0].metadata.inputId') AS input_id FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position DESC LIMIT 1",
+          `SELECT id AS turn_id,json_extract(data_json,'$.value.messages[0].metadata.inputId') AS input_id FROM native_records WHERE kind='turn' AND thread_id=? AND ${TURN_VISIBLE} ORDER BY position DESC LIMIT 1`,
         )
         .get(threadId);
       if (!row?.input_id) return Result.ok(undefined);
@@ -868,7 +944,7 @@ export class NativeStore {
         .replace(/[`*_#~]/g, "")
         .replace(/\s+/g, " ")
         .trim();
-      const body = thread.displayStatus === "error" ? "Run failed" : preview || "Response finished";
+      const body = notificationBody(thread, preview);
       return Result.ok({
         threadId,
         title: `Lilac · ${thread.title || "Untitled thread"}`,
@@ -1194,7 +1270,9 @@ export class NativeStore {
       this.writeRecord(next.id, { kind: "agent-stream", value: next }, next.parentThreadId);
     else this.writeRecord(next.id, { kind: "thread", value: next }, next.id);
     const boundedChanges =
-      encoder.encode(JSON.stringify(changes)).byteLength < WINDOW_BYTES && changes.length <= 128
+      encoder.encode(JSON.stringify(changes)).byteLength < WINDOW_BYTES &&
+      changes.length <= 128 &&
+      changes.every(isBoundedReplayChange)
         ? changes
         : [];
     const replay: NativeRecord = {
@@ -1710,11 +1788,16 @@ export class NativeStore {
           rows[0]?.revision === checkpoint.projectionRevision + 1 &&
           rows.at(-1)?.revision === thread.revision
         ) {
-          const decoded = yield* Result.all(rows.map((row) => decodeNativeRecord(row)));
-          const changes = decoded.flatMap((record) =>
+          // Older Core persisted changes without part-count bounds; an undecodable row falls back
+          // to a bounded window instead of failing every sync from this checkpoint.
+          const decoded = Result.all(rows.map((row) => decodeNativeRecord(row))).match({
+            ok: (records) => records,
+            err: () => null,
+          });
+          const changes = (decoded ?? []).flatMap((record) =>
             record.value.kind === "replay" ? record.value.value.changes : [],
           );
-          const complete = rows.every((row) => row.kind !== "reset");
+          const complete = decoded !== null && rows.every((row) => row.kind !== "reset");
           if (
             complete &&
             changes.length <= 128 &&
@@ -1882,7 +1965,7 @@ export class NativeStore {
       slotId: turnId,
       turnId,
       position: this.nextTurnPosition(thread.id),
-      messages: [message],
+      messages: input.commandId.startsWith(NATIVE_JOB_WAKE_COMMAND_PREFIX) ? [] : [message],
       state: "pending",
     };
     this.writeRecord(turnId, { kind: "turn", value: slot }, thread.id, slot.position);
@@ -1926,8 +2009,11 @@ export class NativeStore {
                 return Result.err(nativeFailure("invalid", "Commands cannot answer a question"));
               const answeringActiveSync =
                 question?.mode === "sync" && thread.activeRunId === question.requestId;
-              const requestedMode = input.command && thread.activeRunId ? "followup" : input.mode;
-              const effectiveMode = answeringActiveSync ? "steer" : requestedMode;
+              const effectiveMode = admittedInputMode(
+                input,
+                thread.activeRunId,
+                answeringActiveSync,
+              );
               const pendingCount =
                 this.db
                   .query<{ count: number }, [string]>(
@@ -1937,12 +2023,6 @@ export class NativeStore {
               if (pendingCount >= 128)
                 return Result.err(
                   nativeFailure("conflict", "Thread already has 128 pending inputs"),
-                );
-              if (effectiveMode !== "prompt" && !thread.activeRunId)
-                return Result.err(nativeFailure("stale", "There is no active run for this input"));
-              if (effectiveMode === "prompt" && thread.activeRunId)
-                return Result.err(
-                  nativeFailure("conflict", "Choose steering or follow-up while a run is active"),
                 );
               const uploads = yield* Result.all(
                 input.attachmentIds.map((id) => this.getUpload(id)),
@@ -2361,12 +2441,13 @@ export class NativeStore {
             {
               position: number;
               posted: number;
+              hidden: number;
               created_at: number | null;
               completed_at: number | null;
             },
             [string, number, number]
           >(
-            `SELECT t.position,${TURN_POSTED} AS posted${gapMs === undefined ? "" : `,${TURN_CREATED_AT} created_at,${TURN_COMPLETED_AT} completed_at`}
+            `SELECT t.position,${TURN_POSTED} AS posted,json_array_length(t.data_json,'$.value.messages')=0 AS hidden${gapMs === undefined ? "" : `,${TURN_CREATED_AT} created_at,${TURN_COMPLETED_AT} completed_at`}
             FROM native_records t INDEXED BY native_records_thread_position
             WHERE t.kind='turn' AND t.thread_id=? AND t.position<? ORDER BY t.position DESC LIMIT ?`,
           )
@@ -2376,7 +2457,7 @@ export class NativeStore {
         const previous = rows.length > OUTLINE_PAGE_TURNS ? rows.shift() : undefined;
         const page = {
           historyGeneration: thread.historyGeneration,
-          positions: rows.flatMap((row) => (row.posted ? [] : [row.position])),
+          positions: rows.flatMap((row) => (row.posted || row.hidden ? [] : [row.position])),
           ...(previous && rows[0] ? { earlierBefore: rows[0].position } : {}),
         };
         if (gapMs === undefined) return page;
@@ -2407,16 +2488,36 @@ export class NativeStore {
         if (thread.historyGeneration !== input.historyGeneration)
           return Result.err(nativeFailure("stale", "History changed before preview"));
         const positions = [...new Set(input.positions)];
-        const records = yield* this.readRows(
-          `SELECT * FROM native_records INDEXED BY native_records_thread_position WHERE kind='turn' AND thread_id=? AND position IN (${positions.map(() => "?").join(",")}) ORDER BY position`,
-          [input.threadId, ...positions],
-        );
+        if (positions.length === 0) return Result.ok([]);
+        const rows = this.db
+          .query<
+            { position: number; user_text: string | null; reply_text: string | null },
+            (string | number)[]
+          >(`
+          SELECT r.position,
+            (SELECT substr(group_concat(substr(json_extract(p.value,'$.text'),1,8192),' '),1,8192)
+              FROM json_each((SELECT m.value FROM json_each(r.data_json,'$.value.messages') m WHERE json_extract(m.value,'$.role')='user' ORDER BY CAST(m.key AS INTEGER) LIMIT 1),'$.parts') p
+              WHERE json_extract(p.value,'$.type')='text') AS user_text,
+            (SELECT substr(group_concat(substr(json_extract(p.value,'$.text'),1,8192),' '),1,8192)
+              FROM json_each((SELECT m.value FROM json_each(r.data_json,'$.value.messages') m WHERE json_extract(m.value,'$.role')='assistant'
+                AND EXISTS(SELECT 1 FROM json_each(m.value,'$.parts') p WHERE json_extract(p.value,'$.type')='text' AND trim(json_extract(p.value,'$.text'), ' '||char(9,10,11,12,13,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288,65279))!='')
+                ORDER BY COALESCE(json_extract(m.value,'$.metadata.phase')='final',0) DESC, CAST(m.key AS INTEGER) DESC LIMIT 1),'$.parts') p
+              WHERE json_extract(p.value,'$.type')='text') AS reply_text
+          FROM native_records r INDEXED BY native_records_thread_position WHERE r.kind='turn' AND r.thread_id=? AND r.position IN (${positions.map(() => "?").join(",")}) ORDER BY r.position
+        `)
+          .all(input.threadId, ...positions);
         return Result.ok(
-          records.flatMap((record) =>
-            record.kind === "turn"
-              ? [{ position: record.value.position, ...turnPreviewText(record.value.messages) }]
-              : [],
-          ),
+          rows.map((row) => ({
+            position: row.position,
+            ...turnPreviewText([
+              { id: "user", role: "user", parts: [{ type: "text", text: row.user_text ?? "" }] },
+              {
+                id: "reply",
+                role: "assistant",
+                parts: [{ type: "text", text: row.reply_text ?? "" }],
+              },
+            ]),
+          })),
         );
       }, this),
     );
@@ -2727,6 +2828,19 @@ export class NativeStore {
             .run(eventId, threadId, historyGeneration);
         return Result.ok(undefined);
       }, this),
+    );
+  }
+
+  /** Rewind cancels the target's input but keeps its record, so this still answers afterwards. */
+  getTurnInputCreatedAt(threadId: string, turnId: string): NativeStoreResult<number | null> {
+    return nativeStoreTransaction(this.db, () =>
+      this.readRows(
+        "SELECT * FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.turnId')=? AND json_extract(data_json,'$.value.mode')!='steer' LIMIT 1",
+        [threadId, turnId],
+      ).map((rows) => {
+        const input = rows[0];
+        return input?.kind === "input" ? input.value.createdAt : null;
+      }),
     );
   }
 
@@ -3689,7 +3803,11 @@ export class NativeStore {
       ...message,
       metadata: { ...message.metadata, position },
     }));
-    if (encoder.encode(JSON.stringify(indexed)).byteLength < WINDOW_BYTES && indexed.length <= 128)
+    if (
+      encoder.encode(JSON.stringify(indexed)).byteLength < WINDOW_BYTES &&
+      indexed.length <= 128 &&
+      indexed.every((message) => message.parts.length <= 128)
+    )
       return { ...slot, messages: indexed };
     const selected: DisplayMessage[] = [];
     let bytes = 0;
@@ -3702,7 +3820,7 @@ export class NativeStore {
         const part = message.parts[p];
         if (!part) continue;
         const size = encoder.encode(JSON.stringify(part)).byteLength;
-        if (bytes + partBytes + size > WINDOW_BYTES - 4096) break;
+        if (parts.length >= 128 || bytes + partBytes + size > WINDOW_BYTES - 4096) break;
         parts.push(part);
         partBytes += size;
       }
@@ -3716,6 +3834,7 @@ export class NativeStore {
     const first = indexed[0];
     if (
       first &&
+      first.parts.length <= 128 &&
       selected[0]?.id !== first.id &&
       bytes + encoder.encode(JSON.stringify(first)).byteLength < WINDOW_BYTES
     )
@@ -3769,8 +3888,11 @@ export class NativeStore {
       const segments = input.cursor.split("_");
       let messageIndex = Number(segments[1]);
       let partIndex = Number(segments[2]);
+      let fragmentOffset = Number(segments[3] ?? 0);
       if (
-        segments.length !== 3 ||
+        (segments.length !== 3 && segments.length !== 4) ||
+        !Number.isSafeInteger(fragmentOffset) ||
+        fragmentOffset < 0 ||
         segments[0] !== "p" ||
         !Number.isSafeInteger(messageIndex) ||
         !Number.isSafeInteger(partIndex) ||
@@ -3798,7 +3920,24 @@ export class NativeStore {
         while (partIndex < message.parts.length) {
           const part = message.parts[partIndex];
           if (!part) break;
-          const chunk = { messageId: message.id, partIndex, part };
+          const serialized = JSON.stringify(part);
+          const oversized = encoder.encode(serialized).byteLength > WINDOW_BYTES - 8192;
+          if (fragmentOffset > serialized.length || (!oversized && fragmentOffset !== 0))
+            return Result.err(nativeFailure("invalid", "Turn fragment cursor is invalid"));
+          // JSON escaping can expand a UTF-16 code unit to six bytes.
+          const fragmentEnd = Math.min(serialized.length, fragmentOffset + 16_384);
+          const chunk = oversized
+            ? {
+                messageId: message.id,
+                partIndex,
+                part: { type: "text" as const, text: "" },
+                fragment: {
+                  offset: fragmentOffset,
+                  total: serialized.length,
+                  json: serialized.slice(fragmentOffset, fragmentEnd),
+                },
+              }
+            : { messageId: message.id, partIndex, part };
           const size = encoder.encode(JSON.stringify(chunk)).byteLength;
           if (bytes + size > WINDOW_BYTES || chunks.length >= 64)
             return Result.ok({
@@ -3807,10 +3946,18 @@ export class NativeStore {
               projectionRevision: thread.revision,
               messages,
               chunks,
-              nextCursor: `p_${messageIndex}_${partIndex}`,
+              nextCursor:
+                fragmentOffset === 0
+                  ? `p_${messageIndex}_${partIndex}`
+                  : `p_${messageIndex}_${partIndex}_${fragmentOffset}`,
             });
           chunks.push(chunk);
           bytes += size;
+          if (oversized && fragmentEnd < serialized.length) {
+            fragmentOffset = fragmentEnd;
+            continue;
+          }
+          fragmentOffset = 0;
           partIndex++;
         }
         messageIndex++;
@@ -4153,4 +4300,13 @@ function finalAssistantText(messages: readonly DisplayMessage[]) {
     messages.findLast((message) => message.metadata?.phase === "final" && hasText(message)) ??
     messages.findLast((message) => message.metadata?.phase === undefined && hasText(message));
   return message ? messageText(message) : "";
+}
+
+function isBoundedReplayChange(change: LiveUpdate["changes"][number]): boolean {
+  if (change.kind === "append-message") return change.message.parts.length <= 128;
+  if (change.kind !== "insert") return true;
+  return (
+    change.slot.messages.length <= 128 &&
+    change.slot.messages.every((message) => message.parts.length <= 128)
+  );
 }

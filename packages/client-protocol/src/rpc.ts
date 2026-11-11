@@ -27,6 +27,7 @@ import {
   nativeTransportSchema,
   nativeDeploymentDocumentSchema,
   subagentSummarySchema,
+  workflowRunSummarySchema,
   catalogReplySchema,
   agentIdentitySchema,
   catalogIdentifierSchema,
@@ -135,6 +136,9 @@ export const turnPageChunkSchema = z.strictObject({
   messageId: identitySchema,
   partIndex: revisionSchema,
   part: displayPartSchema,
+  fragment: z
+    .strictObject({ offset: revisionSchema, total: revisionSchema, json: z.string().max(16_384) })
+    .optional(),
 });
 export const turnPageSchema = z
   .strictObject({
@@ -595,6 +599,30 @@ export const nativeContract = {
           total: z.number().int().nonnegative(),
         }),
       ),
+  },
+  workflows: {
+    list: procedure
+      .input(
+        pageInputSchema.extend({
+          state: z.enum(["active", "finished", "failed", "done"]),
+          query: z.string().min(1).max(256).optional(),
+        }),
+      )
+      .output(
+        z.strictObject({
+          items: z.array(workflowRunSummarySchema).max(100),
+          nextCursor: identitySchema.optional(),
+        }),
+      ),
+    get: procedure
+      .input(
+        z.strictObject({
+          runId: runIdentitySchema,
+          /** Leaves out result and failure text, for callers that only show the title and status. */
+          preview: z.boolean().optional(),
+        }),
+      )
+      .output(workflowRunSummarySchema),
   },
   external: {
     list: procedure.input(pageInputSchema).output(

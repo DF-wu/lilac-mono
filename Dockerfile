@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=ubuntu:24.04
+ARG BASE_IMAGE=debian:13
 ARG NODE_MAJOR=22
 ARG CONTAINER_USER=lilac
 ARG CONTAINER_UID=1000
@@ -72,7 +72,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   fi \
   && rm -rf /var/lib/apt/lists/*
 
-# Ubuntu/Debian call it "fdfind"
+# Debian calls it "fdfind"
 RUN ln -sf /usr/bin/fdfind /usr/local/bin/fd
 
 ARG CONTAINER_USER
@@ -82,7 +82,7 @@ ENV LILAC_UID=${CONTAINER_UID}
 ENV LILAC_GID=${CONTAINER_UID}
 
 # Create a dedicated regular user instead of inheriting an image account's
-# groups or account settings. Ubuntu reserves UID/GID 1000 for `ubuntu`.
+# groups or account settings.
 RUN case "$CONTAINER_USER" in \
       ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) \
         echo "CONTAINER_USER must contain only letters, digits, underscores, or hyphens" >&2; exit 1 ;; \
@@ -100,22 +100,14 @@ RUN case "$CONTAINER_USER" in \
   && if id -u "$LILAC_USER" >/dev/null 2>&1; then \
        echo "CONTAINER_USER is already assigned to a base-image account" >&2; exit 1; \
      fi \
-  && existing_user="$(getent passwd "$CONTAINER_UID" | cut -d: -f1 || true)" \
-  && if [ -n "$existing_user" ]; then \
-       if [ "$existing_user" != "ubuntu" ]; then \
-         echo "CONTAINER_UID is already assigned to a base-image account" >&2; exit 1; \
-       fi; \
-       userdel --remove ubuntu; \
+  && if getent passwd "$CONTAINER_UID" >/dev/null 2>&1; then \
+       echo "CONTAINER_UID is already assigned to a base-image account" >&2; exit 1; \
      fi \
   && if getent group "$LILAC_USER" >/dev/null 2>&1; then \
        echo "CONTAINER_USER is already assigned to a base-image group" >&2; exit 1; \
      fi \
-  && existing_group="$(getent group "$CONTAINER_UID" | cut -d: -f1 || true)" \
-  && if [ -n "$existing_group" ]; then \
-       if [ "$existing_group" != "ubuntu" ]; then \
-         echo "CONTAINER_UID is already assigned to a base-image group" >&2; exit 1; \
-       fi; \
-       groupdel ubuntu; \
+  && if getent group "$CONTAINER_UID" >/dev/null 2>&1; then \
+       echo "CONTAINER_UID is already assigned to a base-image group" >&2; exit 1; \
      fi \
   && groupadd --gid "$CONTAINER_UID" "$LILAC_USER" \
   && useradd --create-home --uid "$CONTAINER_UID" --gid "$LILAC_USER" \
@@ -151,12 +143,28 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 # bun (user-level), pinned to the workspace packageManager version.
 COPY package.json /tmp/lilac-package.json
 RUN BUN_VERSION="$(node -e 'const pm = require("/tmp/lilac-package.json").packageManager; const match = /^bun@(.+)$/.exec(pm ?? ""); if (!match) throw new Error(`packageManager must be bun@<version>, got ${pm}`); process.stdout.write(match[1]);')" \
-  && curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}"
+  && case "$(dpkg --print-architecture)" in \
+       amd64) BUN_ARCH=x64 ;; \
+       arm64) BUN_ARCH=aarch64 ;; \
+       *) echo "Unsupported Bun architecture" >&2; exit 1 ;; \
+     esac \
+  && (curl -fSL --retry 3 --connect-timeout 15 --max-time 120 \
+        "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${BUN_ARCH}.zip" \
+        -o /tmp/bun.zip \
+      || curl -fSL --retry 3 --connect-timeout 15 --max-time 120 \
+        "https://bun.sh/download/${BUN_VERSION}/linux/${BUN_ARCH}?avx2=true&profile=false" \
+        -o /tmp/bun.zip) \
+  && mkdir -p "$HOME/.bun/bin" \
+  && unzip -qj /tmp/bun.zip '*/bun' -d "$HOME/.bun/bin" \
+  && chmod 0755 "$HOME/.bun/bin/bun" \
+  && [ "$("$HOME/.bun/bin/bun" --version)" = "$BUN_VERSION" ] \
+  && rm /tmp/bun.zip
 USER root
 # Keep the runtime Bun executable in a stable, root-owned tools layer.
 RUN install -o root -g root -m 0755 \
      /home/${LILAC_USER}/.bun/bin/bun \
-     /usr/local/bin/bun
+     /usr/local/bin/bun \
+  && ln -s bun /usr/local/bin/bunx
 
 # Isolate Go compilation from Bun, dependency manifests, and application metadata.
 FROM toolchain AS native-launcher
@@ -280,8 +288,6 @@ COPY packages/plugin-runtime packages/plugin-runtime
 COPY packages/remote-fs-runner packages/remote-fs-runner
 COPY packages/tool-results packages/tool-results
 COPY packages/utils packages/utils
-COPY scripts/build-model-catalog.ts scripts/build-model-catalog.ts
-RUN bun scripts/build-model-catalog.ts
 RUN bun run codegen:config-schemas
 COPY --from=web /app/apps/web/dist /app/apps/web/dist
 COPY --from=native-launcher /build/tools /app/apps/tool-bridge/dist/tools

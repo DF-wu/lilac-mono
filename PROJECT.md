@@ -105,6 +105,9 @@ admits execution. Stable delivery identities bridge these stores; the native sur
 second model-execution queue. Each human user also has one permanent native DM, with gap-based
 context sessions and manual compaction through the shared agent engine. DM display history
 is retained, and search/read authority remains restricted to its starter. Starter authority and history generation are rechecked at admission.
+Each native primary transcript row holds one turn; `execution.ts` rebuilds a thread's model context by joining
+the rows of its canonical turns from the selected start, beginning at the newest full row (a compaction checkpoint
+or a row written before turn rows). See [native turn transcripts](MIGRATIONS.md#native-turn-transcripts).
 Native surface-tool sends default to `triggerRun=false` and are persisted in request groups. The request
 lifecycle bus closes groups; native thread activity gates atomic delivery in first-group order. The tool
 returns a queued acknowledgment while messages remain absent from history. Explicit `triggerRun=true` sends retain their
@@ -130,10 +133,31 @@ client store, and web turn renderer. Child `agent-stream` records hold workflow 
 canonical parent request; they are excluded from the sidebar and inherit read access through verified
 workflow ancestry. Completed legacy children are projected from retained transcripts on first open.
 
+A parked run keeps `displayStatus: "working"`, so notifications still see one run end, and adds
+`waitingOn`: `input` for the viewer who must answer a pending question, `other` for everyone else once
+the runner reports that only a sync subagent, sync question, or deferred wait remains. `hasActiveWorkflow`
+marks sidebar rows for runs that outlive the primary agent. Both signals live in memory: runners re-report
+waits and the workflow store reseeds active runs at startup.
+
+`workflows.list` backs the Workflows view: a board with one virtualized column per status group, and a
+sidebar list of titles and statuses that selects a card on the board. It leaves out subagent runs, limits
+participants to threads they can read, and shows runs with no native conversation only to the owner. Active,
+failed, and done runs are separate queries, so columns page independently and polling never re-downloads
+ended result text. Its optional `query` matches workflow names and backs the sidebar search in this view.
+`workflows.get` reads one run by id with the same access rules. Workflow ids stay plain text in messages,
+so the agent can use them directly, and the web renders them as chips with the run's title and status. A card's `source` holds its turn position, which opens the
+thread at that card through the timeline's history jump, and the card's actions for viewers who can edit.
+
 The web turn rail reads `threads.outline` in pages of 256 turns and `threads.outlinePreviews` for
 up to 16 hovered turns. DM outlines group turns into context windows with the same gap rule as
 session selection. A jump hydrates a deferred range with `aroundPosition`, which loads the target and
 leaves deferred ranges on both sides.
+
+`useTimelineScroll` places a thread before its first paint: at the bottom, or at the reading
+position saved when the reader last left that thread above the bottom. Saved positions live in web
+memory keyed by thread store, so a reload or store eviction opens at the bottom. The timeline follows
+the bottom until wheel, touch, key, scrollbar, or focus input moves the reader up; other scrolls, such
+as the composer revealing its caret, return to the bottom.
 
 `useReadingAnchor` keeps the content at the reading line in place while rows above it change height or
 a deferred range fills in. Rows within 1.5 viewports of the screen stay mounted so media settles
@@ -158,7 +182,7 @@ Three concepts must remain distinct:
 
 The registry binds one produced-ref-guarded adapter facade and passes that facade to descriptor ports. Caller refs and adapter-produced refs are checked before shared publication, persistence, or workflow progress. Workflow progress additionally gates exact target, binding, and ref correlation and persists permanent-versus-retryable operation policy. The registry is internal composition, not a dynamic surface plugin API.
 
-Discord owns its gateway ingress, allowlists, mention/active router, local message cache/search, and Discord rendering. Telegram owns long-polling ingress, chat/user admission, command targeting and menus, its local history index, and Telegram rendering. `apps/core/src/conversation` owns shared Discord/native/Telegram conversation-memory indexing, summarization, embeddings, search, and automatic recall; the Telegram source projection lives in `apps/core/src/surface/telegram/telegram-conversation-source.ts`. Agent memory reads include all retained native threads, allowlisted Discord threads, and Telegram threads whose chat is in `allowedChatIds`; native UI permissions and modification authority remain surface-owned. GitHub owns webhook verification, trigger parsing, API authentication, acknowledgement state, pagination, and GitHub rendering. Shared code must not infer that a wire-valid platform has those capabilities.
+Discord owns its gateway ingress, allowlists, mention/active router, local message cache/search, and Discord rendering. Telegram owns long-polling ingress, chat/user admission, command targeting and menus, its local history index, and Telegram rendering. `apps/core/src/conversation` owns shared Discord/native/Telegram conversation-memory indexing, summarization, embeddings, search, and automatic recall; the Telegram source projection lives in `apps/core/src/surface/telegram/telegram-conversation-source.ts`. A thread holds one summary entry per distinct subject, and search and recall return entries that point back at their thread. The native DM is indexed as one thread per context window. Agent memory reads include all retained native threads, allowlisted Discord threads, and Telegram threads whose chat is in `allowedChatIds`; native UI permissions and modification authority remain surface-owned. GitHub owns webhook verification, trigger parsing, API authentication, acknowledgement state, pagination, and GitHub rendering. Shared code must not infer that a wire-valid platform has those capabilities.
 
 Telegram's shared adapter connection initializes its history store and bot identity before request
 and relay consumers can replay retained events. The agent runner subscribes while paused; these
@@ -217,6 +241,16 @@ Lilac uses progressive disclosure, but ownership is more important than the leve
 Level 1 tools are direct model-callable AI SDK tools assembled for each run. `packages/coding-tools`, `packages/fs`, `packages/bash-safety`, and `packages/tool-results` own portable behavior. Core-specific host, SSH, restricted execution, attachments, artifacts, logging, and bus delegation adapters live in `apps/core/src/tools`. Built-in exposure is declared in `apps/core/src/plugins/builtin`, and `apps/core/src/plugins/manager.ts` applies model, profile, safety, and request context.
 
 Native Bash executes with the Core service user's host authority. Static Bash checks, denied paths, redaction, `network`, and `workspaceWrites` are behavioral guardrails, not security boundaries. Use restricted execution or OS isolation when same-user files, secrets, or network access must be unavailable.
+
+### Background Jobs
+
+`apps/core/src/jobs` runs Bash commands that outlive a tool call. The Level 1 `job` tool (`start`, `list`, `read`, `stop`) is a capability like `question`: its plugin enables it only on native and Discord requests, so the GitHub surface, heartbeat sessions, restricted sessions, and subagent profiles without native execution never see it. Starting a job applies foreground Bash's guardrails and environment, excludes SSH targets, and has no no-output timeout.
+
+`await` jobs keep their request open: the runner parks it as it does for deferred subagents. `service` jobs let it finish. `background-jobs.db` holds every job, keyed by request and tool call so a replayed launch returns its existing job, and it never stores tokens or environment. Output is sanitized as it arrives, capped at 50 MB per job, and kept in `background-jobs/` for 7 days. Limits are 8 running jobs per session, 64 globally, and a time limit of 30 minutes for `await` and 4 hours for `service`, adjustable to 24 hours.
+
+A job's end is a stored pending event. The runner reads pending events at each turn boundary and at run start, and appends them as `job_event` generated messages marked as tool output. An idle session gets a wake, which only triggers a turn and shows nothing to people unless the agent replies. On native it is an input whose turn has no display message, which the sidebar, read state, and turn rail skip until the agent writes. On Discord it is a request built from the session's latest transcript, with no post to the channel; its request ID binds it to the job's origin message, so it keeps that person's authority and a reply threads under that message. Jobs that end together share a wake, and delivery is at least once: a wake that cannot be delivered retries with backoff under the same wake ID, then waits for the session's next run or a restart. After 10 wakes in a row with no message from a person, events wait for that message.
+
+The agent hears about exits, time limits, and Core restarts, which report a job as `lost`. It does not hear about stops it or the user caused: `job stop`, the user's Stop (which ends `await` jobs only), native settle, archive, delete, rewind past the launch, or its owning subagent ending. Settling stops jobs only when the person has edit access, because settling is a per-user preference. These jobs stay visible in `job list` with their stop reason. A service's Lilac `tools` calls stop working when its request ends, since request capabilities expire with it. A launch that crashes before recording its PID cannot be identified at the next start and may leave an orphan.
 
 ### Level 2: Core Tool Server
 
@@ -292,7 +326,7 @@ Workflow SQLite state is authoritative for execution and recovery. Do not reintr
 
 - Operator-managed configuration and extensions: Core/MCP config, prompt workspace, skills, plugins, custom commands, personal workflow definitions, and the default tool workspace.
 - Secrets and credentials under `secret/`. Tool denylists and redaction reduce accidents, but same-user native code can bypass them; the directory is not an OS security boundary.
-- SQLite state for Discord cache/search and conversation threads, discovery, agent transcripts and continuation bindings, workflows, durable request delivery, and the agent-run WAL. The workflow database path may be selected separately by `SQLITE_URL`.
+- SQLite state for Discord cache/search and conversation threads, discovery, agent transcripts and continuation bindings, workflows, durable request delivery, background jobs, and the agent-run WAL. The workflow database path may be selected separately by `SQLITE_URL`.
 - Transient or rebuildable artifacts and caches, including bounded tool-result artifacts and filesystem-search caches.
 
 Core-managed opaque bytes live behind `packages/blob-storage`. Domain databases, Redis messages, and

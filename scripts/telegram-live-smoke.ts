@@ -140,7 +140,7 @@ await check("html rendering accepted by telegram", async () => {
       "> quoted line",
     ].join("\n"),
   });
-  const result = await stream.finish();
+  const result = (await stream.finish()).unwrap();
   return `${result.created.length} message(s), no entity rejection`;
 });
 
@@ -148,7 +148,7 @@ await check("html rendering accepted by telegram", async () => {
 await check("overflow splits into messages telegram accepts", async () => {
   const stream = makeStream();
   await stream.push({ type: "text.set", text: "lorem ipsum dolor sit amet ".repeat(400) });
-  const result = await stream.finish();
+  const result = (await stream.finish()).unwrap();
   if (result.created.length < 2) throw new Error("expected the answer to split");
   return `${result.created.length} messages`;
 });
@@ -159,7 +159,7 @@ await check("code block split across messages stays valid", async () => {
   const stream = makeStream();
   const body = Array.from({ length: 260 }, (_, i) => `const line${i} = "value <${i}> & more";`);
   await stream.push({ type: "text.set", text: ["```ts", ...body, "```"].join("\n") });
-  const result = await stream.finish();
+  const result = (await stream.finish()).unwrap();
   if (result.created.length < 2) throw new Error("expected the block to split");
   return `${result.created.length} messages, both accepted`;
 });
@@ -191,9 +191,10 @@ await check("shrinking output deletes surplus messages", async () => {
   await stream.settled();
   const grown = stream.getDeliveredMessages().length;
   await stream.push({ type: "text.set", text: "short final answer" });
-  const result = await stream.finish();
+  const result = (await stream.finish()).unwrap();
   if (grown < 2) throw new Error("expected the draft to overflow first");
-  if (result.created.length !== 1) throw new Error(`expected 1 surviving message, got ${result.created.length}`);
+  if (result.created.length !== 1)
+    throw new Error(`expected 1 surviving message, got ${result.created.length}`);
   return `${grown} -> 1 message`;
 });
 
