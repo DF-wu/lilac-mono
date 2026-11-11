@@ -1,48 +1,33 @@
-# PR #101 integration checkpoint
+# Fork integration execution checkpoint
 
-Status: integration in progress; no validation or release claim.
+The broad integration was merged externally in PR #101 by DF-wu at 2026-11-11T06:16:22Z. This agent did not merge or deploy. Remaining work is delivered in a separate open follow-up PR.
 
-- Fork base: `3c01ce2c29a66fa9be573f573c9865b7cb20c030`.
-- Upstream target and original PR head: `3493c0c6c06260e6c472bd230dc02d4b0308db43`.
-- Merge base: `05c41baa7a45b728d1722d69d5e55d5dc9e580b4`.
-- Integration branch: `catalina/pr101-integration-20261111`.
-- PR: https://github.com/DF-wu/lilac-mono/pull/101.
-- Existing main and earlier resolution worktree remain untouched. Cancelled native handoff left a separate checkout with modified reference submodules; that checkout is untouched too.
-- GitHub account: authorized fallback `DF-wu`; only that login is configured locally. Git author and committer: Catalina.
-- No live service changes, runtime configuration or secret changes, live data migration, merge, or deployment are authorized. Disposable fixture servers and containers are used for verification.
+- Original fork: `3c01ce2c29a66fa9be573f573c9865b7cb20c030`.
+- Refreshed main: `2e5159be7b23fa34a25a517275d20f327858f9f7`.
+- Externally merged head: `691b9bdaff804485d646e8d69351e0ea73649a3a`.
+- Upstream: `3493c0c6c06260e6c472bd230dc02d4b0308db43`.
+- Original merge base: `05c41baa7a45b728d1722d69d5e55d5dc9e580b4`.
+- Candidate snapshot: `abb6ddd3`, saved after a successful full required check.
+- Branch: `catalina/pr101-integration-20261111`.
+- Implementation checkout: `/home/df/workspace/lilac-mono-pr101-integration-20261111`.
+- Existing main, older conflict worktree and delayed native handoff checkout remain untouched.
+- GitHub writes use the authorized `DF-wu` fallback: Catalina-df is unavailable locally. Git author and committer are Catalina.
+- No operator model/alias/preset/agentCanSelect or secret/runtime configuration changes. No live migration, production restart, merge or deployment by this agent.
 
-## Execution plan
+## Reconciliation
 
-1. Refresh complete changed-path inventory and independently validate F01–F23 contracts against both pins. Record source ownership, disposition, behavior, regression checks, and limits for every feature and remaining path.
-2. Merge the exact upstream target. Adopt upstream execution, resource, workflow, persistence, and memory owners. Retain narrow Telegram, provider compatibility, recording, authority, and operational adapters.
-3. Resolve migration support through the historical offline migration baseline; do not restore removed startup migration machinery. Document backup, offline upgrade, support boundary, and rollback. Test disposable fixtures only.
-4. Add regressions for actual integration gaps, run focused workspace tests and typechecks, schema generation, footprint, architecture, lint, format, builds, and full repository checks. Reproduce existing failures on pinned sources before classifying them.
-5. Obtain independent Codex review of connected code at the exact candidate. Fix consequential findings and repeat affected checks. Record review conclusions in the PR.
-6. Run `bun run check` before each commit. Commit coherent integration and documentation changes, verify the remote PR head has not changed, and push normally with `HEAD:automation/sync-upstream`. Update the PR with exact pins, final tested code commit, inventory, migration, validation, review, limits, and deployment gates. Leave it open.
+Tracked/index/unstaged patches and untracked files were saved outside the repository before reconciliation. The candidate was committed, then refreshed main was merged normally. The externally merged source is retained; equivalent source formatting, subject-entry/native-window documentation, and Telegram multi-subject/revision tests from main were preserved. The reviewed authorization, publication and debounce fixes remain. Legacy migration tools and exact registrations are retired under the documented historical offline support boundary.
 
-## Evidence
+## Verification and review
 
-The prior audit at `/home/df/workspace/lilac-fork-audit-20261111` is analysis, not implementation evidence. Fresh checks and source review are required. The target refs were refreshed and match those pins. The first merge produced 19 conflicted paths. Bounded read-only Codex exploration covers Telegram, providers/config/compaction, runtime/authority/recording, and delivery/migration/registrations.
+The pre-reconciliation full check passed with Bun 1.4.4: 7,878 passed, four skipped, zero failed. The earlier domain reviews found Telegram publication ordering, cross-client alias authorization, release-CI evidence and stale migration claims. Their fixes and limits are in REVIEW.md. Final reconciled checks, exact committed-HEAD review and image provenance are recorded in VERIFICATION.md and the follow-up PR.
 
-## Current implementation checkpoint
+Tests run in a disposable init-managed container with clean image home and explicit fixture Redis. The Docker CLI/socket is available only for disposable test containers; production-only backend-socket configuration is cleared. Host-only operator port and compaction-overlay failures were reproduced against pinned upstream; the operator test now uses an ephemeral listener and the compaction test remains unchanged. No live service is used for verification.
 
-All merge conflicts are resolved. Domain implementation and focused checks are complete.
-Independent Core and delivery/provider reviews found Telegram control publication ordering,
-restricted cross-client alias authorization, release verification after token-authenticated sync,
-and stale current migration guidance. These have narrow fixes and regression evidence in REVIEW.md.
-The native operator integration test now binds an ephemeral fixture port through the real Bun
-listener boundary; production operator configuration stays unchanged.
+## Completion plan
 
-Bun 1.4.4 is installed in a task-local toolchain. Full checks use a disposable init-managed
-container, the exact candidate bind mount, a clean image home, current Git metadata, Docker access
-only for the suite's disposable Redis fixture, and an explicitly configured fixture Redis URL.
-The container's production-only backend-socket environment setting is cleared for tests.
-Host failures were reproduced against pinned upstream: the operator fixture's fixed port was
-occupied, and host-global prompt/skill overlays exceeded a small compaction fixture budget.
-The compaction test passes unchanged in the clean container; no budget change was retained.
-Earlier container attempts without init, socket normalization or Docker CLI produced environment
-failures and are not passing evidence. Final required check result remains to be recorded.
-
-Web production build and local linux-x64 installer build passed. Historical offline suites and
-supplemental byte-integrity fixtures passed. Three identity smoke images passed on the earlier
-frozen context; a final candidate rebuild and exact final commit verification remain outstanding.
+1. Regenerate all-path inventory and exact upstream-owned footprint against the refreshed baseline.
+2. Run required checks/builds; commit the reconciliation and final evidence.
+3. Review the exact final HEAD independently, fix consequential findings and reverify.
+4. Rebuild and smoke all three image identities from that commit.
+5. Verify account/target/ref freshness; push this own branch normally and create the follow-up PR. Record exact pins, tested SHA, image IDs, reviews, support limits and deployment gates. Leave the PR open.

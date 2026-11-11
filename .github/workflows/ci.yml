@@ -139,8 +139,8 @@ jobs:
             LILAC_BUILD_COMMIT=${{ inputs.ref || github.sha }}
             LILAC_BUILD_DIRTY=false
           tags: lilac:ci-${{ matrix.variant.name }}
-          cache-from: type=gha,scope=ci-${{ matrix.variant.name }}-amd64
-          cache-to: type=gha,mode=max,scope=ci-${{ matrix.variant.name }}-amd64
+          cache-from: type=gha,scope=ci-lilac-mono-amd64-${{ matrix.variant.name }}
+          cache-to: type=gha,mode=max,scope=ci-lilac-mono-amd64-${{ matrix.variant.name }}
 
       - name: Verify image
         run: |

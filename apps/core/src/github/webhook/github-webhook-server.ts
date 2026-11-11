@@ -34,8 +34,8 @@ import {
   clearGithubAck,
   getGithubAck,
 } from "../github-state";
-import { NO_REPLY_TOKEN } from "../../surface/bridge/reply-directive";
 import { isMarkedGithubAgentComment, markGithubAgentComment } from "../github-comment-marker";
+import { NO_REPLY_TOKEN } from "../../surface/bridge/reply-directive";
 import { parseGithubWorkflowActionReply } from "../../surface/github/github-actions";
 import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
 import { adaptToolResultToHost } from "../../tools/tool-result-adapters";

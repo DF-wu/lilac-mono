@@ -6,6 +6,8 @@ import { Result, type Result as ResultType } from "better-result";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 import { env, isRecord, opaqueErrorMessage } from "@stanley2058/lilac-utils";
 import { buildSyntheticToolCallId } from "@stanley2058/lilac-agent";
+import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
+import type { ConversationSurface } from "../../../conversation/thread-store";
 import {
   createConversationThreadAutoInjectUsageAccumulator,
   type ConversationThreadAutoInjectUsageAccumulator,
@@ -29,8 +31,6 @@ import {
 import { getParticipantUserIdsFromRaw, type AgentRunnerRaw } from "./raw";
 import { latestUserInput, shouldRunAutoInjectedThreadSearch } from "./text-units";
 import { type BusAgentRunnerErrorProjection, projectBusAgentRunnerError } from "./errors";
-import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
-import type { ConversationSurface } from "../../../conversation/thread-store";
 
 function buildAutoInjectedThreadSearchToolCallId(requestId: string): string {
   return buildSyntheticToolCallId({
@@ -231,6 +231,16 @@ function formatInjectedThreadTimeRange(input: { start: string; end: string }): s
   return `${start} - ${end}`;
 }
 
+/**
+ * Surface label for conversation recall. Only surfaces with an indexed history
+ * are named; everything else searches as Discord, the un-prefixed default.
+ */
+export function conversationSurfaceOfRequestClient(client: AdapterPlatform): ConversationSurface {
+  if (client === "native") return "native";
+  if (client === "telegram") return "telegram";
+  return "discord";
+}
+
 async function publishAutoInjectToolStatusBestEffort(
   params: {
     publishToolStatus: (update: AutoInjectToolStatusUpdate) => Promise<void>;
@@ -265,12 +275,6 @@ function notifyAutoInjectObserverBestEffort(
       projectBusAgentRunnerError(attempt.error.cause),
     );
   }
-}
-
-export function conversationSurfaceOfRequestClient(client: AdapterPlatform): ConversationSurface {
-  if (client === "native") return "native";
-  if (client === "telegram") return "telegram";
-  return "discord";
 }
 
 type AutoInjectedThreadSearchParams = {

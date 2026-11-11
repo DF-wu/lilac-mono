@@ -628,11 +628,11 @@ and embedding rows are keyed by thread and entry ordinal. The first open without
 `conversation_index_v3` marker drops and recreates the derived thread, summary, facet, FTS, and
 embedding tables, as the `conversation_index_v2` cutover did. No summaries are copied. Core then
 rematerializes every Discord channel once in the background; the marker keeps that rebuild pending
-across restarts until it finishes. Native threads are projected from retained turns on the first
-refresh. Recall is incomplete until the summarization worker has regenerated every quiet eligible
+across restarts until it finishes. Native threads and Telegram sessions are projected from their retained
+sources on the first refresh. Recall is incomplete until the summarization worker has regenerated every quiet eligible
 thread and its embeddings. The worker handles `conversation.thread.summarization.batchSize` threads
 every ten minutes; manual `conversation.thread.runSummarization` has no batch limit. Retained Discord messages,
-native records, and canonical transcripts are unchanged.
+native records, retained Telegram messages, and canonical transcripts are unchanged.
 
 Search and automatic recall return one result per entry. A result keeps its `threadId` and adds
 `offset` when the entry's subject starts after the first message; pass it to

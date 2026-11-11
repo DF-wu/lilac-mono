@@ -1,6 +1,6 @@
 # Upstream commits covered
 
-All 156 commits reachable from `3493c0c6c06260e6c472bd230dc02d4b0308db43` but absent from fork baseline `3c01ce2c29a66fa9be573f573c9865b7cb20c030` are included by the integration merge.
+All 156 commits reachable from `3493c0c6c06260e6c472bd230dc02d4b0308db43` but absent from fork baseline `3c01ce2c29a66fa9be573f573c9865b7cb20c030` already landed in externally merged PR #101 and remain ancestors of this follow-up. Refreshed main is `2e5159be7b23fa34a25a517275d20f327858f9f7`. No additional upstream commit arrived after the original audit pin.
 
 | Commit | Subject |
 | --- | --- |

@@ -7,13 +7,13 @@ import {
   readNativeConversationTurnTimings,
   readNativeDmContextGapMs,
 } from "../surface/native/conversation-source";
+import { startsContextWindow } from "@stanley2058/lilac-client-protocol";
 import {
   installTelegramConversationSource,
   readTelegramConversationAttachments,
   readTelegramConversationMessages,
   readTelegramConversationThreads,
 } from "../surface/telegram/telegram-conversation-source";
-import { startsContextWindow } from "@stanley2058/lilac-client-protocol";
 import { SUMMARY_QUIET_MS } from "./thread-summary-policy";
 import { CONVERSATION_FACET_WEIGHTS as FACET_WEIGHTS } from "./thread-search-weights";
 import { Database } from "bun:sqlite";

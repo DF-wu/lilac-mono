@@ -1,8 +1,8 @@
-# Fork integration for PR #101
+# Fork integration and follow-up to PR #101
 
-This update integrates the pinned November upstream architecture into the fork while retaining its useful surface, provider, authority, and delivery behavior. It does not change operator model configuration, aliases, presets, or `agentCanSelect`, run a live migration, merge the PR, or deploy it.
+This report accounts for the November upstream integration and the remaining fixes delivered by its follow-up PR. [PR #101](https://github.com/DF-wu/lilac-mono/pull/101) was merged externally by DF-wu at 2026-11-11T06:16:22Z while this work was running. This agent did not merge or deploy it. The follow-up preserves that main and adds the reviewed fixes, regression coverage, delivery verification, and offline migration boundary. Operator model configuration, aliases, presets, and `agentCanSelect` remain unchanged.
 
-The integration retains F01–F23 through current upstream owners and narrow fork adapters. [PATH-INVENTORY.md](PATH-INVENTORY.md) accounts for every path; [UPSTREAM-COMMITS.md](UPSTREAM-COMMITS.md) lists all upstream commits; [REVIEW.md](REVIEW.md) records independent findings and fixes. The verification record and PR identify the exact tested commit. A passing upstream build alone does not validate the combined fork.
+The integration retains F01–F23 through current upstream owners and narrow fork adapters. [PATH-INVENTORY.md](PATH-INVENTORY.md) accounts for every path; [UPSTREAM-COMMITS.md](UPSTREAM-COMMITS.md) lists all upstream commits; [REVIEW.md](REVIEW.md) records independent findings and fixes. [VERIFICATION.md](VERIFICATION.md) and the follow-up PR identify verification evidence and the exact final tested commit.
 
 Domain evidence: [Telegram/memory/workflows](telegram.md), [runtime/authority/recording](runtime.md), [providers/config/compaction](providers.md), [delivery](delivery.md), and [offline migration](migration.md).
 
@@ -11,13 +11,42 @@ Domain evidence: [Telegram/memory/workflows](telegram.md), [runtime/authority/re
 | Source | Commit |
 | --- | --- |
 | Fork baseline | [`3c01ce2c29a66fa9be573f573c9865b7cb20c030`](https://github.com/DF-wu/lilac-mono/commit/3c01ce2c29a66fa9be573f573c9865b7cb20c030) |
+| Refreshed main / follow-up base | [`2e5159be7b23fa34a25a517275d20f327858f9f7`](https://github.com/DF-wu/lilac-mono/commit/2e5159be7b23fa34a25a517275d20f327858f9f7) |
+| Externally merged PR #101 head | [`691b9bdaff804485d646e8d69351e0ea73649a3a`](https://github.com/DF-wu/lilac-mono/commit/691b9bdaff804485d646e8d69351e0ea73649a3a) |
 | Upstream target | [`3493c0c6c06260e6c472bd230dc02d4b0308db43`](https://github.com/stanley2058/lilac-mono/commit/3493c0c6c06260e6c472bd230dc02d4b0308db43) |
 | Previous common ancestor | [`05c41baa7a45b728d1722d69d5e55d5dc9e580b4`](https://github.com/stanley2058/lilac-mono/commit/05c41baa7a45b728d1722d69d5e55d5dc9e580b4) |
 | Historical offline migration baseline | [`f2c90667ac5616796c992602ca5fb5be726cf40d`](https://github.com/stanley2058/lilac-mono/commit/f2c90667ac5616796c992602ca5fb5be726cf40d) |
 
-Refs were fetched again on 2026-11-11. They match the prior audit pins, so there are no additional commits since that audit. The integration covers 156 upstream-only commits. The original common-ancestor-to-fork inventory has 256 paths; the refreshed inventory must also account for every remaining difference from the integrated upstream tree, including new integration files.
+Refs were fetched again on 2026-11-11. Upstream remains at the prior audit pin; the 156 upstream-only commits already landed in #101. Fork main advanced through `1d1b9376`, `691b9bda`, and merge `2e5159be`. The inventory distinguishes all 256 original fork paths, all 466 paths changed between the original and refreshed fork pins, every remaining upstream difference, and the follow-up diff. It does not infer path coverage from commit subjects.
 
 The saved audit was analysis only. Its linked surface and delivery cluster reports were missing on this machine; their conclusions were reconstructed from pinned source. `ref/` was not used as fresh upstream evidence. Existing dirty checkouts and the cancelled handoff's checkout are excluded from this change.
+
+## Already landed and follow-up scope
+
+The original integration candidate was saved in a local merge commit before reconciling the external merge. The follow-up is a normal descendant of refreshed main; the externally merged automation branch is not overwritten. Equivalent source formatting, native context-window documentation, and new Telegram multi-subject/revision regressions from main are preserved.
+
+| Contract | Already landed in #101 | Remaining follow-up |
+| --- | --- | --- |
+| F01 | Current runtime lifecycle and Telegram composition | Stronger typed-startup regression coverage |
+| F02 | Telegram routing on upstream session controls | Fence superseded debounce work; wait for initial publication before controls; failure rerouting regressions |
+| F03–F05 | Telegram output, media authority and menu adapters | Retained and verified; no new protocol product |
+| F06 | Per-subject memory entries, offsets and source revisions | Additional surface/entry/revocation checks, preserving main's new regressions |
+| F07 | Schema28 workflow variants and atomic waits | Reopen/origin/cancellation regression coverage |
+| F08 | Committed-display native observer | Resource/exclusion/blocked-sender regression coverage |
+| F09–F10 | Hosted search and compatible image-script adapters | Retained and verified |
+| F11 | External custom-media source contract | Correct committed bundle Result behavior, source/bundle parity, required check gate |
+| F12–F14 | Parsed tool execution, provider-view images and active-input compaction | Nontrivial execution/image/compaction and lineage regressions |
+| F15 | Authenticated-origin plumbing and plugin compatibility | Deny explicit cross-client targets at both enforcement sites, including equal/omitted session aliases |
+| F16 | Main retained obsolete legacy/startup migration tools | Adopt upstream retirement; exact historical offline support, backup/restore evidence, current errors and docs |
+| F17 | Typed startup identity helper | Named continuation for required flat control flow and stronger failure tests |
+| F18 | Redis cleanup on current lease lifecycle | Retained and verified with disposable Redis |
+| F19 | GitHub final-publication prompt policy | Additional admission/publication regression coverage |
+| F20 | Architecture-aware Bun and named identities | Bun/bunx/rsync/cwd/bind-mount verification on all three images |
+| F21 | Candidate sync and CI plumbing | Exact-SHA/freshness publication, reusable release CI, one Core convenience-tag owner |
+| F22 | Upstream extracted architecture registrations | Retire dead migration registrations; exact strict footprint and full path reconciliation |
+| F23 | Version-owned runtime/editor fields | Additional v1 freeze and v2/v3/default/alias parity checks |
+
+The operator integration fixture now uses an ephemeral listener because its inherited fixed port was occupied on this host. Production operator ports are unchanged. No additional product scope is introduced.
 
 ## Feature decisions
 

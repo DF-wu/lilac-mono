@@ -1,6 +1,6 @@
-# Exact upstream-owned footprint after the PR #101 integration.
-# Each row records a retained fork seam. Fork-owned additions are in the full path inventory.
-# Validate the merged HEAD with bun run fork:footprint -- --strict.
+# Exact upstream-owned footprint after PR #101 and its follow-up.
+# Fork additions and every refreshed-baseline path are in docs/fork-integration-20261111/PATH-INVENTORY.md.
+# Validate with bun run fork:footprint -- --strict.
 
 .env.example  # documents fork-only environment variables
 .github/workflows/ci.yml  # container variant matrix and the upstream-footprint job
@@ -8,7 +8,7 @@
 .gitignore  # ignores local agent state directories
 .oxfmtrc.json  # ignores local agent state directories
 Dockerfile  # container identity variants (CONTAINER_USER/UID build args)
-MIGRATIONS.md  # documents fork v2 config keys (surface.telegram) and the removed tools.generate block
+MIGRATIONS.md  # F16/F23: offline historical blob cutover, current compatibility and rollback boundaries
 PROJECT.md  # documents the Telegram surface and the OpenAI-compatible image script provider
 README.md  # fork entry point; describes fork features and maintenance
 __tests__/docker-build-script.test.ts  # covers the container identity variants
@@ -71,6 +71,7 @@ apps/core/tests/surface/bridge/adapter-event-projection.test.ts  # Telegram adap
 apps/core/tests/surface/bridge/bus-agent-runner-auto-inject.test.ts  # F01–F08/F14/F15: Surface registration/origin/resource seams on current upstream shared owners
 apps/core/tests/surface/bridge/bus-agent-runner.test.ts  # Telegram authority
 apps/core/tests/surface/bridge/subscribe-from-bus.test.ts  # platform-generic relay refs
+apps/core/tests/surface/native/operator-integration.test.ts  # Inherited verification: Real operator gateway fixture uses an ephemeral listener, preserving production port
 apps/core/tests/surface/native/resources-live.test.ts  # verifies exclusive concurrent saves without assuming asynchronous authorization order
 apps/core/tests/surface/operation-contract.test.ts  # resolve-attachment operation
 apps/core/tests/surface/runtime-descriptor.test.ts  # Telegram descriptor

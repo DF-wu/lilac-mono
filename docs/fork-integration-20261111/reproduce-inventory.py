@@ -7,6 +7,7 @@ from pathlib import Path
 
 BASE = "05c41baa7a45b728d1722d69d5e55d5dc9e580b4"
 FORK = "3c01ce2c29a66fa9be573f573c9865b7cb20c030"
+REFRESHED_FORK = "2e5159be7b23fa34a25a517275d20f327858f9f7"
 UPSTREAM = "3493c0c6c06260e6c472bd230dc02d4b0308db43"
 OUT = Path(__file__).resolve().parent
 ROOT = Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip())
@@ -25,13 +26,15 @@ def owner(path):
     p = path.lower()
     if p.startswith("docs/fork-integration-20261111/"):
         return "Integration evidence", "Inventory, source decisions, migration, review and verification evidence", "Report/source reconciliation"
+    if path not in original and path not in remaining and path not in followup:
+        return "Inherited upstream", "Already landed through PR #101; candidate preserves the current upstream owner", "Full repository checks and applicable workspace tests"
     if p == "migrations.md":
         return "F07/F16/F23", "Shared schema transitions and explicit offline support boundary", "Migration, workflow reopen, config parity and backup/restore fixtures"
-    if "migration" in p or "frozen-graceful" in p or "startup-blob" in p:
+    if "migration" in p or "frozen-graceful" in p or "startup-blob" in p or "legacy-transient-blob-state" in p or "migrate-blob-storage" in p:
         return "F16", "Offline baseline replaces removed runtime legacy migration machinery", "Disposable historical migration and backup/restore fixtures"
     if p.startswith(".serena/") or p in (".gitignore", ".oxfmtrc.json"):
         return "Developer metadata", "Preserve existing developer metadata without including local WIP", "Diff review; no runtime behavior"
-    if p.startswith("scripts/architecture/") or p.startswith("scripts/fork/") or "footprint" in p or p == "scripts/run-gates.ts":
+    if p.startswith("scripts/architecture/") or p.startswith("scripts/fork/") or p.startswith("scripts/oxlint-plugins/") or "footprint" in p or p == "scripts/run-gates.ts":
         return "F22", "Exact current architecture and upstream footprint ownership", "Architecture, lint-rule/type checks and strict footprint"
     if p.startswith(".github/") or "release-gate" in p or "fork-delivery-workflows" in p:
         return "F21", "Verified candidate, publication freshness and single image-tag ownership", "Release/sync gates and CI relationship tests"
@@ -97,11 +100,15 @@ def owner(path):
 
 
 original = paths("diff", "--name-only", "--no-renames", BASE, FORK)
+since_audit = paths("diff", "--name-only", "--no-renames", FORK, REFRESHED_FORK)
 remaining = paths("diff", "--name-only", "--no-renames", UPSTREAM)
 remaining |= paths("ls-files", "--others", "--exclude-standard")
 remaining |= {str((OUT / name).relative_to(ROOT)) for name in ("PATH-INVENTORY.md", "path-inventory.json", "UPSTREAM-COMMITS.md")}
+followup = paths("diff", "--name-only", "--no-renames", REFRESHED_FORK)
+followup |= paths("ls-files", "--others", "--exclude-standard")
+followup |= {str((OUT / name).relative_to(ROOT)) for name in ("PATH-INVENTORY.md", "path-inventory.json", "UPSTREAM-COMMITS.md")}
 rows = []
-for path in sorted(original | remaining):
+for path in sorted(original | remaining | since_audit | followup):
     feature, reason, checks = owner(path)
     exists = (ROOT / path).exists()
     upstream_exists = bool(git("ls-tree", UPSTREAM, "--", path))
@@ -112,24 +119,27 @@ for path in sorted(original | remaining):
     else:
         disposition = "Retained/refactored" if path in original else "Integration adaptation/evidence"
     rows.append(dict(path=path, original=path in original, remaining=path in remaining,
+                     changedSinceAudit=path in since_audit, followup=path in followup,
                      upstreamOwned=upstream_exists, formerUpstreamOwned=bool(git("ls-tree", BASE, "--", path)), feature=feature, disposition=disposition,
                      reason=reason, checks=checks))
 
-payload = dict(base=BASE, fork=FORK, upstream=UPSTREAM, originalPaths=len(original),
-               remainingPaths=len(remaining), unionPaths=len(rows), rows=rows)
+payload = dict(base=BASE, fork=FORK, refreshedFork=REFRESHED_FORK, upstream=UPSTREAM,
+               originalPaths=len(original), changedSinceAuditPaths=len(since_audit),
+               remainingPaths=len(remaining), followupPaths=len(followup), unionPaths=len(rows), rows=rows)
 (OUT / "path-inventory.json").write_text(json.dumps(payload, indent=2) + "\n")
-lines = ["# Complete fork-path inventory", "", f"Pins: fork `{FORK}`, upstream `{UPSTREAM}`, prior base `{BASE}`.", "",
-         f"This accounts for all {len(original)} original fork paths and all {len(remaining)} remaining upstream-to-integrated-tree differences ({len(rows)} union paths).",
+lines = ["# Complete fork-path inventory", "", f"Pins: original fork `{FORK}`, refreshed main `{REFRESHED_FORK}`, upstream `{UPSTREAM}`, prior base `{BASE}`.", "",
+         f"This accounts for all {len(original)} original fork paths, all {len(since_audit)} paths changed by the externally merged PR #101 since that fork pin, all {len(remaining)} remaining upstream-to-integrated-tree differences, and all {len(followup)} follow-up paths ({len(rows)} union paths).",
          "No path is inferred from commit subjects. A path matching upstream is inherited; a removed legacy path has an explicit offline support boundary. Each row names its feature/evidence owner and relevant regression family. Executed outcomes and limits are in the verification and domain reports.", "",
          "Regenerate from the candidate root with `python3 docs/fork-integration-20261111/reproduce-inventory.py`. This reads pinned Git objects and the current candidate working tree, including new tracked-intent reports; it does not inspect runtime data.", "",
-         "| Path | Original | Remaining | Source owner | Feature | Disposition | Reason | Regression family |",
-         "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+         "`Since audit` compares the two fork pins; `Follow-up` compares refreshed main with this candidate. Deleted obsolete migration files appear even when both upstream and the candidate omit them. These sets are deliberately distinct.", "",
+         "| Path | Original | Since audit | Remaining | Follow-up | Source owner | Feature | Disposition | Reason | Regression family |",
+         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
 for row in rows:
     link = f"[{row['path']}](../../{row['path']})" if (ROOT / row['path']).exists() else f"`{row['path']}`"
-    lines.append(f"| {link} | {'yes' if row['original'] else 'no'} | {'yes' if row['remaining'] else 'no'} | {'Upstream seam' if row['upstreamOwned'] else 'Former upstream owner' if row['formerUpstreamOwned'] else 'Fork addition'} | {row['feature']} | {row['disposition']} | {row['reason']} | {row['checks']} |")
+    lines.append(f"| {link} | {'yes' if row['original'] else 'no'} | {'yes' if row['changedSinceAudit'] else 'no'} | {'yes' if row['remaining'] else 'no'} | {'yes' if row['followup'] else 'no'} | {'Upstream seam' if row['upstreamOwned'] else 'Former upstream owner' if row['formerUpstreamOwned'] else 'Fork addition'} | {row['feature']} | {row['disposition']} | {row['reason']} | {row['checks']} |")
 (OUT / "PATH-INVENTORY.md").write_text("\n".join(lines) + "\n")
 commits = git("log", "--reverse", "--format=%H%x09%s", f"{FORK}..{UPSTREAM}").splitlines()
-lines = ["# Upstream commits covered", "", f"All {len(commits)} commits reachable from `{UPSTREAM}` but absent from fork baseline `{FORK}` are included by the integration merge.", "", "| Commit | Subject |", "| --- | --- |"]
+lines = ["# Upstream commits covered", "", f"All {len(commits)} commits reachable from `{UPSTREAM}` but absent from fork baseline `{FORK}` already landed in externally merged PR #101 and remain ancestors of this follow-up. Refreshed main is `{REFRESHED_FORK}`. No additional upstream commit arrived after the original audit pin.", "", "| Commit | Subject |", "| --- | --- |"]
 for commit in commits:
     sha, subject = commit.split("\t", 1)
     lines.append(f"| [`{sha[:8]}`](https://github.com/stanley2058/lilac-mono/commit/{sha}) | {subject.replace('|', '&#124;')} |")

@@ -44,7 +44,7 @@ into one runtime.
 
 ## Fork Differences
 
-The [November 11 integration inventory](./docs/fork-integration-20261111/README.md) records the exact upstream and fork pins, every retained feature, migration support boundaries, verification, and remaining limitations for PR #101.
+The [November 11 integration inventory](./docs/fork-integration-20261111/README.md) records the exact upstream and fork pins, every retained feature, migration support boundaries, verification, and remaining limitations for PR #101 and its follow-up.
 
 The table below lists only behavior that still differs from upstream. GitHub reply permalinks and comment self-loop protection were accepted upstream and are no longer listed. For the full rationale, limitations, and every pull request opened against upstream, see [`docs/fork-differences.md`](./docs/fork-differences.md).
 

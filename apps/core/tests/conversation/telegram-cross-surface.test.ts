@@ -22,6 +22,7 @@ import {
 import {
   ConversationThreadService,
   createConversationThreadToolService,
+  type ConversationThreadSummarizer,
 } from "../../src/conversation/thread-service";
 import {
   threadSummarizationHydrationRequestSchema,
@@ -46,6 +47,7 @@ let service: ConversationThreadService;
 let pool: ConversationThreadSearchPool;
 let now: number;
 let afterRecall: (() => void) | undefined;
+let summarize: ConversationThreadSummarizer;
 let cfg: ReturnType<typeof parseCoreConfigV2ToUniversal>;
 const aboutness = {
   domains: [],
@@ -126,6 +128,11 @@ beforeEach(async () => {
   dir = await mkdtemp(path.join(tmpdir(), "lilac-telegram-cross-surface-"));
   now = Date.now() - 7_200_000;
   afterRecall = undefined;
+  summarize = async (input) => ({
+    title: "deployment",
+    brief: input.messages.map((m) => m.text).join(" "),
+    topics: ["deployment"],
+  });
   telegram = new TelegramSurfaceStore(path.join(dir, "telegram.db"));
   discord = new DiscordSearchStore(path.join(dir, "search.db"));
   index = new ConversationThreadStore(path.join(dir, "search.db"), {
@@ -155,11 +162,7 @@ beforeEach(async () => {
     searchPool: pool,
     store: index,
     getConfig: async () => cfg,
-    summarizer: async (input) => ({
-      title: "deployment",
-      brief: input.messages.map((m) => m.text).join(" "),
-      topics: ["deployment"],
-    }),
+    summarizer: (input) => summarize(input),
     attachmentHydrator: async () => Result.ok([]),
     getEmbeddingAdapter: async () => ({
       modelId: "test",
@@ -499,6 +502,63 @@ describe("telegram conversation source", () => {
     expect(results).toMatchObject({
       results: [{ surface: "telegram", threadId: `telegram:${CHAT}`, title: "deployment" }],
     });
+  });
+
+  test("multiple Telegram subjects retain their surface, offsets and current entry identity", async () => {
+    const chat = seedChat();
+    summarize = async () => [
+      { startOrdinal: 0, title: "deployment rollout", brief: "rollout plan", topics: [] },
+      { startOrdinal: 1, title: "billing invoice", brief: "invoice dispute", topics: [] },
+    ];
+    expect((await service.runSummarization({ now: Date.now() })).summarized).toBe(1);
+    const billing = (
+      await service.search({ query: "billing", mode: "lexical", verbose: true })
+    ).unwrap().results;
+    expect(billing).toMatchObject([
+      { threadId: chat, entryId: `${chat}#1`, surface: "telegram", offset: 1 },
+    ]);
+    const metadata = (await service.metadata({ threadIds: [chat] })).unwrap().threads[0];
+    expect(metadata).toMatchObject({
+      surface: "telegram",
+      entries: [
+        { title: "deployment rollout", brief: "rollout plan" },
+        { title: "billing invoice", brief: "invoice dispute", offset: 1 },
+      ],
+    });
+    const read = (await service.read({ threadId: chat, offset: billing[0]!.offset })).unwrap();
+    expect(read.thread.surface).toBe("telegram");
+    expect(read.messages.map((message) => message.content)).toEqual(["deployment answer"]);
+
+    const allowlist = { channelIds: [], guildIds: [], telegramChatIds: [CHAT] };
+    const previous = (await pool.hits({ type: "lexical", query: "billing", allowlist })).unwrap();
+    expect(previous).toHaveLength(1);
+    summarize = async () => ({ title: "deployment rollout", brief: "rollout plan", topics: [] });
+    await service.runSummarization({ now: Date.now(), force: true });
+    expect((await pool.hits({ type: "current", hits: previous, allowlist })).unwrap()).toEqual([]);
+    expect((await service.search({ query: "billing", mode: "lexical" })).unwrap().results).toEqual(
+      [],
+    );
+  });
+
+  test("a Telegram edit prevents committing entries summarized from an older revision", () => {
+    const chat = seedChat();
+    index.refreshSourceThreads();
+    const revision = index.getThread(chat)!.summary_input_hash!;
+    upsert({ sessionId: CHAT, messageId: "1", text: "replacement", editedTs: now + 5_000 });
+    const saved = index
+      .upsertSummary(
+        chat,
+        revision,
+        [
+          { title: "deployment", brief: "old rollout", topics: [] },
+          { title: "billing", brief: "old invoice", topics: [], anchorMessageId: "2" },
+        ],
+        null,
+        { ifCurrent: true },
+      )
+      .unwrap();
+    expect(saved).toBeNull();
+    expect(index.listSummaryEntries(chat).unwrap()).toEqual([]);
   });
 });
 
