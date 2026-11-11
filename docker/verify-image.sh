@@ -16,9 +16,13 @@ readonly expected_uid=${3:-1000}
 container_name="lilac-image-verify-$(date +%s)-$$-${RANDOM}"
 readonly container_name
 readonly log_marker="lilac-direct-output-${container_name}"
+readonly mount_dir=$(mktemp -d)
+chmod 0777 "$mount_dir"
+printf '%s\n' 'readable-bind-mount' > "$mount_dir/input"
 
 cleanup() {
   docker rm --force "$container_name" >/dev/null 2>&1 || true
+  rm -rf "$mount_dir"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -35,6 +39,7 @@ docker run --detach \
   --pids-limit 1024 \
   --stop-timeout 30 \
   --no-healthcheck \
+  --mount "type=bind,src=$mount_dir,dst=/mnt/lilac-image-verification" \
   --env LILAC_USER=runtime-override-must-not-win \
   --env LILAC_UID=9999 \
   --env LILAC_GID=9999 \
@@ -140,6 +145,21 @@ operator_output=$(docker exec \
   fail "operator CLI did not load its token before the expected connection failure"
 docker exec --user "$runtime_user" "$container_name" /usr/local/bin/bun --version >/dev/null ||
   fail "Bun smoke failed"
+runtime_bun_version=$(docker exec --user "$runtime_user" "$container_name" /usr/local/bin/bun --version)
+expected_bun_version=$(docker exec "$container_name" /usr/bin/node -p 'require("/app/package.json").packageManager.replace(/^bun@/, "")')
+[[ $runtime_bun_version == "$expected_bun_version" ]] || fail "Bun does not match packageManager"
+docker exec --user "$runtime_user" "$container_name" /bin/sh -c \
+  'test "$(command -v bunx)" = /usr/local/bin/bunx && test "$(readlink /usr/local/bin/bunx)" = bun' ||
+  fail "runtime bunx does not select the trusted Bun executable"
+docker exec --user "$runtime_user" "$container_name" /usr/bin/rsync --version >/dev/null ||
+  fail "rsync smoke failed"
+runtime_cwd=$(docker exec --user "$runtime_user" "$container_name" /bin/pwd)
+[[ $runtime_cwd == /app ]] || fail "runtime working directory is $runtime_cwd, expected /app"
+docker exec --user "$runtime_user" "$container_name" /bin/sh -c \
+  'test "$(cat /mnt/lilac-image-verification/input)" = readable-bind-mount && printf "%s\n" writable-bind-mount > /mnt/lilac-image-verification/output' ||
+  fail "runtime identity cannot read and write a bind mount"
+mount_owner=$(docker exec "$container_name" /usr/bin/stat --format='%u:%g' /mnt/lilac-image-verification/output)
+[[ $mount_owner == "$expected_uid:$expected_uid" ]] || fail "bind-mount output has the wrong owner"
 docker exec --user "$runtime_user" "$container_name" /usr/local/bin/bun -e \
   'await import("./apps/core/src/surface/native/runtime.ts")' >/dev/null || \
   fail "native runtime dependencies are incomplete"

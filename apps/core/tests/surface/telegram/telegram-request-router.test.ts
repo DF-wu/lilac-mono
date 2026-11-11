@@ -3,6 +3,14 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Result } from "better-result";
+import { AiSdkPiAgent } from "@stanley2058/lilac-agent";
+import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
+import { MockLanguageModelV4 } from "ai/test";
+import {
+  corePrimaryTestPluginManager,
+  level1TextStep,
+  startBusAgentRunner,
+} from "../bridge/bus-agent-runner-test-support";
 
 import {
   EventDeliveryStartFailed,
@@ -670,6 +678,143 @@ describe("the Telegram request router", () => {
 });
 
 describe("the Telegram request router in an active group", () => {
+  it("supersedes a batch whose gate is still pending when a mention arrives", async () => {
+    const enteredGate = Promise.withResolvers<void>();
+    const decision = Promise.withResolvers<RouterGateDecision>();
+    const { bus, published, router } = await startRouter(new FakeTelegramAdapter(), {
+      config: routerConfig({ sessionModes: { [CHAT]: { mode: "active", gate: true } } }),
+      routerGate: async () => {
+        enteredGate.resolve();
+        return decision.promise;
+      },
+    });
+
+    try {
+      await publishTelegramMessage(bus, {
+        messageId: "30",
+        text: "pending thought",
+        raw: groupRaw("30"),
+      });
+      await enteredGate.promise;
+      await publishTelegramMessage(bus, {
+        messageId: "31",
+        text: "@catalina help",
+        raw: groupRaw("31", { mentionsBot: true }),
+      });
+      await waitForPublish(published);
+      decision.resolve({ forward: true, reason: "accepted" });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(published).toHaveLength(1);
+      expect(published[0]?.headers?.request_id).toBe(`telegram:${CHAT}:31`);
+    } finally {
+      decision.resolve({ forward: false, reason: "cleanup" });
+      await router.stop();
+    }
+  });
+
+  it("publishes a claimed batch before its arriving mention can steer", async () => {
+    const composing = Promise.withResolvers<void>();
+    const continueComposition = Promise.withResolvers<void>();
+    class PausedTelegramAdapter extends FakeTelegramAdapter {
+      override async readMsg(ref: MsgRef) {
+        if (ref.messageId === "30") {
+          composing.resolve();
+          await continueComposition.promise;
+        }
+        return super.readMsg(ref);
+      }
+    }
+    const { bus, published, router } = await startRouter(new PausedTelegramAdapter());
+    const firstInput = Promise.withResolvers<string>();
+    const pluginManager = corePrimaryTestPluginManager();
+    const runner = await startBusAgentRunner({
+      bus,
+      blobStore: await getTestBlobStore(),
+      subscriptionId: "telegram-claimed-batch-order",
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      reportFatalPanic: (panic) => firstInput.reject(panic),
+      issueControlCapability: () => ({ capability: "telegram-order-fixture", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "telegram-order-fixture",
+            doStream: async (options) => {
+              firstInput.resolve(JSON.stringify(options.prompt));
+              return level1TextStep("fixture response");
+            },
+          }),
+        }),
+    });
+
+    try {
+      await publishTelegramMessage(bus, {
+        messageId: "30",
+        text: "pending thought",
+        raw: groupRaw("30"),
+      });
+      await composing.promise;
+      const mention = publishTelegramMessage(bus, {
+        messageId: "31",
+        text: "@catalina help",
+        raw: groupRaw("31", { mentionsBot: true }),
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      continueComposition.resolve();
+      await mention;
+      await waitForPublishCount(published, 2);
+
+      expect(published.map((message) => requestData(message).queue)).toEqual(["prompt", "steer"]);
+      expect(published[0]?.headers?.request_id).toBe(published[1]?.headers?.request_id);
+      expect(await firstInput.promise).toContain("pending thought");
+    } finally {
+      continueComposition.resolve();
+      await router.stop();
+      await runner.stop();
+      await pluginManager.destroy();
+    }
+  });
+
+  it("reroutes a waiting mention after its batch composition fails", async () => {
+    const failedRead = Promise.withResolvers<void>();
+    const failComposition = Promise.withResolvers<void>();
+    class FailingTelegramAdapter extends FakeTelegramAdapter {
+      override async readMsg(ref: MsgRef) {
+        if (ref.messageId === "30") {
+          failedRead.resolve();
+          await failComposition.promise;
+          throw new Error("history unavailable");
+        }
+        return super.readMsg(ref);
+      }
+    }
+    const { bus, published, router } = await startRouter(new FailingTelegramAdapter());
+    try {
+      await publishTelegramMessage(bus, {
+        messageId: "30",
+        text: "pending thought",
+        raw: groupRaw("30"),
+      });
+      await failedRead.promise;
+      const mention = publishTelegramMessage(bus, {
+        messageId: "31",
+        text: "@catalina help",
+        raw: groupRaw("31", { mentionsBot: true }),
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      failComposition.resolve();
+      await mention;
+      const request = await waitForPublish(published);
+      expect(requestData(request).queue).toBe("prompt");
+      expect(request.headers?.request_id).toBe(`telegram:${CHAT}:31`);
+    } finally {
+      failComposition.resolve();
+      await router.stop();
+    }
+  });
+
   it("forwards every buffered message of a debounce batch as one request", async () => {
     const adapter = new FakeTelegramAdapter({
       [`${CHAT}:30`]: surfaceMessage({

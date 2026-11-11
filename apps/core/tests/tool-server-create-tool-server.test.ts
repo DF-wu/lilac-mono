@@ -1127,6 +1127,22 @@ describe("createToolServer", () => {
           message: "Tool 'surface.messages.send' is not allowed in restricted public-session mode",
         },
       });
+      for (const input of [
+        { client: "discord", sessionId: originSessionId, text: "blocked equal alias" },
+        { client: "discord", text: "blocked implicit origin" },
+      ]) {
+        const crossClient = await server.app.handle(
+          new Request("http://localhost/call", {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ callableId: "surface.messages.send", input }),
+          }),
+        );
+        expect(await crossClient.json()).toMatchObject({
+          status: "error",
+          error: { kind: "denied" },
+        });
+      }
       expect(calls).toHaveLength(1);
     } finally {
       await server.stop();

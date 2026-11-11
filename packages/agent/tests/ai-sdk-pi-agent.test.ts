@@ -634,6 +634,131 @@ describe("AiSdkPiAgent model spec tracking", () => {
     ).toBe(true);
   });
 
+  it("executes only valid local siblings once when other accompanies malformed and provider-executed calls", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              ...["local-1", "local-2"].map((toolCallId) => ({
+                type: "tool-call" as const,
+                toolCallId,
+                toolName: "read",
+                input: "{}",
+              })),
+              {
+                type: "tool-call",
+                toolCallId: "malformed",
+                toolName: "read",
+                input: "{",
+              },
+              {
+                type: "tool-call",
+                toolCallId: "provider-call",
+                toolName: "remote",
+                input: "{}",
+                providerExecuted: true,
+              },
+              {
+                type: "tool-result",
+                toolCallId: "provider-call",
+                toolName: "remote",
+                result: "provider output",
+                providerExecuted: true,
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "other", raw: "unusual_finish" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        textStream("done", "done"),
+      ],
+    });
+    const executions: string[] = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        read: tool({
+          inputSchema: jsonSchema({ type: "object" }),
+          execute: (_input, { toolCallId }) => {
+            executions.push(toolCallId);
+            return `local output ${toolCallId}`;
+          },
+        }),
+        remote: tool({
+          inputSchema: jsonSchema({ type: "object" }),
+          execute: (): string => {
+            throw new Error("Provider-executed calls must not execute locally");
+          },
+        }),
+      },
+    });
+    await agent.prompt("run the parallel calls");
+    expect(executions.toSorted()).toEqual(["local-1", "local-2"]);
+    expect(model.doStreamCalls).toHaveLength(2);
+    const serialized = JSON.stringify(agent.state.messages);
+    expect(serialized).toContain("provider output");
+    expect(serialized).toContain("local output local-1");
+    expect(serialized).toContain("local output local-2");
+    const results = agent.state.messages.flatMap((message) => {
+      if (message.role !== "tool") return [];
+      return message.content.filter((part) => part.type === "tool-result");
+    });
+    expect(results.filter((part) => part.toolCallId === "local-1")).toHaveLength(1);
+    expect(results.filter((part) => part.toolCallId === "local-2")).toHaveLength(1);
+    expect(results.find((part) => part.toolCallId === "malformed")?.output.type).toBe("error-text");
+  });
+
+  it("recovers length truncation without executing its parsed local calls", async () => {
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "tool-call", toolCallId: "truncated", toolName: "read", input: "{}" },
+              {
+                type: "finish",
+                finishReason: { unified: "length", raw: "length" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        textStream("recovery", "recovered without execution"),
+      ],
+    });
+    let executions = 0;
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        read: tool({
+          inputSchema: jsonSchema({ type: "object" }),
+          execute: () => {
+            executions += 1;
+            return "unexpected execution";
+          },
+        }),
+      },
+    });
+    await agent.prompt("read safely");
+    expect(executions).toBe(0);
+    expect(model.doStreamCalls).toHaveLength(2);
+    const toolMessage = agent.state.messages.find((message) => message.role === "tool");
+    expect(toolMessage?.content[0]).toMatchObject({
+      toolCallId: "truncated",
+      output: { type: "error-text", value: expect.stringContaining("truncated") },
+    });
+    expect(agent.state.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: [{ type: "text", text: "recovered without execution" }],
+    });
+  });
+
   it("serializes non-finite successful tool outputs through JSON fallback", async () => {
     const model = new MockLanguageModelV4({
       doStream: [

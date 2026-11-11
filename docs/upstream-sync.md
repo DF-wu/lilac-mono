@@ -20,7 +20,7 @@ conflict review branch needs one extra repository secret,
    create a PR, invoke Claude, or repair anything automatically.
 3. **Publish:** after CI succeeds, verify that remote `main` still equals the
    pinned baseline. Fast-forward `main` to the verified candidate with an
-   ordinary push, explicitly dispatch `build-image.yml`, and delete this run's
+   ordinary push, call the reusable `build-image.yml` with that exact verified SHA, and delete this run's
    candidate branch. If `main` moved, stop and retain the candidate for a later
    run to re-evaluate. Branch rules still apply to this push.
 4. **Git conflict:** write original upstream commits to
@@ -50,7 +50,7 @@ integrated human changes in `main`; unmerged work is retained.
 
 The built-in `GITHUB_TOKEN` does not trigger normal push/PR workflow events.
 Clean candidates therefore use reusable CI rather than relying on a push event,
-and successful main updates explicitly dispatch image publication. Creating
+and successful main updates pass the same candidate to reusable image publication after verification and fast-forward. Creating
 the conflict PR does not imply CI passed. A human must resolve it and run CI on
 the integrated result; a human branch push triggers the normal PR CI, and
 `ci.yml` also supports manual dispatch. GitHub must permit Actions to create

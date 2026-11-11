@@ -99,7 +99,7 @@ jobs:
       - name: Check modified upstream files against the allowlist
         env:
           LILAC_UPSTREAM_REF: FETCH_HEAD
-        run: bun run fork:footprint
+        run: bun run fork:footprint -- --strict
 
   docker-image:
     name: Docker image smoke (${{ matrix.variant.name }})
@@ -136,6 +136,8 @@ jobs:
           build-args: |
             CONTAINER_USER=${{ matrix.variant.container_user }}
             CONTAINER_UID=${{ matrix.variant.container_uid }}
+            LILAC_BUILD_COMMIT=${{ inputs.ref || github.sha }}
+            LILAC_BUILD_DIRTY=false
           tags: lilac:ci-${{ matrix.variant.name }}
           cache-from: type=gha,scope=ci-lilac-mono-amd64-${{ matrix.variant.name }}
           cache-to: type=gha,mode=max,scope=ci-lilac-mono-amd64-${{ matrix.variant.name }}

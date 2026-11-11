@@ -389,10 +389,10 @@ Runtime startup does not open `graceful-restart.db`. Existing files are inert. T
 migration keeps a frozen graceful-snapshot decoder only so it can classify and discard supported legacy
 blob-bearing snapshots; runtime code has no graceful-snapshot import path.
 
-The fork's default Docker entrypoint runs `apps/core/scripts/startup-blob-storage-migration.ts`
-before Core to coordinate the supported legacy transcript/workflow migration and immutable backup.
-`startup-blob-storage-backup.ts` owns that backup; `runtime/main.ts` and `startCoreRuntime` own
-Core startup settlement and do not invoke the migration. See [migration and rollback rules](MIGRATIONS.md#automatic-transcript-and-workflow-blob-migration).
+Legacy blob migration is an explicit offline operation at historical upstream commit
+`f2c90667ac5616796c992602ca5fb5be726cf40d`; the current Docker entrypoint does not migrate or
+create a backup. `runtime/main.ts` and `startCoreRuntime` own typed Core startup settlement.
+See [the supported cutover and rollback procedure](docs/fork-integration-20261111/migration.md).
 
 Redis Streams is separate durable bus state. Project workflow source lives in each project's `.lilac/workflows`, outside `DATA_DIR`. The workspace operated on by tools is user data, not Lilac metadata.
 

@@ -1,11 +1,16 @@
 import { lengthRecoveryContinueMessage } from "../agent-runtime-support";
 import { Result } from "better-result";
-import { AgentStateTransitionFailed } from "../agent-runtime-support";
+import {
+  AgentStateTransitionFailed,
+  type NormalizeToolResultOutputFn,
+} from "../agent-runtime-support";
 import { describe, expect, it, spyOn } from "bun:test";
 import { jsonSchema, tool, type LanguageModel, type ModelMessage } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 
 import { ModelCapability } from "@stanley2058/lilac-utils/model-capability";
+import { env } from "@stanley2058/lilac-utils/env";
+import { getModelProviders } from "@stanley2058/lilac-utils/model-provider";
 
 import {
   attachAutoCompaction,
@@ -337,6 +342,170 @@ describe("auto-compaction internals", () => {
     expect(JSON.stringify(agent.state.messages)).not.toContain("context-compaction");
   });
 
+  it("retains multipart active input and paired tool images through repeated compaction and checkpoint resume", async () => {
+    const currentInput: ModelMessage = {
+      role: "user",
+      content: [
+        { type: "text", text: "Keep these exact parts throughout the active request.\n  spacing" },
+        {
+          type: "file",
+          data: new Uint8Array([1, 2, 3]),
+          mediaType: "image/png",
+          providerOptions: { test: { detail: "original" } },
+        },
+        {
+          type: "file",
+          data: new Uint8Array([4, 5, 6]),
+          mediaType: "application/pdf",
+          filename: "original.pdf",
+          providerOptions: { test: { source: "active-input" } },
+        },
+      ],
+      providerOptions: { test: { inputId: "protected-input" } },
+    };
+    const originalInput = structuredClone(currentInput);
+    const checkpoints: ModelMessage[][] = [];
+    const suffixStarts: number[] = [];
+    let toolRounds = 0;
+    const mainModel = new MockLanguageModelV4({
+      doStream: async () => {
+        if (toolRounds === 2) return summaryResponse("completed active request");
+        toolRounds += 1;
+        return {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call",
+                toolCallId: `protected-${toolRounds}`,
+                toolName: "read",
+                input: "{}",
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                usage: {
+                  ...zeroUsage(),
+                  inputTokens: { total: 9_000, noCache: 9_000, cacheRead: 0, cacheWrite: 0 },
+                },
+              },
+            ],
+          }),
+        };
+      },
+    });
+    const executions: string[] = [];
+    const tools = {
+      read: tool({
+        inputSchema: jsonSchema({ type: "object" }),
+        execute: (_input, { toolCallId }) => {
+          executions.push(toolCallId);
+          return toolCallId;
+        },
+      }),
+    };
+    const normalizeToolResultOutput: NormalizeToolResultOutputFn = (_output, { toolCallId }) => ({
+      type: "content",
+      value: [
+        { type: "text", text: `exact output ${toolCallId}` },
+        {
+          type: "file",
+          mediaType: "image/png",
+          filename: `${toolCallId}.png`,
+          data: { type: "data", data: "AQID" },
+          providerOptions: { test: { source: toolCallId } },
+        },
+      ],
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: `older input ${"a".repeat(20_000)}` },
+        { role: "user", content: `adjacent older input ${"b".repeat(8_000)}` },
+      ],
+      tools,
+      normalizeToolResultOutput,
+      recoveryCheckpointHandler: (messages) => {
+        checkpoints.push(structuredClone([...messages]));
+      },
+    });
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => summaryResponse("older context"),
+    });
+    const resolveCurrentInputCanonicalStart = (messages: readonly ModelMessage[]) => {
+      const start = messages.findIndex(
+        (message) => message.providerOptions?.test?.inputId === "protected-input",
+      );
+      if (start === -1) throw new Error("Active input was lost");
+      return start;
+    };
+    const options = {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      keepRecentTokens: 0,
+      keepRecentTurns: 1,
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+      resolveCurrentInputCanonicalStart,
+    };
+    const detach = await attachAutoCompaction(agent, {
+      ...options,
+      onCompactionEnd: (event) => {
+        if (event.status !== "completed" || !event.canonicalReplacement) return;
+        suffixStarts.push(event.canonicalReplacement.originalSuffixStart);
+      },
+    });
+    try {
+      await agent.prompt(currentInput);
+    } finally {
+      detach();
+    }
+    expect(suffixStarts).toEqual([2, 1]);
+    expect(summaryModel.doStreamCalls).toHaveLength(2);
+    expect(JSON.stringify(summaryModel.doStreamCalls)).not.toContain("protected-input");
+    expect(JSON.stringify(summaryModel.doStreamCalls)).not.toContain("exact output protected-");
+    expect(agent.state.messages[1]).toEqual(originalInput);
+    expect(currentInput).toEqual(originalInput);
+    expect(executions).toEqual(["protected-1", "protected-2"]);
+    for (const call of mainModel.doStreamCalls) {
+      expect(__autoCompactionInternals.isValidSuffix(call.prompt, 0)).toBe(true);
+    }
+    const checkpoint = checkpoints.findLast(
+      (messages) => messages.at(-1)?.role === "tool" && messages.length === 6,
+    );
+    expect(checkpoint).toBeDefined();
+    expect(checkpoint?.[1]).toEqual(originalInput);
+    const retainedToolMessages = structuredClone(
+      checkpoint!.filter((message) => message.role === "tool"),
+    );
+    expect(retainedToolMessages).toHaveLength(2);
+    const resumedModel = new MockLanguageModelV4({
+      doStream: summaryResponse("resumed exactly once"),
+    });
+    const resumed = new AiSdkPiAgent({
+      system: "test",
+      model: resumedModel,
+      messages: checkpoint,
+      tools,
+      normalizeToolResultOutput,
+    });
+    const detachResumed = await attachAutoCompaction(resumed, { ...options, compactOnStart: true });
+    try {
+      await resumed.continue();
+    } finally {
+      detachResumed();
+    }
+    expect(resumed.state.messages[1]).toEqual(originalInput);
+    expect(resumed.state.messages.filter((message) => message.role === "tool")).toEqual(
+      retainedToolMessages,
+    );
+    expect(executions).toEqual(["protected-1", "protected-2"]);
+    expect(__autoCompactionInternals.isValidSuffix(resumedModel.doStreamCalls[0]!.prompt, 0)).toBe(
+      true,
+    );
+  });
+
   it.each([0, 100])(
     "compacts an older prefix while preserving current input with a %i-token tail cap",
     async (keepRecentTokens) => {
@@ -377,6 +546,121 @@ describe("auto-compaction internals", () => {
       );
     },
   );
+
+  it("projects compacted tool images only into the compatible Chat request", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalCompatible = { ...env.providers.openaiCompatible };
+    const requests: Array<{ messages: Array<Record<string, any>> }> = [];
+    Object.assign(env.providers.openaiCompatible, {
+      baseUrl: "https://compatible.test/v1",
+      apiKey: "fixture-key",
+    });
+    globalThis.fetch = (async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      const response = {
+        id: "image-projection",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: "test-model",
+        choices: [{ index: 0, delta: { content: "inspected" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 100, completion_tokens: 1, total_tokens: 101 },
+      };
+      return new Response(`data: ${JSON.stringify(response)}\n\ndata: [DONE]\n\n`, {
+        headers: { "content-type": "text/event-stream" },
+      });
+    }) as typeof fetch;
+    let detach = () => {};
+    try {
+      const activeMessages: ModelMessage[] = [
+        { role: "user", content: "inspect these retained tool images" },
+        {
+          role: "assistant",
+          content: ["first", "second"].map((toolCallId) => ({
+            type: "tool-call",
+            toolCallId,
+            toolName: "read",
+            input: {},
+          })),
+        },
+        ...["first", "second"].map(
+          (toolCallId): ModelMessage => ({
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId,
+                toolName: "read",
+                output: {
+                  type: "content",
+                  value: [
+                    { type: "text", text: `${toolCallId} crop` },
+                    {
+                      type: "file",
+                      mediaType: "image/png",
+                      filename: `${toolCallId}.png`,
+                      data: { type: "data", data: "AQID" },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+        ),
+      ];
+      const originalActive = structuredClone(activeMessages);
+      const agent = new AiSdkPiAgent({
+        system: "test",
+        model: getModelProviders()["openai-compatible"]!("test-model"),
+        messages: [
+          { role: "user", content: "older request".repeat(2_000) },
+          { role: "assistant", content: "older answer" },
+          ...activeMessages,
+        ],
+      });
+      detach = await attachAutoCompaction(agent, {
+        model: "openai-compatible/test-model",
+        modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+        summaryModel: new MockLanguageModelV4({
+          doStream: async () => summaryResponse("older summary"),
+        }),
+        thresholdInputSource: "transcript-estimate",
+        keepRecentTokens: 0,
+        resolveContextLimit: async () => ({ context: 5_000, output: 1_000 }),
+        resolveCurrentInputCanonicalStart: (messages) =>
+          messages.findIndex(
+            (message) =>
+              message.role === "user" && message.content === "inspect these retained tool images",
+          ),
+      });
+      await agent.continue();
+      expect(agent.state.messages.slice(1, 5)).toEqual(originalActive);
+      expect(activeMessages).toEqual(originalActive);
+      const messages = requests[0]!.messages;
+      expect(messages.map((message) => message.role)).toEqual([
+        "system",
+        "user",
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+        "user",
+      ]);
+      expect(JSON.stringify(messages)).toContain("older summary");
+      expect(JSON.stringify(messages.filter((message) => message.role === "tool"))).not.toContain(
+        "AQID",
+      );
+      const images = messages.at(-1)!.content;
+      expect(images.filter((part: { type: string }) => part.type === "image_url")).toHaveLength(2);
+      expect(JSON.stringify(images)).toContain("tool-returned data");
+      expect(JSON.stringify(images)).toContain("first.png");
+      expect(JSON.stringify(images)).toContain("second.png");
+      expect(agent.state.messages.filter((message) => message.role === "user")).toHaveLength(2);
+    } finally {
+      detach();
+      globalThis.fetch = originalFetch;
+      Object.assign(env.providers.openaiCompatible, originalCompatible);
+    }
+  });
 
   it("still fails real overflow when the current request cannot be compacted", async () => {
     const mainModel = new MockLanguageModelV4({
@@ -2046,9 +2330,25 @@ describe("auto-compaction internals", () => {
     ).toThrow("Compaction could not fit bounded context within the input budget");
   });
 
-  it("activates a generated server-compaction view so rejection retries its portable summary", async () => {
+  it("keeps protected multipart input when generated server-compaction replay falls back to its portable summary", async () => {
     const nativeReplayError = new Error("generated native replay rejected");
     const prompts: string[] = [];
+    const currentInput: ModelMessage = {
+      role: "user",
+      content: [
+        { type: "text", text: "latest request remains verbatim\n  exact spacing" },
+        {
+          type: "file",
+          mediaType: "application/pdf",
+          filename: "active.pdf",
+          data: new Uint8Array([7, 8, 9]),
+          providerOptions: { test: { source: "original-current-input" } },
+        },
+      ],
+      providerOptions: { test: { inputId: "server-protected-input" } },
+    };
+    const originalInput = structuredClone(currentInput);
+    const serverInputs: ModelMessage[][] = [];
     let mainCalls = 0;
     const mainModel = new MockLanguageModelV4({
       doStream: async ({ prompt }) => {
@@ -2089,11 +2389,18 @@ describe("auto-compaction internals", () => {
       thresholdInputSource: "transcript-estimate",
       thresholdFraction: 0.25,
       keepRecentTurns: 1,
-      keepRecentTokens: 100,
+      keepRecentTokens: 0,
       resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+      resolveCurrentInputCanonicalStart: (messages) =>
+        messages.findIndex(
+          (message) => message.providerOptions?.test?.inputId === "server-protected-input",
+        ),
       prepareFullModelView,
       serverCompactionEnabled: () => serverReplayEnabled,
-      serverCompaction: async () => serverCompactionArtifact("generated encrypted context"),
+      serverCompaction: async ({ messages }) => {
+        serverInputs.push(structuredClone([...messages]));
+        return serverCompactionArtifact("generated encrypted context");
+      },
       baseTurnErrorHandler: (error, context) => {
         if (
           error === nativeReplayError &&
@@ -2110,7 +2417,7 @@ describe("auto-compaction internals", () => {
     });
 
     try {
-      await agent.prompt("latest request remains verbatim");
+      await agent.prompt(currentInput);
     } finally {
       detach();
     }
@@ -2119,6 +2426,14 @@ describe("auto-compaction internals", () => {
     expect(prompts[0]).toContain("generated encrypted context");
     expect(prompts[1]).toContain("Condensed prior work.");
     expect(prompts[1]).not.toContain("generated encrypted context");
+    for (const prompt of prompts) expect(prompt).toContain("latest request remains verbatim");
+    expect(serverInputs).toHaveLength(1);
+    expect(JSON.stringify(serverInputs)).not.toContain("server-protected-input");
+    expect(JSON.stringify(summaryModel.doStreamCalls)).not.toContain(
+      "latest request remains verbatim",
+    );
+    expect(agent.state.messages[1]).toEqual(originalInput);
+    expect(currentInput).toEqual(originalInput);
     expect(JSON.stringify(agent.state.messages)).not.toContain("generated encrypted context");
   });
 

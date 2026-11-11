@@ -6,26 +6,23 @@ day-to-day behavior are in [Native surface](docs/native-surface.md). Git history
 of feature introductions. This file keeps the cutover steps and compatibility constraints that still
 matter when upgrading an older installation.
 
-## Automatic Transcript And Workflow Blob Migration
+<a id="automatic-transcript-and-workflow-blob-migration"></a>
 
-The production Docker entrypoint coordinates the one-way Core transcript schema 5 and workflow
-schema 25 migration before starting the default Core command. When both databases are at those exact
-legacy versions, startup first writes an immutable backup to
-`${DATA_DIR}/.migration-backups/blob-storage-v5-v25` (normally
-`/data/.migration-backups/blob-storage-v5-v25` in Docker), then runs the blob-storage migration.
+## Offline transcript and workflow blob cutover
 
-Startup skips this compatibility migration when each database is either absent or within its supported
-post-migration version range. If either database is unsupported or only one database is at the expected
-legacy version, startup fails closed and requires an operator to inspect and migrate the deployment
-explicitly. Rollback after a successful migration
-requires restoring the generated backup and running a pre-migration image that expects schema 5/25.
+Current Core requires managed-blob transcript schema 6 or later and workflow schema 26 or later.
+The Docker entrypoint no longer migrates legacy data or creates a migration backup. The old
+`LILAC_AUTO_MIGRATE_BLOB_STORAGE` opt-out and startup migration wrappers have been retired.
 
-Set `LILAC_AUTO_MIGRATE_BLOB_STORAGE=0` only as an operator-controlled temporary opt-out when the
-migration will be run manually with `bun run migrate:blob-storage`. The Docker gate applies only to the
-image's exact default Core command; maintenance and diagnostic commands do not trigger it.
-The fork-owned `apps/core/scripts/startup-blob-storage-migration.ts` and
-`startup-blob-storage-backup.ts` implement this gate and backup. Running
-`apps/core/src/runtime/main.ts` directly, including through `startCoreRuntime`, does not run it.
+Legacy transcript schema 5 with workflow schema 25 must cross the offline migration at upstream
+commit `f2c90667ac5616796c992602ca5fb5be726cf40d` before starting this build. Stop producers,
+create and verify a coordinated database/blob/state backup, run the historical command's dry-run,
+then apply and verify it offline. Mixed, corrupt, drifted or future states require diagnosis;
+no deployed baseline is assumed. Other legacy combinations need their matching historical path.
+
+See the [verified offline procedure, support boundary and rollback instructions](docs/fork-integration-20261111/migration.md).
+Restore matching pre-upgrade databases and blob storage together when rolling back or recovering
+from a partially applied migration. Starting an older binary alone does not undo the cutover.
 
 ## Plan the cutover
 
@@ -328,8 +325,9 @@ adapter-neutral references. Tool-result encryption and domain retention metadata
 domains.
 
 This transition is offline and fail-closed. Runtime startup does not read or rewrite legacy blob state.
-This fork retains the legacy migration tools for its Docker startup migration and manual upgrades.
-For a manual migration, stop Core, back up its data, and run the command below from this checkout:
+The legacy migration tools were removed after commit `f2c90667`, the last commit containing them.
+Older deployments must first check out `f2c90667`, stop Core, back up its data, and run the command
+below from that checkout. Complete the migration before upgrading to the current release:
 
 ```sh
 bun run migrate:blob-storage -- --config /path/to/core-config.yaml --data-dir /path/to/data
@@ -512,7 +510,7 @@ from accepted work.
 
 The former runtime graceful-restart snapshot subsystem is removed. Runtime startup does not open,
 import, migrate, or delete `graceful-restart.db`; existing files remain inert. The offline unified blob
-migration retains its frozen decoder only for that operator command and the fork-owned Docker startup gate.
+migration at `f2c90667` retains its frozen decoder only for that operator command.
 
 Before the first upgrade, stop and drain Core and back up `request-delivery.db` when avoiding duplicate
 effects matters. No graceful snapshot is imported. Work accepted by an older build may restart from its

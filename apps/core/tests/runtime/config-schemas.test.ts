@@ -160,14 +160,47 @@ test("Core editor diagnostics reject wrong versions, fields, types, and units", 
 test("Core editor web provider aliases use the selected config version's provider enum", () => {
   for (const section of ["extract", "search"]) {
     for (const selection of [{ provider: "openai" }, { providers: ["openai"] }]) {
-      for (const configVersion of [1, 2]) {
+      for (const configVersion of [1, 2, 3]) {
         const input = { configVersion, tools: { web: { [section]: selection } } };
-        const accepted = configVersion === 2;
+        const accepted =
+          configVersion === 2 ||
+          (configVersion === 3 && section === "extract" && "providers" in selection);
         expect(parseCoreConfigResult(input).isOk()).toBe(accepted);
         expect(validateCore(input), JSON.stringify(validateCore.errors)).toBe(accepted);
       }
     }
   }
+});
+
+test("V3 editor and runtime retain Telegram and hosted search without extending frozen V1", () => {
+  const fields = {
+    surface: {
+      telegram: {
+        enabled: true,
+        allowedChatIds: ["-100123"],
+        inboundMedia: { maxBytesPerAttachment: "2MiB" },
+      },
+    },
+    tools: {
+      web: {
+        extract: { providers: ["openai", "tavily", "openai"] },
+        openai: { model: "openai-compatible/search-model", searchContextSize: "high" as const },
+      },
+    },
+  };
+  for (const configVersion of [2, 3]) {
+    const input = { configVersion, ...fields };
+    const parsed = parseCoreConfigResult(input).unwrap();
+    expect(validateCore(input), JSON.stringify(validateCore.errors)).toBe(true);
+    expect(parsed.surface.telegram.inboundMedia.maxBytesPerAttachment).toBe(2 * 1024 * 1024);
+    expect(parsed.tools.web.extract.providers).toEqual(["openai", "tavily"]);
+    expect(parsed.tools.web.openai).toEqual(fields.tools.web.openai);
+  }
+  expect(validateCore({ configVersion: 1, ...fields })).toBe(false);
+  expect(parseCoreConfigResult({ configVersion: 1, ...fields }).isErr()).toBe(true);
+  const v1 = coreSchema.anyOf.find((schema) => schema.properties.configVersion.const === 1);
+  expect(v1?.properties.surface.properties).not.toHaveProperty("telegram");
+  expect(v1?.properties.tools.properties.web.properties).not.toHaveProperty("openai");
 });
 
 test("MCP schema validates transport-specific fields and credential source shapes", () => {
