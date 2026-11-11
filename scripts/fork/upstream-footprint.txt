@@ -38,12 +38,10 @@ apps/core/src/surface/bridge/request-ids.ts  # telegram:<session>:<message> requ
 apps/core/src/surface/bridge/subscribe-from-bus.ts  # platform-generic relay refs
 apps/core/src/surface/builtin-surface-protocols.ts  # registers telegramSurfaceProtocol in the closed catalog
 apps/core/src/surface/native/runtime.ts  # composes the opt-in fork-owned Discord recorder at native ingress and shutdown
-apps/core/src/surface/native/store.ts  # exposes committed-display notifications and destination-scoped durable Discord child routing
+apps/core/src/surface/native/store.ts  # exposes bounded committed-display notifications after native persistence and destination-scoped durable Discord child routing
 apps/core/src/surface/native/push.test.ts  # updates the native schema upgrade regression for durable Discord child routing
-docs/native-surface.md  # links the fork-only recorder setup and delivery guarantees
 
 # --- OpenAI web.search provider (staged for an upstream contribution; remove once accepted)
-apps/core/src/surface/native/store.ts  # exposes bounded committed-display notifications after native persistence
 apps/core/src/surface/types.ts  # adds "telegram" to the closed SessionRef/MsgRef unions
 apps/core/src/tool-server/create-tool-server.ts  # x-lilac-origin-session-id header and initiator-scoped restricted calls
 apps/core/src/tool-server/request-control-authority.ts  # origin session authority
