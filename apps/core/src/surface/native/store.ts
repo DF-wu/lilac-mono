@@ -75,6 +75,12 @@ type ReplayConversation = Pick<
 
 type StoredRow = NativePersistedRow & { id: string; position: number };
 
+export type NativeDisplayCommit = {
+  threadId: string;
+  reset: boolean;
+  changes: LiveUpdate["changes"];
+};
+
 function nativeSqliteFailure(cause: Error): NativeStoreFailure | undefined {
   const classified = classifyBunSqliteError(cause);
   if (!classified) return undefined;
@@ -173,6 +179,13 @@ function notificationBody(thread: NativeThread, preview: string) {
 }
 
 export class NativeStore {
+  private readonly displayListeners = new Set<(commit: NativeDisplayCommit) => void>();
+  private readonly displayCommits = new Map<
+    string,
+    { revision: number; data: string; commit: NativeDisplayCommit }
+  >();
+  private displayBytes = 0;
+  private displayCommitScheduled = false;
   private readonly listeners = new Set<(threadId: string) => void>();
   private readonly pendingNotifications = new Set<string>();
   private notificationScheduled = false;
@@ -192,6 +205,48 @@ export class NativeStore {
   }
   subscribeChanges(listener: (threadId: string) => void): () => void {
     return this.subscribe(listener);
+  }
+  // Process-local and bounded: the persisted replay row proves the outer transaction committed.
+  subscribeCommittedDisplay(listener: (commit: NativeDisplayCommit) => void): () => void {
+    this.displayListeners.add(listener);
+    return () => {
+      this.displayListeners.delete(listener);
+    };
+  }
+
+  private queueDisplayCommit(revision: number, data: string, commit: NativeDisplayCommit): void {
+    if (this.displayListeners.size === 0) return;
+    const key = `${commit.threadId}:${revision}`;
+    const previous = this.displayCommits.get(key);
+    const bytes = this.displayBytes - (previous?.data.length ?? 0) + data.length;
+    if ((!previous && this.displayCommits.size >= 128) || bytes > 2 * 1024 * 1024) return;
+    this.displayCommits.set(key, { revision, data, commit });
+    this.displayBytes = bytes;
+    if (this.displayCommitScheduled) return;
+    this.displayCommitScheduled = true;
+    queueMicrotask(() => this.flushDisplayCommits());
+  }
+
+  private flushDisplayCommits(): void {
+    const pending = [...this.displayCommits.values()];
+    this.displayCommits.clear();
+    this.displayBytes = 0;
+    this.displayCommitScheduled = false;
+    if (this.displayListeners.size === 0) return;
+    for (const entry of pending) {
+      const persisted = Result.try({
+        try: () =>
+          this.db
+            .query<{ data_json: string }, [string, number]>(
+              "SELECT data_json FROM native_changes WHERE thread_id=? AND revision=?",
+            )
+            .get(entry.commit.threadId, entry.revision),
+        catch: () => null,
+      }).match({ ok: (value) => value, err: () => null });
+      if (persisted?.data_json !== entry.data) continue;
+      for (const listener of this.displayListeners)
+        Result.try({ try: () => listener(entry.commit), catch: () => null });
+    }
   }
   notifyDisplayChanged(threadId: string): void {
     this.notify(threadId);
@@ -266,6 +321,8 @@ export class NativeStore {
 
   close(): void {
     this.listeners.clear();
+    this.displayListeners.clear();
+    this.displayCommits.clear();
     this.db.close();
   }
 
@@ -1224,6 +1281,12 @@ export class NativeStore {
         data,
       );
     this.notify(thread.id);
+    if (!("parentThreadId" in thread))
+      this.queueDisplayCommit(next.revision, data, {
+        threadId: next.id,
+        reset: kind === "rewind" || kind === "delete" || boundedChanges !== changes,
+        changes: boundedChanges,
+      });
     return next;
   }
 

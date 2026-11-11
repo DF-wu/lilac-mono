@@ -2,6 +2,8 @@
 
 This is the durable map of the current Lilac monorepo: product boundaries, terminology, ownership, trust boundaries, persistence categories, and the best places to make changes. It intentionally omits route inventories, configuration field catalogs, startup call order, and implementation-plan history.
 
+The DF-wu fork extends Core with a Telegram surface, an OpenAI-compatible provider for `generate.image` scripts, and an OpenAI `web.search` provider while preserving these upstream ownership boundaries.
+
 ## Documentation Authority
 
 Current behavior is authoritative in production source, wire schemas, persisted codecs, `scripts/architecture/manifest.ts`, and root `package.json` scripts. This guide summarizes those contracts; it does not replace them.
@@ -31,10 +33,10 @@ Current Core configuration uses schema-backed editor documentation described in
 `docs/core-config.md`; manual version upgrades are in
 `docs/core-config-migrations.md`.
 
-1. Authenticated Discord gateway ingress publishes normalized adapter events to the typed bus. Verified GitHub webhooks can create request messages directly.
-2. The Discord router converts eligible adapter events into `cmd.request.message` commands. Visible Discord attachments become structured `resource://` parts before publication. A request is the unit of agent work; `prompt`, `steer`, `followUp`, and `interrupt` describe admission into a session's active work.
+1. Authenticated Discord and Telegram ingress publish normalized adapter events to the typed bus. Verified GitHub webhooks can create request messages directly.
+2. The Discord and Telegram routers convert eligible adapter events into `cmd.request.message` commands. Visible Discord attachments become structured `resource://` parts before publication. A request is the unit of agent work; `prompt`, `steer`, `followUp`, and `interrupt` describe admission into a session's active work.
 3. The request-delivery store durably accepts each prompt or control. The bus agent runner serializes accepted work per session, checkpoints every active primary or subagent run in the agent-run WAL, publishes request lifecycle events, and streams output on `out.req.<request_id>`.
-4. A registered surface relay consumes the request output stream and renders it to Discord or GitHub. Relay state is live and process-local. The relay durably links each created output message. A recovered Discord run edits the latest linked message when it still exists and remains editable, otherwise it publishes a fresh continuation. Stale partial output or duplicate terminal output is still possible after a crash.
+4. A registered surface relay consumes the request output stream and renders it to Discord, Telegram, or GitHub. Relay state is live and process-local. The relay durably links each created output message. A recovered Discord run edits the latest linked message when it still exists and remains editable, otherwise it publishes a fresh continuation. Stale partial output or duplicate terminal output is still possible after a crash.
 5. The durable workflow engine uses the same request-delivery and agent-runner path for child-agent operations. Workflow journals, triggers, waits, receipts, and progress remain owned by the workflow engine.
 
 `packages/event-bus/lilac-spec.ts` is the canonical event catalog and payload schema. `request_id`, `session_id`, and `request_client` are the correlation headers; request and output contracts require a request ID where specified by that catalog.
@@ -172,12 +174,18 @@ before the reader reaches it.
 Three concepts must remain distinct:
 
 - The event bus `AdapterPlatform` is a compatibility wire enum and includes values that Core does not implement.
-- `BUILTIN_SURFACE_PROTOCOLS` in `apps/core/src/surface/builtin-surface-protocols.ts` is the exhaustive static catalog for the closed `SessionRef`/`MsgRef` platforms, currently Discord, GitHub and native. It owns protocol-specific ref construction, request-ID interpretation, and tool target projection. Catalog membership does not enable a surface or grant trust.
+- `BUILTIN_SURFACE_PROTOCOLS` in `apps/core/src/surface/builtin-surface-protocols.ts` is the exhaustive static catalog for the closed `SessionRef`/`MsgRef` platforms, currently Discord, GitHub, Telegram, and native. It owns protocol-specific ref construction, request-ID interpretation, and tool target projection. Catalog membership does not enable a surface or grant trust.
 - `SurfaceRuntimeRegistry` in `apps/core/src/surface/runtime-descriptor.ts` contains the executable descriptors installed in one Core process. A descriptor explicitly contributes an adapter and optional adapter ingress, request ingress, relay, workflow-progress, and health ports. Resolution is exact; it is not inferred from the wire enum or static catalog.
 
 The registry binds one produced-ref-guarded adapter facade and passes that facade to descriptor ports. Caller refs and adapter-produced refs are checked before shared publication, persistence, or workflow progress. Workflow progress additionally gates exact target, binding, and ref correlation and persists permanent-versus-retryable operation policy. The registry is internal composition, not a dynamic surface plugin API.
 
-Discord owns its gateway ingress, allowlists, mention/active router, local message cache/search, and Discord rendering. `apps/core/src/conversation` owns shared Discord/native conversation-memory indexing, summarization, embeddings, search, and automatic recall. A thread holds one summary entry per distinct subject, and search and recall return entries that point back at their thread. The native DM is indexed as one thread per context window. Agent memory reads include all retained native threads and allowlisted Discord threads; native UI permissions and modification authority remain surface-owned. GitHub owns webhook verification, trigger parsing, API authentication, acknowledgement state, pagination, and GitHub rendering. Shared code must not infer that a wire-valid platform has those capabilities.
+Discord owns its gateway ingress, allowlists, mention/active router, local message cache/search, and Discord rendering. Telegram owns long-polling ingress, chat/user admission, command targeting and menus, its local history index, and Telegram rendering. `apps/core/src/conversation` owns shared Discord/native/Telegram conversation-memory indexing, summarization, embeddings, search, and automatic recall; the Telegram source projection lives in `apps/core/src/surface/telegram/telegram-conversation-source.ts`. A thread holds one summary entry per distinct subject, and search and recall return entries that point back at their thread. The native DM is indexed as one thread per context window. Agent memory reads include all retained native threads, allowlisted Discord threads, and Telegram threads whose chat is in `allowedChatIds`; native UI permissions and modification authority remain surface-owned. GitHub owns webhook verification, trigger parsing, API authentication, acknowledgement state, pagination, and GitHub rendering. Shared code must not infer that a wire-valid platform has those capabilities.
+
+Telegram's shared adapter connection initializes its history store and bot identity before request
+and relay consumers can replay retained events. The agent runner subscribes while paused; these
+consumers are installed before Telegram starts polling or replaying its ingress outbox. Unexpected
+router subscription termination withdraws readiness and reports a fatal runtime failure; normal
+shutdown stops supervision with the router.
 
 Discord conversation materialization is reactive. Startup, worker recovery, and configuration reload
 leave inactive channels untouched. The first channel activity after startup or invalidation repairs
@@ -198,7 +206,11 @@ modes and streaming previews. Image cells support bold, italic, inline code, str
 `__underline__`, and nested combinations. Links display their labels. The default style remains
 `unicode`; `ascii` also stays text-only.
 
-Trust admission starts at authenticated Discord or native ingress, or verified GitHub webhook ingress. A `SurfacePrincipal` is created only from correlated normalized identity carried through the trusted request path. Protocol catalog membership, descriptor registration, a request header, or a claimed platform cannot create authority; conflicting or missing correlation falls back to restricted behavior.
+Trust admission starts at authenticated Discord, Telegram, or native ingress, or verified GitHub webhook ingress. A `SurfacePrincipal` is created only from correlated normalized identity carried through the trusted request path. Protocol catalog membership, descriptor registration, a request header, or a claimed platform cannot create authority; conflicting or missing correlation falls back to restricted behavior.
+
+The Discord adapter maintains `discord-surface.db` as a local read-history cache. Telegram maintains
+`telegram-surface.db` as its authoritative local history index because the Bot API cannot fetch past
+messages. See `docs/telegram-surface.md` for the downstream surface contract.
 
 ## Event Delivery
 
@@ -259,6 +271,9 @@ script's `providers` global supplies resolved endpoints and credentials. The bui
 skill owns the default model catalog and native request recipes. Scripts save images and print paths;
 the tool returns bounded stdout/stderr, exit status, and truncation state. This is trusted native
 execution and is unavailable to restricted sessions. `generate.video` retains its model-based interface.
+The fork adds the OpenAI-compatible endpoint as `providers.openaiCompatible` when
+`OPENAI_COMPATIBLE_BASE_URL` is set (`tools/image-script-openai-compatible.ts`), with a gateway recipe
+in the skill.
 
 Request capabilities bind request context, cwd, profile, callable authority, and expiry. They constrain agent calls but are not general public HTTP authentication. The Core tool server belongs on a trusted host/network. Core also owns configured MCP clients process-wide; MCP tools join the run-scoped catalog only through the Core manager and profile policy.
 
@@ -292,7 +307,7 @@ Core has one current programmatic workflow runtime, `lilac-workflow-js-v4`, unde
 - Agent cwd is free-form, absolute or relative to the invocation project, and may address any path available to the service UID. Native Bash remains host-authority execution.
 - The immutable resource policy bounds agent concurrency and count, nesting, allowed wait kinds, and per-operation idle time; separate limits bound source, input, operation output, and final result sizes.
 - The deterministic program child is a plain `bun --smol` subprocess with deterministic-global lockdown and an NDJSON host protocol. It is not an OS security sandbox. The host owns cancellation, operation-idle, output-size, and protocol limits. A workflow has no total wall-time limit.
-- Current host operations are agent orchestration, phase/parallel/pipeline composition, Discord-only `waitForReply`, and `sleep`. Reply waits are limited to the authenticated originating Discord session and user.
+- Current host operations are agent orchestration, phase/parallel/pipeline composition, Discord or Telegram `waitForReply`, and `sleep`. Reply waits are limited to the authenticated originating platform, session, and user. Telegram progress targets are restricted to the originating session and rechecked against the live `allowedChatIds` before schedule fire and each send, edit, or recreation.
 - Journals, dispatch epochs, owner fencing, pinned resolved-model identity, waits, triggers, cancellation, terminal receipts, generated subagent runs, and progress actions are durable. Replay reuses operation identity rather than rerunning completed effects.
 - Recurring reconciliation selects expired running claims before applying its page limit and takes them over through the same atomic claim fence used for startup recovery. Live owners renew their claims through heartbeats.
 - Primary-created runs, ordinary workflow children, durable triggers, and generated subagent runs share the global active-run cap. Shared filesystem or external operations may race.
@@ -371,6 +386,11 @@ Runtime startup does not open `graceful-restart.db`. Existing files are inert. T
 migration keeps a frozen graceful-snapshot decoder only so it can classify and discard supported legacy
 blob-bearing snapshots; runtime code has no graceful-snapshot import path.
 
+The fork's default Docker entrypoint runs `apps/core/scripts/startup-blob-storage-migration.ts`
+before Core to coordinate the supported legacy transcript/workflow migration and immutable backup.
+`startup-blob-storage-backup.ts` owns that backup; `runtime/main.ts` and `startCoreRuntime` own
+Core startup settlement and do not invoke the migration. See [migration and rollback rules](MIGRATIONS.md#automatic-transcript-and-workflow-blob-migration).
+
 Redis Streams is separate durable bus state. Project workflow source lives in each project's `.lilac/workflows`, outside `DATA_DIR`. The workspace operated on by tools is user data, not Lilac metadata.
 
 ### Computer use
@@ -393,6 +413,12 @@ Core selects native OpenAI and Codex adapters for WebSocket execution. Codex own
 stateless request normalization, backend event repairs, and its SSE fallback. Codex steering remains at
 turn boundaries. The OpenAI adapter gates native steering to exactly `gpt-6-astra` in compatible
 single-agent settings. Conversation binding and automatic compaction use boundary delivery.
+
+`packages/agent/auto-compaction.ts` owns local compaction selection. It validates the protected
+current-input boundary before threshold preflight and skips the soft trigger when no older prefix
+can be summarized. Existing history can still compact while current input remains verbatim; actual
+context overflow continues through the existing recovery/failure path. A skipped trigger does not
+reduce input size or guarantee that the next model request fits.
 
 Native tool discovery uses client-executed OpenAI `tool_search` on the official OpenAI API and
 Codex native paths for the supported GPT-5.4, GPT-5.5, GPT-5.6, and GPT-6 Astra model families.
@@ -488,6 +514,7 @@ These invariants matter more than a fragile numbered list. Update this section o
 - Core process composition or lifecycle: `apps/core/src/runtime/create-core-runtime.ts`, `compose-builtin-surface-runtimes.ts`, and `surface-runtime-lifecycle.ts`.
 - Surface ref semantics versus executable participation: `apps/core/src/surface/builtin-surface-protocols.ts`, protocol modules, `runtime-descriptor.ts`, and the platform's runtime descriptor.
 - Discord request admission and queue selection: `apps/core/src/surface/discord/discord-request-router.ts`.
+- Telegram ingress, admission, command menus, history, and rendering: `apps/core/src/surface/telegram` and `docs/telegram-surface.md`. Core builds its runtime descriptor through `telegram-surface-runtime.ts` and starts ingress after the shared consumers; its configuration lives in `packages/utils/core-config/telegram-surface.ts` and `telegram-runtime.ts`. See `docs/fork-differences.md#fork-code-layout` for the fork/upstream ownership map.
 - Core resource URI, origin, cache, classification, access, and materialization behavior:
   `apps/core/src/resource`; Discord origin refresh belongs in
   `apps/core/src/surface/discord/discord-resource-origin.ts`.
@@ -503,6 +530,7 @@ These invariants matter more than a fragile numbered list. Update this section o
 - Workflow definition, runtime, persistence, scheduling, waits, or progress: the corresponding owner in `apps/core/src/workflow`; Level 2 adaptation is `apps/core/src/tool-server/tools/programmatic-workflow.ts`.
 - Core config/model/provider/prompt behavior: `packages/utils`; config version changes also require
   `docs/core-config-migrations.md`.
+- Downstream OpenAI-compatible image provider: `apps/core/src/tool-server/tools/image-script-openai-compatible.ts`, `packages/utils/builtin-skills/image-generation/references/openai-compatible.md`, and `docs/generate-image-openai-compatible.md`.
 - Core managed opaque bytes, adapter behavior, handle/reference codecs, integrity, or expiry:
   `packages/blob-storage`; domain retention and ownership stay with the consuming Core module.
 - Architecture boundary registration or a new workspace: `scripts/architecture/manifest.ts` and its focused tests; read `scripts/architecture/README.md` first.

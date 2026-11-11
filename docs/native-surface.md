@@ -4,6 +4,9 @@ The native surface runs inside Core. It owns `native-surface.db` independently o
 the web app, authenticated HTTP bootstrap, file endpoints, and typed oRPC over WebSocket or HTTP+SSE. A native
 thread is a session. Messages start work without a mention or active-channel mode.
 
+The DF fork can optionally [record new native user-surface messages to Discord](native-discord-mirror.md)
+using an owner-provisioned webhook. Recording is disabled by default and does not backfill history.
+
 Use [Local setup](#local-setup) and [Clerk](#clerk) to configure access, [Settings and updates](#settings-and-updates)
 for runtime settings, and [Persistence and rollback](#persistence-and-rollback) before upgrading.
 The container console is covered under [Temporary operator console](#temporary-operator-console).

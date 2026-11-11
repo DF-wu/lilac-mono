@@ -574,7 +574,7 @@ function validateSnapshotCorrelation(
   };
   const relayByRequestId = new Map<
     string,
-    { readonly platform: "discord" | "github"; readonly sessionId: string }
+    { readonly platform: "discord" | "github" | "telegram"; readonly sessionId: string }
   >();
   const relayIdentities = new Set<string>();
   for (const relay of snapshot.relays) {

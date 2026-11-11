@@ -360,8 +360,9 @@ test("competing saves against one revision let exactly one write land", async ()
     remoteDenyPaths: [],
   });
   const { revision } = value(await service.document("owner", thread.id, file));
+  const texts = ["first\n", "second\n"];
   const results = await Promise.all(
-    ["first\n", "second\n"].map((text) =>
+    texts.map((text) =>
       service.saveDocument("owner", {
         threadId: thread.id,
         path: file,
@@ -376,6 +377,7 @@ test("competing saves against one revision let exactly one write land", async ()
   expect(conflicts).toHaveLength(1);
   expect(conflicts[0]?.error).toMatchObject({ code: "conflict" });
   expect(saved.map((result) => result.value.text)).toEqual([await readFile(file, "utf8")]);
+  expect(await readFile(file, "utf8")).toBe(texts[results.findIndex((result) => result.isOk())]!);
   native.close();
 });
 

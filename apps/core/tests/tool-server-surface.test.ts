@@ -436,6 +436,88 @@ describe("tool-server surface", () => {
     }
   });
 
+  it.each([
+    ["thread", "thread", "native", true],
+    ["thread", "native:thread", "native", true],
+    ["native:thread", "thread", "native", true],
+    ["native:thread", "native:thread", "native", true],
+    ["thread", "other", "native", false],
+    ["thread", "native:other", "native", false],
+    ["thread", "native:thread", "discord", false],
+  ] as const)(
+    "restricted native session %s scopes explicit target %s on %s",
+    async (originSessionId, sessionId, client, allowed) => {
+      const sessionRef = { platform: "native" as const, channelId: "thread" };
+      const adapter = new FakeAdapter([], {
+        thread: [
+          {
+            ref: { ...sessionRef, messageId: "message" },
+            session: sessionRef,
+            userId: "native-user",
+            text: "hello",
+            ts: 0,
+          },
+        ],
+      });
+      const tool = new ProductionSurface({
+        adapterResolver: createTestAdapterResolver([
+          { protocol: BUILTIN_SURFACE_PROTOCOLS.native, adapter },
+          { protocol: BUILTIN_SURFACE_PROTOCOLS.discord, adapter },
+        ]),
+        nativeAdapterForContext: () => Result.ok(adapter),
+        config: testConfig({}),
+      });
+      const result = await tool.callResult(
+        "surface.messages.read",
+        { client, sessionId, messageId: "message" },
+        {
+          context: {
+            sessionId: "native:thread",
+            requestClient: "native",
+            requestInitiator: { platform: "native", userId: "native-user" },
+            requestInitiatorSessionId: originSessionId,
+            safetyMode: "restricted",
+            serverOwnedRequest: true,
+          },
+        },
+      );
+      if (!allowed) {
+        expect(result).toMatchObject({ status: "error", error: { kind: "denied" } });
+        expect(adapter.readCalls).toEqual([]);
+        return;
+      }
+      expect(result).toMatchObject({
+        status: "ok",
+        value: {
+          meta: { session: { platform: "native", channelId: "thread" } },
+          message: { richText: "hello" },
+        },
+      });
+      expect(adapter.readCalls).toEqual([
+        { platform: "native", channelId: "thread", messageId: "message" },
+      ]);
+    },
+  );
+
+  it("keeps restricted non-native session IDs literal", async () => {
+    const adapter = new FakeAdapter([], {});
+    const tool = new Surface({ adapter, config: testConfig({}) });
+    const result = await tool.callResult(
+      "surface.messages.read",
+      { client: "discord", sessionId: "native:123", messageId: "message" },
+      {
+        context: {
+          requestClient: "discord",
+          requestInitiator: { platform: "discord", userId: "discord-user" },
+          requestInitiatorSessionId: "123",
+          safetyMode: "restricted",
+        },
+      },
+    );
+    expect(result).toMatchObject({ status: "error", error: { kind: "denied" } });
+    expect(adapter.readCalls).toEqual([]);
+  });
+
   it("rejects the removed surface.messages.search callable", async () => {
     const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
     expect(
@@ -3570,4 +3652,55 @@ describe("Discord projection parity", () => {
       }
     });
   }
+});
+
+describe("recent agent writes from Telegram", () => {
+  it("hides writes whose chat left the Telegram allowlist", async () => {
+    const cfg = testConfig({
+      surface: {
+        discord: {
+          tokenEnv: "DISCORD_TOKEN",
+          allowedChannelIds: ["c1"],
+          allowedGuildIds: [],
+          botName: "lilac",
+        },
+      },
+    });
+    cfg.surface.telegram.allowedChatIds = ["-100123"];
+
+    const tmp = await fs.mkdtemp(join(tmpdir(), "lilac-surface-transcript-"));
+    const transcriptStore = new SqliteTranscriptStore(join(tmp, "transcripts.sqlite"));
+
+    try {
+      for (const [requestId, channelId] of [
+        ["telegram:-100123:1", "-100123"],
+        ["telegram:-100999:1", "-100999"],
+        ["telegram:-100123:7:2", "-100123:7"],
+      ] as const) {
+        transcriptStore.saveRequestTranscript({
+          requestId,
+          sessionId: channelId,
+          requestClient: "telegram",
+          messages: [],
+          finalText: `write in ${channelId}`,
+        });
+        transcriptStore.linkSurfaceMessagesToRequest({
+          requestId,
+          created: [{ platform: "telegram", channelId, messageId: "9" }],
+          last: { platform: "telegram", channelId, messageId: "9" },
+        });
+      }
+
+      const tool = new Surface({ adapter: new FakeAdapter([], {}), config: cfg, transcriptStore });
+      const out = (await tool.call("surface.activities.recentAgentWrites", {
+        limit: 5,
+      })) as Array<{ sessionId: string; client: string; preview: string }>;
+
+      expect(out.map((row) => row.sessionId).sort()).toEqual(["-100123", "-100123:7"]);
+      expect(out.every((row) => row.client === "telegram")).toBe(true);
+      expect(out.find((row) => row.sessionId === "-100123")?.preview).toBe("write in -100123");
+    } finally {
+      transcriptStore.close();
+    }
+  });
 });
