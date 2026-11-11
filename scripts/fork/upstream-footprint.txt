@@ -58,7 +58,7 @@ apps/core/src/tools/bash-impl.ts  # forwards LILAC_ORIGIN_SESSION_ID to tool pro
 apps/core/src/transcript/transcript-store.ts  # Telegram platform filters
 apps/core/src/workflow/durable-workflow-store.ts  # Telegram target revalidation
 apps/core/src/workflow/workflow-domain.ts  # Telegram workflow targets
-apps/core/src/workflow/workflow-engine.ts  # Telegram waitForReply and targets
+apps/core/src/workflow/workflow-engine.ts  # Telegram waitForReply/targets and legacy cancellation key to wire UUID normalization (#108)
 apps/core/src/workflow/workflow-operation-policy.ts  # Telegram waitForReply policy
 apps/core/src/workflow/workflow-progress-projector.ts  # target authorization hook and Telegram ports
 apps/core/src/workflow/workflow-progress-view.ts  # Telegram progress card rendering
@@ -85,7 +85,7 @@ apps/core/tests/tools/bash.test.ts  # probes stdin with readSync to distinguish 
 apps/core/tests/tools/subagent.test.ts  # origin session context
 apps/core/tests/tools/web.test.ts  # covers search-only provider skipping
 apps/core/tests/transcript/transcript-store.test.ts  # Telegram platform filters
-apps/core/tests/workflow/durable-workflow-store.test.ts  # F07/F15: Telegram origin/wait/progress authorization on schema28 workflow owner
+apps/core/tests/workflow/durable-workflow-store.test.ts  # Telegram authorization and real cancellation outbox/engine/durable delivery regression (#108)
 apps/core/tests/workflow/workflow-engine.test.ts  # Telegram workflow targets
 apps/core/tests/workflow/workflow-progress-projector.test.ts  # target authorization
 apps/core/tests/workflow/workflow-trigger-scheduler.test.ts  # target rechecks
