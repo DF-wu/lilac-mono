@@ -25,7 +25,7 @@ apps/core/src/conversation/thread-summarization-worker.ts  # opens the telegram 
 apps/core/src/conversation/thread-worker.ts  # forwards the telegram source and hydrates telegram refs
 apps/core/src/custom-commands/manager.ts  # menu alias index and @target-aware command parsing
 apps/core/src/generated/config-schemas/core-config.schema.json  # generated from fork input schemas including Telegram and OpenAI search
-apps/core/src/github/webhook/github-webhook-server.ts  # prompts forbid duplicate final publications and define NO_REPLY
+apps/core/src/github/webhook/github-webhook-server.ts  # final publication policy, UUID delivery identity repair and redacted contract error logging (#107)
 apps/core/src/runtime/compose-builtin-surface-runtimes.ts  # includes the Telegram runtime descriptor entry
 apps/core/src/runtime/create-core-runtime.ts  # constructs and registers the Telegram surface module
 apps/core/src/runtime/main.ts  # settles Core creation/start Results through the fork-owned startCoreRuntime helper
