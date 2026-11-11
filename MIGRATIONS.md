@@ -791,6 +791,17 @@ Bundled remote runners are cached under `${XDG_CACHE_HOME:-$HOME/.cache}/lilac/r
 by SHA-256 content hash. No database migration is required. Those runner files can be removed
 when no tool calls are active; a failed execution invalidates Core's deployment cache so the next call repairs the runner.
 
+## Workflow cancellation request delivery identities
+
+Workflow cancellation outbox keys now map deterministically to UUIDv8 request delivery IDs before
+publication. Schema 28 creates `workflow-cancel:<request>:<dispatch-epoch>` outbox keys, which the UUID
+request contract previously rejected. Both existing pending cancellations and new cancellations use
+the corrected publication path. Retries and restarts reuse the same UUID so request delivery can
+deduplicate a publication even if Core stopped before removing its outbox entry.
+
+No database schema or outbox rewrite is required. Deploy the updated Core normally. Rolling back
+leaves stored data readable, but restores the cancellation publication defect for pending entries.
+
 ## Redis subscription owner leases and reaping
 
 Managed Redis subscriptions now register an owner key per process and subscription incarnation under

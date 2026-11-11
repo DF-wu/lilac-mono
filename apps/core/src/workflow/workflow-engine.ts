@@ -76,6 +76,13 @@ const WORKFLOW_LEASE_STALE_MS = 60_000;
 const WORKFLOW_LEASE_HEARTBEAT_MS = 20_000;
 const WORKFLOW_REQUEST_LEASE_STALE_MS = 30_000;
 
+function workflowCancellationDeliveryId(outboxId: string): string {
+  // Keep legacy outbox keys intact while retries share one UUID wire identity.
+  const hash = sha256(`workflow-cancellation:${outboxId}`);
+  const variant = ((Number.parseInt(hash.slice(16, 17), 16) & 3) | 8).toString(16);
+  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-8${hash.slice(13, 16)}-${variant}${hash.slice(17, 20)}-${hash.slice(20, 32)}`;
+}
+
 async function cancelWorkflowSandboxForEngineHost(sandbox: WorkflowSandboxRun): Promise<void> {
   const cancelled: ResultType<void, WorkflowSandboxTerminationFailed> = await sandbox.cancel();
   adaptToolResultToHost(cancelled);
@@ -637,7 +644,7 @@ export class WorkflowEngine {
       const published = await this.input.bus.publish(
         lilacEventTypes.CmdRequestMessage,
         {
-          requestDeliveryId: intent.deliveryId,
+          requestDeliveryId: workflowCancellationDeliveryId(intent.deliveryId),
           queue: "interrupt",
           messages: [],
           raw: { cancel: true, cancelQueued: true },

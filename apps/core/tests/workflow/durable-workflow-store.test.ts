@@ -1,11 +1,20 @@
 import { normalizeWorkflowResourcePolicy, workflowStoreValue } from "./workflow-store-test-helpers";
 import { Database } from "bun:sqlite";
-import { describe, expect, it } from "bun:test";
-import { Panic } from "better-result";
+import { describe, expect, it, spyOn } from "bun:test";
+import { Panic, Result } from "better-result";
+import { createLilacBus, type RawBus } from "@stanley2058/lilac-event-bus";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
+import { WorkflowEngine } from "../../src/workflow/workflow-engine";
+import {
+  corePreparedRequestEnvelopeSchema,
+  createCoreRequestDelivery,
+  createDurableCoreRequestBus,
+  createLilacBusRequestDeliveryPublisher,
+  type CorePreparedRequestEnvelope,
+} from "../../src/surface/bridge/request-delivery";
 import {
   canonicalJsonSha256,
   WORKFLOW_RUNTIME_VERSION,
@@ -25,7 +34,10 @@ import {
   WORKFLOW_SCHEMA_VERSION,
 } from "../../src/workflow/workflow-migrations";
 import { workflowResolvedModelRequestSchema } from "../../src/workflow/workflow-request-authority";
-import { workflowSourceArtifactReferenceForTest } from "./workflow-test-blob-store";
+import {
+  createWorkflowTestBlobStore,
+  workflowSourceArtifactReferenceForTest,
+} from "./workflow-test-blob-store";
 function dbPath(label: string): string {
   return join(tmpdir(), `lilac-workflow-${label}-${crypto.randomUUID()}.sqlite`);
 }
@@ -1471,6 +1483,144 @@ describe("workflow audit recovery invariants", () => {
     }
   });
 });
+
+for (const failurePoint of ["before publication", "after publication"] as const) {
+  it(`delivers a persisted cancellation once after restart ${failurePoint}`, async () => {
+    const file = dbPath("cancel-delivery");
+    const deliveryFile = `${file}.delivery`;
+    let store = new DurableWorkflowStore(file);
+    const db = new Database(file);
+    const blobs = await createWorkflowTestBlobStore();
+    let delivery = createCoreRequestDelivery({ dbPath: deliveryFile, blobStore: blobs });
+    const claimIds: string[] = [];
+    const published: CorePreparedRequestEnvelope[] = [];
+    let failClaim = failurePoint === "before publication";
+    const raw: RawBus = {
+      publish: async () => ({ id: "ordinary-1", cursor: "ordinary-1" }),
+      acquireRequestPublicationClaim: async (requestDeliveryId) => {
+        claimIds.push(requestDeliveryId);
+        if (failClaim) throw new Error("test transport unavailable");
+        return {
+          status: "acquired",
+          claim: { requestDeliveryId, token: crypto.randomUUID() },
+        };
+      },
+      publishClaimedRequest: async (message) => {
+        published.push(
+          corePreparedRequestEnvelopeSchema.parse({
+            headers: message.headers,
+            data: message.data,
+          }),
+        );
+        const id = `${published.length}-0`;
+        return { status: "published", receipt: { id, cursor: id } };
+      },
+      confirmRequestPublication: async () => "confirmed",
+      abandonRequestPublicationClaim: async () => "abandoned",
+      subscribe: async () => {
+        const done = Promise.withResolvers<ReturnType<typeof Result.ok<void>>>();
+        return Result.ok({
+          done: done.promise,
+          stop: async () => {
+            done.resolve(Result.ok(undefined));
+            return Result.ok(undefined);
+          },
+        });
+      },
+      fetch: async () => ({ messages: [] }),
+      close: async () => {},
+    };
+    const transportBus = createLilacBus(raw);
+    const createEngine = () =>
+      new WorkflowEngine({
+        store,
+        bus: createDurableCoreRequestBus({
+          transportBus,
+          coordinator: delivery.coordinator,
+          publisher: createLilacBusRequestDeliveryPublisher(transportBus),
+        }),
+        blobStore: blobs,
+        dataDir: tmpdir(),
+        subscriptionId: "cancel-delivery-test",
+        pollMs: 1_000_000,
+      });
+    let engine = createEngine();
+    try {
+      workflowStoreValue(store.createInvocation({ revision: revision(), run: run() }));
+      store.tryClaimRun({ runId: "run-1", claimerId: "worker", now: 20 });
+      store.createOperation(operation("run-1", "agent"), "worker");
+      db.run(
+        `INSERT INTO workflow_request_dispatches
+         (request_id, run_id, operation_id, session_id, platform, policy_json, active,
+          created_at, updated_at, dispatch_epoch)
+         VALUES ('request', 'run-1', 'agent', 'session', 'discord', '{}', 1, 20, 20, 'epoch')`,
+      );
+      expect(
+        store.cancelRunAndChildren({ runId: "run-1", now: 30, detail: "cancelled" })?.state,
+      ).toBe("cancelled");
+      const [intent] = store.pendingCancellations();
+      if (!intent) throw new Error("Missing cancellation intent");
+      expect(intent.deliveryId).toBe("workflow-cancel:request:epoch");
+      store.close();
+      store = new DurableWorkflowStore(file);
+      engine = createEngine();
+      const acknowledge = spyOn(store, "completeCancellation");
+      if (failurePoint === "after publication") acknowledge.mockImplementation(() => {});
+      await engine.start();
+      expect(store.pendingCancellations()).toEqual([intent]);
+      expect(claimIds).toHaveLength(1);
+      expect(published).toHaveLength(failurePoint === "after publication" ? 1 : 0);
+      await engine.stop();
+      acknowledge.mockRestore();
+      store.close();
+      delivery.store.close();
+
+      failClaim = false;
+      store = new DurableWorkflowStore(file);
+      delivery = createCoreRequestDelivery({ dbPath: deliveryFile, blobStore: blobs });
+      engine = createEngine();
+      await engine.start();
+      expect(store.pendingCancellations()).toEqual([]);
+      const deliveryId = claimIds[0];
+      if (!deliveryId) throw new Error("Missing cancellation publication claim");
+      expect(claimIds).toEqual([deliveryId, deliveryId]);
+      expect(published).toHaveLength(1);
+      expect(published[0]).toMatchObject({
+        headers: { request_id: "request", session_id: "session", request_client: "unknown" },
+        data: { queue: "interrupt", messages: [], raw: { cancel: true, cancelQueued: true } },
+      });
+      expect(published[0]?.data.requestDeliveryId).toBe(deliveryId);
+      expect(
+        workflowStoreValue(await delivery.coordinator.handleDelivery(deliveryId)).disposition,
+      ).toBe("accepted");
+
+      for (const { requestId, epoch } of [
+        { requestId: "request", epoch: "epoch-2" },
+        { requestId: "other-request", epoch: "epoch-2" },
+      ]) {
+        await engine.stop();
+        db.run("INSERT INTO workflow_cancellation_outbox VALUES (?, 'session', ?)", [
+          requestId,
+          `workflow-cancel:${requestId}:${epoch}`,
+        ]);
+        engine = createEngine();
+        await engine.start();
+        expect(store.pendingCancellations()).toEqual([]);
+      }
+      expect(published).toHaveLength(3);
+      expect(new Set(published.map(({ data }) => data.requestDeliveryId)).size).toBe(3);
+    } finally {
+      await engine.stop();
+      await transportBus.close();
+      delivery.store.close();
+      db.close();
+      store.close();
+      await blobs.close({ deadlineAtMs: Date.now() + 1_000 });
+      rmSync(file, { force: true });
+      rmSync(deliveryFile, { force: true });
+    }
+  });
+}
 
 it("uses claim, due-time and deadline indexes for maintenance scans", () => {
   const file = dbPath("maintenance-query-plans");
