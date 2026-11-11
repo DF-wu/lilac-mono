@@ -22,6 +22,7 @@ afterEach(async () => {
 function fixture(
   webhookUrl: string | undefined = "https://discord.com/api/webhooks/123/test-only",
   beforeMirror?: (store: NativeStore, threadId: string) => void,
+  routing?: string,
 ) {
   const db = new Database(":memory:");
   const store = new NativeStore(db);
@@ -39,6 +40,9 @@ function fixture(
     payload: Record<string, unknown>;
     files: Blob[];
   }[] = [];
+  const routingRequests: { method: string; url: string }[] = [];
+  let parentId = "200";
+  const children = new Map<string, string>();
   const warnings: string[] = [];
   let respond = (_request: RequestInit): Promise<Response> =>
     Promise.resolve(Response.json({ id: String(1000 + requests.length) }));
@@ -51,12 +55,35 @@ function fixture(
   const mirror = createNativeDiscordMirror({
     store,
     webhookUrl,
+    routing,
+    botToken: () => "synthetic-bot",
     resources: resourceBinding,
     wait: async (ms) => {
       waits.push(ms);
     },
     warn: (message) => warnings.push(message),
     fetch: async (url, init) => {
+      if (init.method === "GET" || !url.includes("/webhooks/")) {
+        routingRequests.push({ method: init.method ?? "GET", url });
+        if (url.includes("/webhooks/"))
+          return Response.json({ id: "123", type: 1, channel_id: parentId });
+        if (init.method === "POST") {
+          const id = String(300 + children.size);
+          children.set(id, parentId);
+          return Response.json({ id, type: 11, parent_id: parentId });
+        }
+        const id = new URL(url).pathname.split("/").at(-1)!;
+        return Response.json(
+          id === parentId
+            ? { id, type: 0 }
+            : {
+                id,
+                type: 11,
+                parent_id: children.get(id),
+                thread_metadata: { archived: false, locked: false },
+              },
+        );
+      }
       const form = init.body instanceof FormData ? init.body : null;
       requests.push({
         method: init.method ?? "GET",
@@ -92,6 +119,10 @@ function fixture(
     thread,
     mirror,
     requests,
+    routingRequests,
+    parent: (id: string) => {
+      parentId = id;
+    },
     warnings,
     post,
     settle,
@@ -103,8 +134,8 @@ function fixture(
   };
 }
 
-test("allowlists human/assistant text and excludes system, reasoning, tools and service inputs", async () => {
-  const f = fixture();
+async function checkFiltering(routing: string) {
+  const f = fixture(undefined, undefined, routing);
   f.store
     .acceptInput("owner", {
       threadId: f.thread.id,
@@ -176,7 +207,12 @@ test("allowlists human/assistant text and excludes system, reasoning, tools and 
       roles: [],
       replied_user: false,
     });
-});
+}
+
+test.each(["flat", "threaded"])(
+  "%s: allowlists human/assistant text and excludes system, reasoning, tools and service inputs",
+  checkFiltering,
+);
 
 test("no history on enable, disabled/invalid URL sends nothing, and rolled back writes stay private", async () => {
   for (const url of [
@@ -372,8 +408,8 @@ test("committed-display observer contains listener exceptions, closed DB reads a
   expect(f.requests).toHaveLength(1);
 });
 
-test("ready attachments use verified bytes, replace on edit, and omit unavailable/oversized uploads without private URIs", async () => {
-  const f = fixture();
+async function checkAttachments(routing: string) {
+  const f = fixture(undefined, undefined, routing);
   const blobs = (await createMemoryBlobStore()).unwrap();
   const transcript = new SqliteTranscriptStore(":memory:");
   const access = new CoreResourceService({
@@ -569,7 +605,12 @@ test("ready attachments use verified bytes, replace on edit, and omit unavailabl
     }),
   );
   await lateCanceled.promise;
-});
+}
+
+test.each(["flat", "threaded"])(
+  "%s: ready attachments use verified bytes, replace on edit, and omit unavailable/oversized uploads without private URIs",
+  checkAttachments,
+);
 
 test("growth chunks preserve source/part identity while following serialized Discord mutation order", async () => {
   const f = fixture();
@@ -741,4 +782,89 @@ test("a stalled/failed webhook cannot block native writes and does not log its U
   ]);
   expect(f.warnings.length).toBeGreaterThan(0);
   expect(JSON.stringify(f.warnings)).not.toMatch(/test-only|https:|private response body/);
+});
+
+test("threaded delivery isolates conversations and routes streaming edits, shrink and removals with thread_id", async () => {
+  const f = fixture(undefined, undefined, "threaded");
+  const second = f.store.createThread("owner", { commandId: "second", title: "Second" }).unwrap();
+  const message: DisplayMessage = {
+    id: "stream",
+    role: "assistant",
+    parts: [{ type: "text", text: "a".repeat(3000) }],
+  };
+  f.post(message);
+  f.store
+    .postMessage("owner", second.id, {
+      id: "second-answer",
+      role: "assistant",
+      metadata: { createdAt: Date.now() },
+      parts: [{ type: "text", text: "Second answer" }],
+    })
+    .unwrap();
+  await f.settle();
+  expect(f.requests.map((request) => new URL(request.url).searchParams.get("thread_id"))).toEqual([
+    "300",
+    "300",
+    "301",
+  ]);
+  for (const request of f.requests)
+    expect(new URL(request.url).searchParams.get("wait")).toBe("true");
+  f.store
+    .updateSurfaceMessage("owner", f.thread.id, "stream", {
+      ...message,
+      parts: [{ type: "text", text: "Streamed edit" }],
+    })
+    .unwrap();
+  await f.settle();
+  f.store.updateSurfaceMessage("owner", f.thread.id, "stream", null).unwrap();
+  await f.settle();
+  expect(f.requests.slice(3).map((request) => request.method)).toEqual([
+    "PATCH",
+    "DELETE",
+    "DELETE",
+  ]);
+  for (const request of f.requests.slice(3)) {
+    const url = new URL(request.url);
+    expect(url.searchParams.get("thread_id")).toBe("300");
+    expect(url.searchParams.has("wait")).toBe(false);
+    expect(url.pathname).toMatch(/\/messages\/\d+$/);
+  }
+  expect(f.routingRequests.filter((request) => request.method === "POST")).toHaveLength(2);
+});
+
+test("threaded routing creates nothing for empty, filtered and historical messages; invalid mode fails closed", async () => {
+  for (const routing of ["threaded", "invalid"]) {
+    const f = fixture(undefined, undefined, routing);
+    f.post({ id: "empty", role: "assistant", parts: [{ type: "text", text: "" }] });
+    f.post({ id: "system-only", role: "system", parts: [{ type: "text", text: "Private" }] });
+    f.post({
+      id: "old-only",
+      role: "assistant",
+      metadata: { createdAt: 1 },
+      parts: [{ type: "text", text: "Old" }],
+    });
+    await f.settle();
+    expect(f.requests).toHaveLength(0);
+    expect(f.routingRequests).toHaveLength(0);
+  }
+});
+
+test("moving a destination drops edits to tracked copies and routes only new messages to a new child", async () => {
+  const f = fixture(undefined, undefined, "threaded");
+  f.post({ id: "original", role: "assistant", parts: [{ type: "text", text: "Original" }] });
+  await f.settle();
+  f.parent("201");
+  f.store
+    .updateSurfaceMessage("owner", f.thread.id, "original", {
+      id: "original",
+      role: "assistant",
+      parts: [{ type: "text", text: "Edited" }],
+    })
+    .unwrap();
+  await f.settle();
+  expect(f.requests).toHaveLength(1);
+  expect(f.routingRequests.filter((request) => request.method === "POST")).toHaveLength(1);
+  f.post({ id: "new", role: "assistant", parts: [{ type: "text", text: "New" }] });
+  await f.settle();
+  expect(new URL(f.requests.at(-1)!.url).searchParams.get("thread_id")).toBe("301");
 });

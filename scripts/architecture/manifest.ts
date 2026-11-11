@@ -4916,6 +4916,9 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               exportName,
             })),
             ...[
+              "NativeStore.readDiscordMirrorThread",
+              "NativeStore.reserveDiscordMirrorThread",
+              "NativeStore.settleDiscordMirrorThread",
               "NativeStore.initialize",
               "NativeStore.initializeDeployment",
               "NativeStore.getDeployment",

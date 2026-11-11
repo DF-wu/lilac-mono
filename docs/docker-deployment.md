@@ -37,7 +37,8 @@ docker compose logs -f lilac
 ## Optional Native Conversation Recording
 
 This fork can record new native human messages and visible assistant text/ready attachments to an
-owner-provisioned Discord webhook. Set `LILAC_NATIVE_DISCORD_WEBHOOK_URL` in the protected `.env` used
+owner-provisioned Discord webhook. Optional `LILAC_NATIVE_DISCORD_ROUTING=threaded` creates one public
+child per Native conversation using the existing Discord bot credential; empty/unset keeps flat routing. Set `LILAC_NATIVE_DISCORD_WEBHOOK_URL` in the protected `.env` used
 by source Compose; `compose.yaml` forwards it with an empty default. Installer deployments already
 load additional keys from their protected `secrets.env`. The feature works with any image user and is
 disabled when the value is empty or unset. See [recording setup and delivery guarantees](native-discord-mirror.md)

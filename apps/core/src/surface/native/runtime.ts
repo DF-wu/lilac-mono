@@ -32,7 +32,11 @@ import {
   type NativeOutputEvent,
 } from "@stanley2058/lilac-event-bus";
 import { discoverSkills, type DiscoveredSkill } from "@stanley2058/lilac-utils/skills";
-import { toDurableResolvedModelPlan, type CoreConfig } from "@stanley2058/lilac-utils";
+import {
+  resolveDiscordTokenResult,
+  toDurableResolvedModelPlan,
+  type CoreConfig,
+} from "@stanley2058/lilac-utils";
 import type { CustomCommandManager } from "../../custom-commands/manager";
 import type { ConversationThreadToolService } from "../../conversation/thread-service";
 import type { McpRegistryApi } from "../../mcp/registry-types";
@@ -830,6 +834,12 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       store,
       resources,
       webhookUrl: process.env.LILAC_NATIVE_DISCORD_WEBHOOK_URL,
+      routing: process.env.LILAC_NATIVE_DISCORD_ROUTING,
+      botToken: () =>
+        resolveDiscordTokenResult(options.getConfig()).match({
+          ok: (token) => token,
+          err: () => undefined,
+        }),
       warn: (message) =>
         options.warn(message, new Error("Native Discord mirror delivery is best-effort")),
     });
