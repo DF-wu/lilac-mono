@@ -217,7 +217,7 @@ export function createDiscordMirrorThreads(options: {
       return null;
     }
     // A skipped send or confirmed client rejection proves that no child was created.
-    if (created && (created.status === 0 || (created.status >= 400 && created.status < 500)))
+    if (created && [0, 400, 401, 403, 404, 405, 429].includes(created.status))
       options.store
         .settleDiscordMirrorThread(destination, nativeThreadId, null)
         .match({ ok: () => undefined, err: () => undefined });

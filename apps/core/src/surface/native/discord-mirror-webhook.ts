@@ -16,6 +16,7 @@ const replySchema = z.object({
   parent_id: z
     .string()
     .regex(/^\d{1,20}$/)
+    .nullable()
     .optional(),
   type: z.number().int().optional(),
   thread_metadata: z.object({ archived: z.boolean(), locked: z.boolean() }).optional(),

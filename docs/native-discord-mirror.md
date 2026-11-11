@@ -84,8 +84,9 @@ with at most three HTTP attempts per operation, ten-second deadlines and a 30-se
 `native-surface.db` schema 8 stores only destination identities, Native IDs, and nullable Discord
 thread IDs in `native_discord_threads`. An atomic insert reserves a mapping **before** create. One
 in-process promise deduplicates concurrent resolution; the unique SQLite key also arbitrates racing
-reservations. A skipped unsent request or confirmed HTTP 4xx rejection releases the reservation, including an exhausted confirmed
-429. Network failures, malformed success bodies, HTTP 5xx, or a crash leave it unresolved. No automatic
+reservations. A skipped unsent request or confirmed HTTP 400/401/403/404/405/429 rejection releases the
+reservation, including an exhausted confirmed 429. HTTP 408 timeouts and other unclassified responses,
+network failures, malformed success bodies, HTTP 5xx, or a crash leave it unresolved. No automatic
 retry or background recovery scans Discord for a candidate, so an uncertain create cannot blindly
 produce duplicate children. A crash before the HTTP request can therefore leave a reservation with
 no child and requires the same manual reconciliation.

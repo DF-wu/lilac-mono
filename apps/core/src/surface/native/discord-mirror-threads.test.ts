@@ -69,7 +69,7 @@ function fixture() {
           return Response.json(thread);
         }
         const id = new URL(url).pathname.split("/").at(-1)!;
-        if (id === parent) return Response.json({ id, type: parentType });
+        if (id === parent) return Response.json({ id, type: parentType, parent_id: null });
         if (channelStatus !== 200)
           return Response.json({ message: "PRIVATE_SENTINEL" }, { status: channelStatus });
         const thread = threads.get(id);
@@ -147,11 +147,12 @@ test("destination includes webhook and parent identity, but excludes credential 
 });
 
 test("uncertain create responses and crash reservations block duplicate creates across restart", async () => {
-  for (const outcome of ["network", "server", "malformed"] as const) {
+  for (const outcome of ["network", "server", "malformed", "http-timeout"] as const) {
     const f = fixture();
     f.create(async () => {
       if (outcome === "network") throw new Error("PRIVATE_SENTINEL");
       if (outcome === "server") return Response.json({}, { status: 503 });
+      if (outcome === "http-timeout") return Response.json({}, { status: 408 });
       return Response.json({ id: "broken" });
     });
     expect(await f.make().resolve("native-a", "First")).toBeNull();
@@ -252,4 +253,11 @@ test("a superseded message during the pre-create wait releases its unsent reserv
   f.reopen();
   f.onWait(async () => {});
   expect(await f.make().resolve("native-a", "First")).toBe("300");
+});
+
+test("uncategorized text parents accept Discord null parent_id on create and reuse", async () => {
+  const f = fixture();
+  expect(await f.make().resolve("native-a", "First")).toBe("300");
+  expect(await f.make().resolve("native-a", "Second")).toBe("300");
+  expect(f.creates()).toHaveLength(1);
 });
