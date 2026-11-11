@@ -20,6 +20,12 @@ checks out that SHA and checks successful push-CI evidence and main freshness be
 It checks main again immediately before pushing tags, so a build overtaken by a later main
 update does not publish its convenience tags.
 
+All invocations also share a repository/variant job concurrency group with cancellation disabled.
+An already-started old upload therefore finishes before a new publisher for those tags can run;
+it cannot finish after a newer successful publication and restore the old tag. Both main-freshness
+checks remain, including for a job that waited. GitHub can replace pending jobs and does not promise
+dispatch order; this is not a durable release queue or an atomic transaction with advancing main.
+
 Scheduled upstream sync retains its fixed baseline/upstream/candidate SHAs, full reusable CI,
 strict footprint gate, and main freshness/ancestry checks before fast-forward. Its image job
 calls the reusable publisher only after verification and fast-forward succeed, passing that same

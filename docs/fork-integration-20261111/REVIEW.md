@@ -14,6 +14,7 @@ the tested commit and any subsequent review confirmation.
 | P2: restricted target could cross clients through the same literal alias | Both the HTTP authority gate and surface adapter compared session strings without first rejecting a different explicit client. Reviewer reproduced a native-origin call reading an allowed Discord channel through an alias equal to the native origin. Inherited fork behavior, but violates F15's explicit cross-client denial requirement. | Both guards reject a differing explicit client before defaulting or comparing IDs. Native raw/prefixed aliases remain valid within native. Equal-literal and omitted-session regressions failed before the surface fix; HTTP tests cover both forms under authenticated workflow origin. |
 | P2: scheduled releases rejected successful sync tips | The inherited release demanded a prior push-CI event. `GITHUB_TOKEN` sync updates deliberately do not produce that event, despite the sync's reusable CI. | Release artifact builds now depend on reusable CI for the release's exact SHA and pinned upstream footprint ref. The unchanged-release skip remains. The dependency regression failed before the change; actual YAML gate and publication tests pass after it. |
 | Stale current migration guidance promised an automatic backup/migration | The entrypoint hook and wrappers were removed, while current `MIGRATIONS.md`, `PROJECT.md` and fork inventories still described them. | Current guidance now names the supported offline baseline and verified backup/restore procedure. Historical dated reports remain historical. The old migration anchor remains usable and points at the new cutover description. |
+| P2: overlapping image uploads could restore an older convenience tag | Fresh review at committed `2313d208` executed the actual publication shell with Git/Docker stubs and FIFO synchronization. Old upload started; main advanced; new upload completed; old upload resumed. Both exited zero, leaving the tag at old while main was new. The pre-push freshness guard alone could not prevent this. | The publisher job now uses one repository/variant concurrency group shared by direct, manual and reusable invocations, with `cancel-in-progress: false`. An upload finishes before another publisher for its tags starts; both freshness gates remain. The configuration regression failed on the missing policy, then all 11 publication/release tests passed. |
 
 The provider reviewer demonstrated no further consequential F09–F14/F23 issue. The inventory
 was independently recounted at review time without missing or extra paths; final counts are
@@ -22,6 +23,23 @@ regenerated after adding the final evidence files.
 The Core reviewer independently ran 40 startup, lineage, mirror and Telegram-memory tests
 with Bun 1.4.4: zero failures and 230 assertions. Reviewer bug reproductions used in-memory
 fixtures and mocked execution, without live services or private data.
+
+## Refreshed-main review
+
+Two fresh Codex reviewers examined committed `2313d208daa7bbdea3f4048c18aa7f854044ea67`
+against refreshed main `2e5159be7b23fa34a25a517275d20f327858f9f7`. Core review found no
+consequential remaining issue and independently passed 426 tests with 3,049 assertions across
+16 files. Delivery/provider review passed 643 tests, schema freshness and strict footprint;
+it independently matched every path set (256 original, 466 since audit, 275 remaining,
+82 follow-up, 694 union) and found the overlapping-upload race above.
+
+The publication fix uses GitHub's existing job concurrency rather than a new runtime queue or
+recovery subsystem. [GitHub's concurrency contract](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
+defines a single running job per repository concurrency group and allows matrix expressions.
+The group deliberately excludes workflow name, event and SHA, so all callers of a variant
+share it. The regression verifies that infrastructure policy; the FIFO reproduction exercises
+the actual shell race that requires it. Local tests do not execute GitHub's scheduler.
+Fresh final-HEAD confirmation and subsequent full checks are recorded in the follow-up PR.
 
 ## Residual findings and limits
 

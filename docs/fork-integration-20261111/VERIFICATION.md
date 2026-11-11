@@ -21,6 +21,8 @@ Two host failures were reproduced on pinned upstream `3493c0c6` before being cla
 
 Earlier container attempts without init, Docker CLI or normalized backend-socket environment failed for those environment reasons and are not passing evidence. Current full checks pass under the documented isolated setup. Three inherited Oxlint warnings remain (unused disposal bindings and a throwing async-generator test); lint reports zero errors. No required check is waived.
 
+An additional exact-HEAD attempt at `2313d208` overlapped image builds and failed three inherited five-second test budgets (workflow wait cleanup, populated schema26 upgrade and plugin callable registration). The failed log is retained as `check-exact-2313d208.log`; those timeouts are not passing evidence. Final verification reruns the affected cases and full gate after image builds finish, without increasing budgets. The follow-up PR records the actual final outcome.
+
 ## Focused evidence
 
 Domain reports name the source boundaries and regression families. Focused Telegram/memory/workflow suites passed 941 tests; command suites passed 53; provider/compaction/config suites passed 389. The independent Core reviewer ran 40 tests with 230 assertions. Runtime/native recording, authenticated-origin, Redis cleanup and publication YAML shell-gate suites also passed. Their meaningful regressions and review corrections are described in REVIEW.md.

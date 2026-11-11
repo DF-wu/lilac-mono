@@ -5,6 +5,7 @@ import path from "node:path";
 
 type Step = { name: string; run?: string; uses?: string; with?: Record<string, unknown> };
 type Job = {
+  concurrency?: { group: string; "cancel-in-progress": boolean };
   needs?: string[];
   if?: string;
   uses?: string;
@@ -133,6 +134,14 @@ test("image workflow binds checkout, tags and build metadata to the publication 
   expect(source).toContain("LILAC_BUILD_COMMIT=${{ env.PUBLISH_SHA }}");
   expect(source).toContain("value=${{ matrix.variant.tag }}-${{ steps.source.outputs.short_sha }}");
   expect(source).not.toContain("type=sha,");
+});
+
+test("image publishers serialize each variant across direct, manual and reusable invocations", async () => {
+  const image = await workflow("build-image.yml");
+  expect(image.jobs["build-and-push"]?.concurrency).toEqual({
+    group: "fork-core-image-${{ github.repository }}-${{ matrix.variant.tag }}",
+    "cancel-in-progress": false,
+  });
 });
 
 test("all CI jobs check out the requested candidate and footprint is strict", async () => {

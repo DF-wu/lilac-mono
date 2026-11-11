@@ -22,6 +22,14 @@ Tracked/index/unstaged patches and untracked files were saved outside the reposi
 
 The pre-reconciliation full check passed with Bun 1.4.4: 7,878 passed, four skipped, zero failed. The earlier domain reviews found Telegram publication ordering, cross-client alias authorization, release-CI evidence and stale migration claims. Their fixes and limits are in REVIEW.md. Final reconciled checks, exact committed-HEAD review and image provenance are recorded in VERIFICATION.md and the follow-up PR.
 
+The reconciled full gate passed 7,880 tests before commit `2313d208`. Fresh committed-HEAD review
+passed 426 Core and 643 delivery/provider tests and verified every inventory set. It found an
+overlapping image-upload race; the follow-up now serializes publisher jobs by repository/variant
+without canceling an active upload. The regression failed before the change and all 11 delivery
+gate tests passed after it. Three exact-HEAD test timeouts overlapped image builds; all affected
+suites passed 101 tests in isolation with unchanged budgets. All three `2313d208` images passed
+smoke, but final provenance must identify the later publication-fix commit.
+
 Tests run in a disposable init-managed container with clean image home and explicit fixture Redis. The Docker CLI/socket is available only for disposable test containers; production-only backend-socket configuration is cleared. Host-only operator port and compaction-overlay failures were reproduced against pinned upstream; the operator test now uses an ephemeral listener and the compaction test remains unchanged. No live service is used for verification.
 
 ## Completion plan
