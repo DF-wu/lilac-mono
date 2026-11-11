@@ -41,7 +41,7 @@ from a partially applied migration. Starting an older binary alone does not undo
    Verify native deployment settings and subagent authority after adopting v3.
 
 Rollback uses the matching pre-upgrade databases and blob storage together. Current workflow schema
-28, transcript schema 14, and native schema 7 are not readable by older builds. Strict record codecs
+28, transcript schema 14, and native schema 8 are not readable by older builds. Strict record codecs
 can also change within a schema version; a matching version number alone does not establish downgrade
 compatibility. Keep producers stopped while restoring. Never remove migration markers to force an
 older binary to open current data.
@@ -226,7 +226,7 @@ by installation and principal; canonical conversation history remains on the ser
 conversation views after upgrading. Old standalone terminal binaries and their credential/cache files
 are no longer used; run the container-local operator console and remove obsolete local files if unwanted.
 
-Native schema migrations run automatically. The current schema is 7:
+Native schema migrations run automatically. The current schema is 8:
 
 - Schema 1 establishes the native store. Record additions include deployment settings, DMs,
   temporary operator conversations, HTML previews, identity, and title-generation metadata.
@@ -239,6 +239,12 @@ Native schema migrations run automatically. The current schema is 7:
 - Schema 6 adds native questions and optional question-reply references. Existing records are retained.
 - Schema 7 adds per-user model favorites, optional reasoning on threads/inputs, and child task/model
   display metadata. Existing aliases and old completion targets remain valid.
+- Schema 8 adds `native_discord_threads`: one routing reservation/mapping per webhook ID,
+  parent-channel ID, and Native conversation ID. A NULL Discord thread ID means creation is unresolved;
+  it blocks another create across restart. No credentials or message correspondence are stored.
+  Existing records are retained. Back up `native-surface.db` consistently before upgrading; older builds
+  reject schema 8. Restore the matching pre-upgrade backup for rollback. See
+  [mirror recovery](docs/native-discord-mirror.md#thread-routing-recovery) before changing a reservation.
 
 Before moving customized native settings to config v3, start with v2 and verify the one-time import
 of `titleModel`, `outputStreaming`, `oldMessageSelectionMaxAgeMs`, `storageRetentionMaxAgeMs`, and

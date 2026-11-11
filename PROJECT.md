@@ -89,6 +89,12 @@ The fail-closed workspace inventory is `ACTIVE_WORKSPACES` in `scripts/architect
 - `packages/client`: framework-independent native socket, replay, receipt and cache coordination.
 - `apps/web`: React/Vite native chat UI. Core serves its built assets from the native gateway.
 
+The optional Native Discord mirror observes committed human/Lilac display messages without historical
+backfill. `LILAC_NATIVE_DISCORD_ROUTING=threaded` selects public child threads in a normal text parent,
+using existing Discord bot credential resolution. `NativeStore` owns destination-scoped durable routing
+reservations; webhook message/edit correspondence stays bounded and process-local. See
+[mirror setup and recovery](docs/native-discord-mirror.md).
+
 Native surface ownership is in `apps/core/src/surface/native`: `store.ts` owns native SQLite state,
 `execution.ts` bridges accepted input to existing request delivery, and `runtime.ts` composes auth,
 resources, search, semantic output projection and the HTTP/WebSocket gateway. The surface uses

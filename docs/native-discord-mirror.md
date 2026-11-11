@@ -2,7 +2,8 @@
 
 This optional DF-wu fork feature records new native user-surface messages to one owner-provisioned
 Discord incoming webhook. It is disabled by default. It does not use an agent transcript, expose a
-configuration API, add a UI, or change any stored or wire format.
+configuration API, add a UI, or change the Native wire format. Optional threaded routing adds a small
+durable routing table.
 It works with any configured image user and native authentication provider; no deployment identity
 or named account is required.
 
@@ -41,7 +42,70 @@ or named account is required.
 Keep the key empty or unset to leave recording disabled. Use an image/build containing this fork
 feature. Do not print a resolved Compose configuration with real credentials during validation.
 These instructions do not provision secrets, restart Core, or send a verification post automatically.
-Forum/media channels and a `thread_id` destination are not supported in this first version.
+Forum/media parents and manually supplied `thread_id` webhook query parameters are unsupported.
+
+### One Discord child thread per Native conversation
+
+Set `LILAC_NATIVE_DISCORD_ROUTING=threaded` independently in each Core instance. Empty/unset or `flat`
+keeps legacy flat delivery. The webhook key must still be nonempty; an empty/unset webhook disables
+both modes. Unknown routing values disable mirroring with a sanitized warning. Compose forwards both
+keys; installer `secrets.env` also accepts both without a new prompt or YAML configuration field.
+Each instance needs its own destination webhook/parent and durable data volume. Do not share a Native
+SQLite database between Core processes.
+
+Threaded mode uses the existing bot credential selected by `surface.discord.tokenEnv` (the same
+resolver as the Discord adapter). No second token setting is introduced; no bot or webhook credential
+is written to the Native DB. The bot needs View Channel, Create Public Threads, Send Messages in
+Threads, and permission to reopen unlocked archived threads in the webhook parent. Discord can require
+Manage Threads for some archive operations; missing permissions drop delivery safely. The parent must
+be a normal guild text channel (`GUILD_TEXT`), not an announcement, forum, media, or child channel.
+Missing auth, inaccessible parents, and failed creation produce fixed warnings, with **no flat fallback**.
+The existing bot credential can serve this REST path without enabling Discord gateway ingress.
+
+The first eligible, nonempty display message lazily creates a public child thread without a starter
+message in the parent. Empty conversations, filtered output and historical replay do not create one.
+Its name contains the sanitized Native title (or `Native conversation`) and a stable ten-character
+SHA-256 suffix of the Native ID, bounded to 100 UTF-16 units. Later Native title changes do not rename
+Discord threads. Later messages and tracked edits/deletes reuse the child via `thread_id`.
+
+Before delivery, Core resolves the webhook parent again. Durable mappings are keyed by webhook ID,
+parent channel ID and Native conversation ID. Rotating credentials while preserving those identities
+reuses the child. Replacing the webhook or moving its parent selects a new mapping; updates to already
+tracked copies are dropped after a parent move, rather than targeting message IDs in the new child.
+New messages use the new child. Old copies remain in their original destination.
+
+Unlocked archived children are explicitly reopened before sends, edits or deletes. Locked children
+are not unlocked. Deleted, inaccessible, wrong-parent or locked children retain their mapping and drop
+the update. There is no automatic replacement thread or fallback. Later messages may retry access,
+with at most three HTTP attempts per operation, ten-second deadlines and a 30-second wait budget.
+
+### Thread routing recovery
+
+`native-surface.db` schema 8 stores only destination identities, Native IDs, and nullable Discord
+thread IDs in `native_discord_threads`. An atomic insert reserves a mapping **before** create. One
+in-process promise deduplicates concurrent resolution; the unique SQLite key also arbitrates racing
+reservations. A skipped unsent request or confirmed HTTP 400/401/403/404/405/429 rejection releases the
+reservation, including an exhausted confirmed 429. HTTP 408 timeouts and other unclassified responses,
+network failures, malformed success bodies, HTTP 5xx, or a crash leave it unresolved. No automatic
+retry or background recovery scans Discord for a candidate, so an uncertain create cannot blindly
+produce duplicate children. A crash before the HTTP request can therefore leave a reservation with
+no child and requires the same manual reconciliation.
+
+On an unresolved-creation warning, the operator should stop the affected Core instance and back up its
+Native DB consistently. Inspect `native_discord_threads` locally and use the destination webhook/parent
+identities and stable name suffix to find the child in Discord, including archived children. If its
+identity and parent are verified, set that row's `discord_thread_id` to the verified child ID. If no child
+exists, clear only that exact unresolved row after ruling out a still-running/in-flight create. If
+uncertain, leave it blocked. For a known deleted/locked/inaccessible child, restore access or make an
+explicit operator decision before changing its mapping. Restart Core through the normal deployment
+workflow after reconciliation. Never delete all mappings as a troubleshooting shortcut: that can
+fork every conversation. This task does not perform these operations.
+
+This conservative recovery policy trades unattended liveness for duplicate protection. Lost updates
+are not replayed after repair; only subsequent live updates/messages are eligible.
+
+Protocol references: [Discord child thread creation](https://docs.discord.com/developers/resources/channel#start-thread-without-message)
+and [webhook query routing](https://docs.discord.com/developers/resources/webhook#execute-webhook).
 
 ## Content and source boundary
 
@@ -100,10 +164,12 @@ bodies, resource references or captured exception messages.
 
 ## Limits and restart guarantees
 
-This is best-effort recording, not an audit log or exactly-once delivery service. There is no durable
+This is best-effort recording, not an audit log or exactly-once delivery service. Only the
+conversation-to-child routing map is durable. There is no durable
 outbox, restart replay, recovery worker or persistent webhook-message map. A crash, shutdown, pruning,
-overload or exhausted retry can lose changes; a crash after a create can leave an orphaned/duplicate
-recording. Edits/deletes to messages from an earlier process are ignored. Failed retractions can leave
+overload or exhausted retry can lose changes; a crash after a webhook message create can leave an
+orphaned recording. Uncertain child creation stays reserved for operator reconciliation; it is never
+blindly recreated. Edits/deletes to messages from an earlier process are ignored. Failed retractions can leave
 stale Discord content. Native retention/deletion is not a guarantee that Discord copies are erased.
 
 Resources are deliberately bounded:

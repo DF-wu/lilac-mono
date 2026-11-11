@@ -9,6 +9,17 @@ const replySchema = z.object({
     .string()
     .regex(/^\d{1,20}$/)
     .optional(),
+  channel_id: z
+    .string()
+    .regex(/^\d{1,20}$/)
+    .optional(),
+  parent_id: z
+    .string()
+    .regex(/^\d{1,20}$/)
+    .nullable()
+    .optional(),
+  type: z.number().int().optional(),
+  thread_metadata: z.object({ archived: z.boolean(), locked: z.boolean() }).optional(),
   retry_after: z.number().nonnegative().optional(),
 });
 
@@ -34,7 +45,7 @@ export function discordMirrorWebhookUrl(value?: string): string | undefined {
   return `https://discord.com${url.pathname.replace(/^\/api\/(?!v10\/)/, "/api/v10/")}`;
 }
 
-async function readReply(response: Response) {
+export async function readDiscordMirrorReply(response: Response) {
   const reader = response.body?.getReader();
   if (!reader) return null;
   let length = 0;
@@ -72,6 +83,7 @@ export function createDiscordMirrorWebhook(options: {
     content: string,
     files: MirrorFile[] = [],
     current: () => boolean = () => true,
+    threadId?: string,
   ): Promise<string | null> {
     for (let attempt = 0; attempt < 3; attempt++) {
       if (options.signal.aborted) return null;
@@ -100,16 +112,19 @@ export function createDiscordMirrorWebhook(options: {
           new Blob([Uint8Array.from(file.bytes)], { type: file.mediaType }),
           file.name,
         );
-      const url = id ? `${options.url}/messages/${id}` : `${options.url}?wait=true`;
+      const url = new URL(options.url);
+      if (id) url.pathname += `/messages/${id}`;
+      if (method === "POST") url.searchParams.set("wait", "true");
+      if (threadId) url.searchParams.set("thread_id", threadId);
       const captured = await Result.tryPromise({
         try: async () => {
-          const response = await send(url, {
+          const response = await send(url.toString(), {
             method,
             redirect: "error",
             signal: AbortSignal.any([options.signal, AbortSignal.timeout(10_000)]),
             ...(method === "DELETE" ? {} : { body: form }),
           });
-          const reply = await readReply(response);
+          const reply = await readDiscordMirrorReply(response);
           return {
             status: response.status,
             reply,

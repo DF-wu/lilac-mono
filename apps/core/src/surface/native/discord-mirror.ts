@@ -1,5 +1,6 @@
 import type { DisplayMessage, DisplayPart } from "@stanley2058/lilac-client-protocol";
 import { Result } from "better-result";
+import { createDiscordMirrorThreads } from "./discord-mirror-threads";
 import { readDiscordMirrorAttachment } from "./discord-mirror-attachment";
 import type { NativeResourceService } from "./resources";
 import type { NativeDisplayCommit, NativeStore } from "./store";
@@ -19,6 +20,7 @@ type MirroredMessage = {
   parts: (VisiblePart | null)[];
   ids: string[];
   fingerprint?: string;
+  discordThreadId?: string;
   removed: boolean;
   revision: number;
 };
@@ -52,10 +54,17 @@ export function createNativeDiscordMirror(options: {
   store: NativeStore;
   resources: Pick<NativeResourceService, "scopedAccess">;
   webhookUrl?: string;
+  routing?: string;
+  botToken?: () => string | undefined;
   warn: (message: string) => void;
   fetch?: MirrorFetch;
   wait?: (ms: number, signal: AbortSignal) => Promise<void>;
 }) {
+  const mode = options.routing || "flat";
+  if (mode !== "flat" && mode !== "threaded") {
+    options.warn("Native Discord mirror disabled: invalid routing configuration");
+    return { drain: async () => {}, stop: async () => {} };
+  }
   const url = discordMirrorWebhookUrl(options.webhookUrl);
   if (!url) {
     if (options.webhookUrl)
@@ -65,6 +74,15 @@ export function createNativeDiscordMirror(options: {
   const abort = new AbortController();
   const activatedAt = Date.now();
   const webhook = createDiscordMirrorWebhook({ ...options, url, signal: abort.signal });
+  const threads =
+    mode === "threaded"
+      ? createDiscordMirrorThreads({
+          ...options,
+          url,
+          signal: abort.signal,
+          botToken: options.botToken ?? (() => undefined),
+        })
+      : undefined;
   const messages = new Map<string, MirroredMessage>();
   const pending = new Map<string, MirroredMessage>();
   let active: Promise<void> | undefined;
@@ -117,6 +135,7 @@ export function createNativeDiscordMirror(options: {
       author: message.role === "user" ? `human:${authorId}` : "assistant:lilac",
       parts: message.parts.slice(0, 128).map(visiblePart),
       ids: existing?.ids ?? [],
+      discordThreadId: existing?.discordThreadId,
       removed: false,
       revision: existing?.revision ?? 0,
     };
@@ -250,6 +269,18 @@ export function createNativeDiscordMirror(options: {
     const body = `${text}${omitted ? "\n[Attachment unavailable or exceeds mirror limits]" : ""}`;
     const content = chunks(body);
     if (files.length && content.length === 0) content.push("[Attachment]");
+    if (!content.length && !entry.ids.length) return;
+    const thread = threads
+      ? options.store
+          .getThreadRecord(entry.threadId)
+          .match({ ok: (value) => value, err: () => null })
+      : null;
+    const discordThreadId = threads
+      ? await threads.resolve(entry.threadId, thread?.title ?? "", entry.discordThreadId, current)
+      : undefined;
+    if (threads && !discordThreadId) return;
+    if (!current() || abort.signal.aborted) return;
+    entry.discordThreadId = discordThreadId ?? undefined;
     for (let index = 0; index < content.length; index++) {
       const header = `[native:${entry.threadId} | ${entry.author} | ${entry.id} | ${index + 1}]\n`;
       const id = await webhook.request(
@@ -258,13 +289,14 @@ export function createNativeDiscordMirror(options: {
         header + content[index],
         index === 0 ? files : [],
         current,
+        entry.discordThreadId,
       );
       if (!id) return;
       entry.ids[index] = id;
     }
     while (entry.ids.length > content.length) {
       const id = entry.ids.at(-1)!;
-      if (!(await webhook.request("DELETE", id, "", [], current))) return;
+      if (!(await webhook.request("DELETE", id, "", [], current, entry.discordThreadId))) return;
       entry.ids.pop();
     }
     entry.fingerprint = fingerprint;
