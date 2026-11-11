@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+enable_free_tier: true
+tone_instructions: >-
+  Use concise engineering English. Prioritize actionable correctness, security,
+  and regression findings with concrete evidence. Avoid style-only nitpicks,
+  praise, and repeated summaries.
+reviews:
+  profile: chill
+  auto_approvals:
+    enabled: false
+  high_level_summary: false
+  poem: false
+  in_progress_fortune: false
+  sequence_diagrams: false
+  suggested_labels: false
+  suggested_reviewers: false
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 0
+    drafts: false
+    base_branches:
+      - ".*"
+  path_filters:
+    - "!ref/**"
+  path_instructions:
+    - path: "apps/core/**"
+      instructions: >-
+        Check authenticated surface admission, canonical session/request identity,
+        and isolation across users and conversations. For durable delivery and
+        workflow changes, check replay, cancellation, and idempotency boundaries
+        against PROJECT.md and the architecture gate.
+    - path: "packages/**"
+      instructions: >-
+        Check changes to shared event, client-protocol, filesystem, and plugin
+        contracts against their callers and MIGRATIONS.md. Check tool permissions,
+        remote path containment, and credential redaction where applicable.
+chat:
+  auto_reply: false
