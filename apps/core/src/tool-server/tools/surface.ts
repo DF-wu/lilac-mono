@@ -412,6 +412,17 @@ function withDefaultSessionId<
       ? ctx.requestInitiatorSessionId
       : undefined;
 
+  if (
+    ctx?.safetyMode === "restricted" &&
+    ctx.requestInitiator &&
+    input.client !== undefined &&
+    input.client !== ctx.requestInitiator.platform
+  ) {
+    return Result.err(
+      surfaceFailure("denied", "Restricted surface call cannot change origin client"),
+    );
+  }
+
   if (input.sessionId !== undefined) {
     const nativeRefs = getBuiltinSurfaceProtocol("native").refs;
     const matchesNativeSession =

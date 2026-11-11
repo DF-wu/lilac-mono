@@ -401,10 +401,11 @@ function isCurrentSessionScopedSurfaceCall(params: {
   if (!params.sessionId) return false;
   if (!params.input || typeof params.input !== "object" || Array.isArray(params.input)) return true;
 
+  const inputClient = Reflect.get(params.input, "client");
+  if (inputClient !== undefined && inputClient !== params.requestClient) return false;
   const inputSessionId = Reflect.get(params.input, "sessionId");
   if (inputSessionId === undefined || inputSessionId === null || inputSessionId === "") return true;
   if (typeof inputSessionId !== "string") return false;
-  const inputClient = Reflect.get(params.input, "client");
   if (
     params.requestClient === "native" &&
     (inputClient === undefined || inputClient === "native")

@@ -5,6 +5,7 @@ export const CHECK_GATES = [
   "lint:oxlint",
   "lint:architecture",
   "test:ci",
+  "test:custom-media",
   "typecheck",
   "fmt:check",
 ] as const;

@@ -2,7 +2,8 @@ import { afterEach, expect, test, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Result } from "better-result";
 import type { DisplayMessage } from "@stanley2058/lilac-client-protocol";
-import { NativeStore, nativeStoreTransaction } from "./store";
+import { NativeStore, NATIVE_JOB_WAKE_COMMAND_PREFIX, nativeStoreTransaction } from "./store";
+import { NativeQuestions } from "./questions";
 import { nativeFailure } from "./errors";
 import { createNativeDiscordMirror } from "./discord-mirror";
 import { createMemoryBlobStore } from "@stanley2058/lilac-blob-storage";
@@ -218,6 +219,70 @@ test.each(["flat", "threaded"])(
   "%s: allowlists human/assistant text and excludes system, reasoning, tools and service inputs",
   checkFiltering,
 );
+
+test("job wakes and deferred question parts stay private while visible replies are recorded", async () => {
+  const f = fixture();
+  const receipt = f.store
+    .acceptSurfaceInput("owner", {
+      threadId: f.thread.id,
+      commandId: `${NATIVE_JOB_WAKE_COMMAND_PREFIX}mirror-test`,
+      historyGeneration: 0,
+      text: "JOB_WAKE_SENTINEL",
+      mode: "prompt",
+      attachmentIds: [],
+      skillIds: [],
+    })
+    .unwrap();
+  const input = f.store.getInput(receipt.inputId).unwrap();
+  const questions = new NativeQuestions(f.store);
+  (
+    await questions.begin({
+      requestId: input.requestId,
+      requestDeliveryId: input.deliveryId,
+      sessionId: f.thread.id,
+      platform: "native",
+      userId: "owner",
+      toolCallId: "mirror-question",
+      mode: "deferred",
+      questions: {
+        questions: [
+          {
+            id: "destination",
+            header: "QUESTION_HEADER_SENTINEL",
+            question: "QUESTION_TEXT_SENTINEL",
+            options: [
+              { id: "yes", label: "QUESTION_OPTION_SENTINEL", description: "Choose" },
+              { id: "no", label: "No", description: "Decline" },
+            ],
+          },
+        ],
+      },
+    })
+  ).unwrap();
+  await f.settle();
+  expect(f.requests).toHaveLength(0);
+
+  const question = f.store.listPendingQuestions("owner", f.thread.id).unwrap()[0]!;
+  f.post({
+    id: "visible-after-wake",
+    role: "assistant",
+    parts: [
+      { type: "text", text: "Visible reply after the job" },
+      { type: "data-question", id: "question-copy", data: question },
+    ],
+  });
+  await f.settle();
+  expect(f.requests).toHaveLength(1);
+  const output = JSON.stringify(f.requests[0]!.payload);
+  expect(output).toContain("Visible reply after the job");
+  for (const sentinel of [
+    "JOB_WAKE_SENTINEL",
+    "QUESTION_HEADER_SENTINEL",
+    "QUESTION_TEXT_SENTINEL",
+    "QUESTION_OPTION_SENTINEL",
+  ])
+    expect(output).not.toContain(sentinel);
+});
 
 test("no history on enable, disabled/invalid URL sends nothing, and rolled back writes stay private", async () => {
   for (const url of [

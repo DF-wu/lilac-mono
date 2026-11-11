@@ -61,8 +61,8 @@
     "build:model-catalog": "bun run codegen:model-catalog",
     "codegen:model-catalog": "bun scripts/build-model-catalog.ts",
     "fork:footprint": "bun scripts/fork/check-upstream-footprint.ts",
-    "migrate:blob-storage": "bun apps/core/scripts/migrate-blob-storage.ts",
-    "typecheck:fork": "bunx tsc --ignoreConfig --noEmit --strict --skipLibCheck --target ESNext --module Preserve --moduleResolution bundler --allowImportingTsExtensions --types bun scripts/fork/*.ts"
+    "typecheck:fork": "bunx tsc --ignoreConfig --noEmit --strict --skipLibCheck --target ESNext --module Preserve --moduleResolution bundler --allowImportingTsExtensions --types bun scripts/fork/*.ts",
+    "test:custom-media": "bun install --cwd=examples/plugins/custom-media --frozen-lockfile && bun run --cwd=examples/plugins/custom-media test && bun run --cwd=examples/plugins/custom-media typecheck"
   },
   "devDependencies": {
     "@oxlint/plugins": "1.75.0",

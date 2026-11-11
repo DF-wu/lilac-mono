@@ -2,6 +2,8 @@
 
 語言：[`English（主要／規範版本）`](./fork-differences.md) · [`繁體中文（翻譯）`](./fork-differences.zh-TW.md)
 
+Current integration: upstream `3493c0c6c06260e6c472bd230dc02d4b0308db43`, PR #101. The [English integration inventory](./fork-integration-20261111/README.md) owns the current feature dispositions, offline migration support and verification; older dated baselines below are historical.
+
 本文件描述 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) 相對於 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的現行差異。
 
 比較基準為 upstream commit [`4f7eedb8`](https://github.com/stanley2058/lilac-mono/commit/4f7eedb80dece58c79369b62210574ea869bbae6)，透過 fork PR [#92](https://github.com/DF-wu/lilac-mono/pull/92) 整合。本 fork 在其上保留下列功能與維運修改。
@@ -124,7 +126,7 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 | GitHub final-publication policy | 尚無；改動仍在 upstream 檔案裡 | `github/webhook/github-webhook-server.ts`（issue 與 PR review prompt 的發布政策）。Reply permalinks 已改由 upstream PR #35 提供，不再占用任何接縫 |
 | Agent 與 event bus 修正 | 尚無；改動仍在 upstream 檔案裡 | `packages/agent/adapters/ai-sdk/adapter.ts`（非標準 finish reason 下的 tool calls）、`packages/agent/auto-compaction.ts`（本次輸入保護）、`packages/event-bus/redis-streams-bus.ts`（single-flight subscription cleanup）。Idle watchdog 現在與 upstream 相同，已移除無使用者的 timer-injection 補丁 |
 | Compatible-provider tool images | `packages/utils/openai-compatible-tool-images.ts` | `packages/utils/model-provider.ts` 僅包裝 `openai-compatible` chat provider |
-| 啟動時的 legacy blob migration | `apps/core/scripts/startup-blob-storage-migration.ts` 與 `startup-blob-storage-backup.ts` | `docker/direct-entrypoint.sh` 在精確符合預設 Core command 時先跑 migration；`legacy-transcript-blob-migration.ts` 保留明確的 `close(false)` 清理。備份與支援版本規則見 [`MIGRATIONS.md`](../MIGRATIONS.md#automatic-transcript-and-workflow-blob-migration) |
+| Legacy blob cutover | Historical upstream offline tool at `f2c90667ac5616796c992602ca5fb5be726cf40d` | Automatic startup migration and backups are retired. Follow the [current offline support and rollback procedure](./fork-integration-20261111/migration.md). |
 | Core 啟動 Result 邊界 | `apps/core/src/runtime/start-core-runtime.ts` | `runtime/main.ts` 委派此 helper 處理 Core 建立與啟動的 Result；它不會執行自動 blob migration |
 | Architecture gate | 無 | `scripts/architecture/manifest.ts`、`precise-exception-identities.ts` 與 `core-final-boundary-identities.ts` 註冊 fork 模組；`architecture.test.ts` 預期 Telegram request router 的 event consumer |
 

@@ -102,21 +102,21 @@ separate syntax exception catalog.
 ### Unified blob storage
 
 `BLOB_STORAGE_ARCHITECTURE_POLICY` registers the storage workspace, adapter construction owners, Core
-close owner, materialization modules, current event schema, benchmark targets, and frozen migration
-modules. The syntax gate enforces these contracts:
+close owner, materialization modules, current event schema, and benchmark target modules. The syntax
+gate enforces these contracts:
 
 - only `packages/blob-storage` imports Bun S3 storage operations;
 - `packages/blob-storage` does not import another Lilac workspace domain;
-- only registered composition, benchmark, and migration modules construct adapters;
+- only registered composition and benchmark modules construct adapters;
 - current event schemas and Core databases do not store managed inline bytes;
 - only the Core runtime owner closes the runtime-composed `BlobStore`; the benchmark closes its
-  separate store, and the offline migration closes its own store;
+  separate store;
 - `BlobStore.open` stays in registered hydration or materialization modules; and
-- legacy blob decoder imports stay within registered migration modules.
+- legacy blob decoder imports are forbidden.
 
 The Core BLOB-column check has one registered structured-data exception: conversation-thread vector
-embeddings. Frozen legacy migration tools retain their exact registrations for the fork's supported
-schema-5/25 automatic migration. Follow `MIGRATIONS.md` before upgrading older deployments.
+embeddings. Legacy migration tools were removed after `f2c90667`. Older deployments must follow the cutoff
+in `MIGRATIONS.md` before upgrading.
 
 Semantic and syntax checks share the exclusions in `source-policy.ts`. Test modules, test-support
 trees, vendored source, generated output, and the Core remote-runner bundle are excluded. Generated

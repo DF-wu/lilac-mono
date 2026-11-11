@@ -378,8 +378,17 @@ jobs:
           test "$(git rev-parse origin/main)" = "$BASELINE_SHA"
           # 不在 main 建立 commit；只把 main ref 快轉至已驗證的候選 commit。
           git push origin "$CANDIDATE_SHA:refs/heads/main"
-          # GITHUB_TOKEN push 不會觸發另一個 workflow，故明確啟動映像發布。
-          gh workflow run build-image.yml --ref main
           # 僅刪除此執行建立且已整合到 main 的暫存候選分支。
           git push origin --delete "$CANDIDATE_REF"
           echo "Updated main to verified candidate $CANDIDATE_SHA." >> "$GITHUB_STEP_SUMMARY"
+
+  images:
+    needs: [prepare, verify, publish]
+    if: needs.prepare.outputs.mode == 'clean' && needs.verify.result == 'success' && needs.publish.result == 'success'
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    uses: ./.github/workflows/build-image.yml
+    with:
+      verified_sha: ${{ needs.prepare.outputs.candidate_sha }}

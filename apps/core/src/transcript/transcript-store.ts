@@ -58,7 +58,6 @@ import {
   decodeResourceRecordRow as decodePersistedResourceRecordRow,
   decodeSurfaceMessageLinkRow as decodePersistedSurfaceMessageLinkRow,
   decodeTranscriptCompactionContext as decodePersistedTranscriptCompactionContext,
-  decodeTranscriptMessages as decodePersistedTranscriptMessages,
   decodeTranscriptRow as decodePersistedTranscriptRow,
   defaultStoredBlobFilename,
   hashCanonicalStoredMessagesV2,

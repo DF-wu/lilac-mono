@@ -186,6 +186,82 @@ afterEach(async () => {
 });
 
 describe("telegram conversation source", () => {
+  test("keeps Telegram subjects, entry generations, and read offsets through the worker pool", async () => {
+    const threadId = seedChat(TOPIC);
+    upsert({ sessionId: TOPIC, messageId: "3", text: "billing invoice", offsetMs: 2_000 });
+    const subjects = new ConversationThreadService({
+      store: index,
+      searchPool: pool,
+      getConfig: async () => cfg,
+      summarizer: async () => [
+        { startOrdinal: 0, title: "deployment rollout", brief: "deployment", topics: [] },
+        { startOrdinal: 2, title: "billing invoice", brief: "billing", topics: [] },
+      ],
+    });
+    expect((await subjects.runSummarization({ now: Date.now() })).failed).toBe(0);
+    const billing = (
+      await subjects.search({ query: "billing", mode: "lexical", verbose: true })
+    ).unwrap().results;
+    expect(billing).toMatchObject([
+      { threadId, entryId: `${threadId}#1`, surface: "telegram", offset: 2 },
+    ]);
+    expect(billing[0]?.session?.platform).toBe("telegram");
+    const read = (await subjects.read({ threadId, offset: billing[0]?.offset })).unwrap();
+    expect(read.messages[0]?.content).toBe("billing invoice");
+    expect((await subjects.metadata({ threadIds: [threadId] })).unwrap().threads[0]).toMatchObject({
+      surface: "telegram",
+      entries: [
+        { title: "deployment rollout", brief: "deployment" },
+        { title: "billing invoice", brief: "billing", offset: 2 },
+      ],
+    });
+
+    const allowlist = { channelIds: [], guildIds: [], telegramChatIds: [CHAT] };
+    const previous = (await pool.hits({ type: "lexical", query: "billing", allowlist })).unwrap();
+    const revision = index.getThread(threadId)!.summary_input_hash!;
+    index
+      .upsertSummary(threadId, revision, [
+        { title: "deployment replacement", brief: "deployment", topics: [] },
+        { title: "billing replacement", brief: "billing", topics: [], anchorMessageId: "3" },
+      ])
+      .unwrap();
+    expect((await pool.hits({ type: "current", hits: previous, allowlist })).unwrap()).toEqual([]);
+    const replacement = (
+      await pool.hits({ type: "lexical", query: "billing", allowlist })
+    ).unwrap();
+    expect(replacement[0]?.sourceRevision).toBe(previous[0]?.sourceRevision);
+    expect(replacement[0]?.summaryUpdatedAt).toBeGreaterThan(previous[0]!.summaryUpdatedAt);
+    upsert({ sessionId: TOPIC, messageId: "3", text: "invoice removed", offsetMs: 2_000 });
+    expect((await pool.hits({ type: "current", hits: replacement, allowlist })).unwrap()).toEqual(
+      [],
+    );
+  });
+
+  test("rebuilds the derived v3 index while retaining Telegram source messages", () => {
+    const threadId = seedChat();
+    index.refreshTelegramThreads();
+    const revision = index.getThread(threadId)!.summary_input_hash!;
+    index.upsertSummary(threadId, revision, {
+      title: "old summary",
+      brief: "deployment",
+      topics: [],
+    });
+    index.close();
+    const db = new Database(path.join(dir, "search.db"));
+    db.run("DROP TABLE conversation_index_v3");
+    db.close();
+    index = new ConversationThreadStore(path.join(dir, "search.db"), {
+      telegramDbPath: path.join(dir, "telegram.db"),
+      telegramBotName: TELEGRAM_BOT_NAME,
+    });
+    index.refreshTelegramThreads();
+    expect(index.getSummary(threadId).unwrap()).toBeNull();
+    expect(index.listMessages(threadId).map((message) => message.text)).toEqual([
+      "deployment telegram",
+      "deployment answer",
+    ]);
+  });
+
   test("projects sessions as threads with ordered messages, bot rows, and attachment metadata", () => {
     seedChat();
     upsert({

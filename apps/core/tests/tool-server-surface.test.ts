@@ -444,6 +444,8 @@ describe("tool-server surface", () => {
     ["thread", "other", "native", false],
     ["thread", "native:other", "native", false],
     ["thread", "native:thread", "discord", false],
+    ["thread", "thread", "discord", false],
+    ["thread", undefined, "discord", false],
   ] as const)(
     "restricted native session %s scopes explicit target %s on %s",
     async (originSessionId, sessionId, client, allowed) => {

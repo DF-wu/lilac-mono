@@ -37,17 +37,12 @@ describe("Docker image identity variants", () => {
     expect(verifier).not.toContain("docker exec --user lilac");
   });
 
-  it("runs the automatic blob migration only for the exact Core image command", async () => {
+  it("starts current Core without importing retired legacy blob migrators", async () => {
     const entrypoint = await readRepoFile("docker/direct-entrypoint.sh");
 
-    expect(entrypoint).toContain('[ "$#" -eq 2 ]');
-    expect(entrypoint).toContain('[ "$1" = "/usr/local/bin/bun" ]');
-    expect(entrypoint).toContain('[ "$2" = "apps/core/src/runtime/main.ts" ]');
-    expect(entrypoint).toContain("${LILAC_AUTO_MIGRATE_BLOB_STORAGE:-1}");
-    expect(entrypoint).toContain("apps/core/scripts/startup-blob-storage-migration.ts");
-    expect(entrypoint.indexOf("startup-blob-storage-migration.ts")).toBeLessThan(
-      entrypoint.indexOf('exec /usr/bin/setpriv --reuid="$uid"'),
-    );
+    expect(entrypoint).not.toContain("LILAC_AUTO_MIGRATE_BLOB_STORAGE");
+    expect(entrypoint).not.toContain("startup-blob-storage-migration");
+    expect(entrypoint).toContain('exec /usr/bin/setpriv --reuid="$uid"');
   });
 
   it("verifies each published variant before pushing its tags", async () => {

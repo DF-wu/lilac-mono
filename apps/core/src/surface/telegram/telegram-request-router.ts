@@ -133,6 +133,7 @@ export type StartTelegramRequestRouterInput = {
 
 type ActiveSessionState = {
   requestId: string;
+  pendingPublication?: Promise<void>;
   /** Ids of the bot's output messages in the active request's current chain. */
   readonly activeOutputMessageIds: Set<string>;
 };
@@ -166,6 +167,7 @@ type PendingMentionReplyBatch = {
 type RouterState = {
   readonly activeBySession: Map<string, ActiveSessionState>;
   readonly buffers: Map<string, DebounceBuffer>;
+  readonly debounceEpochs: Map<string, number>;
   /** Keyed by `pendingReplyKey`, so batches of different requests never collide. */
   readonly pendingMentionRepliesByRequest: Map<string, PendingMentionReplyBatch>;
 };
@@ -299,8 +301,10 @@ function logRouteDecision(
 // Publication
 // ---------------------------------------------------------------------------
 
-function markActive(ctx: RouterContext, sessionId: string, requestId: string): void {
-  ctx.state.activeBySession.set(sessionId, { requestId, activeOutputMessageIds: new Set() });
+function markActive(ctx: RouterContext, sessionId: string, requestId: string): ActiveSessionState {
+  const active = { requestId, activeOutputMessageIds: new Set<string>() };
+  ctx.state.activeBySession.set(sessionId, active);
+  return active;
 }
 
 async function publishPrompt(
@@ -527,6 +531,11 @@ function clearDebounceBuffer(ctx: RouterContext, sessionId: string): void {
   ctx.state.buffers.delete(sessionId);
 }
 
+function supersedeDebounceBuffer(ctx: RouterContext, sessionId: string): void {
+  ctx.state.debounceEpochs.set(sessionId, (ctx.state.debounceEpochs.get(sessionId) ?? 0) + 1);
+  clearDebounceBuffer(ctx, sessionId);
+}
+
 function bufferActiveChannelMessage(ctx: RouterContext, routed: RoutedMessage): void {
   const message: TelegramBufferedMessage = {
     event: routed.event,
@@ -571,7 +580,7 @@ async function handleActiveChannel(ctx: RouterContext, routed: RoutedMessage): R
   const hasReplyTarget = typeof routed.replyToMessageId === "string";
 
   if (routed.continueCount !== undefined && !isTrigger && !hasReplyTarget) {
-    clearDebounceBuffer(ctx, routed.sessionId);
+    supersedeDebounceBuffer(ctx, routed.sessionId);
     logRouteDecision(ctx, routed, { decision: "forward", reason: "continue_directive" });
     return publishPrompt(ctx, routed, {
       requestId: formatGenericRequestId(),
@@ -585,7 +594,7 @@ async function handleActiveChannel(ctx: RouterContext, routed: RoutedMessage): R
   if (isTrigger) {
     // A mention or reply bypasses the gate; drop any pending batch so the same
     // context is not forwarded twice.
-    clearDebounceBuffer(ctx, routed.sessionId);
+    supersedeDebounceBuffer(ctx, routed.sessionId);
     logRouteDecision(ctx, routed, { decision: "forward", reason: "mention_or_reply" });
     return publishPrompt(ctx, routed, {
       requestId: formatTelegramMessageRequestId({
@@ -607,12 +616,15 @@ async function flushDebounce(ctx: RouterContext, sessionId: string): RoutingResu
   const buffer = ctx.state.buffers.get(sessionId);
   if (!buffer) return Result.ok(undefined);
   clearDebounceBuffer(ctx, sessionId);
+  const epoch = ctx.state.debounceEpochs.get(sessionId);
+  const superseded = () => ctx.state.debounceEpochs.get(sessionId) !== epoch;
 
   const cfg = await ctx.currentConfig();
   const gateEnabled = resolveSessionGateEnabled(cfg, sessionId, buffer.parentChannelId);
   const decision = gateEnabled
     ? await evaluateActiveBatchGate(ctx, cfg, buffer)
     : { forward: true, reason: "disabled" };
+  if (superseded()) return Result.ok(undefined);
   ctx.logger.info(
     "router.route.decision",
     formatBridgeLogContext({
@@ -633,12 +645,28 @@ async function flushDebounce(ctx: RouterContext, sessionId: string): RoutingResu
     botName: cfg.surface.telegram.botName,
     botUsername: cfg.surface.telegram.botUsername,
   });
+  const botUserId = newest.botUserId ?? (await ctx.adapter.getSelf()).userId;
+  if (superseded()) return Result.ok(undefined);
+  // A mention arriving during composition must join this request.
+  const requestId = formatGenericRequestId();
+  const previousActive = ctx.state.activeBySession.get(sessionId);
+  const claimed = markActive(ctx, sessionId, requestId);
+  const publication = Promise.withResolvers<void>();
+  claimed.pendingPublication = publication.promise;
+  let publishedSuccessfully = false;
+  using _claim = {
+    [Symbol.dispose]() {
+      if (!publishedSuccessfully) releaseDebounceClaim(ctx, sessionId, requestId, previousActive);
+      delete claimed.pendingPublication;
+      publication.resolve();
+    },
+  };
   const composed = await composeTelegramMessages({
     adapter: ctx.adapter,
     event: newest.event,
     batch: buffer.messages.map((message) => message.event),
     includeReplyChain: true,
-    botUserId: newest.botUserId ?? (await ctx.adapter.getSelf()).userId,
+    botUserId,
     botNames,
     blobStore: ctx.blobStore,
     inboundMedia: cfg.surface.telegram.inboundMedia,
@@ -651,7 +679,6 @@ async function flushDebounce(ctx: RouterContext, sessionId: string): RoutingResu
       : {}),
   });
   // Gate-forwarded prompts do not reply to a message; the newest one anchors context.
-  const requestId = formatGenericRequestId();
   const published = await publishTelegramRequest({
     bus: ctx.bus,
     logger: ctx.logger,
@@ -666,7 +693,24 @@ async function flushDebounce(ctx: RouterContext, sessionId: string): RoutingResu
     composed,
     origin: { userId: newest.userId, messageRef: messageRef(newest.event) },
   });
-  return published.map(() => markActive(ctx, sessionId, requestId));
+  const error = published.match({ ok: () => null, err: (failure) => failure });
+  if (error) return Result.err(error);
+  publishedSuccessfully = true;
+  return Result.ok(undefined);
+}
+
+function releaseDebounceClaim(
+  ctx: RouterContext,
+  sessionId: string,
+  requestId: string,
+  previousActive: ActiveSessionState | undefined,
+): void {
+  if (ctx.state.activeBySession.get(sessionId)?.requestId !== requestId) return;
+  if (previousActive) {
+    ctx.state.activeBySession.set(sessionId, previousActive);
+    return;
+  }
+  ctx.state.activeBySession.delete(sessionId);
 }
 
 async function evaluateActiveBatchGate(
@@ -1071,7 +1115,11 @@ async function routeAdapterMessage(
     return Result.ok(undefined);
   }
 
-  const routed = await describeRouting(ctx, event);
+  let routed = await describeRouting(ctx, event);
+  while (routed.active?.pendingPublication) {
+    await routed.active.pendingPublication;
+    routed = await describeRouting(ctx, event);
+  }
   const command = ctx.customCommands
     ? commandMetadata(ctx.customCommands, event.text, routed.botUsername)
     : null;
@@ -1169,6 +1217,7 @@ export async function startTelegramRequestRouter(
   const state: RouterState = {
     activeBySession: new Map(),
     buffers: new Map(),
+    debounceEpochs: new Map(),
     pendingMentionRepliesByRequest: new Map(),
   };
   const debounceDefect = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();

@@ -54,7 +54,11 @@ export async function startCoreRuntime(options: {
     }
     return operationResult.result;
   });
-  return runtime.andThenAsync(async (runtimeValue) => {
+  return runtime.andThenAsync(startRuntime);
+
+  async function startRuntime(
+    runtimeValue: CoreRuntime,
+  ): Promise<ResultType<CoreRuntime, CoreRuntimeStartupError>> {
     const started = await Result.tryPromise({
       try: () => runtimeValue.start(),
       catch: (cause) =>
@@ -76,5 +80,5 @@ export async function startCoreRuntime(options: {
       }
       return operationResult.result.map(() => runtimeValue);
     });
-  });
+  }
 }
