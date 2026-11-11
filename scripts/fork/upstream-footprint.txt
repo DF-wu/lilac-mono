@@ -28,7 +28,8 @@ apps/core/tests/surface/native/resources-live.test.ts  # verifies exclusive conc
 
 # --- Native visible-message recording
 apps/core/src/surface/native/runtime.ts  # composes the opt-in fork-owned Discord recorder at native ingress and shutdown
-apps/core/src/surface/native/store.ts  # exposes bounded committed-display notifications after native persistence
+apps/core/src/surface/native/store.ts  # exposes committed-display notifications and destination-scoped durable Discord child routing
+apps/core/src/surface/native/push.test.ts  # updates the native schema upgrade regression for durable Discord child routing
 docs/native-surface.md  # links the fork-only recorder setup and delivery guarantees
 
 # --- OpenAI web.search provider (staged for an upstream contribution; remove once accepted)

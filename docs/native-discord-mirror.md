@@ -2,7 +2,8 @@
 
 This optional DF-wu fork feature records new native user-surface messages to one owner-provisioned
 Discord incoming webhook. It is disabled by default. It does not use an agent transcript, expose a
-configuration API, add a UI, or change the Native wire format. Optional threaded routing adds a small durable routing table.
+configuration API, add a UI, or change the Native wire format. Optional threaded routing adds a small
+durable routing table.
 It works with any configured image user and native authentication provider; no deployment identity
 or named account is required.
 
@@ -83,7 +84,7 @@ with at most three HTTP attempts per operation, ten-second deadlines and a 30-se
 `native-surface.db` schema 8 stores only destination identities, Native IDs, and nullable Discord
 thread IDs in `native_discord_threads`. An atomic insert reserves a mapping **before** create. One
 in-process promise deduplicates concurrent resolution; the unique SQLite key also arbitrates racing
-reservations. Confirmed HTTP 4xx rejection releases the reservation, including an exhausted confirmed
+reservations. A skipped unsent request or confirmed HTTP 4xx rejection releases the reservation, including an exhausted confirmed
 429. Network failures, malformed success bodies, HTTP 5xx, or a crash leave it unresolved. No automatic
 retry or background recovery scans Discord for a candidate, so an uncertain create cannot blindly
 produce duplicate children. A crash before the HTTP request can therefore leave a reservation with
@@ -162,10 +163,12 @@ bodies, resource references or captured exception messages.
 
 ## Limits and restart guarantees
 
-This is best-effort recording, not an audit log or exactly-once delivery service. Only the conversation-to-child routing map is durable. There is no durable
+This is best-effort recording, not an audit log or exactly-once delivery service. Only the
+conversation-to-child routing map is durable. There is no durable
 outbox, restart replay, recovery worker or persistent webhook-message map. A crash, shutdown, pruning,
-overload or exhausted retry can lose changes; a crash after a webhook message create can leave an orphaned recording.
-Uncertain child creation stays reserved for operator reconciliation; it is never blindly recreated. Edits/deletes to messages from an earlier process are ignored. Failed retractions can leave
+overload or exhausted retry can lose changes; a crash after a webhook message create can leave an
+orphaned recording. Uncertain child creation stays reserved for operator reconciliation; it is never
+blindly recreated. Edits/deletes to messages from an earlier process are ignored. Failed retractions can leave
 stale Discord content. Native retention/deletion is not a guarantee that Discord copies are erased.
 
 Resources are deliberately bounded:

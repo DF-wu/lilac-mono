@@ -276,7 +276,7 @@ export function createNativeDiscordMirror(options: {
           .match({ ok: (value) => value, err: () => null })
       : null;
     const discordThreadId = threads
-      ? await threads.resolve(entry.threadId, thread?.title ?? "", entry.discordThreadId)
+      ? await threads.resolve(entry.threadId, thread?.title ?? "", entry.discordThreadId, current)
       : undefined;
     if (threads && !discordThreadId) return;
     if (!current() || abort.signal.aborted) return;

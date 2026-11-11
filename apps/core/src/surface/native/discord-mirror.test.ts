@@ -42,6 +42,7 @@ function fixture(
   }[] = [];
   const routingRequests: { method: string; url: string }[] = [];
   let parentId = "200";
+  let routeWait = async () => {};
   const children = new Map<string, string>();
   const warnings: string[] = [];
   let respond = (_request: RequestInit): Promise<Response> =>
@@ -65,6 +66,7 @@ function fixture(
     fetch: async (url, init) => {
       if (init.method === "GET" || !url.includes("/webhooks/")) {
         routingRequests.push({ method: init.method ?? "GET", url });
+        await routeWait();
         if (url.includes("/webhooks/"))
           return Response.json({ id: "123", type: 1, channel_id: parentId });
         if (init.method === "POST") {
@@ -120,6 +122,9 @@ function fixture(
     mirror,
     requests,
     routingRequests,
+    routeWait: (wait: () => Promise<void>) => {
+      routeWait = wait;
+    },
     parent: (id: string) => {
       parentId = id;
     },
@@ -867,4 +872,26 @@ test("moving a destination drops edits to tracked copies and routes only new mes
   f.post({ id: "new", role: "assistant", parts: [{ type: "text", text: "New" }] });
   await f.settle();
   expect(new URL(f.requests.at(-1)!.url).searchParams.get("thread_id")).toBe("301");
+});
+
+test("removing the first message during destination lookup does not create an empty child", async () => {
+  const f = fixture(undefined, undefined, "threaded");
+  const started = Promise.withResolvers<void>();
+  const proceed = Promise.withResolvers<void>();
+  f.routeWait(async () => {
+    started.resolve();
+    await proceed.promise;
+  });
+  f.post({
+    id: "removed",
+    role: "assistant",
+    parts: [{ type: "text", text: "Removed before routing" }],
+  });
+  await started.promise;
+  f.store.updateSurfaceMessage("owner", f.thread.id, "removed", null).unwrap();
+  await new Promise<void>(queueMicrotask);
+  proceed.resolve();
+  await f.settle();
+  expect(f.requests).toHaveLength(0);
+  expect(f.routingRequests.filter((request) => request.method === "POST")).toHaveLength(0);
 });

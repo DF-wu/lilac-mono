@@ -37,17 +37,18 @@ export function createDiscordMirrorThreads(options: {
     url: string,
     token?: string,
     body?: object,
+    current: () => boolean = () => true,
   ) {
     for (let attempt = 0; attempt < 3; attempt++) {
-      if (options.signal.aborted) return null;
+      if (options.signal.aborted || !current()) return { status: 0, reply: null };
       const pause = Math.max(0, blockedUntil - Date.now());
-      if (pause > 30_000) return null;
+      if (pause > 30_000) return { status: 0, reply: null };
       const waited = await Result.tryPromise({
         try: () => wait(pause, options.signal),
         catch: () => null,
       });
-      if (waited.isErr()) return null;
-      if (options.signal.aborted) return null;
+      if (waited.isErr()) return { status: 0, reply: null };
+      if (options.signal.aborted || !current()) return { status: 0, reply: null };
       const captured = await Result.tryPromise({
         try: async () => {
           const response = await send(url, {
@@ -128,6 +129,7 @@ export function createDiscordMirrorThreads(options: {
     nativeThreadId: string,
     title: string,
     expectedThreadId?: string,
+    current: () => boolean = () => true,
   ): Promise<string | null> {
     const token = options.botToken();
     if (!token) {
@@ -176,6 +178,7 @@ export function createDiscordMirrorThreads(options: {
       );
       return null;
     }
+    if (!current() || options.signal.aborted) return null;
     const reserved = options.store
       .reserveDiscordMirrorThread(destination, nativeThreadId)
       .match({ ok: (value) => value, err: () => false });
@@ -193,6 +196,7 @@ export function createDiscordMirrorThreads(options: {
         type: 11,
         auto_archive_duration: 1440,
       },
+      current,
     );
     const child = created?.reply;
     if (
@@ -212,8 +216,8 @@ export function createDiscordMirrorThreads(options: {
       );
       return null;
     }
-    // Only confirmed client rejection proves that Discord did not create a child.
-    if (created && created.status >= 400 && created.status < 500)
+    // A skipped send or confirmed client rejection proves that no child was created.
+    if (created && (created.status === 0 || (created.status >= 400 && created.status < 500)))
       options.store
         .settleDiscordMirrorThread(destination, nativeThreadId, null)
         .match({ ok: () => undefined, err: () => undefined });
@@ -227,11 +231,12 @@ export function createDiscordMirrorThreads(options: {
     nativeThreadId: string,
     title: string,
     expectedThreadId?: string,
+    current: () => boolean = () => true,
   ): Promise<string | null> {
     const key = `${nativeThreadId}:${expectedThreadId ?? ""}`;
     const existing = inFlight.get(key);
     if (existing) return existing;
-    const pending = route(nativeThreadId, title, expectedThreadId).finally(() => {
+    const pending = route(nativeThreadId, title, expectedThreadId, current).finally(() => {
       inFlight.delete(key);
     });
     inFlight.set(key, pending);

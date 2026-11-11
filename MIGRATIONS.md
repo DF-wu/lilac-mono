@@ -242,7 +242,6 @@ Native schema migrations run automatically. The current schema is 8:
 - Schema 6 adds native questions and optional question-reply references. Existing records are retained.
 - Schema 7 adds per-user model favorites, optional reasoning on threads/inputs, and child task/model
   display metadata. Existing aliases and old completion targets remain valid.
-
 - Schema 8 adds `native_discord_threads`: one routing reservation/mapping per webhook ID,
   parent-channel ID, and Native conversation ID. A NULL Discord thread ID means creation is unresolved;
   it blocks another create across restart. No credentials or message correspondence are stored.

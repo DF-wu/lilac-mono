@@ -33,6 +33,7 @@ function fixture() {
   let create: (() => Promise<Response>) | undefined;
   let channelStatus = 200;
   let parentType = 0;
+  let onWait = async () => {};
   let token: string | undefined = "synthetic-bot";
   const abort = new AbortController();
   const make = (webhookId = "100", secret = "synthetic-webhook") =>
@@ -42,7 +43,9 @@ function fixture() {
       botToken: () => token,
       signal: abort.signal,
       warn: (warning) => warnings.push(warning),
-      wait: async () => {},
+      wait: async () => {
+        await onWait();
+      },
       fetch: async (url, init) => {
         const method = init.method ?? "GET";
         const body = JSON.parse(String(init.body ?? "{}"));
@@ -81,6 +84,9 @@ function fixture() {
   });
   return {
     make,
+    onWait: (wait: () => Promise<void>) => {
+      onWait = wait;
+    },
     calls,
     warnings,
     threads,
@@ -220,4 +226,30 @@ test("thread names sanitize untrusted titles and fit Discord limits with a stabl
   const suffix = name.slice(-13);
   expect(discordMirrorThreadName("Renamed", id).endsWith(suffix)).toBe(true);
   expect(discordMirrorThreadName("\n\u0000", id)).toMatch(/^Native conversation /);
+});
+
+test("independent routers atomically reserve a single child create", async () => {
+  const f = fixture();
+  const results = await Promise.all([
+    f.make().resolve("native-a", "First"),
+    f.make().resolve("native-a", "First"),
+  ]);
+  expect(results.filter((id) => id === "300")).toHaveLength(1);
+  expect(f.creates()).toHaveLength(1);
+  expect(await f.make().resolve("native-a", "First")).toBe("300");
+});
+
+test("a superseded message during the pre-create wait releases its unsent reservation", async () => {
+  const f = fixture();
+  let current = true;
+  let waits = 0;
+  f.onWait(async () => {
+    if (++waits === 3) current = false;
+  });
+  expect(await f.make().resolve("native-a", "First", undefined, () => current)).toBeNull();
+  expect(f.creates()).toHaveLength(0);
+  expect(f.store.readDiscordMirrorThread("100:200", "native-a").unwrap()).toBeNull();
+  f.reopen();
+  f.onWait(async () => {});
+  expect(await f.make().resolve("native-a", "First")).toBe("300");
 });
