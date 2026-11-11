@@ -38,6 +38,7 @@ export class WorkflowTriggerScheduler {
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
   private readonly unauthorizedTriggerIds = new Set<string>();
+  private tickPromise: Promise<void> | null = null;
 
   constructor(
     private readonly input: {
@@ -78,10 +79,13 @@ export class WorkflowTriggerScheduler {
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    await this.tickPromise;
   }
 
   async tick(): Promise<void> {
-    if (this.running) return;
+    if (this.running) return this.tickPromise ?? undefined;
+    const completion = Promise.withResolvers<void>();
+    this.tickPromise = completion.promise;
     this.running = true;
     {
       const attempt = await Result.tryPromise({
@@ -104,6 +108,8 @@ export class WorkflowTriggerScheduler {
       const cleanupAttempt = Result.try({
         try: () => {
           this.running = false;
+          this.tickPromise = null;
+          completion.resolve();
         },
         catch: captureError,
       });
@@ -139,7 +145,7 @@ export class WorkflowTriggerScheduler {
 
   private reconcileTimestampCompletion(now: number): void {
     const readActiveTriggers = this.input.store
-      .listTriggers({ state: "active", limit: 1_000 })
+      .listTriggers({ state: "active", awaitingTimestampCompletion: true, limit: 1_000 })
       .match({
         ok: (value) => () => value,
         err: (error) => () => signalDurableWorkflowReadErrorToHost(error),

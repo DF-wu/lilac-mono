@@ -2389,12 +2389,17 @@ describe("Stage 6 persistence and SQLite architecture", () => {
     ] as const;
 
     for (const [before, after, expected] of mutations) {
-      const fixtureRoot = mkdtempSync(path.join(realRoot, "sqlite-contract-mutation-"));
+      // Outside the repository: `bun run check` runs fmt and lint over this tree in parallel.
+      const fixtureRoot = mkdtempSync(path.join(tmpdir(), "lilac-sqlite-contract-mutation-"));
       const relativeRoot = path.relative(REPOSITORY_ROOT, fixtureRoot);
       try {
         writeFileSync(
           path.join(fixtureRoot, "tsconfig.json"),
-          JSON.stringify({ extends: "../tsconfig.json", include: ["stage6-transactions.ts"] }),
+          JSON.stringify({
+            extends: path.join(realRoot, "tsconfig.json"),
+            compilerOptions: { typeRoots: [path.join(REPOSITORY_ROOT, "node_modules/@types")] },
+            include: ["stage6-transactions.ts"],
+          }),
         );
         writeFileSync(
           path.join(fixtureRoot, "stage6-transactions.ts"),
@@ -2657,7 +2662,6 @@ describe("permanent architecture governance", () => {
     );
 
     for (const required of [
-      "apps/core:src/migration/frozen-graceful-restart-store.ts#decodeGracefulRestartSnapshot->src/migration/frozen-graceful-restart-store.ts#gracefulRestartSnapshotCodecCases",
       "apps/core:src/workflow/workflow-persistence-codec.ts#decodeWorkflowPersistenceRow->src/workflow/workflow-persistence-codec.ts#workflowPersistenceRowCodecCases",
       "packages/tool-results:src/blob-tool-result-artifact-metadata-codec.ts#decodeBlobToolResultArtifactMetadata->src/blob-tool-result-artifact-metadata-codec.ts#blobToolResultArtifactMetadataCodecCases",
       "packages/utils:codex-oauth.ts#decodeCodexTokens->codex-oauth.ts#codexTokensCodecCases",

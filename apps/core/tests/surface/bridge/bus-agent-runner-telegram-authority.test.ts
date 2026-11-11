@@ -176,6 +176,7 @@ async function runRequest(input: {
   const authority = new RequestControlAuthority();
   const issued: IssuedCapabilityCall[] = [];
   const builds: BuildLevel1ToolsetParams[] = [];
+  const toolsetBuilt = Promise.withResolvers<void>();
   const delegations: TrustedSubagentDelegationRegistration[] = [];
   const config = parseCoreConfigV1ToUniversal({});
   config.models.main = { model: "openai/telegram-authority" };
@@ -194,7 +195,10 @@ async function runRequest(input: {
     blobStore: await getTestBlobStore(),
     subscriptionId: `telegram-authority-${input.requestClient}`,
     config,
-    pluginManager: recordingPluginManager((params) => builds.push(params)),
+    pluginManager: recordingPluginManager((params) => {
+      builds.push(params);
+      toolsetBuilt.resolve();
+    }),
     cwd: "/workspace",
     surfaceProtocolResolver: TEST_SURFACE_PROTOCOL_RESOLVER,
     workflowLiveParentBridge: stubLiveParentBridge(),
@@ -255,7 +259,7 @@ async function runRequest(input: {
       },
     );
 
-    await runner.getActiveDrainOperation();
+    await toolsetBuilt.promise;
 
     // The delegation hook is what a `subagent_delegate` call would reach. The
     // model never gets that far here, so invoke it directly to read back the

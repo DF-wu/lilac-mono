@@ -14,13 +14,14 @@ permissions:
 
 jobs:
   release-info:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       actions: read
     outputs:
       version: ${{ steps.info.outputs.version }}
       owner: ${{ steps.info.outputs.owner }}
       should-release: ${{ steps.check.outputs.should-release }}
+      upstream-ref: ${{ steps.info.outputs.upstream-ref }}
     steps:
       - name: Check for changes since the last successful run
         id: check
@@ -44,13 +45,25 @@ jobs:
 
       - name: Select one release identity
         id: info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           echo "version=build-${GITHUB_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
           echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+          upstream_ref=$(gh api repos/stanley2058/lilac-mono/commits/main --jq .sha)
+          echo "upstream-ref=$upstream_ref" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: release-info
+    if: needs.release-info.outputs.should-release == 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ github.sha }}
+      upstream_ref: ${{ needs.release-info.outputs.upstream-ref }}
 
   images:
-    needs: release-info
+    needs: [release-info, verify]
     if: needs.release-info.outputs.should-release == 'true'
     permissions:
       contents: read
@@ -70,7 +83,7 @@ jobs:
             context: packages/computer-use-runner
             dockerfile: packages/computer-use-runner/Dockerfile
         architecture: [amd64, arm64]
-    runs-on: ${{ matrix.architecture == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    runs-on: ${{ matrix.architecture == 'arm64' && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
     timeout-minutes: 120
     steps:
       - name: Checkout
@@ -144,7 +157,7 @@ jobs:
 
   image-manifests:
     needs: [release-info, images]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write
@@ -212,9 +225,9 @@ jobs:
       matrix:
         include:
           - target: linux-x64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - target: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - target: darwin-x64
             runner: macos-15-intel
           - target: darwin-arm64
@@ -272,7 +285,7 @@ jobs:
 
   publish:
     needs: [release-info, image-manifests, cli]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
       packages: write
@@ -325,5 +338,9 @@ jobs:
           RUNNER: ${{ needs.image-manifests.outputs.runner }}
         run: |
           for image in "$CORE" "$GATEWAY" "$RUNNER"; do
+            # The fork's Catalina publication owns its Core latest tag.
+            if [ "$GITHUB_REPOSITORY" = "DF-wu/lilac-mono" ] && [ "$image" = "$CORE" ]; then
+              continue
+            fi
             docker buildx imagetools create --tag "${image%@*}:latest" "$image"
           done

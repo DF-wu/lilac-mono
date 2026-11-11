@@ -18,6 +18,7 @@ import {
   ConversationThreadOperationFailed,
   ConversationThreadService as RuntimeConversationThreadService,
   ConversationThreadSummaryParseError,
+  encodeInlineFileData,
   filterUtilityModelAttachments,
   selectAutoInjectPlannerModel,
 } from "../../src/conversation/thread-service";
@@ -519,7 +520,7 @@ describe("conversation thread store", () => {
       embeddingInputHash: "embedding-input",
       modelId: "test-model",
       dimensions: 2,
-      embeddings: [{ facet: "title", embedding: new Float32Array([1, 0]) }],
+      embeddings: [{ entryOrdinal: 0, facet: "title", embedding: new Float32Array([1, 0]) }],
     });
     const summarized = threadStore.getThread(threadId)!;
     const membershipBefore = readThreadResult(threadStore, threadId)!.messages.map(
@@ -3357,6 +3358,37 @@ describe("conversation thread store", () => {
     }
   });
 
+  it("encodes inline file bytes as base64 and leaves other parts unchanged", () => {
+    const bytes = new Uint8Array([0, 1, 2, 3, 4, 250, 251, 252]).subarray(2, 6);
+    const text = { type: "text" as const, text: "See this diagram" };
+    const url = new URL("https://example.com/diagram.png");
+    const linked = { type: "file" as const, data: url, mediaType: "image/png" };
+    const [encoded] = encodeInlineFileData([
+      {
+        role: "user",
+        content: [
+          text,
+          linked,
+          { type: "file", data: bytes, filename: "diagram.png", mediaType: "image/png" },
+        ],
+      },
+    ]);
+
+    expect(encoded).toEqual({
+      role: "user",
+      content: [
+        text,
+        linked,
+        {
+          type: "file",
+          data: Buffer.from([2, 3, 4, 250]).toString("base64"),
+          filename: "diagram.png",
+          mediaType: "image/png",
+        },
+      ],
+    });
+  });
+
   it("filters planner media using the utility model capability", () => {
     const input = [
       {
@@ -3891,10 +3923,10 @@ describe("conversation thread store", () => {
       modelId: "test-2d",
       dimensions: 2,
       embeddings: [
-        { facet: "combined", embedding: match },
-        { facet: "brief", embedding: miss },
-        { facet: "topics", embedding: miss },
-        { facet: "title", embedding: miss },
+        { entryOrdinal: 0, facet: "combined", embedding: match },
+        { entryOrdinal: 0, facet: "brief", embedding: miss },
+        { entryOrdinal: 0, facet: "topics", embedding: miss },
+        { entryOrdinal: 0, facet: "title", embedding: miss },
       ],
     });
     threadStore.upsertEmbeddings({
@@ -3903,10 +3935,10 @@ describe("conversation thread store", () => {
       modelId: "test-2d",
       dimensions: 2,
       embeddings: [
-        { facet: "combined", embedding: miss },
-        { facet: "brief", embedding: match },
-        { facet: "topics", embedding: match },
-        { facet: "title", embedding: match },
+        { entryOrdinal: 0, facet: "combined", embedding: miss },
+        { entryOrdinal: 0, facet: "brief", embedding: match },
+        { entryOrdinal: 0, facet: "topics", embedding: match },
+        { entryOrdinal: 0, facet: "title", embedding: match },
       ],
     });
 
@@ -3927,4 +3959,29 @@ describe("conversation thread store", () => {
     searchStore.close();
     threadStore.close();
   });
+});
+
+it("keeps unchanged membership rows while refreshing edited message content", async () => {
+  const dbPath = await createDbPath();
+  const search = new DiscordSearchStore(dbPath);
+  const threads = new ConversationThreadStore(dbPath);
+  search.upsertMessages([
+    msg({ channelId: "c1", messageId: "m1", userId: "u", text: "before", ts: 1 }),
+  ]);
+  threads.refreshInferredThreads();
+  const db = new Database(dbPath);
+  db.run(
+    "CREATE TABLE membership_writes(count INTEGER); INSERT INTO membership_writes VALUES(0); CREATE TRIGGER count_membership_insert AFTER INSERT ON conversation_thread_messages BEGIN UPDATE membership_writes SET count=count+1; END; CREATE TRIGGER count_membership_delete AFTER DELETE ON conversation_thread_messages BEGIN UPDATE membership_writes SET count=count+1; END;",
+  );
+  search.upsertMessages([
+    msg({ channelId: "c1", messageId: "m1", userId: "u", text: "after", ts: 1 }),
+  ]);
+  threads.refreshInferredThreads();
+  expect(db.query<{ count: number }, []>("SELECT count FROM membership_writes").get()?.count).toBe(
+    0,
+  );
+  expect(threads.listMessages("discord:channel:c1:m1")[0]?.text).toBe("after");
+  db.close();
+  threads.close();
+  search.close();
 });

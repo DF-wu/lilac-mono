@@ -22,6 +22,16 @@ import {
   type TelegramSendMessageParams,
 } from "../apps/core/src/surface/telegram/output/telegram-output-stream";
 import type { TelegramSessionRef } from "../apps/core/src/surface/types";
+import type { SurfaceOperationResult } from "../apps/core/src/surface/adapter";
+
+function requireOperation<T>(result: SurfaceOperationResult<T>): T {
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw error;
+    },
+  })();
+}
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -140,7 +150,7 @@ await check("html rendering accepted by telegram", async () => {
       "> quoted line",
     ].join("\n"),
   });
-  const result = await stream.finish();
+  const result = requireOperation(await stream.finish());
   return `${result.created.length} message(s), no entity rejection`;
 });
 
@@ -148,7 +158,7 @@ await check("html rendering accepted by telegram", async () => {
 await check("overflow splits into messages telegram accepts", async () => {
   const stream = makeStream();
   await stream.push({ type: "text.set", text: "lorem ipsum dolor sit amet ".repeat(400) });
-  const result = await stream.finish();
+  const result = requireOperation(await stream.finish());
   if (result.created.length < 2) throw new Error("expected the answer to split");
   return `${result.created.length} messages`;
 });
@@ -159,7 +169,7 @@ await check("code block split across messages stays valid", async () => {
   const stream = makeStream();
   const body = Array.from({ length: 260 }, (_, i) => `const line${i} = "value <${i}> & more";`);
   await stream.push({ type: "text.set", text: ["```ts", ...body, "```"].join("\n") });
-  const result = await stream.finish();
+  const result = requireOperation(await stream.finish());
   if (result.created.length < 2) throw new Error("expected the block to split");
   return `${result.created.length} messages, both accepted`;
 });
@@ -170,7 +180,7 @@ await check("throttled streaming edits avoid rate limiting", async () => {
   for (let i = 1; i <= 12; i += 1) {
     await stream.push({ type: "text.delta", delta: `chunk ${i} of streamed output. ` });
   }
-  await stream.finish();
+  requireOperation(await stream.finish());
   const edits = calls.filter((c) => c.method === "editMessageText");
   return `${edits.length} edits issued, ${edits.filter((c) => !c.ok).length} rejected`;
 });
@@ -180,7 +190,7 @@ await check("cancel inline keyboard accepted", async () => {
   const stream = makeStream({ requestId: `telegram:${chatId}:1` });
   await stream.push({ type: "text.delta", delta: "working on it" });
   await stream.settled();
-  await stream.finish();
+  requireOperation(await stream.finish());
   return "reply_markup accepted";
 });
 
@@ -191,9 +201,10 @@ await check("shrinking output deletes surplus messages", async () => {
   await stream.settled();
   const grown = stream.getDeliveredMessages().length;
   await stream.push({ type: "text.set", text: "short final answer" });
-  const result = await stream.finish();
+  const result = requireOperation(await stream.finish());
   if (grown < 2) throw new Error("expected the draft to overflow first");
-  if (result.created.length !== 1) throw new Error(`expected 1 surviving message, got ${result.created.length}`);
+  if (result.created.length !== 1)
+    throw new Error(`expected 1 surviving message, got ${result.created.length}`);
   return `${grown} -> 1 message`;
 });
 

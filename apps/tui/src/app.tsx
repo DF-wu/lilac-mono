@@ -4,6 +4,7 @@ import { render, useKeyboard, usePaste, useRenderer, useTerminalDimensions } fro
 import {
   createEffect,
   createMemo,
+  untrack,
   createSignal,
   onCleanup,
   onMount,
@@ -17,7 +18,7 @@ import type { TuiSession } from "./session.ts";
 import { Result } from "better-result";
 import { rethrowTuiDefect, captureTuiException } from "./fatal.ts";
 import { TuiController } from "./controller.ts";
-import { safeText, slotText, textWindow } from "./plaintext.ts";
+import { isHiddenSlot, safeText, slotText, textWindow } from "./plaintext.ts";
 
 const colors = {
   background: "#17161b",
@@ -78,12 +79,15 @@ export function TuiApp(props: {
     void state().version;
     return menuHidden() ? [] : controller.completions();
   });
+  const history = createMemo(() => state().historyVersion);
+  const queue = createMemo(() => state().queue);
   const content = createMemo(() => {
-    const snapshot = state();
+    history();
+    const snapshot = untrack(state);
     if (view() === "help") return help;
     if (view() === "queue")
       return (
-        snapshot.queue
+        queue()
           .map((item, index) => `${index + 1}. [${item.state}] ${item.text}`)
           .join("\n\n") || "Queue is empty."
       );
@@ -94,6 +98,7 @@ export function TuiApp(props: {
       .slice(Math.max(0, end - 5), end)
       .map((id) => store.get(id))
       .filter((slot) => slot !== undefined)
+      .filter((slot) => !isHiddenSlot(slot))
       .map(slotText)
       .join("\n\n");
   });

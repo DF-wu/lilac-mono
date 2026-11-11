@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/stanley2058/lilac-mono"><img alt="Upstream" src="https://img.shields.io/badge/upstream-stanley2058%2Flilac--mono-6f42c1"></a>
-  <a href="./package.json"><img alt="Bun 1.4.2" src="https://img.shields.io/badge/Bun-1.4.2-14151a?logo=bun&logoColor=white"></a>
+  <a href="./package.json"><img alt="Bun 1.4.4" src="https://img.shields.io/badge/Bun-1.4.4-14151a?logo=bun&logoColor=white"></a>
   <a href="./LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
 </p>
 
@@ -84,7 +84,7 @@ Git conflict 仍由 fork review PR 交由人工解決。這次對齊 upstream �
 
 ### Core：Docker Compose
 
-需求：Docker Compose 2.30 以上、Bun 1.4.2，以及至少一組符合 `models.main` 設定的 model provider credential。只有啟用 Discord 時才需要有效的 `DISCORD_TOKEN`；各 surface 的 allowlist 依然採 fail-closed 設計。
+需求：Docker Compose 2.30 以上、Bun 1.4.4，以及至少一組符合 `models.main` 設定的 model provider credential。只有啟用 Discord 時才需要有效的 `DISCORD_TOKEN`；各 surface 的 allowlist 依然採 fail-closed 設計。
 
 ```bash
 git clone https://github.com/DF-wu/lilac-mono.git

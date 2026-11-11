@@ -8,9 +8,11 @@ type Prompt = Parameters<ReturnType<OpenAICompatibleProvider>["doGenerate"]>[0][
 
 const originalFetch = globalThis.fetch;
 const originalSettings = { ...env.providers.openaiCompatible };
+const originalOpenAISettings = { ...env.providers.openai };
 afterEach(() => {
   globalThis.fetch = originalFetch;
   Object.assign(env.providers.openaiCompatible, originalSettings);
+  Object.assign(env.providers.openai, originalOpenAISettings);
 });
 
 function captureProvider() {
@@ -263,4 +265,39 @@ it("passes URL tool images to the vision converter without inserting image bytes
     type: "image_url",
     image_url: { url: "https://example.test/image.png" },
   });
+});
+
+it("leaves official Responses tool images on its own protocol without a lifted user message", async () => {
+  Object.assign(env.providers.openai, {
+    apiKey: "fixture-openai-key",
+    baseUrl: "https://official.test/v1",
+    responsesTransport: "sse",
+  });
+  const requests: Array<{ input: Array<Record<string, any>> }> = [];
+  globalThis.fetch = (async (_input, init) => {
+    requests.push(JSON.parse(String(init?.body)));
+    return Response.json({
+      id: "response-fixture",
+      created_at: 0,
+      model: "gpt-4.1-mini",
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          id: "message-fixture",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "done", annotations: [] }],
+        },
+      ],
+      usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11 },
+    });
+  }) as typeof fetch;
+  const originalPrompt = structuredClone(prompt);
+  await getModelProviders().openai!.responses("gpt-4.1-mini").doGenerate({ prompt });
+  expect(requests).toHaveLength(1);
+  expect(requests[0]!.input.filter((item) => item.role === "user")).toHaveLength(1);
+  expect(requests[0]!.input.filter((item) => item.type === "function_call_output")).toHaveLength(2);
+  expect(JSON.stringify(requests[0])).not.toContain("tool-returned data");
+  expect(prompt).toEqual(originalPrompt);
 });

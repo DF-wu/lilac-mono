@@ -15,7 +15,7 @@ integrations add computer use and GitHub access.
 <p align="center">
   <a href="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/stanley2058/lilac-mono"><img alt="Upstream" src="https://img.shields.io/badge/upstream-stanley2058%2Flilac--mono-6f42c1"></a>
-  <a href="./package.json"><img alt="Bun 1.4.2" src="https://img.shields.io/badge/Bun-1.4.2-14151a?logo=bun&logoColor=white"></a>
+  <a href="./package.json"><img alt="Bun 1.4.4" src="https://img.shields.io/badge/Bun-1.4.4-14151a?logo=bun&logoColor=white"></a>
   <a href="./LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
 </p>
 
@@ -43,6 +43,8 @@ Lilac brings platform messaging, routing, model execution, tools, Skills, and re
 into one runtime.
 
 ## Fork Differences
+
+The [November 11 integration inventory](./docs/fork-integration-20261111/README.md) records the exact upstream and fork pins, every retained feature, migration support boundaries, verification, and remaining limitations for PR #101.
 
 The table below lists only behavior that still differs from upstream. GitHub reply permalinks and comment self-loop protection were accepted upstream and are no longer listed. For the full rationale, limitations, and every pull request opened against upstream, see [`docs/fork-differences.md`](./docs/fork-differences.md).
 
@@ -99,7 +101,7 @@ Git conflicts remain fork review PRs for human resolution. See the
 
 ### Core: Docker Compose
 
-Requirements: Docker Compose 2.30 or newer, Bun 1.4.2, and at least one model provider credential matching the `models.main` configuration. A valid `DISCORD_TOKEN` is required only when Discord is enabled. All surface allowlists remain fail-closed.
+Requirements: Docker Compose 2.30 or newer, Bun 1.4.4, and at least one model provider credential matching the `models.main` configuration. A valid `DISCORD_TOKEN` is required only when Discord is enabled. All surface allowlists remain fail-closed.
 
 ```bash
 git clone https://github.com/DF-wu/lilac-mono.git

@@ -1,3 +1,5 @@
+import { nativeSessionId } from "./native-protocol";
+import type { JobService } from "../../jobs/job-service";
 import type { NativeQuestions } from "./questions";
 import type { NativePush } from "./push";
 import type { NativeComputer } from "./computer";
@@ -5,6 +7,7 @@ import type { NativeReferences } from "./references";
 import { resolveLinkPreview } from "./link-preview";
 import type { NativeLiveFileService } from "./resources-live";
 import type { NativeSubagents } from "./subagents";
+import type { NativeWorkflows } from "./workflows";
 import { randomUUID } from "node:crypto";
 import type {
   BootstrapReply,
@@ -38,12 +41,14 @@ import type { NativeSearchStore } from "./store-search";
 import type { NativeSurfaceStore } from "./store-surface";
 
 export type NativeRpcServiceOptions = {
+  jobs?: Pick<JobService, "stopSession">;
   questions?: Pick<NativeQuestions, "read" | "pending" | "dismiss">;
   push?: NativePush;
   computer?: Pick<NativeComputer, "read">;
   references?: Pick<NativeReferences, "resolve" | "read" | "range">;
   files?: Pick<NativeLiveFileService, "resolve" | "tree" | "document" | "saveDocument">;
   subagents?: Pick<NativeSubagents, "list" | "read" | "stream">;
+  workflows?: Pick<NativeWorkflows, "list" | "get">;
   store: NativeStore;
   auth: NativeAuthenticator;
   installationId: string;
@@ -95,6 +100,8 @@ function summarySignature(thread: NativeThread): string {
     thread.starterDisplayName,
     thread.starterAvatarUrl,
     thread.displayStatus,
+    thread.waitingOn,
+    thread.hasActiveWorkflow,
     thread.workingSince,
     thread.preview,
   ]);
@@ -149,6 +156,22 @@ class CoalescedWake {
 
 export function createNativeRpcServices(options: NativeRpcServiceOptions): NativeRpcServices {
   const { store, auth, catalogs, config, execution, resources, search, external } = options;
+
+  /**
+   * Settling is a per-user sidebar preference that needs only read access, so a viewer who cannot
+   * edit the thread moves their own sidebar without stopping anything for other participants.
+   */
+  function stopJobsForSettledThread(
+    actorId: string,
+    input: { readonly threadId: string; readonly section: string },
+  ): void {
+    if (input.section !== "settled" || !options.jobs) return;
+    const canEdit = store.authorizeThread(actorId, input.threadId, true).match({
+      ok: () => true,
+      err: () => false,
+    });
+    if (canEdit) void options.jobs.stopSession(nativeSessionId(input.threadId), "thread_settled");
+  }
   let catalogCursor = randomUUID();
   store.subscribe(() => {
     catalogCursor = randomUUID();
@@ -731,7 +754,10 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
         return store.listSidebar(principal.userId, input);
       },
       move(principal, input) {
-        return store.moveSidebarThread(principal.userId, input);
+        return store.moveSidebarThread(principal.userId, input).map((moved) => {
+          stopJobsForSettledThread(principal.userId, input);
+          return moved;
+        });
       },
     },
     threads: {
@@ -803,11 +829,15 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
               input.reasoning ??
                 (input.modelId && input.modelId !== thread.modelId ? undefined : thread.reasoning),
             );
-          return store.updateThread(principal.userId, {
+          const updated = yield* store.updateThread(principal.userId, {
             ...input,
             revision: input.expectedRevision,
             commandId: randomUUID(),
           });
+          if (input.archived === true) {
+            void options.jobs?.stopSession(nativeSessionId(input.threadId), "thread_archived");
+          }
+          return Result.ok(updated);
         });
       },
       async delete(principal, input) {
@@ -945,7 +975,8 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
     },
     inputs: {
       async submit(principal, input) {
-        return Result.gen(async function* () {
+        // Synchronous so the run state read here still holds when acceptInput picks the mode.
+        return Result.gen(function* () {
           const existing = yield* store.lookupInputReceipt(principal.userId, input);
           if (existing) return Result.ok(existing);
           yield* inputSelections(principal, input);
@@ -966,10 +997,11 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
           const reasoning =
             input.reasoning ??
             (input.modelId && input.modelId !== thread.modelId ? undefined : thread.reasoning);
-          if (input.mode !== "steer")
-            yield* modelChoice(principal, input.modelId ?? thread.modelId, reasoning);
+          // The store admits a steer without an active run as a prompt, which needs a pinned model.
+          const steering = input.mode === "steer" && !!thread.activeRunId;
+          if (!steering) yield* modelChoice(principal, input.modelId ?? thread.modelId, reasoning);
           const resolvedModelRequest =
-            input.mode === "steer" && !input.command
+            steering && !input.command
               ? undefined
               : yield* options.resolveModel(input.modelId ?? thread.modelId, reasoning);
           const receipt = yield* store.acceptInput(principal.userId, input, {
@@ -1132,6 +1164,13 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
       read: (principal, input) =>
         options.subagents?.read(principal.userId, input) ??
         Result.err(nativeFailure("not-found", "Subagent not found")),
+    },
+    workflows: {
+      list: (principal, input) =>
+        options.workflows?.list(principal.userId, input) ?? Result.ok({ items: [] }),
+      get: (principal, input) =>
+        options.workflows?.get(principal.userId, input) ??
+        Result.err(nativeFailure("not-found", "Workflow not found")),
     },
     external: {
       list(principal, input) {

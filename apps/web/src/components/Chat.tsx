@@ -7,6 +7,7 @@ import { rewindDraft } from "../rewind-draft";
 import type { OptimisticTurn } from "../optimistic-turns";
 import { useEventCallback } from "../use-event-callback";
 import { useStore } from "zustand";
+import { useShallow } from "zustand/react/shallow";
 import { draftAttachment, releaseDraftAttachments, type DraftThread } from "../draft-thread";
 import type { ActorIdentity } from "./ActorAvatar";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -50,22 +51,24 @@ import {
   type PromptAnswer,
 } from "../question-reply";
 import { QuestionPanel, QuestionWaiting } from "./QuestionReply";
-import { composerSubmissionMarkdown, createComposerEditor } from "./composer-document";
 import { useWorkspace } from "../workspace-context";
 import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   useSyncExternalStore,
   type ReactNode,
 } from "react";
-import { X, RotateCcw } from "lucide-react";
+import { RotateCcw } from "lucide-react";
 import type {
   NativeInput,
+  NativeInputReceipt,
   NativeQuestion,
+  QueuedInput,
   DisplayPart,
   NativeThread,
   ReadyTurnSlot,
@@ -74,28 +77,35 @@ import type { ChatCommon, ComposerSubmission } from "../types";
 import { resolveAttachmentIds } from "../uploads";
 import { inputDeliveryOptions } from "../input-mode";
 import { deliverPendingInput, type PendingInput } from "../pending-input";
-import { pendingMessageParts } from "../pending-message";
-export type { PendingInput } from "../pending-input";
+import { pendingTurnSlot } from "../pending-message";
 import { Button } from "./ui/button";
-import { Composer } from "./Composer";
 import { ConversationStatus } from "./ConversationStatus";
-import { Timeline, ThinkingIndicator, useLatestReadableTurn } from "./Timeline";
+import { Timeline, useLatestReadableTurn } from "./Timeline";
+import { QueuedMessage, QueuedMessages } from "./QueuedMessage";
 import type { OutlineSource } from "../timeline-outline";
-import { attempt, IconButton, Modal, VirtualList } from "./ui";
+import { attempt, Modal } from "./ui";
 import { toast } from "./ui/toast";
 import { isConnectionFailure } from "../connection-lifecycle";
-
 import { UploadProgressContext } from "../upload-context";
+import {
+  type Draft,
+  emptyDraft,
+  summarizeDraft,
+  emptySummary,
+  DraftComposer,
+  localDraftSummary,
+  localThreadSettings,
+} from "./chat-draft";
+export type { PendingInput } from "../pending-input";
+export type { Draft } from "./chat-draft";
 
-const queueLabels = { prompt: "Prompt", steer: "Steering", followup: "Follow-up" };
-export type Draft = {
-  text: string;
-  skillIds: string[];
-  commandId?: string;
-  attachments: string[];
-  savedText?: string;
+const queueLabels: Record<ComposerSubmission["mode"], string> = {
+  steer: "Steering",
+  followup: "Follow-up",
 };
-const emptyDraft: Draft = { text: "", skillIds: [], attachments: [] };
+// The compiler cannot memoize a component that contains `import()`.
+const loadComposerEditor = () => import("./composer-editor");
+const noPrompts: ReturnType<typeof questionPrompts> = [];
 export type ChatProps = Pick<ChatCommon, "catalog" | "onError"> & {
   threadId: string;
   thread?: NativeThread;
@@ -125,7 +135,14 @@ export function Chat(props: ChatProps) {
   } = useWorkspace();
   const { thread, threadId } = props;
   const local = threadId.startsWith("draft:");
-  const localThread = useStore(draftStore, (state) => state.localDrafts.get(threadId));
+  const localThread = useStore(
+    draftStore,
+    useShallow((state) => localThreadSettings(state.localDrafts.get(threadId))),
+  );
+  const localDraft = useStore(
+    draftStore,
+    useShallow((state) => localDraftSummary(state.localDrafts.get(threadId))),
+  );
   const editable = local ? !!localThread : !!thread?.capabilities.edit;
   const queries = useQueryClient();
   const identity = useContext(MessageIdentityContext);
@@ -171,10 +188,7 @@ export function Chat(props: ChatProps) {
   const replyChoice = useStore(questionReplyStore, (state) => state.choices.get(threadId));
   const replyQuestion = activeReplyQuestion(answerable, replyChoice);
   const replyMessageId = replyQuestion?.questionCallId;
-  const replyPrompts = useMemo(
-    () => (replyQuestion ? questionPrompts(replyQuestion) : []),
-    [replyQuestion],
-  );
+  const replyPrompts = replyQuestion ? questionPrompts(replyQuestion) : noPrompts;
   const progressKey = replyMessageId ? replyProgressKey(threadId, replyMessageId) : "";
   const progress = useStore(
     questionReplyStore,
@@ -187,13 +201,18 @@ export function Chat(props: ChatProps) {
       ? questionDraftKey(threadId, replyMessageId, replyPrompt.ordinal)
       : threadId;
   const draftOptions = composerDraftOptions(scope, draftKey, draftCache);
+  // Draft writes wait for a pause in typing; leaving the conversation writes them now.
+  useEffect(() => () => void draftCache?.flushDrafts?.(), [draftCache, threadId]);
+  const draftInitialData = draftKey === threadId ? props.draft : undefined;
   const draftQuery = useQuery({
     ...draftOptions,
-    initialData: draftKey === threadId ? props.draft : undefined,
+    initialData: draftInitialData,
     enabled: !local,
+    select: summarizeDraft,
   });
-  const draft = localThread?.draft ?? draftQuery.data ?? emptyDraft;
+  const draft = localDraft ?? draftQuery.data ?? emptySummary;
   const draftLoaded = local ? !!localThread : !draftQuery.isPending;
+  const draftSource = { local, threadId, options: draftOptions, initialData: draftInitialData };
   const [view, setView] = useState<{
     id: string;
     error?: string;
@@ -236,7 +255,6 @@ export function Chat(props: ChatProps) {
   const { error, historyError, rewindTarget, rewinding, latestVisible, unknownAuthor } =
     view.id === threadId ? view : {};
   const currentId = useRef(threadId);
-  currentId.current = threadId;
   const getDraft = (key = draftKey) =>
     local
       ? (draftStore.getState().localDrafts.get(threadId)?.draft ?? emptyDraft)
@@ -249,6 +267,14 @@ export function Chat(props: ChatProps) {
     updateComposerDraft(queries, key, value);
     if (key === threadId) props.onDraft(threadId, value);
     if (draftCache) void attempt(() => draftCache.saveDraft(scope, key, value), setError);
+  };
+  // Answered or closed question drafts are never shown again, so their saved row and cached query go.
+  const removeQuestionDraft = (key: string) => {
+    commitDraft(emptyDraft, key);
+    queries.removeQueries({
+      queryKey: composerDraftOptions(scope, key, draftCache).queryKey,
+      exact: true,
+    });
   };
   const pendingEntries = props.pending;
   const commitPending = (update: (entries: PendingInput[]) => PendingInput[]) =>
@@ -273,7 +299,11 @@ export function Chat(props: ChatProps) {
   const active = serverActive || !!sendingEntry;
   const previousActive = useRef(active);
   const canEdit = useRef(editable);
-  canEdit.current = editable;
+  // Async sends compare against the conversation and permission that are on screen now.
+  useLayoutEffect(() => {
+    currentId.current = threadId;
+    canEdit.current = editable;
+  });
   const participants = useQuery({
     ...participantOptions(client, threadId),
     enabled: online && !local,
@@ -315,9 +345,11 @@ export function Chat(props: ChatProps) {
     ...queueOptions(client, threadId),
     enabled: online && !local && editable,
   });
-  const queue = editable
-    ? (queueQuery.data?.items ?? []).filter((entry) => entry.mode !== "prompt")
-    : [];
+  const queuedItems = editable ? (queueQuery.data?.items ?? []) : [];
+  const queue = queuedItems.filter((entry) => entry.mode !== "prompt");
+  // A steer or a prompt with a turn already shows in the timeline. The rest wait after the last
+  // turn, such as a prompt held behind an earlier input that is still uploading.
+  const queuedWithoutTurn = queuedItems.filter((entry) => entry.mode !== "steer" && !entry.turnId);
   const subscribe = useCallback(
     (listener: () => void) => pool.subscribe(threadId, listener),
     [pool, threadId],
@@ -340,21 +372,7 @@ export function Chat(props: ChatProps) {
   );
   const pendingTurn = useMemo<ReadyTurnSlot | undefined>(() => {
     if (!sendingEntry || (!sendingEntry.optimisticSlotIds && serverActive)) return;
-    return {
-      kind: "ready",
-      slotId: `sending:${sendingEntry.commandId}`,
-      turnId: `sending:${sendingEntry.commandId}`,
-      position: store.size,
-      state: "pending",
-      messages: [
-        {
-          id: sendingEntry.commandId,
-          role: "user",
-          metadata: { authorId: scope.principalId },
-          parts: pendingMessageParts(sendingEntry.submission, pendingAttachments),
-        },
-      ],
-    };
+    return pendingTurnSlot(sendingEntry, pendingAttachments, store.size, scope.principalId);
   }, [sendingEntry, pendingAttachments, serverActive, scope.principalId, store]);
   const optimisticTurn = useMemo<OptimisticTurn | undefined>(() => {
     if (!pendingTurn || !sendingEntry) return;
@@ -422,10 +440,12 @@ export function Chat(props: ChatProps) {
     };
   }, [client, store, threadId, local, queries]);
   const regularDraftEmpty =
-    draftKey === threadId ? !draft.text.trim() && !draft.attachments.length : false;
+    draftKey === threadId ? !draft.hasText && !draft.attachments.length : false;
   const autoReply = draftLoaded
     ? autoReplyQuestion(answerable, replyChoice, regularDraftEmpty)
     : undefined;
+  const chooseReply = (messageId: string, replying: boolean) =>
+    questionReplyStore.getState().choose(threadId, { messageId, replying });
   useEffect(() => {
     if (autoReply) chooseReply(autoReply, true);
   }, [autoReply, threadId]);
@@ -448,10 +468,10 @@ export function Chat(props: ChatProps) {
     for (const ordinal of previous.ordinals) {
       const key = questionDraftKey(threadId, previous.messageId, ordinal);
       const leftover = getDraft(key);
+      removeQuestionDraft(key);
       if (!leftover.text.trim() && !leftover.attachments.length && !leftover.skillIds.length)
         continue;
       commitDraft(mergeClosedReply(getDraft(threadId), leftover), threadId);
-      commitDraft(emptyDraft, key);
       moved = true;
     }
     if (moved) toast.add({ title: "The question closed. Your reply is now a regular draft." });
@@ -497,7 +517,7 @@ export function Chat(props: ChatProps) {
   ): Promise<NativeInput | undefined> {
     const [ids, { resolveComposerAttachments }] = await Promise.all([
       resolveAttachmentIds(pool, threadId, entry.submission.attachments, retryFailed),
-      import("./composer-editor"),
+      loadComposerEditor(),
     ]);
     if (currentId.current === threadId && !canEdit.current) {
       setPending(entry.commandId, {
@@ -577,20 +597,74 @@ export function Chat(props: ChatProps) {
   }
   async function deliver(entry: PendingInput, retryFailed = false) {
     let awaitingProjection = false;
+    let sent: NativeInput | undefined;
     const outcome = await deliverPendingInput(
       entry,
       () => prepareInput(entry, retryFailed),
       (input) => client.submit(input),
       (patch) => {
         awaitingProjection = patch?.state === "accepted";
+        if (patch?.input) sent = patch.input;
         setPending(entry.commandId, patch);
       },
       currentId.current !== threadId || canEdit.current,
     );
     if (outcome?.kind !== "accepted") return;
+    if (sent) showQueued(sent, outcome.receipt);
     if (!awaitingProjection)
       for (const attachment of entry.submission.attachments) pool.release(threadId, attachment.key);
     void refreshQueue();
+  }
+  /** Puts an accepted input without a turn in the queue right away, so it does not vanish until the refetch. */
+  function showQueued(input: NativeInput, receipt: NativeInputReceipt) {
+    if (receipt.turnId || receipt.state === "admitted") return;
+    // The server keeps a steer a steer during a run and admits other input during a run as a follow-up.
+    if (receipt.runId && input.mode === "steer") return;
+    const item: QueuedInput = {
+      ...receipt,
+      authorId: scope.principalId,
+      text: input.text.slice(0, 4096),
+      mode: receipt.runId ? "followup" : "prompt",
+      createdAt: Date.now(),
+    };
+    queries.setQueryData(queueOptions(client, threadId).queryKey, (current) =>
+      current?.items.some((entry) => entry.inputId === receipt.inputId)
+        ? current
+        : { items: [...(current?.items ?? []), item] },
+    );
+  }
+  function retryPending(entry: PendingInput) {
+    void deliver(
+      {
+        ...entry,
+        submission: {
+          ...entry.submission,
+          attachments: entry.submission.attachments.map(
+            (attachment) =>
+              uploads.find((candidate) => candidate.key === attachment.key) ?? attachment,
+          ),
+        },
+      },
+      true,
+    );
+  }
+  function discardPending(entry: PendingInput) {
+    for (const attachment of entry.submission.attachments) pool.release(threadId, attachment.key);
+    setPending(entry.commandId, null);
+  }
+  function removeQueued(inputId: string) {
+    const checkpoint = store.checkpoint;
+    if (!client.rpc || !checkpoint) return;
+    void attempt(
+      () =>
+        client.rpc!.runs.removeQueued({
+          threadId: threadId,
+          commandId: crypto.randomUUID(),
+          historyGeneration: checkpoint.historyGeneration,
+          inputId,
+        }),
+      setError,
+    ).then(refreshQueue);
   }
   function submit(
     submission: ComposerSubmission,
@@ -603,6 +677,7 @@ export function Chat(props: ChatProps) {
     const entry: PendingInput = {
       commandId: crypto.randomUUID(),
       text: submission.text,
+      createdAt: Date.now(),
       submission: questionReply ? { ...submission, questionReply } : submission,
       optimisticSlotIds: serverActive ? undefined : [...store.slotIds],
       state: "preparing",
@@ -712,7 +787,7 @@ export function Chat(props: ChatProps) {
         setError,
       );
     },
-    [client, threadId],
+    [client, threadId, setError],
   );
   const onReaction = useCallback(
     (messageId: string, emoji: string, enabled: boolean) => {
@@ -722,10 +797,8 @@ export function Chat(props: ChatProps) {
         setError,
       );
     },
-    [client, threadId],
+    [client, threadId, setError],
   );
-  const chooseReply = (messageId: string, replying: boolean) =>
-    questionReplyStore.getState().choose(threadId, { messageId, replying });
   const updateProgress = (messageId: string, change: ProgressChange) =>
     questionReplyStore.getState().update(replyProgressKey(threadId, messageId), change);
   const loadDraft = async (key: string) =>
@@ -740,12 +813,15 @@ export function Chat(props: ChatProps) {
     const current =
       prompt.ordinal === replyPrompt?.ordinal
         ? draft
-        : getDraft(questionDraftKey(threadId, replyMessageId!, prompt.ordinal));
-    return promptAnswered({
-      option: progress.options[prompt.ordinal],
-      text: current.text,
-      attachments: current.attachments.length,
-    });
+        : summarizeDraft(getDraft(questionDraftKey(threadId, replyMessageId!, prompt.ordinal)));
+    return (
+      current.hasText ||
+      promptAnswered({
+        option: progress.options[prompt.ordinal],
+        text: "",
+        attachments: current.attachments.length,
+      })
+    );
   });
   const replyChosen = replyPrompt ? progress.options[replyPrompt.ordinal] : undefined;
   const replyLast =
@@ -760,9 +836,12 @@ export function Chat(props: ChatProps) {
     const messageId = question.questionCallId;
     const prompts = questionPrompts(question);
     sendingReply.current = true;
-    const drafts = await Promise.all(
-      prompts.map((prompt) => loadDraft(questionDraftKey(threadId, messageId, prompt.ordinal))),
-    );
+    const [drafts, { composerSubmission }] = await Promise.all([
+      Promise.all(
+        prompts.map((prompt) => loadDraft(questionDraftKey(threadId, messageId, prompt.ordinal))),
+      ),
+      loadComposerEditor(),
+    ]);
     sendingReply.current = false;
     const choice = questionReplyStore.getState().choices.get(threadId);
     if (currentId.current !== threadId || choice?.messageId !== messageId || !choice.replying)
@@ -776,7 +855,7 @@ export function Chat(props: ChatProps) {
       const saved = drafts[position];
       if (!saved) return;
       const answer = { option: options[prompt.ordinal], attachments: saved.attachments.length };
-      const text = composerSubmissionMarkdown(createComposerEditor(saved.text));
+      const text = composerSubmission(saved.text);
       answers.set(prompt.ordinal, { ...answer, text });
       typed.set(prompt.ordinal, { ...answer, text: saved.text });
     }
@@ -800,7 +879,7 @@ export function Chat(props: ChatProps) {
       target,
     );
     for (const prompt of prompts)
-      commitDraft(emptyDraft, questionDraftKey(threadId, messageId, prompt.ordinal));
+      removeQuestionDraft(questionDraftKey(threadId, messageId, prompt.ordinal));
   }
   const questionAdvance = useEventCallback(() => {
     if (!replyQuestion) return;
@@ -875,14 +954,8 @@ export function Chat(props: ChatProps) {
   const dismissReply = useEventCallback(() =>
     replyQuestion ? questionDismiss(replyQuestion) : Promise.resolve(undefined),
   );
-  const questionServices = useMemo<QuestionServices>(
-    () => ({ onReply: questionReply, onDismiss: questionDismiss }),
-    [questionReply, questionDismiss],
-  );
-  const replyView = useMemo<QuestionReplyView>(
-    () => ({ messageId: replyMessageId }),
-    [replyMessageId],
-  );
+  const questionServices: QuestionServices = { onReply: questionReply, onDismiss: questionDismiss };
+  const replyView: QuestionReplyView = { messageId: replyMessageId };
   const replyReady = replyChosen !== undefined;
   const replyCount = replyPrompt ? replyPrompts.length : 0;
   // The composer is memoized, so typing and streaming must not hand it a new object each render.
@@ -943,7 +1016,8 @@ export function Chat(props: ChatProps) {
       return;
     }
     pool.remove(threadId, key);
-    commitDraft({ ...draft, attachments: draft.attachments.filter((id) => id !== key) });
+    const current = getDraft();
+    commitDraft({ ...current, attachments: current.attachments.filter((id) => id !== key) });
   });
   const composerRetryAttachment = useEventCallback((key: string) => pool.retry(threadId, key));
   const composerModelChange = useEventCallback((modelId: string, reasoning?: ModelReasoning) => {
@@ -994,119 +1068,68 @@ export function Chat(props: ChatProps) {
     });
     return () => toast.close(id);
   }, [composerError, threadId, dismissComposerError, dropConnectionError]);
+  const failedCreation =
+    localThread?.creation && !localThread.sending ? localThread.creation.entry : undefined;
+  const trailing =
+    failedCreation || queuedWithoutTurn.length || visiblePendingEntries.length ? (
+      <QueuedMessages>
+        {failedCreation ? (
+          <QueuedMessage
+            text={failedCreation.text}
+            state="failed"
+            error="Conversation could not be created."
+            onRetry={() => props.onLocalSubmit(threadId, failedCreation.submission)}
+          />
+        ) : null}
+        {queuedWithoutTurn.map((entry) => (
+          <QueuedMessage
+            key={entry.inputId}
+            text={entry.text}
+            state="queued"
+            label={entry.mode === "followup" ? queueLabels.followup : undefined}
+            removeLabel="Remove queued message"
+            onRemove={() => removeQueued(entry.inputId)}
+          />
+        ))}
+        {visiblePendingEntries.map((entry) => {
+          const failed = entry.state === "rejected" || entry.state === "uncertain";
+          return (
+            <QueuedMessage
+              key={entry.commandId}
+              text={entry.text}
+              state={failed ? "failed" : "sending"}
+              label={entry.optimisticSlotIds ? undefined : queueLabels[entry.submission.mode]}
+              error={entry.error}
+              retryLabel={entry.questionClosed ? "Send as message" : undefined}
+              onRetry={failed && editable ? () => retryPending(entry) : undefined}
+              onRemove={failed ? () => discardPending(entry) : undefined}
+            />
+          );
+        })}
+      </QueuedMessages>
+    ) : undefined;
   const composer = (
     <div className="chat-bottom w-full max-w-[var(--ui-chat-width)] my-0 mx-auto pt-2 px-6 pb-6 max-workspace:px-3 max-workspace:pb-3">
-      {localThread?.creation && !pendingTurn ? (
-        <div className="pending-input flex flex-wrap gap-2 p-2 mb-2 rounded-sm bg-surface text-sm">
-          <span>{localThread.creation.entry.text}</span>
-          <small>
-            {localThread.sending ? <ThinkingIndicator /> : "Conversation could not be created."}
-          </small>
-          {!localThread.sending ? (
-            <Button
-              onClick={() => props.onLocalSubmit(threadId, localThread.creation!.entry.submission)}
-            >
-              Retry message
-            </Button>
-          ) : null}
-        </div>
-      ) : null}
-      {visiblePendingEntries.length ? (
-        <VirtualList
-          className="pending-inputs max-h-48 h-24"
-          items={visiblePendingEntries}
-          itemKey={(entry) => entry.commandId}
-          label="Pending messages"
-          estimate={88}
-          render={(entry) => (
-            <div
-              className="pending-input flex flex-wrap gap-2 p-2 mb-2 rounded-sm bg-surface text-sm"
-              key={entry.commandId}
-            >
-              <span>{entry.text}</span>
-              {entry.error ? <small>{entry.error}</small> : <ThinkingIndicator />}
-              {editable && entry.state !== "preparing" && entry.state !== "accepted" ? (
-                <Button
-                  type="button"
-                  onClick={() =>
-                    void deliver(
-                      {
-                        ...entry,
-                        submission: {
-                          ...entry.submission,
-                          attachments: entry.submission.attachments.map(
-                            (attachment) =>
-                              uploads.find((candidate) => candidate.key === attachment.key) ??
-                              attachment,
-                          ),
-                        },
-                      },
-                      true,
-                    )
-                  }
-                >
-                  {entry.questionClosed ? "Send as message" : "Retry message"}
-                </Button>
-              ) : null}
-            </div>
-          )}
-        />
-      ) : null}
-      {editable && queue.length ? (
-        <div className="queue bg-surface rounded-md mb-2 p-1">
-          <VirtualList
-            items={queue}
-            itemKey={(entry) => entry.inputId}
-            label="Queued messages"
-            estimate={48}
-            render={(entry) => (
-              <div className="queue-entry flex items-center gap-2 py-1 px-2 text-sm">
-                <span className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap">
-                  {queueLabels[entry.mode]}
-                </span>
-                <span>{entry.text}</span>
-                <IconButton
-                  label="Remove queued message"
-                  onClick={() => {
-                    const checkpoint = store.checkpoint;
-                    if (!client.rpc || !checkpoint) return;
-                    void attempt(
-                      () =>
-                        client.rpc!.runs.removeQueued({
-                          threadId: threadId,
-                          commandId: crypto.randomUUID(),
-                          historyGeneration: checkpoint.historyGeneration,
-                          inputId: entry.inputId,
-                        }),
-                      setError,
-                    ).then(refreshQueue);
-                  }}
-                >
-                  <X />
-                </IconButton>
-              </div>
-            )}
-          />
-        </div>
-      ) : null}
       {draft.savedText ? (
         <Button
           type="button"
           variant="ghost"
           className="text-primary py-2 px-3 text-sm"
-          onClick={() =>
+          onClick={() => {
+            const current = getDraft();
             commitDraft({
-              ...draft,
-              text: draft.savedText ?? "",
-              savedText: draft.text || undefined,
-            })
-          }
+              ...current,
+              text: current.savedText ?? "",
+              savedText: current.text || undefined,
+            });
+          }}
         >
           Restore previous draft
         </Button>
       ) : null}
       <div hidden={!editable}>
-        <Composer
+        <DraftComposer
+          source={draftSource}
           documentKey={draftKey}
           header={questionHeader()}
           placeholder={replyPrompt ? answerPlaceholder(replyChosen !== undefined) : undefined}
@@ -1116,7 +1139,6 @@ export function Chat(props: ChatProps) {
           loadingDraft={!draftLoaded}
           windowDrop={props.foreground}
           catalog={props.catalog}
-          text={draft.text}
           skillIds={draft.skillIds}
           onSkills={composerSkills}
           commandId={draft.commandId}
@@ -1148,7 +1170,7 @@ export function Chat(props: ChatProps) {
           question={replyQuestion}
           step={replyStep}
           chosen={replyChosen}
-          typed={!!draft.text.trim()}
+          typed={draft.hasText}
           answered={replyAnswered}
           disabled={!draftLoaded}
           onChoose={questionChoose}
@@ -1183,6 +1205,7 @@ export function Chat(props: ChatProps) {
                 centerEmpty={local || (historyLoaded && !props.loadError)}
                 header={props.header}
                 footer={composer}
+                trailing={trailing}
                 onLatestVisibleChange={setLatestVisible}
                 client={client}
                 threadId={threadId}

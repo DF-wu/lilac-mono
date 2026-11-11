@@ -1,3 +1,4 @@
+import "./styles.css";
 import { CopySessionIdMenuItem } from "./components/CopySessionIdMenuItem";
 import { SkeletonRows } from "./components/ui/skeleton";
 import { DirectThreadCard, DirectThreadTitle } from "./components/DirectThreadCard";
@@ -5,10 +6,8 @@ import { currentPushDeviceId } from "./push-device";
 import { NativeComputerViewer } from "./components/ComputerViewer";
 import { FloatingChatMenu } from "./components/FloatingChatMenu";
 import { useWorkspaceViewport } from "./use-workspace-viewport";
-import { Kbd } from "./components/ui/kbd";
 import {
   useAppShortcuts,
-  useThreadShortcut,
   useShortcut,
   ThreadShortcutTargets,
   focusMainComposer,
@@ -21,7 +20,7 @@ import { parseReferenceHref } from "@stanley2058/lilac-client-protocol";
 import { ThreadReferenceView } from "./components/ThreadReferenceView";
 import { SidebarEmptyState } from "./components/SidebarEmptyState";
 import type { WorkspaceSearch } from "./router";
-import { readTheme, setThemeMode } from "./theme/theme";
+import { chooseThemeMode, useThemeMode } from "./theme/theme";
 import { FileViewerProvider } from "./components/file-viewer-context";
 import { RightPanel } from "./components/FileViewer";
 import { useEventCallback } from "./use-event-callback";
@@ -50,14 +49,12 @@ import {
 import { useStore } from "zustand";
 import { WorkspaceProvider, useWorkspace } from "./workspace-context";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Result } from "better-result";
 import { Tooltip } from "@base-ui/react/tooltip";
 import {
   Plus,
   Settings as SettingsIcon,
   LogOut,
   Archive,
-  Globe,
   MessageCirclePlus,
   ArchiveRestore,
   Pencil,
@@ -72,14 +69,11 @@ import type { DisplayCatalog, NativeThread, SkillChoice } from "@stanley2058/lil
 import type { AppProps, ComposerSubmission } from "./types";
 import { resolveAttachmentIds } from "./uploads";
 import { Chat, type Draft, type PendingInput } from "./components/Chat";
+import { patchPendingInputs } from "./pending-input";
+import { isNarrowWorkspace, useNarrowWorkspace } from "./workspace-breakpoint";
+import { useModalSidebar } from "./modal-sidebar";
 import { Settings } from "./components/Settings";
 import { SidebarSearch } from "./components/SidebarSearch";
-const Sharing = lazy(() =>
-  import("./components/Sharing").then((module) => ({ default: module.Sharing })),
-);
-const External = lazy(() =>
-  import("./components/External").then((module) => ({ default: module.External })),
-);
 import { attempt, IconButton, Modal, VirtualList } from "./components/ui";
 import { MessageIdentityContext } from "./components/message-identity";
 import { WorkingIndicatorsContext } from "./components/WorkVerb";
@@ -88,6 +82,10 @@ import { SkillCatalogContext } from "./components/skill-mentions";
 import { toast } from "./components/ui/toast";
 import { refreshSidebar } from "./sidebar-queries";
 import { ExternalSidebar, ExternalSkeleton } from "./components/ExternalSidebar";
+import { ViewSwitcher, type OtherView } from "./components/ViewSwitcher";
+import { WorkflowSidebar } from "./components/WorkflowSidebar";
+import { focusWorkflowCard } from "./workflow-board-store";
+import { openThreadAtWorkflowCard, type WorkflowCardLocation } from "./message-target-store";
 import { ExternalMenuItems } from "./components/ExternalActions";
 import { SidebarQueue } from "./components/SidebarQueue";
 import { SidebarThread } from "./components/SidebarThread";
@@ -114,7 +112,18 @@ import {
 } from "./components/ui/context-menu";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
-import "./styles.css";
+import { keyedSearchHits, SearchThreadButton } from "./components/SearchThreadButton";
+const Sharing = lazy(() =>
+  import("./components/Sharing").then((module) => ({ default: module.Sharing })),
+);
+// The compiler cannot memoize a component that contains `import()`.
+const loadComposerEditor = () => import("./components/composer-editor");
+const WorkflowBoard = lazy(() =>
+  import("./components/WorkflowBoard").then((module) => ({ default: module.WorkflowBoard })),
+);
+const External = lazy(() =>
+  import("./components/External").then((module) => ({ default: module.External })),
+);
 
 export type { AppProps } from "./types";
 const noSkills: readonly SkillChoice[] = [];
@@ -129,6 +138,8 @@ export function App(props: AppProps) {
   );
 }
 function Workspace(props: AppProps) {
+  // Callbacks here read the latest selection through refs assigned during render.
+  "use no memo";
   const viewport = useWorkspaceViewport();
   const navigate = useNavigate();
   const router = useRouter();
@@ -148,6 +159,7 @@ function Workspace(props: AppProps) {
     notifications,
     backgroundPush,
     presence,
+    threadMetadata,
   } = useWorkspace();
   const draftIds = useStore(draftStore, (state) => state.ids);
   const setLocalDrafts = draftStore.getState().setLocalDrafts;
@@ -215,7 +227,9 @@ function Workspace(props: AppProps) {
       )
     : undefined;
   const settings = search.settings;
-  const viewedNotificationThread = search.view === "others" ? search.otherThread : routeThreadId;
+  const viewedRouteThread = search.view === "workflows" ? undefined : routeThreadId;
+  const viewedNotificationThread =
+    search.view === "others" ? search.otherThread : viewedRouteThread;
   const openNotificationThread = useEventCallback((threadId: string) => {
     void navigate({ to: "/threads/$threadId", params: { threadId }, search: {} });
   });
@@ -235,7 +249,7 @@ function Workspace(props: AppProps) {
     const update = () => {
       release?.();
       release = undefined;
-      presence.view(
+      void presence.view(
         active && !settings && document.visibilityState === "visible" && document.hasFocus()
           ? viewedNotificationThread
           : undefined,
@@ -253,7 +267,7 @@ function Workspace(props: AppProps) {
         );
     };
     const hide = () => {
-      presence.view();
+      void presence.view();
       release?.();
       release = undefined;
     };
@@ -264,7 +278,7 @@ function Workspace(props: AppProps) {
     window.addEventListener("blur", update);
     document.addEventListener("visibilitychange", update);
     return () => {
-      presence.view();
+      void presence.view();
       release?.();
       window.removeEventListener("pagehide", hide);
       window.removeEventListener("pageshow", update);
@@ -276,6 +290,7 @@ function Workspace(props: AppProps) {
 
   const archived = search.view === "archived";
   const external = search.view === "others" && viewer.role === "owner";
+  const workflowsView = search.view === "workflows";
   const externalId = search.otherThread;
   const changeView = useEventCallback((change: Partial<WorkspaceSearch>) => {
     void navigate({
@@ -293,11 +308,13 @@ function Workspace(props: AppProps) {
   );
   const sidebar = sidebarLayout.open;
   const rightOpen = rightLayout.open;
+  const narrow = useNarrowWorkspace();
+  useModalSidebar(viewport, narrow && sidebar && !rightOpen, panels.getState().toggleSidebar);
   const [searchQuery, setSearchQuery] = useState("");
   const queries = useQueryClient();
   const searchResults = useInfiniteQuery({
     ...searchOptions(client, searchQuery),
-    enabled: online && !!searchQuery,
+    enabled: online && !!searchQuery && !workflowsView,
     placeholderData: online ? keepPreviousData : undefined,
   });
   const changeSearchQuery = useEventCallback((query: string) => {
@@ -305,12 +322,14 @@ function Workspace(props: AppProps) {
     if (!query) void queries.resetQueries({ queryKey: ["search"] });
     setSearchQuery(query);
   });
-  const results = searchQuery
-    ? {
-        items: keyedSearchHits(searchResults.data?.pages.flatMap((page) => page.items) ?? []),
-        nextCursor: searchResults.hasNextPage,
-      }
-    : undefined;
+  // The workflows view searches workflow titles, so the same query filters its lists instead.
+  const results =
+    searchQuery && !workflowsView
+      ? {
+          items: keyedSearchHits(searchResults.data?.pages.flatMap((page) => page.items) ?? []),
+          nextCursor: searchResults.hasNextPage,
+        }
+      : undefined;
   const searching = searchResults.isFetching;
   useEffect(() => {
     if (searchResults.error) setError(searchResults.error.message);
@@ -323,22 +342,24 @@ function Workspace(props: AppProps) {
     setRename(undefined);
     setConfirmDelete(undefined);
   }, [active]);
-  const [theme, setTheme] = useState<string>(() => readTheme());
+  const theme = useThemeMode();
   const drafts = useRef(new Map<string, Draft>());
   const [pendingInputs, setPendingInputs] = useState(new Map<string, PendingInput[]>());
   const pending = useRef(pendingInputs);
   pending.current = pendingInputs;
   const patchPending = useCallback(
     (id: string, update: (entries: PendingInput[]) => PendingInput[]) => {
-      const changed = new Map(pending.current);
-      changed.set(id, update(changed.get(id) ?? []));
+      const changed = patchPendingInputs(pending.current, id, update);
       pending.current = changed;
       setPendingInputs(changed);
     },
     [],
   );
   const readTurns = useRef(new Map<string, string>());
-  const selected = threads.find((thread) => thread.id === selectedId);
+  // Metadata comes from the shared store, so a conversation found only in a sidebar page still has it.
+  const selected = useStore(threadMetadata, (state) =>
+    selectedId ? state.threads.get(selectedId) : undefined,
+  );
   const owner = viewer.role === "owner";
   const activeRef = useRef(active);
   activeRef.current = active;
@@ -357,12 +378,6 @@ function Workspace(props: AppProps) {
     }),
     [catalog?.agent, viewer],
   );
-  const listedArchived = useRef(false);
-  useEffect(() => {
-    if (listedArchived.current === archived) return;
-    listedArchived.current = archived;
-    void listThreads(archived);
-  }, [archived]);
   const [draftsHydrated, setDraftsHydrated] = useState(!props.draftCache);
   const routeDraftExists = useStore(
     draftStore,
@@ -416,14 +431,6 @@ function Workspace(props: AppProps) {
     navigate,
   ]);
 
-  useEffect(() => {
-    setThemeMode(theme);
-    const saved = Result.try({
-      try: () => localStorage.setItem("lilac-theme-v1", theme),
-      catch: () => "Storage unavailable",
-    });
-    saved.match({ ok: () => {}, err: () => {} });
-  }, [theme]);
   const upsert = useCallback(
     (thread: NativeThread) =>
       setThreads((current) => {
@@ -437,6 +444,48 @@ function Workspace(props: AppProps) {
       }),
     [],
   );
+  async function listThreads(showArchived: boolean, cursor?: string) {
+    if (!client.rpc || (cursor && threadListRequest.current.loading)) return;
+    const request = { loading: true };
+    threadListRequest.current = request;
+    setLoadingThreads(true);
+    setThreadListError(false);
+    if (!cursor) setNextCursor(undefined);
+    const page = await attempt(
+      () =>
+        client.rpc!.threads.list({
+          archived: showArchived,
+          excludeSettled: !showArchived,
+          limit: 100,
+          cursor,
+        }),
+      (message) => {
+        if (threadListRequest.current === request) setError(message);
+      },
+    );
+    if (threadListRequest.current !== request) return;
+    request.loading = false;
+    setLoadingThreads(false);
+    if (!page) {
+      setThreadListError(true);
+      return;
+    }
+    setThreads((current) => {
+      if (!cursor) return [...current.filter((thread) => thread.kind === "dm"), ...page.items];
+      const ids = new Set(current.map((thread) => thread.id));
+      return [...current, ...page.items.filter((thread) => !ids.has(thread.id))];
+    });
+    setNextCursor(page.nextCursor);
+  }
+  const createThread = useEventCallback(function createThread() {
+    blurForThreadNavigation();
+    const draft = newDraftThread();
+    const changed = new Map(draftStore.getState().localDrafts);
+    for (const [id, existing] of changed) if (!hasDraftContent(existing)) changed.delete(id);
+    changed.set(draft.id, draft);
+    setLocalDrafts(changed);
+    void navigate({ to: "/", state: { draftThreadId: draft.id }, search: {} });
+  });
   useEffect(
     () =>
       client.subscribe((event) => {
@@ -466,7 +515,10 @@ function Workspace(props: AppProps) {
             setThreads((items) => items.filter((thread) => thread.id !== event.threadId));
             queries.removeQueries({ queryKey: ["participants", event.threadId] });
             drafts.current.delete(event.threadId);
-            pending.current.delete(event.threadId);
+            if (pending.current.has(event.threadId)) {
+              pending.current = patchPendingInputs(pending.current, event.threadId, null);
+              setPendingInputs(pending.current);
+            }
             readTurns.current.delete(event.threadId);
             if (activeRef.current && selectedRef.current === event.threadId) createThread();
             return;
@@ -494,8 +546,10 @@ function Workspace(props: AppProps) {
     enabled: online && !!selectedId && !selectedId.startsWith("draft:") && !selected,
   });
   useEffect(() => {
-    if (selectedMetadata.data && !selected) upsert(selectedMetadata.data);
-  }, [selectedMetadata.data, !!selected, upsert]);
+    if (!selectedMetadata.data) return;
+    threadMetadata.getState().put([selectedMetadata.data]);
+    upsert(selectedMetadata.data);
+  }, [selectedMetadata.data, threadMetadata, upsert]);
   function changeLocalDraft(id: string, update: (thread: DraftThread) => DraftThread) {
     const current = draftStore.getState().localDrafts.get(id);
     if (!current) return;
@@ -552,6 +606,7 @@ function Workspace(props: AppProps) {
   const select = useEventCallback(function select(id: string) {
     blurForThreadNavigation();
     if (id === selectedRef.current) focusMainComposer();
+    // Archived lists conversations, so it stays open. The workflow board would hide this one.
     const search = { view: archived ? ("archived" as const) : undefined };
     if (id.startsWith("draft:")) {
       void navigate({ to: "/", state: { draftThreadId: id }, search });
@@ -564,15 +619,6 @@ function Workspace(props: AppProps) {
     void navigate({ to: "/threads/$threadId", params: { threadId: id }, search });
   });
 
-  const createThread = useEventCallback(function createThread() {
-    blurForThreadNavigation();
-    const draft = newDraftThread();
-    const changed = new Map(draftStore.getState().localDrafts);
-    for (const [id, existing] of changed) if (!hasDraftContent(existing)) changed.delete(id);
-    changed.set(draft.id, draft);
-    setLocalDrafts(changed);
-    void navigate({ to: "/", state: { draftThreadId: draft.id }, search: {} });
-  });
   function finishDraftNavigation(draftId: string, threadId: string) {
     if (selectedRef.current !== draftId) return;
     if (activeRef.current) {
@@ -618,8 +664,7 @@ function Workspace(props: AppProps) {
       (error) => changeLocalDraft(id, (draft) => ({ ...draft, sending: false, error })),
     );
     if (!initialThread || pool.signal.aborted) return;
-    const { remapComposerAttachments, resolveComposerAttachments } =
-      await import("./components/composer-editor");
+    const { remapComposerAttachments, resolveComposerAttachments } = await loadComposerEditor();
     const created = await applyDraftTitleChanges({
       thread: initialThread,
       initialTitle: creation.autoTitle ? undefined : creation.title,
@@ -741,39 +786,13 @@ function Workspace(props: AppProps) {
         : { state: "rejected", error: outcome.error.message },
     );
   }
-  async function listThreads(showArchived: boolean, cursor?: string) {
-    if (!client.rpc || (cursor && threadListRequest.current.loading)) return;
-    const request = { loading: true };
-    threadListRequest.current = request;
-    setLoadingThreads(true);
-    setThreadListError(false);
-    if (!cursor) setNextCursor(undefined);
-    const page = await attempt(
-      () =>
-        client.rpc!.threads.list({
-          archived: showArchived,
-          excludeSettled: !showArchived,
-          limit: 100,
-          cursor,
-        }),
-      (message) => {
-        if (threadListRequest.current === request) setError(message);
-      },
-    );
-    if (threadListRequest.current !== request) return;
-    request.loading = false;
-    setLoadingThreads(false);
-    if (!page) {
-      setThreadListError(true);
-      return;
-    }
-    setThreads((current) => {
-      if (!cursor) return [...current.filter((thread) => thread.kind === "dm"), ...page.items];
-      const ids = new Set(current.map((thread) => thread.id));
-      return [...current, ...page.items.filter((thread) => !ids.has(thread.id))];
-    });
-    setNextCursor(page.nextCursor);
-  }
+
+  const listedArchived = useRef(false);
+  useEffect(() => {
+    if (listedArchived.current === archived) return;
+    listedArchived.current = archived;
+    void listThreads(archived);
+  }, [archived]);
   async function update(
     id: string,
     change: { title?: string; archived?: boolean; regenerateTitle?: true },
@@ -785,7 +804,7 @@ function Workspace(props: AppProps) {
     }
     if (!client.rpc) return;
     const target =
-      threads.find((thread) => thread.id === id) ??
+      threadMetadata.getState().threads.get(id) ??
       (await attempt(() => client.rpc!.threads.get({ threadId: id }), setError));
     if (!target) return;
     const revision = client.thread(id).checkpoint?.projectionRevision ?? target.revision;
@@ -912,35 +931,36 @@ function Workspace(props: AppProps) {
       if (focused) focusMainComposer();
     },
   });
-  const showView = useEventCallback((view?: "archived" | "others") =>
+  const showView = useEventCallback((view?: OtherView) =>
     changeView({ view, otherThread: undefined }),
   );
+  const openWorkflowThread = useEventCallback((threadId: string, source?: WorkflowCardLocation) => {
+    blurForThreadNavigation();
+    if (source) openThreadAtWorkflowCard(threadId, source);
+    if (threadId === directThread?.id) {
+      void navigate({ to: "/dm", search: {} });
+      return;
+    }
+    void navigate({ to: "/threads/$threadId", params: { threadId }, search: {} });
+  });
+  const selectWorkflowRun = useEventCallback((runId: string) => {
+    focusWorkflowCard(runId);
+    // The sidebar covers the board on narrow screens, so step aside to reveal the card.
+    if (isNarrowWorkspace() && panels.getState().sidebar.open) panels.getState().toggleSidebar();
+  });
+  const otherView = external || archived || workflowsView ? search.view : undefined;
   const sidebarToolbar = useMemo(
     () => (
       <div className="sidebar-search-row flex items-center gap-1 min-w-0 mb-3">
-        <SidebarSearch onSearch={changeSearchQuery} />
+        <SidebarSearch
+          label={workflowsView ? "Search workflows" : "Search conversations"}
+          onSearch={changeSearchQuery}
+        />
         <nav
           className="sidebar-tabs flex items-center gap-0.5"
           aria-label="Conversation filters and actions"
         >
-          <IconButton
-            label={archived ? "Show active conversations" : "Show archived conversations"}
-            tooltip="Archived"
-            aria-pressed={archived}
-            onClick={() => showView(archived ? undefined : "archived")}
-          >
-            <Archive />
-          </IconButton>
-          {owner ? (
-            <IconButton
-              label={external ? "Show active conversations" : "Show other conversations"}
-              tooltip="Others"
-              aria-pressed={external}
-              onClick={() => showView(external ? undefined : "others")}
-            >
-              <Globe />
-            </IconButton>
-          ) : null}
+          <ViewSwitcher view={otherView} owner={owner} onChange={showView} />
           <IconButton
             label="New conversation"
             tooltip="New conversation"
@@ -953,7 +973,7 @@ function Workspace(props: AppProps) {
         </nav>
       </div>
     ),
-    [archived, external, owner, showView, createThread],
+    [otherView, workflowsView, owner, showView, createThread],
   );
   const sidebarFooter = useMemo(
     () => (
@@ -989,7 +1009,8 @@ function Workspace(props: AppProps) {
     ),
     [viewer, props.sessionControl, openSettings, openDesign, logout, settingsKeys.label],
   );
-  const actionThread = !external && !reference ? (selected ?? selectedMetadata.data) : undefined;
+  const actionThread =
+    !external && !workflowsView && !reference ? (selected ?? selectedMetadata.data) : undefined;
   return (
     <MessageIdentityContext.Provider value={identities}>
       <WorkingIndicatorsContext value={workingIndicators}>
@@ -998,7 +1019,7 @@ function Workspace(props: AppProps) {
             <NativeSubagentProvider
               threadId={selectedId ?? ""}
               running={selected?.displayStatus === "working"}
-              foreground={active && !external && !reference}
+              foreground={active && !external && !workflowsView && !reference}
             >
               <Tooltip.Provider delay={350}>
                 <main
@@ -1060,6 +1081,7 @@ function Workspace(props: AppProps) {
                       <button
                         type="button"
                         aria-label="Close sidebar"
+                        data-sidebar-scrim
                         className="absolute inset-0 z-20 hidden bg-overlay max-workspace:block"
                         onClick={panels.getState().toggleSidebar}
                       />
@@ -1095,7 +1117,10 @@ function Workspace(props: AppProps) {
                         {external && owner && !results ? (
                           <ExternalSidebar selectedId={externalId} onSelect={selectExternal} />
                         ) : null}
-                        {(results || !external) &&
+                        {workflowsView && !results ? (
+                          <WorkflowSidebar query={searchQuery} onSelect={selectWorkflowRun} />
+                        ) : null}
+                        {(results || (!external && !workflowsView)) &&
                           (results ? (
                             <>
                               <VirtualList
@@ -1103,12 +1128,14 @@ function Workspace(props: AppProps) {
                                 itemKey={(hit) => hit.key}
                                 label="Search results"
                                 className="thread-list flex-1"
+                                roving={{ selected: "[aria-current]" }}
                                 estimate={92}
                                 render={(hit) => (
                                   <SearchThreadButton
                                     id={hit.threadId}
                                     title={hit.title}
                                     excerpt={hit.excerpt}
+                                    query={searchQuery}
                                     onSelect={() => {
                                       if (hit.surface === "native") select(hit.threadId);
                                       else {
@@ -1160,7 +1187,6 @@ function Workspace(props: AppProps) {
                                     viewer={viewer}
                                     external={external}
                                     models={catalog?.models}
-                                    onThread={upsert}
                                     onSelect={select}
                                     onRename={renameSidebarThread}
                                     onRegenerateTitle={regenerateSidebarTitle}
@@ -1181,6 +1207,10 @@ function Workspace(props: AppProps) {
                                   items={sidebarThreads}
                                   itemKey={(thread) => thread.id}
                                   label="Conversations"
+                                  roving={{
+                                    primary: ".thread-card-select",
+                                    selected: "[aria-current]",
+                                  }}
                                   scrollFade
                                   hasMore={!!nextCursor && !threadListError}
                                   loading={loadingThreads}
@@ -1233,7 +1263,12 @@ function Workspace(props: AppProps) {
                             <External threadId={externalId} />
                           </Suspense>
                         ) : null}
-                        {!reference && !external && selectedId && routeDraftExists
+                        {!reference && workflowsView ? (
+                          <Suspense fallback={null}>
+                            <WorkflowBoard query={searchQuery} onOpen={openWorkflowThread} />
+                          </Suspense>
+                        ) : null}
+                        {!reference && !external && !workflowsView && selectedId && routeDraftExists
                           ? (() => {
                               const thread = selected ?? selectedMetadata.data;
                               const conversationActions = thread ? (
@@ -1336,13 +1371,13 @@ function Workspace(props: AppProps) {
                               );
                             })()
                           : null}
-                        {!reference && !external && !selectedId ? (
+                        {!reference && !external && !workflowsView && !selectedId ? (
                           <div className="welcome">
                             <Button
                               title={
                                 newThreadKeys.label
-                                  ? `New thread (${newThreadKeys.label})`
-                                  : "New thread"
+                                  ? `New conversation (${newThreadKeys.label})`
+                                  : "New conversation"
                               }
                               aria-keyshortcuts={newThreadKeys.aria}
                               onClick={createThread}
@@ -1373,7 +1408,7 @@ function Workspace(props: AppProps) {
                       onTabChange={(settings) => changeView({ settings })}
                       agent={identities.agent}
                       theme={theme}
-                      onTheme={setTheme}
+                      onTheme={chooseThemeMode}
                     />
                   ) : null}
                   {sharing && owner && selected ? (
@@ -1469,45 +1504,3 @@ function sameWords(current: readonly string[], next: readonly string[]): readonl
 }
 
 // Search returns one hit per message, so a turn can match more than once.
-function keyedSearchHits<T extends { threadId: string; turnId?: string; excerpt: string }>(
-  hits: readonly T[],
-) {
-  const seen = new Map<string, number>();
-  return hits.map((hit) => {
-    const base = `${hit.threadId}:${hit.turnId ?? hit.excerpt}`;
-    const count = seen.get(base) ?? 0;
-    seen.set(base, count + 1);
-    return { ...hit, key: count ? `${base}:${count}` : base };
-  });
-}
-
-function SearchThreadButton({
-  id,
-  title,
-  excerpt,
-  onSelect,
-}: {
-  id: string;
-  title: string;
-  excerpt: string;
-  onSelect: () => void;
-}) {
-  const shortcut = useThreadShortcut(id);
-  return (
-    <Button
-      type="button"
-      variant="ghost"
-      className="search-result relative flex w-full gap-1 p-3 text-left rounded-sm h-auto flex-col items-start whitespace-normal"
-      aria-keyshortcuts={shortcut.aria}
-      onClick={onSelect}
-    >
-      <strong>{title}</strong>
-      <span>{excerpt}</span>
-      {shortcut.held && shortcut.label ? (
-        <Kbd className="absolute bottom-2 right-2 bg-popover px-2 text-popover-foreground shadow-sm">
-          {shortcut.label}
-        </Kbd>
-      ) : null}
-    </Button>
-  );
-}

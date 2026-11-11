@@ -10,7 +10,7 @@ import {
 } from "@tanstack/react-query";
 import type { NativeClient } from "@stanley2058/lilac-client";
 
-import type { CacheScope } from "@stanley2058/lilac-client";
+import { cacheScopeKey, type CacheScope } from "@stanley2058/lilac-client";
 import type { AppProps } from "./types";
 import type { Draft } from "./components/Chat";
 
@@ -27,6 +27,16 @@ export function composerDraftOptions(
     },
     staleTime: "static",
     // Live attachment keys must survive sidebar unmounts and thread switches.
+    gcTime: Infinity,
+  });
+}
+
+/** Conversations with a saved reply draft. Rows prefer a live composer draft once one is loaded. */
+export function draftedThreadsOptions(scope: CacheScope, cache: AppProps["draftCache"]) {
+  return queryOptions({
+    queryKey: ["drafted-threads", cacheScopeKey(scope)],
+    queryFn: async () => (await cache?.listDraftedThreads?.(scope)) ?? new Set<string>(),
+    staleTime: "static",
     gcTime: Infinity,
   });
 }
@@ -149,6 +159,54 @@ export function configOptions(client: NativeClient, kind: "core" | "mcp") {
     queryFn: ({ signal }) => queryNativeRPC(client, (rpc) => rpc.config.read({ kind }, { signal })),
     staleTime: 0,
     gcTime: 0,
+  });
+}
+
+const ACTIVE_WORKFLOW_POLL_MS = 3_000;
+
+export type WorkflowListState = "active" | "failed" | "done";
+
+const ACTIVE_WORKFLOW_CHIP_POLL_MS = 10_000;
+
+/** Lives under the workflow key so an action on any card also refreshes this run. */
+export function workflowRunOptions(
+  client: NativeClient | undefined,
+  runId: string,
+  preview: boolean,
+) {
+  return queryOptions({
+    queryKey: ["workflows", "run", runId, preview],
+    queryFn: ({ signal }) =>
+      queryNativeRPC(client!, (rpc) => rpc.workflows.get({ runId, preview }, { signal })),
+    refetchInterval: (query) =>
+      query.state.data && query.state.data.card.endedAt === undefined
+        ? ACTIVE_WORKFLOW_CHIP_POLL_MS
+        : false,
+  });
+}
+
+/**
+ * Only active runs poll here. Ended runs carry result text and rarely change, so returning to the
+ * window does not reload their history. useNewestFinishedRuns adds the ones that end.
+ */
+export function workflowRunsOptions(
+  client: NativeClient,
+  state: WorkflowListState,
+  query: string = "",
+) {
+  return infiniteQueryOptions({
+    queryKey: ["workflows", state, query],
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam, signal }) =>
+      queryNativeRPC(client, (rpc) =>
+        rpc.workflows.list(
+          { state, limit: 30, cursor: pageParam, ...(query ? { query } : {}) },
+          { signal },
+        ),
+      ),
+    getNextPageParam: (page) => page.nextCursor,
+    staleTime: state === "active" ? 0 : Infinity,
+    refetchInterval: state === "active" ? ACTIVE_WORKFLOW_POLL_MS : false,
   });
 }
 

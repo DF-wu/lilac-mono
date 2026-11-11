@@ -28,7 +28,7 @@ permissions:
 jobs:
   ci:
     name: Source checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       REDIS_URL: redis://127.0.0.1:6379
@@ -60,6 +60,12 @@ jobs:
           sudo apt-get install -y fd-find ripgrep
           sudo ln -sf /usr/bin/fdfind /usr/local/bin/fd
 
+      # GitHub has no Debian runners. Match the GNU coreutils in the Debian images.
+      - name: Use GNU coreutils
+        run: |
+          sudo apt-get install -y --allow-remove-essential coreutils-from-gnu coreutils-from-uutils-
+          cat --version | grep -F 'GNU coreutils'
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
@@ -68,7 +74,7 @@ jobs:
 
   fork-footprint:
     name: Upstream footprint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
 
     steps:
@@ -93,11 +99,11 @@ jobs:
       - name: Check modified upstream files against the allowlist
         env:
           LILAC_UPSTREAM_REF: FETCH_HEAD
-        run: bun run fork:footprint
+        run: bun run fork:footprint -- --strict
 
   docker-image:
     name: Docker image smoke (${{ matrix.variant.name }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -119,13 +125,22 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
       - name: Build image
-        run: |
-          docker build \
-            --build-arg "CONTAINER_USER=${{ matrix.variant.container_user }}" \
-            --build-arg "CONTAINER_UID=${{ matrix.variant.container_uid }}" \
-            --tag "lilac:ci-${{ matrix.variant.name }}" \
-            .
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          build-args: |
+            CONTAINER_USER=${{ matrix.variant.container_user }}
+            CONTAINER_UID=${{ matrix.variant.container_uid }}
+            LILAC_BUILD_COMMIT=${{ inputs.ref || github.sha }}
+            LILAC_BUILD_DIRTY=false
+          tags: lilac:ci-${{ matrix.variant.name }}
+          cache-from: type=gha,scope=ci-${{ matrix.variant.name }}-amd64
+          cache-to: type=gha,mode=max,scope=ci-${{ matrix.variant.name }}-amd64
 
       - name: Verify image
         run: |
@@ -133,3 +148,23 @@ jobs:
             "lilac:ci-${{ matrix.variant.name }}" \
             "${{ matrix.variant.container_user }}" \
             "${{ matrix.variant.container_uid }}"
+
+  computer-use:
+    name: Computer-use Docker integration
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build runner and gateway images
+        run: bun run docker:build:computer-use
+      - name: Test Docker lifecycle
+        run: bun run test:computer-use:docker
