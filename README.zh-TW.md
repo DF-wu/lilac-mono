@@ -322,3 +322,13 @@ bun run fmt:check
 感謝 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的原始設計與持續開發。本 fork 與上游維護者沒有從屬或官方背書關係。
 
 `ref/` 內的 vendored/reference material 各自適用其原始授權條款。
+
+## Star 趨勢
+
+<a href="https://www.star-history.com/?repos=DF-wu/lilac-mono&amp;type=date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=DF-wu/lilac-mono&amp;type=Date&amp;theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=DF-wu/lilac-mono&amp;type=Date" />
+    <img alt="DF-wu/lilac-mono 的 GitHub 星數隨時間變化圖" src="https://api.star-history.com/svg?repos=DF-wu/lilac-mono&amp;type=Date" />
+  </picture>
+</a>

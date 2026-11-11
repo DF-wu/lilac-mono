@@ -351,3 +351,13 @@ This repository is released under the [MIT License](./LICENSE), retaining the or
 Thanks to [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) for the original design and continued development. This fork has no affiliation with or official endorsement from the upstream maintainers.
 
 Vendored/reference material in `ref/` is subject to its original license terms.
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=DF-wu/lilac-mono&amp;type=date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=DF-wu/lilac-mono&amp;type=Date&amp;theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=DF-wu/lilac-mono&amp;type=Date" />
+    <img alt="GitHub stars over time for DF-wu/lilac-mono" src="https://api.star-history.com/svg?repos=DF-wu/lilac-mono&amp;type=Date" />
+  </picture>
+</a>
