@@ -93,7 +93,9 @@ apps/core/tests/workflow/workflow-wait-resolver.test.ts  # Telegram reply waits
 apps/tool-bridge/client.test.ts  # origin session header
 apps/tool-bridge/client.ts  # forwards the origin session header
 apps/tool-bridge/index.ts  # preserves lazy runtime configuration for content.inspect in the standalone bridge
+apps/web/src/cache.ts  # issue #111: transaction-derived persistent cache recency across clock ties
 apps/web/src/generated/tool-activities.ts  # generated from fork tool definitions and workflow progress content
+apps/web/tests/cache.test.ts  # issue #111: recache, cross-instance ordering, capacity and safe-integer regressions
 bun.lock  # grammY (Telegram Bot API) dependency
 compose.yaml  # container identity variants, native surface port and optional native Discord webhook forwarding
 docker/direct-entrypoint.sh  # restores configured image identity/home and preserves the direct-launch contract
