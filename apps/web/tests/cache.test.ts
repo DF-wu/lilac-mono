@@ -886,7 +886,8 @@ for (const separateValidMaximum of [false, true]) {
     const clock = spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
     try {
       const factory = new IDBFactory();
-      const first = cache(factory);
+      const limits = { maxThreads: separateValidMaximum ? 3 : 2 };
+      const first = cache(factory, limits);
       await first.commit(scope, "a-corrupt", patch());
       if (separateValidMaximum) await first.commit(scope, "b-saturated", patch());
       await first.saveDraft(scope, "draft:kept", { text: "unsent user draft", skillIds: [] });
@@ -914,12 +915,12 @@ for (const separateValidMaximum of [false, true]) {
       };
       await done;
       raw.close();
-      const writer = cache(factory);
+      const writer = cache(factory, limits);
       expect(await writer.read(scope, "a-corrupt")).toBeUndefined();
       await writer.commit(scope, "z-valid", patch(1, "retained"));
       const persistent = writer.persistent;
       writer.close();
-      const reopened = cache(factory);
+      const reopened = cache(factory, limits);
       expect((await reopened.readDraft(scope, "draft:kept")).text).toBe("unsent user draft");
       expect(persistent).toBe(true);
       const value = await reopened.read(scope, "z-valid");
@@ -927,6 +928,12 @@ for (const separateValidMaximum of [false, true]) {
       expect(value?.slots[0]?.slot).toMatchObject({
         messages: [{ parts: [{ text: "retained" }] }],
       });
+      await reopened.commit(scope, "zz-new", patch());
+      expect((await storedRows(factory)).threads.map((row) => row.threadId)).toEqual(
+        separateValidMaximum ? ["b-saturated", "z-valid", "zz-new"] : ["z-valid", "zz-new"],
+      );
+      expect(await reopened.read(scope, "a-corrupt")).toBeUndefined();
+      expect((await reopened.readDraft(scope, "draft:kept")).text).toBe("unsent user draft");
     } finally {
       clock.mockRestore();
     }

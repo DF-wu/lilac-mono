@@ -225,6 +225,20 @@ function decodeThreadUsage(value: unknown): z.infer<typeof threadUsageSchema> | 
   const parsed = threadUsageSchema.safeParse(value);
   return parsed.success ? parsed.data : undefined;
 }
+async function rebaseThreadRecency(
+  threads: IDBObjectStore,
+  metadata: z.infer<typeof threadUsageSchema>[],
+  touchedKey: string,
+): Promise<number> {
+  for (const [index, usage] of metadata.entries()) {
+    usage.updatedAt = index;
+    if (usage.key === touchedKey) continue;
+    const row = await idbRequest(threads.get(usage.key));
+    if (!row || typeof row !== "object") continue;
+    threads.put({ ...row, updatedAt: index });
+  }
+  return metadata.length - 1;
+}
 async function threadRecency(threads: IDBObjectStore, touchedKey: string) {
   const all = await idbRequest(threads.getAll());
   const metadata = Array.isArray(all)
@@ -235,16 +249,8 @@ async function threadRecency(threads: IDBObjectStore, touchedKey: string) {
     : [];
   let newest = metadata.at(-1)?.updatedAt ?? 0;
   // Rebase only at integer exhaustion, preserving legacy ties in primary-key order.
-  if (newest === Number.MAX_SAFE_INTEGER) {
-    for (const [index, usage] of metadata.entries()) {
-      usage.updatedAt = index;
-      if (usage.key === touchedKey) continue;
-      const row = decodeThread(await idbRequest(threads.get(usage.key)));
-      if (!row) continue;
-      threads.put({ ...row, updatedAt: index });
-    }
-    newest = metadata.length - 1;
-  }
+  if (newest === Number.MAX_SAFE_INTEGER)
+    newest = await rebaseThreadRecency(threads, metadata, touchedKey);
   return { metadata, updatedAt: Math.max(Date.now(), newest + 1) };
 }
 /** Folds a later patch into one still waiting to be written, as if both were applied in order. */
