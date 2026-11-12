@@ -136,41 +136,48 @@ describe("WebNativeCache", () => {
   });
 
   test("a thread evicted from IndexedDB caches again on its next update", async () => {
-    const factory = new IDBFactory();
-    const first = cache(factory, { maxThreads: 1 });
-    const client = new NativeClient({
-      scope,
-      cache: first,
-      openSocket: () => new WebSocket("ws://unused.invalid"),
-      bootstrap: async () => bootstrap,
-    });
-    const one = client.thread("one");
-    one.replay({ kind: "window", checkpoint: patch().checkpoint, slots: [patch().put[0]!.slot] });
-    await client.loadCached("one");
-    const two = client.thread("two");
-    two.replay({ kind: "window", checkpoint: patch().checkpoint, slots: [patch().put[0]!.slot] });
-    await client.loadCached("two");
-    one.update({
-      checkpoint: patch(2).checkpoint,
-      changes: [
-        {
-          kind: "append-text",
-          turnId: "turn",
-          position: 1,
-          messageId: "msg",
-          partIndex: 0,
-          text: " again",
-        },
-      ],
-    });
-    await client.loadCached("one");
-    await client.dispose();
-    first.close();
-    const reopened = await cache(factory, { maxThreads: 1 }).read(scope, "one");
-    expect(reopened?.checkpoint.projectionRevision).toBe(2);
-    expect(reopened?.slots[0]?.slot).toMatchObject({
-      messages: [{ parts: [{ text: "hello again" }] }],
-    });
+    const clock = spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+    try {
+      const factory = new IDBFactory();
+      const first = cache(factory, { maxThreads: 1 });
+      const client = new NativeClient({
+        scope,
+        cache: first,
+        openSocket: () => new WebSocket("ws://unused.invalid"),
+        bootstrap: async () => bootstrap,
+      });
+      const one = client.thread("one");
+      one.replay({ kind: "window", checkpoint: patch().checkpoint, slots: [patch().put[0]!.slot] });
+      await client.loadCached("one");
+      const two = client.thread("two");
+      two.replay({ kind: "window", checkpoint: patch().checkpoint, slots: [patch().put[0]!.slot] });
+      await client.loadCached("two");
+      one.update({
+        checkpoint: patch(2).checkpoint,
+        changes: [
+          {
+            kind: "append-text",
+            turnId: "turn",
+            position: 1,
+            messageId: "msg",
+            partIndex: 0,
+            text: " again",
+          },
+        ],
+      });
+      await client.loadCached("one");
+      await client.dispose();
+      first.close();
+      const second = cache(factory, { maxThreads: 1 });
+      const reopened = await second.read(scope, "one");
+      expect(reopened?.checkpoint.projectionRevision).toBe(2);
+      expect(reopened?.slots[0]?.slot).toMatchObject({
+        messages: [{ parts: [{ text: "hello again" }] }],
+      });
+      expect(await second.read(scope, "two")).toBeUndefined();
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   test("unsupported IndexedDB uses isolated memory cache", async () => {
@@ -712,4 +719,176 @@ describe("projection version changes", () => {
     ]);
     expect(await reopened.read(scope, "old")).toBeUndefined();
   });
+});
+
+async function storedRows(factory: IDBFactory) {
+  const db = await openRaw(factory);
+  const tx = db.transaction(["threads", "slots"], "readonly");
+  const done = new Promise<void>((resolve) => {
+    tx.oncomplete = () => resolve();
+  });
+  const read = (name: string) =>
+    new Promise<
+      Array<{
+        key: string;
+        threadId: string;
+        updatedAt: number;
+        bytes: number;
+        threadKey: string;
+      }>
+    >((resolve, reject) => {
+      const request = tx.objectStore(name).getAll();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  const [threads, slots] = await Promise.all([read("threads"), read("slots")]);
+  await done;
+  db.close();
+  return { threads, slots };
+}
+
+async function setStoredRecency(factory: IDBFactory, updatedAt: number) {
+  const db = await openRaw(factory);
+  const tx = db.transaction("threads", "readwrite");
+  const done = new Promise<void>((resolve) => {
+    tx.oncomplete = () => resolve();
+  });
+  const request = tx.objectStore("threads").openCursor();
+  request.onsuccess = () => {
+    const cursor = request.result;
+    if (!cursor) return;
+    cursor.update({ ...cursor.value, updatedAt });
+    cursor.continue();
+  };
+  await done;
+  db.close();
+}
+
+for (const keys of [
+  ["a", "b", "c"],
+  ["z", "y", "x"],
+]) {
+  for (const maxThreads of [1, 2]) {
+    test(`persistent recency follows writes for ${keys.join(",")} with capacity ${maxThreads}`, async () => {
+      const clock = spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+      try {
+        const factory = new IDBFactory();
+        const first = cache(factory, { maxThreads });
+        for (const key of keys) await first.commit(scope, key, patch(1, key));
+        first.close();
+        const rows = await storedRows(factory);
+        expect(rows.threads.map((row) => row.threadId).sort()).toEqual(
+          keys.slice(-maxThreads).sort(),
+        );
+        expect(rows.slots.map((row) => row.threadKey).sort()).toEqual(
+          rows.threads.map((row) => row.key).sort(),
+        );
+        const second = cache(factory, { maxThreads });
+        for (const key of keys.slice(-maxThreads)) {
+          expect((await second.read(scope, key))?.slots[0]?.slot).toMatchObject({
+            messages: [{ parts: [{ text: key }] }],
+          });
+        }
+      } finally {
+        clock.mockRestore();
+      }
+    });
+  }
+}
+
+test("byte pressure uses global recency and atomically removes evicted slots", async () => {
+  const clock = spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+  try {
+    const factory = new IDBFactory();
+    const first = cache(factory, { maxThreads: 8, maxBytes: 1024 });
+    await first.commit({ ...scope, principalId: "z-other" }, "z-old", patch(1, "x".repeat(500)));
+    await first.commit(scope, "a-new", patch(1, "y".repeat(500)));
+    first.close();
+    const rows = await storedRows(factory);
+    expect(rows.threads.map((row) => row.threadId)).toEqual(["a-new"]);
+    expect(rows.threads.reduce((sum, row) => sum + row.bytes, 0)).toBeLessThanOrEqual(1024);
+    expect(rows.slots.map((row) => row.threadKey)).toEqual(rows.threads.map((row) => row.key));
+    const second = cache(factory, { maxThreads: 8, maxBytes: 1024 });
+    const value = await second.read(scope, "a-new");
+    expect(value?.checkpoint.projectionRevision).toBe(1);
+    expect(value?.slots[0]?.slot).toMatchObject({
+      messages: [{ parts: [{ text: "y".repeat(500) }] }],
+    });
+    await second.commit(scope, "a-huge", patch(1, "x".repeat(2048)));
+    const oversized = await storedRows(factory);
+    expect(oversized.threads).toHaveLength(0);
+    expect(oversized.slots).toHaveLength(0);
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+test("persistent read after reopen makes a thread newer than another instance's write", async () => {
+  const clock = spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+  try {
+    const factory = new IDBFactory();
+    const first = cache(factory, { maxThreads: 2 });
+    await first.commit(scope, "a", patch());
+    await first.commit(scope, "b", patch());
+    first.close();
+    const second = cache(factory, { maxThreads: 2 });
+    expect(await second.read(scope, "a")).toBeDefined();
+    await cache(factory, { maxThreads: 2 }).commit(scope, "c", patch());
+    expect((await storedRows(factory)).threads.map((row) => row.threadId)).toEqual(["a", "c"]);
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+test("two instances preserve write order even when the clock moves backwards", async () => {
+  const clock = spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+  try {
+    const factory = new IDBFactory();
+    const first = cache(factory, { maxThreads: 2 });
+    const second = cache(factory, { maxThreads: 2 });
+    await first.commit(scope, "z", patch());
+    await second.commit(scope, "a", patch());
+    clock.mockReturnValue(1_600_000_000_000);
+    await first.commit(scope, "b", patch());
+    expect((await storedRows(factory)).threads.map((row) => row.threadId)).toEqual(["a", "b"]);
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+for (const legacyRecency of [1_700_000_000_000, Number.MAX_SAFE_INTEGER]) {
+  test(`legacy ties at ${legacyRecency} retain deterministic order and safe persistent touches`, async () => {
+    const clock = spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+    try {
+      const factory = new IDBFactory();
+      const first = cache(factory, { maxThreads: 3 });
+      for (const key of ["a", "b", "c"]) await first.commit(scope, key, patch());
+      first.close();
+      await setStoredRecency(factory, legacyRecency);
+      const second = cache(factory, { maxThreads: 3 });
+      expect(await second.read(scope, "a")).toBeDefined();
+      await second.commit(scope, "d", patch());
+      const rows = await storedRows(factory);
+      expect(rows.threads.map((row) => row.threadId)).toEqual(["a", "c", "d"]);
+      expect(
+        rows.threads.every((row) => Number.isSafeInteger(row.updatedAt) && row.updatedAt >= 0),
+      ).toBe(true);
+      second.close();
+      expect(await cache(factory).read(scope, "a")).toBeDefined();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+}
+
+test("memory hits do not persist touches or scan IndexedDB metadata", async () => {
+  const first = cache();
+  await first.commit(scope, "thread", patch());
+  const transactions = spyOn(IDBDatabase.prototype, "transaction");
+  try {
+    expect(await first.read(scope, "thread")).toBeDefined();
+    expect(transactions).not.toHaveBeenCalled();
+  } finally {
+    transactions.mockRestore();
+  }
 });
