@@ -881,6 +881,58 @@ for (const legacyRecency of [1_700_000_000_000, Number.MAX_SAFE_INTEGER]) {
   });
 }
 
+for (const separateValidMaximum of [false, true]) {
+  test(`recency rebasing preserves drafts beside malformed replay rows, separate maximum=${separateValidMaximum}`, async () => {
+    const clock = spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+    try {
+      const factory = new IDBFactory();
+      const first = cache(factory);
+      await first.commit(scope, "a-corrupt", patch());
+      if (separateValidMaximum) await first.commit(scope, "b-saturated", patch());
+      await first.saveDraft(scope, "draft:kept", { text: "unsent user draft", skillIds: [] });
+      first.close();
+      const raw = await openRaw(factory);
+      const tx = raw.transaction("threads", "readwrite");
+      const done = new Promise<void>((resolve, reject) => {
+        tx.oncomplete = () => resolve();
+        tx.onabort = () => reject(tx.error);
+      });
+      const request = tx.objectStore("threads").openCursor();
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        if (cursor.value.threadId === "a-corrupt") {
+          cursor.update({
+            ...cursor.value,
+            updatedAt: separateValidMaximum ? 1_700_000_000_000 : Number.MAX_SAFE_INTEGER,
+            checkpoint: { invalid: true },
+          });
+        } else {
+          cursor.update({ ...cursor.value, updatedAt: Number.MAX_SAFE_INTEGER });
+        }
+        cursor.continue();
+      };
+      await done;
+      raw.close();
+      const writer = cache(factory);
+      expect(await writer.read(scope, "a-corrupt")).toBeUndefined();
+      await writer.commit(scope, "z-valid", patch(1, "retained"));
+      const persistent = writer.persistent;
+      writer.close();
+      const reopened = cache(factory);
+      expect((await reopened.readDraft(scope, "draft:kept")).text).toBe("unsent user draft");
+      expect(persistent).toBe(true);
+      const value = await reopened.read(scope, "z-valid");
+      expect(value?.checkpoint.projectionRevision).toBe(1);
+      expect(value?.slots[0]?.slot).toMatchObject({
+        messages: [{ parts: [{ text: "retained" }] }],
+      });
+    } finally {
+      clock.mockRestore();
+    }
+  });
+}
+
 test("memory hits do not persist touches or scan IndexedDB metadata", async () => {
   const first = cache();
   await first.commit(scope, "thread", patch());

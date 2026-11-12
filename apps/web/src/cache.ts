@@ -240,7 +240,7 @@ async function threadRecency(threads: IDBObjectStore, touchedKey: string) {
       usage.updatedAt = index;
       if (usage.key === touchedKey) continue;
       const row = decodeThread(await idbRequest(threads.get(usage.key)));
-      if (!row) signalWebCacheFailure(new Error("Invalid cache thread during recency rebase"));
+      if (!row) continue;
       threads.put({ ...row, updatedAt: index });
     }
     newest = metadata.length - 1;
