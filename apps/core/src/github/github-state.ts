@@ -15,6 +15,7 @@ export type GithubRequestMeta = {
     prNumber: number;
     headSha: string;
     mode: "review";
+    pendingInterrupt?: { requestId: string; requestDeliveryId: string };
   };
 };
 
@@ -88,6 +89,12 @@ export function setGithubRequestMeta(meta: GithubRequestMeta) {
 
 export function getGithubRequestMeta(requestId: string): GithubRequestMeta | undefined {
   return metaByRequest.get(requestId);
+}
+
+export function hasGithubPendingReviewInterrupt(requestDeliveryId: string): boolean {
+  return [...metaByRequest.values()].some(
+    (meta) => meta.pr?.pendingInterrupt?.requestDeliveryId === requestDeliveryId,
+  );
 }
 
 export function setGithubAck(requestId: string, ack: GithubAckState) {

@@ -1,3 +1,5 @@
+import { createRealCoreBusFixture, requireBusOk, withBusDeadline } from "../helpers/real-core-bus";
+import { lilacEventTypes, type LilacMessageForTopic } from "@stanley2058/lilac-event-bus";
 import { normalizeWorkflowResourcePolicy, workflowStoreValue } from "./workflow-store-test-helpers";
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
@@ -30,6 +32,7 @@ import { createMemoryBlobStore } from "@stanley2058/lilac-blob-storage";
 import { createLilacBus, type RawBus } from "@stanley2058/lilac-event-bus";
 import { z } from "zod";
 import { WorkflowEngine } from "../../src/workflow/workflow-engine";
+import { WorkflowWaitResolver } from "../../src/workflow/workflow-wait-resolver";
 import {
   RequestDeliveryCoordinator,
   SqliteRequestDeliveryStore,
@@ -1777,3 +1780,261 @@ it("uses claim, due-time and deadline indexes for maintenance scans", () => {
     rmSync(file, { force: true });
   }
 });
+
+it("delivers persisted cancellation intents through Redis and deduplicates replay after store reopen", async () => {
+  const f = await createRealCoreBusFixture();
+  const workflowPath = join(f.directory, "workflow.sqlite");
+  let store = new DurableWorkflowStore(workflowPath);
+  const legacyId = "workflow-cancel:request-a:epoch";
+  const existingId = crypto.randomUUID();
+  const insert = () => {
+    const db = new Database(workflowPath);
+    try {
+      db.run("INSERT INTO workflow_cancellation_outbox VALUES (?, 'session', ?)", [
+        "request-a",
+        legacyId,
+      ]);
+      db.run("INSERT INTO workflow_cancellation_outbox VALUES (?, 'session', ?)", [
+        "request-b",
+        existingId,
+      ]);
+    } finally {
+      db.close();
+    }
+  };
+  const messages: LilacMessageForTopic<"cmd.request">[] = [];
+  const received = Promise.withResolvers<void>();
+  const subscription = requireBusOk(
+    await f.bus.subscribeTopic(
+      "cmd.request",
+      { mode: "fanout", subscriptionId: "workflow-cancellations" },
+      async (message) => {
+        messages.push(message);
+        if (messages.length === 2) received.resolve();
+        return Result.ok(undefined);
+      },
+      () => "commit",
+    ),
+  );
+  const drain = async () => {
+    const engine = new WorkflowEngine({
+      bus: f.bus,
+      store,
+      blobStore: f.blobs,
+      dataDir: f.directory,
+      subscriptionId: "cancellation-real-bus",
+      pollMs: 60_000,
+    });
+    try {
+      await engine.start();
+    } finally {
+      await engine.stop();
+    }
+  };
+  try {
+    insert();
+    await drain();
+    await withBusDeadline(received.promise, "workflow cancellation delivery");
+    expect(store.pendingCancellations()).toEqual([]);
+    expect(messages.map((message) => message.type)).toEqual([
+      lilacEventTypes.CmdRequestMessage,
+      lilacEventTypes.CmdRequestMessage,
+    ]);
+    const first = messages.find((message) => message.headers?.request_id === "request-a")!;
+    const second = messages.find((message) => message.headers?.request_id === "request-b")!;
+    expect(first.data).toMatchObject({
+      queue: "interrupt",
+      messages: [],
+      raw: { cancel: true, cancelQueued: true },
+    });
+    expect(z.uuid().safeParse(first.data.requestDeliveryId).success).toBe(true);
+    expect(second.data.requestDeliveryId).toBe(existingId);
+    expect(first.headers).toMatchObject({ session_id: "session", request_client: "unknown" });
+    expect(requireBusOk(f.store.load(first.data.requestDeliveryId)).publication?.streamId).toBe(
+      first.id,
+    );
+    const watermark = await f.raw.watermark!("cmd.request");
+    store.close();
+    store = new DurableWorkflowStore(workflowPath);
+    insert();
+    await drain();
+    expect(store.pendingCancellations()).toEqual([]);
+    expect(await f.raw.watermark!("cmd.request")).toBe(watermark);
+    expect(requireBusOk(f.store.load(first.data.requestDeliveryId)).publication?.streamId).toBe(
+      first.id,
+    );
+    expect(requireBusOk(f.store.load(second.data.requestDeliveryId)).publication?.streamId).toBe(
+      second.id,
+    );
+  } finally {
+    requireBusOk(await subscription.stop());
+    store.close();
+    await f.close();
+  }
+}, 15_000);
+
+for (const historicalVersion of [26, 27]) {
+  it(`recovers retained waits and active requests after workflow schema ${historicalVersion} upgrade`, async () => {
+    const f = await createRealCoreBusFixture();
+    const file = join(f.directory, "old-workflow.sqlite");
+    let store = new DurableWorkflowStore(file);
+    let resolver: WorkflowWaitResolver | undefined;
+    let engine: WorkflowEngine | undefined;
+    const db = new Database(file);
+    try {
+      workflowStoreValue(store.createInvocation({ revision: revision(), run: run() }));
+      store.tryClaimRun({ runId: "run-1", claimerId: "older-worker", now: 20 });
+      expect(store.createOperation(operation("run-1", "agent"), "older-worker")).toBe(true);
+      expect(
+        store.createOperationAndWait(
+          { ...operation("run-1", "sleep"), kind: "wait" },
+          {
+            runId: "run-1",
+            operationId: "sleep",
+            state: "pending",
+            match: { kind: "sleep" },
+            matchKey: "sleep:30",
+            dueAt: 30,
+            deadlineAt: null,
+            resolverCursor: null,
+            result: null,
+            resolvedBy: null,
+            claimedBy: null,
+            claimedAt: null,
+            createdAt: 20,
+            updatedAt: 20,
+            resolvedAt: null,
+          },
+          "older-worker",
+        ),
+      ).toBe(true);
+      db.run(`INSERT INTO workflow_request_dispatches
+        (request_id, run_id, operation_id, session_id, platform, policy_json, active, created_at, updated_at, dispatch_epoch)
+        VALUES ('retained-request', 'run-1', 'agent', 'retained-session', 'discord', '{}', 1, 20, 20, 'retained-epoch')`);
+      const previousRun = workflowStoreValue(store.getRun("run-1"));
+      const previousWait = workflowStoreValue(store.getWait("run-1", "sleep"));
+      store.close();
+      // Remove exactly the additive migrations after the supported blob baseline.
+      db.run(`DROP TRIGGER workflow_operation_cancellation_intent;
+        DROP TABLE workflow_cancellation_outbox;
+        DROP INDEX idx_workflow_runs_claim;
+        DROP INDEX idx_workflow_waits_deadline;
+        DELETE FROM workflow_schema_migrations WHERE version = 28;`);
+      if (historicalVersion === 26) {
+        db.run(`DROP TABLE workflow_artifact_publications;
+          DELETE FROM workflow_schema_migrations WHERE version = 27;`);
+      }
+      expect(
+        db
+          .query<{ version: number }, []>(
+            "SELECT MAX(version) AS version FROM workflow_schema_migrations",
+          )
+          .get()?.version,
+      ).toBe(historicalVersion);
+      store = new DurableWorkflowStore(file);
+      expect(store.listMigrations().at(-1)?.version).toBe(28);
+      expect(workflowStoreValue(store.getRun("run-1"))).toEqual(previousRun);
+      expect(workflowStoreValue(store.getWait("run-1", "sleep"))).toEqual(previousWait);
+      const wakeup = Promise.withResolvers<void>();
+      requireBusOk(
+        await f.bus.subscribeTopic(
+          "evt.workflow",
+          {
+            mode: "fanout",
+            subscriptionId: "upgraded-wait-progress",
+          },
+          async (message) => {
+            if (
+              message.type === lilacEventTypes.EvtWorkflowProgressRequested &&
+              message.data.runId === "run-1"
+            )
+              wakeup.resolve();
+            return Result.ok(undefined);
+          },
+          () => "stop",
+        ),
+      );
+      resolver = new WorkflowWaitResolver({
+        bus: f.bus,
+        store,
+        subscriptionId: "upgraded-wait",
+        now: () => 30,
+        pollMs: 60_000,
+      });
+      await resolver.start();
+      await resolver.reconcileTimers();
+      await withBusDeadline(wakeup.promise, "retained workflow wait wakeup");
+      expect(workflowStoreValue(store.getWait("run-1", "sleep"))?.state).toBe("resolved");
+      await resolver.stop();
+      resolver = undefined;
+      const cancellation = Promise.withResolvers<LilacMessageForTopic<"cmd.request">>();
+      requireBusOk(
+        await f.bus.subscribeTopic(
+          "cmd.request",
+          {
+            mode: "fanout",
+            subscriptionId: "upgraded-cancellation",
+          },
+          async (message) => {
+            cancellation.resolve(message);
+            return Result.ok(undefined);
+          },
+          () => "stop",
+        ),
+      );
+      expect(
+        store.terminalizeRun({
+          runId: "run-1",
+          from: "running",
+          to: "failed",
+          ownerId: "older-worker",
+          now: 31,
+          detail: "cancel retained active request",
+          result: null,
+          resultArtifact: null,
+        }),
+      ).toBe(true);
+      expect(store.pendingCancellations()).toEqual([
+        {
+          requestId: "retained-request",
+          sessionId: "retained-session",
+          deliveryId: "workflow-cancel:retained-request:retained-epoch",
+        },
+      ]);
+      engine = new WorkflowEngine({
+        bus: f.bus,
+        store,
+        blobStore: f.blobs,
+        dataDir: f.directory,
+        subscriptionId: "upgraded-engine",
+        now: () => 32,
+        pollMs: 60_000,
+      });
+      await engine.start();
+      const interrupt = await withBusDeadline(
+        cancellation.promise,
+        "upgraded cancellation delivery",
+      );
+      await f.waitForCommit(interrupt.id, "cmd.request");
+      expect(interrupt.headers).toMatchObject({
+        request_id: "retained-request",
+        session_id: "retained-session",
+      });
+      expect(interrupt.data).toMatchObject({
+        queue: "interrupt",
+        raw: { cancel: true, cancelQueued: true },
+      });
+      expect(z.uuid().safeParse(interrupt.data.requestDeliveryId).success).toBe(true);
+      expect(store.pendingCancellations()).toEqual([]);
+      expect(
+        requireBusOk(f.store.load(interrupt.data.requestDeliveryId)).publication?.streamId,
+      ).toBe(interrupt.id);
+    } finally {
+      await engine?.stop();
+      await resolver?.stop();
+      store.close();
+      db.close();
+      await f.close();
+    }
+  }, 15_000);
+}

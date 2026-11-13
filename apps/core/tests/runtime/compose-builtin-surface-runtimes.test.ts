@@ -116,6 +116,7 @@ function createComposition(input: {
     subscriptionPrefix: "focused",
     webhookSecret: input.webhookSecret,
     githubAppCredentialsAvailable: input.githubAppCredentialsAvailable,
+    hasPublishedRequest: () => Result.ok(false),
     getTranscriptStore: () => {
       transcriptStoreLookups += 1;
       return undefined;

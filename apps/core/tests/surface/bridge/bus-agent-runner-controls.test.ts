@@ -66,7 +66,7 @@ describe("applyToRunningAgent", () => {
       }),
       (checkpoint) => retained.push(checkpoint.kind),
       (operation) => void operation(),
-      { isCurrent: () => current, dropEnded: async () => undefined },
+      { isCurrent: () => current, acceptsInput: () => true, dropEnded: async () => undefined },
     );
     await materializing.promise;
     current = false;
@@ -79,36 +79,73 @@ describe("applyToRunningAgent", () => {
     expect(outcome).toBe("target-ended");
   });
 
-  it("drops a deferred idle interrupt whose run ended before it ran", async () => {
+  it("routes input away from a finalizing run but still applies a cancel", async () => {
     const { agent, calls } = countingAgent();
-    let current = true;
-    let dropped = 0;
-    const retained: string[] = [];
-    const pending: { operation?: () => Promise<void> } = {};
-    const applied = await applyToRunningAgent(
-      agent,
-      controlEntry("interrupt", "late interrupt"),
-      new Set(),
-      fakeActiveRun(null),
-      (checkpoint) => retained.push(checkpoint.kind),
-      (operation) => {
-        pending.operation = operation;
-      },
-      {
-        isCurrent: () => current,
-        dropEnded: async () => {
-          dropped += 1;
-        },
-      },
-    );
-    current = false;
-    expect(pending.operation).toBeDefined();
-    await pending.operation?.();
+    const cancelled = new Set<string>();
+    const target = {
+      isCurrent: () => true,
+      acceptsInput: () => false,
+      dropEnded: async () => undefined,
+    };
+    const apply = (entry: Enqueued) =>
+      applyToRunningAgent(
+        agent,
+        entry,
+        cancelled,
+        fakeActiveRun(null),
+        () => undefined,
+        (operation) => void operation(),
+        target,
+      );
+
+    const steered = await apply(controlEntry("steer", "late steer"));
+    const cancel = { ...controlEntry("interrupt", ""), raw: { cancel: true } } as Enqueued;
+    const cancelOutcome = await apply(cancel);
     await agent.waitForIdle();
 
+    expect(steered).toBe("target-ended");
     expect(calls.count).toBe(0);
-    expect(retained).toEqual([]);
-    expect(dropped).toBe(1);
-    expect(applied).toBe("applied");
+    expect(cancelOutcome).toBe("applied");
+    expect([...cancelled]).toEqual(["request"]);
   });
+
+  it.each(["ended", "finalizing"])(
+    "routes deferred idle interrupt input after its run is %s",
+    async (phase) => {
+      const { agent, calls } = countingAgent();
+      let current = true;
+      const routed: Enqueued[] = [];
+      let accepting = true;
+      const retained: string[] = [];
+      const pending: { operation?: () => Promise<void> } = {};
+      const entry = controlEntry("interrupt", "late interrupt");
+      const applied = await applyToRunningAgent(
+        agent,
+        entry,
+        new Set(),
+        fakeActiveRun(null),
+        (checkpoint) => retained.push(checkpoint.kind),
+        (operation) => {
+          pending.operation = operation;
+        },
+        {
+          isCurrent: () => current,
+          acceptsInput: () => accepting,
+          dropEnded: async () => {
+            routed.push(entry);
+          },
+        },
+      );
+      if (phase === "ended") current = false;
+      else accepting = false;
+      expect(pending.operation).toBeDefined();
+      await pending.operation?.();
+      await agent.waitForIdle();
+
+      expect(calls.count).toBe(0);
+      expect(retained).toEqual([]);
+      expect(routed).toEqual([entry]);
+      expect(applied).toBe("applied");
+    },
+  );
 });

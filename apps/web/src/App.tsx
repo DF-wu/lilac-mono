@@ -48,7 +48,7 @@ import {
 } from "./queries";
 import { useStore } from "zustand";
 import { WorkspaceProvider, useWorkspace } from "./workspace-context";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Activity, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Tooltip } from "@base-ui/react/tooltip";
 import {
   Plus,
@@ -1178,11 +1178,7 @@ function Workspace(props: AppProps) {
                                     </div>
                                   ) : null}
                                   <SidebarQueue
-                                    fallbackThreads={
-                                      online
-                                        ? undefined
-                                        : threads.filter((thread) => thread.kind !== "dm")
-                                    }
+                                    fallbackThreads={threads}
                                     draftIds={draftIds}
                                     viewer={viewer}
                                     external={external}
@@ -1268,8 +1264,10 @@ function Workspace(props: AppProps) {
                             <WorkflowBoard query={searchQuery} onOpen={openWorkflowThread} />
                           </Suspense>
                         ) : null}
-                        {!reference && !external && !workflowsView && selectedId && routeDraftExists
-                          ? (() => {
+                        {/* Hidden instead of unmounted, so switching views does not rebuild the timeline. */}
+                        {!reference && selectedId && routeDraftExists ? (
+                          <Activity mode={!external && !workflowsView ? "visible" : "hidden"}>
+                            {(() => {
                               const thread = selected ?? selectedMetadata.data;
                               const conversationActions = thread ? (
                                 <>
@@ -1369,8 +1367,9 @@ function Workspace(props: AppProps) {
                                   }
                                 />
                               );
-                            })()
-                          : null}
+                            })()}
+                          </Activity>
+                        ) : null}
                         {!reference && !external && !workflowsView && !selectedId ? (
                           <div className="welcome">
                             <Button

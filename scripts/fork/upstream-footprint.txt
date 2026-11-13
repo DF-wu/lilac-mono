@@ -38,7 +38,7 @@ apps/core/src/surface/bridge/request-ids.ts  # telegram:<session>:<message> requ
 apps/core/src/surface/bridge/subscribe-from-bus.ts  # platform-generic relay refs
 apps/core/src/surface/builtin-surface-protocols.ts  # registers telegramSurfaceProtocol in the closed catalog
 apps/core/src/surface/native/runtime.ts  # composes the opt-in fork-owned Discord recorder at native ingress and shutdown
-apps/core/src/surface/native/store.ts  # exposes bounded committed-display notifications after native persistence and destination-scoped durable Discord child routing
+apps/core/src/surface/native/store.ts  # committed display notifications, durable Discord child routing, and PR113 revoked-steer admission and assistant attribution
 apps/core/src/surface/native/push.test.ts  # updates the native schema upgrade regression for durable Discord child routing
 
 # --- OpenAI web.search provider (staged for an upstream contribution; remove once accepted)
@@ -131,3 +131,65 @@ scripts/architecture/core-final-boundary-identities.ts  # registers the attachme
 scripts/architecture/manifest.ts  # registers fork module boundaries, codecs, and exception adapters
 scripts/architecture/precise-exception-identities.ts  # registers fork module exception identities
 scripts/run-gates.ts  # runs external custom-media source/bundle regression and typecheck in the repository gate
+
+# --- PR113 integration regressions
+apps/installer/src/data-files.ts  # preserves the existing image runtime identity when preparing private bind-mounted data
+apps/installer/tests/integration/verify-installation.ts  # verifies private installer ownership against each image's actual account
+apps/core/src/surface/native/execution.test.ts  # guards revoked automatic-steer admission and busy-send assistant attribution
+apps/installer/tests/runtime-contract.test.ts  # resolves existing fork Docker ARG defaults without weakening runtime environment assertions
+DEVELOPMENT.md  # records changed runner fingerprints before npm publication
+apps/core/scripts/generate-client-protocol-compat.ts  # stages historical schema export before replacing frozen fixtures
+apps/core/src/github/github-state.ts  # preserves unfinished interrupt retry after durable prompt publication
+apps/core/src/tools/orchestrate.ts  # stable keyed follow-up identity across parent request retries
+apps/core/src/workflow/workflow-subagent-dispatcher.ts  # reuses existing transactional invocation receipts and stored run handles
+apps/core/src/workflow/subagent-follow-up.ts  # derives missed-steer child identity from the existing durable delivery
+apps/core/tests/e2e/conversation.e2e.ts  # quotes synthetic FIFO paths
+apps/core/tests/e2e/discord.e2e.ts  # quotes FIFO paths and exercises a temporary path containing spaces
+apps/core/tests/e2e/harness/core-process.ts  # observes crashes, fatal errors, output drains and diagnostic-directory setup
+apps/core/tests/e2e/harness/index.ts  # preserves cleanup failures after forced termination
+apps/core/tests/e2e/harness/native-session.ts  # disposes clients on setup failure
+apps/core/tests/e2e/harness/previous-release.ts  # verifies predecessor ancestry and falls back to remote release tags
+apps/core/tests/e2e/harness/responses-protocol.ts  # isolates stored continuation messages from normalization mutation
+apps/core/tests/e2e/harness/scripted-model.ts  # treats synthetic tool-returned image messages as tool data
+apps/core/tests/e2e/mcp.e2e.ts  # asserts structured binary materialization and retained image attachment
+apps/core/tests/e2e/wire-compat.e2e.ts  # applies old-client validation only to endpoints present in its verified release
+apps/core/tests/e2e/recovery.e2e.ts  # observes completed durable replay from an independent client before reconnect
+apps/core/tests/github/github-webhook-durable-delivery.test.ts  # regression for unfinished interrupt-stage redelivery
+apps/core/tests/heartbeat/heartbeat-real-bus.test.ts  # retains body and cleanup failures with lexical disposal
+apps/core/tests/helpers/client-compat.ts  # historical integrity list excludes workflow endpoints absent from that release
+apps/core/tests/ssh/ssh-exec.test.ts  # expects the unpublished changed runner version
+apps/core/tests/surface/bridge/bus-agent-runner-controls.test.ts  # preserves deferred ordinary input after target finalization
+apps/core/tests/surface/bridge/bus-agent-runner-session-queue.test.ts  # fences late steering during failure finalization
+apps/core/tests/tools/orchestrate.test.ts  # real durable publication regression for keyed live-to-ended concurrency
+apps/core/tests/workflow/workflow-subagent-convergence.test.ts  # concurrent, reopened-store and hard-exit receipt regressions; real bus deadlines
+apps/web/src/components/composer-editor.tsx  # preserves caret and selection across Activity editor recreation
+packages/client-protocol/compat/previous-release/actionsPartSchema.schema.json  # removes generated schema absent from verified release build-3c01ce2c29a6-42575569714-1
+packages/client-protocol/compat/previous-release/bootstrap.get.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/bootstrap.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/bootstrap.watch.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/bootstrapReplySchema.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/catalogEventSchema.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/nativeThreadSchema.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/sidebar.list.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/sidebarPageSchema.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/streams.watch.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/threadEventSchema.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/threadListSchema.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/threads.create.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/threads.get.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/threads.list.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/threads.update.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/threads.watch.schema.json  # regenerated from verified historical release schemas
+packages/client-protocol/compat/previous-release/workflowRunSummarySchema.schema.json  # removes generated schema absent from verified historical release
+packages/client-protocol/compat/previous-release/workflows.get.schema.json  # removes generated endpoint fixture absent from verified historical release
+packages/client-protocol/compat/previous-release/workflows.list.schema.json  # removes generated endpoint fixture absent from verified historical release
+packages/event-bus/tests/redis-load.test.ts  # observes actual post-commit burst completion before trim assertions
+packages/fs/src/glob-match.ts  # preserves character exclusions and ranges while matching dot-prefixed segments
+packages/fs/tests/glob-match.test.ts  # cross-runtime negated-class, range and brace regressions
+packages/remote-fs-runner/build.ts  # preserves source and unrelated output-directory contents
+packages/remote-fs-runner/package.json  # bumps changed runner to unpublished 0.0.8
+packages/remote-fs-runner/published-fingerprint.json  # records exact changed unpublished runner source fingerprint
+packages/remote-fs-runner/tests/published-fingerprint.test.ts  # enforces record-before-publish constraints
+packages/remote-fs-runner/tests/published-package.case.ts  # accepts npm12 pack JSON while retaining exact package-content assertions
+packages/remote-fs-runner/tests/version.test.ts  # verifies version and non-destructive build output
+scripts/remote-fs-runner-fingerprint.ts  # rejects recording any changed already-published version
