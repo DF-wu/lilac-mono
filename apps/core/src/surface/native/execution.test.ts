@@ -799,6 +799,85 @@ describe("native execution admission", () => {
     }
   });
 
+  test("a busy surface send preserves assistant attribution and steering metadata", async () => {
+    const f = fixture();
+    try {
+      f.submit("first");
+      value(await f.execution.kick(f.thread.id));
+      const receipt = value(
+        f.store.acceptSurfaceInput(
+          "owner",
+          {
+            threadId: f.thread.id,
+            commandId: `${NATIVE_AUTO_STEER_COMMAND_PREFIX}role`,
+            historyGeneration: 0,
+            text: "Include the totals",
+            mode: "steer",
+            attachmentIds: [],
+            skillIds: [],
+          },
+          "lilac",
+          {
+            id: "service-message",
+            role: "assistant",
+            parts: [{ type: "text", text: "Include the totals" }],
+          },
+          pinnedModel,
+        ),
+      );
+      expect(
+        value(f.store.readDisplayMessage("owner", f.thread.id, receipt.messageId)),
+      ).toMatchObject({
+        role: "assistant",
+        metadata: { authorId: "lilac", inputId: receipt.inputId, inputMode: "steer" },
+      });
+    } finally {
+      f.close();
+    }
+  });
+
+  test("an abandoned automatic steer loses admission when its sender loses edit access", async () => {
+    const abandoned = new Set<string>();
+    const f = fixture(undefined, false, (id) =>
+      Result.ok(abandoned.has(id) ? "abandoned" : "owned"),
+    );
+    try {
+      value(
+        f.store.shareThread("owner", { threadId: f.thread.id, userId: "guest", grant: "edit" }),
+      );
+      f.submit("first");
+      value(await f.execution.kick(f.thread.id));
+      const first = f.request();
+      const receipt = value(
+        f.store.acceptSurfaceInput(
+          "guest",
+          {
+            threadId: f.thread.id,
+            commandId: `${NATIVE_AUTO_STEER_COMMAND_PREFIX}revoked`,
+            historyGeneration: 0,
+            text: "Include the totals",
+            mode: "steer",
+            attachmentIds: [],
+            skillIds: [],
+          },
+          "lilac",
+          undefined,
+          pinnedModel,
+        ),
+      );
+      value(await f.execution.kick(f.thread.id));
+      abandoned.add(value(f.store.getInput(receipt.inputId)).deliveryId);
+      value(f.store.shareThread("owner", { threadId: f.thread.id, userId: "guest", grant: null }));
+      value(await finishFirstRun(f, first));
+      expect(value(f.store.getInput(receipt.inputId)).state).toBe("target-ended");
+      const next = f.submit("authorized next");
+      value(await f.execution.kick(f.thread.id));
+      expect(parseNativeRequestMetadata(f.published.at(-1)!.data.raw)?.inputId).toBe(next.inputId);
+    } finally {
+      f.close();
+    }
+  });
+
   test("an agent's automatic steer the runner abandons becomes a follow-up", async () => {
     const abandoned = new Set<string>();
     const f = fixture(undefined, false, (deliveryId) =>

@@ -2336,6 +2336,12 @@ export class NativeStore {
           thread.mutationPending
         )
           return Result.ok(null);
+        if (
+          !(yield* nullableAuthority(
+            this.authorizeThread(input.initiatingUserId, input.threadId, true),
+          ))
+        )
+          return Result.ok(null);
         if (input.turnId) {
           const turn = yield* this.readRecord("turn", input.turnId);
           if (turn?.kind === "turn" && turn.value.messages.some((m) => m.id === input.messageId))
@@ -3532,9 +3538,8 @@ export class NativeStore {
           resolvedModelRequest,
         });
         const accepted = yield* this.getInput(receipt.inputId);
-        // A queued input has no turn until it is admitted, and a steer joins the active turn as
-        // input; only an input that already opened its own turn takes the caller's display.
-        if (message && accepted.mode !== "steer" && accepted.turnId)
+        // Queued inputs have no turn yet; an admitted steer keeps its input metadata below.
+        if (message && accepted.turnId)
           yield* this.updateSurfaceMessage(actorId, input.threadId, receipt.messageId, {
             ...message,
             id: receipt.messageId,

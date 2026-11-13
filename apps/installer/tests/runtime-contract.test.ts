@@ -102,10 +102,14 @@ it("keeps shared Compose and Dockerfile environment defaults equal", async () =>
     "utf8",
   );
   const imageEnvironment: Record<string, string> = {};
+  const buildDefaults = Object.fromEntries(
+    [...source.matchAll(/^ARG ([A-Z][A-Z0-9_]*)=(.*)$/gm)].map((match) => [match[1]!, match[2]!]),
+  );
   for (const match of source.matchAll(/^ENV ([A-Z][A-Z0-9_]*)=(.*)$/gm)) {
     const value = match[2]!.replace(/\$\{([A-Z][A-Z0-9_]*)\}/g, (_whole, key: string) => {
-      expect(imageEnvironment[key], `Unresolved Docker ENV ${key}`).toBeDefined();
-      return imageEnvironment[key]!;
+      const resolved = imageEnvironment[key] ?? buildDefaults[key];
+      expect(resolved, `Unresolved Docker ENV ${key}`).toBeDefined();
+      return resolved!;
     });
     imageEnvironment[match[1]!] = value;
   }

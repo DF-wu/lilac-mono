@@ -38,7 +38,7 @@ apps/core/src/surface/bridge/request-ids.ts  # telegram:<session>:<message> requ
 apps/core/src/surface/bridge/subscribe-from-bus.ts  # platform-generic relay refs
 apps/core/src/surface/builtin-surface-protocols.ts  # registers telegramSurfaceProtocol in the closed catalog
 apps/core/src/surface/native/runtime.ts  # composes the opt-in fork-owned Discord recorder at native ingress and shutdown
-apps/core/src/surface/native/store.ts  # exposes bounded committed-display notifications after native persistence and destination-scoped durable Discord child routing
+apps/core/src/surface/native/store.ts  # committed display notifications, durable Discord child routing, and PR113 revoked-steer admission and assistant attribution
 apps/core/src/surface/native/push.test.ts  # updates the native schema upgrade regression for durable Discord child routing
 
 # --- OpenAI web.search provider (staged for an upstream contribution; remove once accepted)
@@ -131,3 +131,7 @@ scripts/architecture/core-final-boundary-identities.ts  # registers the attachme
 scripts/architecture/manifest.ts  # registers fork module boundaries, codecs, and exception adapters
 scripts/architecture/precise-exception-identities.ts  # registers fork module exception identities
 scripts/run-gates.ts  # runs external custom-media source/bundle regression and typecheck in the repository gate
+
+# --- PR113 integration regressions
+apps/core/src/surface/native/execution.test.ts  # guards revoked automatic-steer admission and busy-send assistant attribution
+apps/installer/tests/runtime-contract.test.ts  # resolves existing fork Docker ARG defaults without weakening runtime environment assertions
