@@ -227,6 +227,7 @@ class ToolPayloadInvalid extends TaggedError("ToolPayloadInvalid")<{
 
 class ToolRequestAuthenticationError extends TaggedError("ToolRequestAuthenticationError")<{
   readonly cause?: unknown;
+  readonly unavailable?: true;
   readonly message: string;
 }> {}
 
@@ -516,7 +517,7 @@ function adaptToolAuthenticationResultToElysia(
   result: ResultType<AuthenticatedToolRequest, ToolRequestAuthenticationError>,
 ): AuthenticatedToolRequest {
   return adaptResultToHost(result, (error) =>
-    Object.assign(new Error(error.message), { status: 403 }),
+    Object.assign(new Error(error.message), { status: error.unavailable ? 503 : 403 }),
   );
 }
 
@@ -937,6 +938,7 @@ export function createToolServer(options: ToolServerOptions) {
             if (isPanic(cause)) return adaptPanicToToolServerHost(cause);
             return Result.err(
               new ToolRequestAuthenticationError({
+                unavailable: true,
                 cause: safePluginExceptionCause(cause),
                 message: opaquePluginExceptionMessage(cause),
               }),

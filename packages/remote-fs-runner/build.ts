@@ -1,4 +1,4 @@
-import { chmod, mkdir, rm } from "node:fs/promises";
+import { chmod, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
 
@@ -21,7 +21,6 @@ async function main(): Promise<void> {
   const packageVersion = (await Bun.file(path.join(RUNNER_PACKAGE_DIR, "package.json")).json())
     .version;
 
-  await rm(outdir, { recursive: true, force: true });
   await mkdir(outdir, { recursive: true });
 
   const result = await Bun.build({

@@ -91,6 +91,12 @@ export function getGithubRequestMeta(requestId: string): GithubRequestMeta | und
   return metaByRequest.get(requestId);
 }
 
+export function hasGithubPendingReviewInterrupt(requestDeliveryId: string): boolean {
+  return [...metaByRequest.values()].some(
+    (meta) => meta.pr?.pendingInterrupt?.requestDeliveryId === requestDeliveryId,
+  );
+}
+
 export function setGithubAck(requestId: string, ack: GithubAckState) {
   ackByRequest.set(requestId, ack);
 }

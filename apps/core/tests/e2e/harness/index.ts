@@ -54,7 +54,12 @@ export async function startE2E(
     let credentials: { token: string; cookie: string } | undefined;
     cleanup.defer(async () => {
       for (const session of sessions.splice(0)) await session.close().catch(() => undefined);
-      await core.stop().catch(() => core.kill());
+      try {
+        await core.stop();
+      } catch (error) {
+        await core.kill();
+        throw error;
+      }
     });
     await core.ready();
     const moved = cleanup.move();

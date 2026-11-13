@@ -26,6 +26,7 @@ import {
   claimGithubAcknowledgement,
   getGithubLatestRequestForSession,
   getGithubRequestMeta,
+  hasGithubPendingReviewInterrupt,
   restoreGithubLatestRequestForSession,
   rollbackGithubAcknowledgementClaim,
   setGithubAck,
@@ -571,6 +572,7 @@ export function createGithubWebhookApp(options: {
 
   function dedupe(deliveryId: string | undefined): boolean {
     if (!deliveryId) return false;
+    if (hasGithubPendingReviewInterrupt(githubDeliveryId(deliveryId, "interrupt"))) return false;
     const now = Date.now();
     for (const [k, exp] of seen) {
       if (exp <= now) seen.delete(k);

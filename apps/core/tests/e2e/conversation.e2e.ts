@@ -21,7 +21,7 @@ async function barrier() {
   const made = Bun.spawnSync(["mkfifo", fifo]);
   if (made.exitCode !== 0) throw new Error("mkfifo failed");
   return {
-    command: `read line < ${fifo}; echo "released:$line"`,
+    command: `read line < '${fifo.replaceAll("'", "'\\''")}' ; echo "released:$line"`,
     async release(value = "ok") {
       const handle = await open(fifo, "w");
       await handle.write(`${value}\n`);

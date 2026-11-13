@@ -14,9 +14,14 @@ import { z } from "zod";
 
 const packageDir = path.resolve(import.meta.dir, "..");
 const INSTALL_TIMEOUT_MS = 180_000;
-const packResultSchema = z.array(
-  z.object({ filename: z.string(), files: z.array(z.object({ path: z.string() })) }),
-);
+const packedFileSchema = z.object({
+  filename: z.string(),
+  files: z.array(z.object({ path: z.string() })),
+});
+const packResultSchema = z.union([
+  z.array(packedFileSchema),
+  z.record(z.string(), packedFileSchema).transform((packages) => Object.values(packages)),
+]);
 const packedManifestSchema = z.looseObject({
   name: z.string(),
   version: z.string(),
@@ -74,6 +79,7 @@ beforeAll(async () => {
     ),
   );
   const [result] = packed;
+  expect(packed).toHaveLength(1);
   if (!result) throw new Error("npm pack produced no tarball");
   tarball = path.join(tempDir, result.filename);
   packedFiles = result.files.map((file) => file.path).sort();

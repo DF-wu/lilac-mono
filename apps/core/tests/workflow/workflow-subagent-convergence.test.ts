@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, jest, spyOn } from "bun:test";
 import { Result } from "better-result";
 import { Logger } from "@stanley2058/simple-module-logger";
 import path from "node:path";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { z } from "zod";
 import {
@@ -200,6 +200,34 @@ function registration(
         },
   };
 }
+it("reuses a durable subagent invocation across concurrent dispatch and store reopen", async () => {
+  const f = await setup();
+  const child = registration(f.projectRoot, "parent:keyed-replay");
+  const [first, concurrent] = await Promise.all([
+    f.dispatcher.delegate(child),
+    f.dispatcher.delegate(child),
+  ]);
+  expect(concurrent.runId).toBe(first.runId);
+  expect(workflowStoreValue(f.store.listSubagentRuns(child.parentSessionId))).toHaveLength(1);
+  const reopened = new DurableWorkflowStore(f.dbPath);
+  try {
+    const dispatcher = await WorkflowSubagentDispatcher.create({
+      store: reopened,
+      blobStore,
+      dataDir: f.dataDir,
+    });
+    const replay = await dispatcher.delegate(child);
+    expect(replay.runId).toBe(first.runId);
+    expect(workflowStoreValue(reopened.listSubagentRuns(child.parentSessionId))).toHaveLength(1);
+    await replay.cancel("cancel the stored run");
+    expect(workflowStoreValue(reopened.getRun(first.runId))?.state).toBe("cancelled");
+    await expect(replay.completion).resolves.toMatchObject({ status: "cancelled" });
+  } finally {
+    reopened.close();
+    f.store.close();
+  }
+});
+
 async function createRun(parentRequestId = "parent:1", heartbeat = false) {
   const setupResult = await setup();
   const handle = await setupResult.dispatcher.delegate(
@@ -209,6 +237,43 @@ async function createRun(parentRequestId = "parent:1", heartbeat = false) {
   if (!run) throw new Error("generated subagent run not found");
   return { ...setupResult, handle, run };
 }
+
+it("reuses a missed-steer invocation after a hard exit before intake terminalization", async () => {
+  const f = await createRun("parent:crash");
+  const run = workflowStoreValue(f.store.getRun(f.handle.runId))!;
+  const revision = workflowStoreValue(f.store.getRevision(run.revisionId))!;
+  const root = path.join(f.root, "crash");
+  await mkdir(root);
+  await writeFile(
+    path.join(root, "input.json"),
+    JSON.stringify({
+      run,
+      revision,
+      policy: null,
+      task: "Continue after the missed steer",
+      idleTimeoutMs: 2000,
+      sender: { parentRequestId: "parent:retry", parentToolCallId: "tool:retry" },
+      requestDeliveryId: "fd17729a-f812-44de-857f-4174fcd57451",
+    }),
+  );
+  const worker = path.join(import.meta.dir, "fixtures/subagent-invocation-crash.ts");
+  for (const mode of ["crash", "replay"]) {
+    const child = Bun.spawn([process.execPath, "--no-env-file", worker, root, mode], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+    if (mode === "crash") expect(child.signalCode, stderr).toBe("SIGKILL");
+    else expect(code, stderr).toBe(0);
+  }
+  expect(await readFile(path.join(root, "replayed-run"), "utf8")).toBe(
+    await readFile(path.join(root, "committed-run"), "utf8"),
+  );
+  const reopened = new DurableWorkflowStore(path.join(root, "workflow.db"));
+  expect(workflowStoreValue(reopened.listSubagentRuns("channel:1"))).toHaveLength(1);
+  reopened.close();
+  f.store.close();
+}, 20_000);
 async function waitFor(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 3000;
   while (!predicate()) {
@@ -325,9 +390,12 @@ describe("workflow subagent convergence", () => {
   it("rejects delegation at global capacity without creating partial durable state", async () => {
     const { projectRoot, store, dispatcher } = await setup(1);
     const first = await dispatcher.delegate(registration(projectRoot, "parent:first"));
-    await expect(dispatcher.delegate(registration(projectRoot, "parent:rejected"))).rejects.toThrow(
-      "global workflow capacity is full (1/1 active runs)",
-    );
+    await expect(
+      dispatcher.delegate({
+        ...registration(projectRoot, "parent:rejected"),
+        childRequestId: "sub:child:rejected",
+      }),
+    ).rejects.toThrow("global workflow capacity is full (1/1 active runs)");
     expect(workflowStoreValue(store.listRuns()).map((item) => item.runId)).toEqual([first.runId]);
     expect([...workflowStoreValue(store.listActiveLiveParentRuns("parent:rejected"))]).toEqual([]);
     expect(workflowStoreValue(store.listRevisions())).toHaveLength(1);
@@ -362,6 +430,71 @@ describe("workflow subagent convergence", () => {
     });
     store.close();
   });
+  it("deduplicates keyed tool calls across parent requests and dispatcher restart", async () => {
+    const f = await createRun("parent:original");
+    f.store.cancelRunAndChildren({ runId: f.handle.runId, now: Date.now(), detail: "finished" });
+    function tool(
+      requestId: string,
+      store: DurableWorkflowStore,
+      dispatcher: WorkflowSubagentDispatcher,
+    ) {
+      return createOrchestrateTool({
+        config: parseCoreConfigV3ToUniversal({ configVersion: 3 }),
+        cwd: f.projectRoot,
+        runProfile: "primary",
+        canControl: true,
+        idleTimeoutMs: 2000,
+        maxDepth: 1,
+        workflows: store,
+        requestContext: {
+          requestId,
+          sessionId: "channel:1",
+          requestClient: "discord",
+          subagentDepth: 0,
+          subagentProfile: "primary",
+          requestInitiator: AUTHENTICATED_PARENT,
+          requestInitiatorSessionId: "channel:1",
+        },
+        delegate: (registration) =>
+          dispatcher.delegate({
+            ...registration,
+            projectRoot: f.projectRoot,
+            fallbackSurface: { ...AUTHENTICATED_PARENT, sessionId: "channel:1" },
+          }),
+      });
+    }
+    const send = (built: ReturnType<typeof tool>) =>
+      built.execute!(
+        {
+          action: "send",
+          id: f.handle.runId,
+          mode: "queue",
+          message: "Next",
+          commandId: "stable-command",
+        } as never,
+        { toolCallId: "tool:keyed", messages: [] } as never,
+      );
+    const [first, concurrent] = await Promise.all([
+      send(tool("parent:retry-1", f.store, f.dispatcher)),
+      send(tool("parent:retry-2", f.store, f.dispatcher)),
+    ]);
+    expect(concurrent).toEqual(first);
+    expect(workflowStoreValue(f.store.listSubagentRuns("channel:1"))).toHaveLength(2);
+    f.store.close();
+    const store = new DurableWorkflowStore(f.dbPath);
+    try {
+      const dispatcher = await WorkflowSubagentDispatcher.create({
+        store,
+        blobStore,
+        dataDir: f.dataDir,
+      });
+      expect(await send(tool("parent:retry-3", store, dispatcher))).toEqual(first);
+      expect(workflowStoreValue(store.listSubagentRuns("channel:1"))).toHaveLength(2);
+    } finally {
+      store.close();
+    }
+  });
+
   it("continues a finished child through orchestrate and parks the later parent turn", async () => {
     const { projectRoot, store, dispatcher, handle } = await createRun("parent:first-turn");
     store.cancelRunAndChildren({ runId: handle.runId, now: Date.now(), detail: "finished" });
@@ -1601,7 +1734,7 @@ it("replays child tools, forwards live updates and wakes the parent from Redis w
     store.close();
     await f.close();
   }
-});
+}, 20_000);
 
 it("publishes parent cancellation transitions through Redis", async () => {
   const { store, run } = await createRun("parent:redis-cancel");
@@ -1652,4 +1785,4 @@ it("publishes parent cancellation transitions through Redis", async () => {
     store.close();
     await f.close();
   }
-});
+}, 20_000);

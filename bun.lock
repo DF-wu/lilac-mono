@@ -376,7 +376,7 @@
     },
     "packages/remote-fs-runner": {
       "name": "@stanley2058/lilac-remote-fs-runner",
-      "version": "0.0.7",
+      "version": "0.0.8",
       "bin": {
         "lilac-remote-fs": "dist/cli.js",
       },

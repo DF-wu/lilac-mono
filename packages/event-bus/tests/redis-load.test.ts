@@ -1,3 +1,4 @@
+import { Result } from "better-result";
 import { expect, it } from "bun:test";
 import Redis from "ioredis";
 import { env } from "@stanley2058/lilac-utils";
@@ -92,8 +93,13 @@ it("bounds pooled connections and retained history across slow-consumer bursts a
           async (message) => {
             const value = sequence(message);
             fastSeen.push(value);
-            if (value === last) fastFinished.resolve();
-            return { disposition: "commit" };
+            return {
+              disposition: "commit",
+              observePostCommit: async () => {
+                if (value === last) fastFinished.resolve();
+                return Result.ok(undefined);
+              },
+            };
           },
         )
       ).unwrap();
@@ -113,8 +119,13 @@ it("bounds pooled connections and retained history across slow-consumer bursts a
               slowStarted.resolve();
               await releaseSlow.promise;
             }
-            if (value === last) slowFinished.resolve();
-            return { disposition: "commit" };
+            return {
+              disposition: "commit",
+              observePostCommit: async () => {
+                if (value === last) slowFinished.resolve();
+                return Result.ok(undefined);
+              },
+            };
           },
         )
       ).unwrap();

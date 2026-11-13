@@ -178,6 +178,7 @@ export async function startCore(
   });
   // LILAC_E2E_LOG_DIR keeps each Core process's output for debugging a failed scenario.
   const logDir = process.env.LILAC_E2E_LOG_DIR;
+  if (logDir) await mkdir(logDir, { recursive: true });
   const logFile = logDir ? path.join(logDir, `core-${child.pid}.log`) : undefined;
   const drain = async (stream: ReadableStream<Uint8Array>) => {
     const decoder = new TextDecoder();
@@ -187,8 +188,7 @@ export async function startCore(
       if (logFile) await appendFile(logFile, text);
     }
   };
-  void drain(child.stdout);
-  void drain(child.stderr);
+  const drained = Promise.all([drain(child.stdout), drain(child.stderr)]);
   const phase = async (name: string, timeoutMs = 30_000) => {
     if (seen.has(name)) return;
     const waiter = phases.get(name) ?? Promise.withResolvers<void>();
@@ -210,15 +210,20 @@ export async function startCore(
     output: () => output,
     ready: () => phase("ready"),
     async stop() {
-      if (child.exitCode !== null) return;
-      child.send("stop");
-      await phase("stopped");
-      await child.exited;
+      if (child.exitCode === null) {
+        child.send("stop");
+        await phase("stopped");
+      }
+      const code = await child.exited;
+      await drained;
+      if (code !== 0 || !seen.has("stopped"))
+        throw new Error(`Core exited ${code} without a clean stop:\n${output.slice(-8_000)}`);
       if (fatal.length) throw new Error(`Core reported fatal errors:\n${fatal.join("\n")}`);
     },
     async kill() {
       if (child.exitCode === null) child.kill("SIGKILL");
       await child.exited;
+      await drained;
     },
   };
 }

@@ -155,6 +155,9 @@ test("a client whose connection drops mid run resumes without gaps or duplicates
         entry.scenario === "network-drop" && entry.reply?.text === "Finished after the drop.",
       "run finished during drop",
     );
+    const fresh = await e2e.session({ style: "bearer" });
+    const freshTurns = await fresh.settled(fresh.watch(threadId), 1);
+    expect(freshTurns[0]!.assistant).toContain("Finished after the drop.");
     proxy.reconnect();
     const turns = await session.waitForTurns(
       store,
@@ -175,8 +178,6 @@ test("a client whose connection drops mid run resumes without gaps or duplicates
       session.events.some((event) => event.kind === "connection" && event.state === "offline"),
     ).toBe(true);
     // A fresh client agrees with the resumed one.
-    const fresh = await e2e.session({ style: "bearer" });
-    const freshTurns = await fresh.settled(fresh.watch(threadId), 1);
     // Live projection omits per-message positions that replay fills in; nothing renders from them.
     expect(withoutPositions(freshTurns)).toEqual(withoutPositions(turns));
   } finally {

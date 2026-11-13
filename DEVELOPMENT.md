@@ -276,10 +276,9 @@ fails when those inputs change while the version stays the same. To release a ru
 1. Bump `version` in `packages/remote-fs-runner/package.json`. The version tests in
    `packages/remote-fs-runner/tests/version.test.ts` and `apps/core/tests/ssh/ssh-exec.test.ts`
    name it too.
-2. Run `bun run build:remote-fs` and `bun run test:remote-fs-package`, then publish the package from
-   `packages/remote-fs-runner`.
-3. Run `bun run remote-fs:fingerprint` and commit the updated record. The script refuses to record
-   new inputs for a version that npm already has.
+2. Run `bun run build:remote-fs` and `bun run test:remote-fs-package`, then run the next step before publishing.
+3. Run `bun run remote-fs:fingerprint` and commit the updated record, then publish the package from
+   `packages/remote-fs-runner`. The script refuses to record new inputs for a version that npm already has.
 
 `bun run test:remote-fs-package` packs the runner with `npm pack` and installs the tarball through
 `bunx` and `npx` outside the workspace. It needs npm and registry access, and CI runs it after the

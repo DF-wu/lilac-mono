@@ -1360,6 +1360,33 @@ describe("createToolServer", () => {
     }
   });
 
+  it("keeps authentication dependency failures retryable", async () => {
+    const server = createToolServer({
+      tools: [],
+      requestMessageCache: {
+        get: () => {
+          throw new Error("cache unavailable");
+        },
+      },
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/list", {
+          headers: {
+            "x-lilac-request-id": "request-1",
+            "x-lilac-session-id": "channel-1",
+            "x-lilac-request-client": "discord",
+            "x-lilac-cwd": "/workspace",
+          },
+        }),
+      );
+      expect(response.status).toBe(503);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("rejects a control capability whose principal conflicts with the cached origin", async () => {
     const server = createToolServer({
       tools: [],

@@ -670,7 +670,7 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
         task: input.message,
         ...(input.commandId
           ? {
-              childRequestId: `sub:${requestContext.requestId}${followUpKeySuffix(input.commandId)}`,
+              childRequestId: `sub:${sha256(target.childSessionId).slice(0, 40)}${followUpKeySuffix(input.commandId)}`,
             }
           : {}),
         ...(target.title ? { title: target.title } : {}),

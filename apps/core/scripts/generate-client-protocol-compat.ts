@@ -1,4 +1,5 @@
-import { mkdir, readdir, rm } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { compatSchemas } from "../tests/helpers/client-compat-schemas";
@@ -18,28 +19,33 @@ if (import.meta.main) {
     const validators = await loadCompatValidators();
     console.log(`Validated ${validators.size} previous-release schemas`);
   } else {
-    await mkdir(baselineDirectory, { recursive: true });
-    for (const name of await readdir(baselineDirectory)) {
-      if (name.endsWith(".schema.json")) await rm(path.join(baselineDirectory, name));
-    }
+    const staged = await mkdtemp(path.join(tmpdir(), "lilac-compat-export-"));
+    await using cleanup = new AsyncDisposableStack();
+    cleanup.defer(() => rm(staged, { recursive: true, force: true }));
+    let exported = true;
     if (process.argv.includes("--from-head")) {
       for (const [name, schema] of Object.entries(compatSchemas()))
         await Bun.write(
-          path.join(baselineDirectory, `${name}.schema.json`),
+          path.join(staged, `${name}.schema.json`),
           JSON.stringify(z.toJSONSchema(schema, EXPORT_OPTIONS)),
         );
-    } else if (!(await exportPreviousRelease())) {
-      process.exitCode = 1;
+    } else exported = await exportPreviousRelease(staged);
+    if (!exported || !(await formatBaseline(staged))) process.exitCode = 1;
+    if (!process.exitCode) {
+      await mkdir(baselineDirectory, { recursive: true });
+      for (const name of await readdir(baselineDirectory))
+        if (name.endsWith(".schema.json")) await rm(path.join(baselineDirectory, name));
+      for (const name of await readdir(staged))
+        await copyFile(path.join(staged, name), path.join(baselineDirectory, name));
     }
-    if (!process.exitCode && !(await formatBaseline())) process.exitCode = 1;
   }
 }
 
 /** Formats every generated file like the repository so fmt:check accepts them. */
-async function formatBaseline(): Promise<boolean> {
-  for (const name of await readdir(baselineDirectory)) {
+async function formatBaseline(directory: string): Promise<boolean> {
+  for (const name of await readdir(directory)) {
     if (!name.endsWith(".schema.json")) continue;
-    const outputPath = path.join(baselineDirectory, name);
+    const outputPath = path.join(directory, name);
     const formatted = Bun.spawnSync(["bunx", "oxfmt", "--stdin-filepath", outputPath], {
       stdin: Bun.file(outputPath),
     });
@@ -56,7 +62,7 @@ async function formatBaseline(): Promise<boolean> {
  * Writes the schemas of the newest release older than HEAD, so the baseline is what deployed
  * clients actually parse. The registry module only uses relative imports that releases share.
  */
-async function exportPreviousRelease(): Promise<boolean> {
+async function exportPreviousRelease(directory: string): Promise<boolean> {
   const { previousRelease } = await import("../tests/e2e/harness/previous-release");
   const { root, tag } = await previousRelease();
   await Bun.write(
@@ -76,7 +82,7 @@ for (const [name, schema] of Object.entries(compatSchemas()))
   );
 `,
   );
-  const child = Bun.spawn([process.execPath, exporter, baselineDirectory], {
+  const child = Bun.spawn([process.execPath, exporter, directory], {
     cwd: path.dirname(exporter),
     stdout: "ignore",
     stderr: "pipe",

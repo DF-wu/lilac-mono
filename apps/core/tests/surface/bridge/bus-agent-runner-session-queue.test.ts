@@ -1432,6 +1432,38 @@ describe("session queue admission", () => {
     }
   });
 
+  it("queues a late steer while a failed run is terminalizing", async () => {
+    let first = "";
+    const reached = deferred<void>();
+    const release = deferred<void>();
+    const harness = await startUnconsumedControlRunner({
+      beforeTerminalize: async (id) => {
+        if (id !== first) return;
+        reached.resolve(undefined);
+        await release.promise;
+      },
+    });
+    try {
+      first = await harness.publish({ queue: "prompt", text: "first" });
+      await harness.firstStarted.promise;
+      harness.releaseFirst.resolve(undefined);
+      await reached.promise;
+      const steer = await harness.publish({ queue: "steer", text: "late after failure" });
+      await harness.handled(steer);
+      expect(harness.modelCalls()).toBe(1);
+      release.resolve(undefined);
+      await harness.runner.waitForIdle();
+      expect(harness.prompts).toEqual([["late after failure"]]);
+      expect(harness.terminalized).toEqual([
+        { requestDeliveryId: first, kind: "failed", code: undefined },
+        { requestDeliveryId: steer, kind: "completed", code: undefined },
+      ]);
+    } finally {
+      release.resolve(undefined);
+      await harness.close();
+    }
+  });
+
   it("runs a steer that reaches a finalizing run as the next prompt", async () => {
     const { harness, first, releaseCleanup } = await startFinalizingRun();
     try {

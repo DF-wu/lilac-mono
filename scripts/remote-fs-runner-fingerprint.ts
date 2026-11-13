@@ -141,7 +141,7 @@ async function refresh(): Promise<void> {
     return;
   }
   const published = await isPublished(spec);
-  if (recorded?.version === manifest.version && published) {
+  if (published) {
     console.error(
       `${spec} is already on npm, so remote hosts would keep running the published code. ` +
         "Bump the version in packages/remote-fs-runner/package.json, then run this again.",

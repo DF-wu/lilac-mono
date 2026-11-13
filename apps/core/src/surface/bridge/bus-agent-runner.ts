@@ -2376,16 +2376,6 @@ export async function startBusAgentRunner(params: {
               if (state.running) return routeBehindOtherRequest();
               return routeToIdleSession();
             };
-            const dropControlForEndedRun = async (): Promise<void> => {
-              logQueueTransition({
-                action: "drop",
-                queueDepthBefore: state.queue.length,
-                queueDepthAfter: state.queue.length,
-                reason: "target_run_ended",
-              });
-              if (await terminalizeProjectedDelivery("abandoned", "control-target-absent")) return;
-              if (intakeError) signalBusAgentRunnerHostFailure(intakeError);
-            };
             const controlTargetFor = (
               runningAgent: AiSdkPiAgent<ToolSet>,
             ): RunningAgentControlTarget => {
@@ -2393,7 +2383,7 @@ export async function startBusAgentRunner(params: {
               return {
                 isCurrent: () => state.activeRun === targetRun && state.agent === runningAgent,
                 acceptsInput: () => targetRun?.acceptsInput === true,
-                dropEnded: dropControlForEndedRun,
+                dropEnded: routeAfterTargetEnded,
               };
             };
 
@@ -3094,6 +3084,7 @@ export async function startBusAgentRunner(params: {
           revision,
           policy,
           task,
+          requestDeliveryId: entry.requestDeliveryId ?? entry.queueEntryId,
           idleTimeoutMs: deriveSubagentIdleTimeoutMs(cfg.agent.idleTimeoutMs),
           sender,
         }),
@@ -7039,6 +7030,7 @@ export async function startBusAgentRunner(params: {
         err: (error) => error,
       });
       if (runFailure) {
+        if (state.activeRun) state.activeRun.acceptsInput = false;
         if (requiresAgentRecovery()) {
           shouldTerminalizeRequest = false;
           preserveWorkflowClaim = true;

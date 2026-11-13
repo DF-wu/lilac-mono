@@ -15,14 +15,14 @@ describe("published remote fs runner fingerprint", () => {
     expect(
       recorded?.version,
       `packages/remote-fs-runner/published-fingerprint.json has no record for ${spec}. ` +
-        "Publish this version, then run `bun run remote-fs:fingerprint`.",
+        "Run `bun run remote-fs:fingerprint` before publishing this version.",
     ).toBe(manifest.version);
     expect(
       await computeRunnerFingerprint(),
       `The remote fs runner changed since ${spec} was recorded. Core pins remote hosts to ` +
         `${spec} from npm, so they would keep running the old code. Bump the version in ` +
-        "packages/remote-fs-runner/package.json, publish it, then run " +
-        "`bun run remote-fs:fingerprint`. See DEVELOPMENT.md.",
+        "packages/remote-fs-runner/package.json, run " +
+        "`bun run remote-fs:fingerprint`, then publish. See DEVELOPMENT.md.",
     ).toBe(recorded?.fingerprint ?? "no recorded fingerprint");
   });
 });

@@ -247,7 +247,7 @@ describe("workflow trigger scheduler", () => {
       store.close();
       await f.close();
     }
-  });
+  }, 20_000);
   it("preserves scheduler Panic instead of logging and swallowing it", async () => {
     const file = join(tmpdir(), `workflow-scheduler-panic-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(file);

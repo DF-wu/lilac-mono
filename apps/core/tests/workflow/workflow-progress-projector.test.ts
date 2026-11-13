@@ -2037,7 +2037,9 @@ describe("WorkflowProgressProjector", () => {
       expect(
         workflowStoreValue(store.getSurfaceActionByTokenSha256(tokenSha256))?.consumedAt,
       ).toBeNull();
-      expect([...workflowStoreValue(store.listPendingActionOutboxEvents(100))]).toEqual([]);
+      expect([
+        ...workflowStoreValue(store.listPendingActionOutboxEvents(Number.MAX_SAFE_INTEGER)),
+      ]).toEqual([]);
     } finally {
       inspection.close();
       await projector.stop();
@@ -2082,7 +2084,9 @@ describe("WorkflowProgressProjector", () => {
       expect(
         workflowStoreValue(store.getSurfaceActionByTokenSha256(tokenSha256))?.consumedAt,
       ).toBeNull();
-      expect([...workflowStoreValue(store.listPendingActionOutboxEvents(100))]).toEqual([]);
+      expect([
+        ...workflowStoreValue(store.listPendingActionOutboxEvents(Number.MAX_SAFE_INTEGER)),
+      ]).toEqual([]);
     } finally {
       await projector.stop();
       await bus.close();
@@ -3259,7 +3263,9 @@ it("consumes real Redis actions and projects authorized pause, resume, and cance
       ).toBe(21);
     }
     expect(adapter.contents.at(-1)?.actions).toEqual([]);
-    expect(workflowStoreValue(store.listPendingActionOutboxEvents(100))).toEqual([]);
+    expect(
+      workflowStoreValue(store.listPendingActionOutboxEvents(Number.MAX_SAFE_INTEGER)),
+    ).toEqual([]);
     const watermark = await f.raw.watermark!("evt.workflow");
     await publish(initialPause);
     expect(workflowStoreValue(store.getRun("run-1"))?.state).toBe("cancelled");
