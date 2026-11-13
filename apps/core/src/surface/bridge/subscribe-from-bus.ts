@@ -1173,6 +1173,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       abortReason: "reanchor" | "reanchor_interrupt";
       replayStatus: boolean;
     }): Promise<void> => {
+      const continuesAfterCommentary = relayStream.textPhase === "commentary";
       // Make the new stream active before abort can create follow-up messages.
       streamToken += 1;
       activeOutputRefs = [];
@@ -1195,7 +1196,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
         streamPhaseBoundaryPrefixChars: 0,
         streamPhaseBoundaryOffsetChars: 0,
         streamPhaseBoundaryPrefix: undefined,
-        awaitingFinalPhaseBoundaryPrefix: false,
+        awaitingFinalPhaseBoundaryPrefix: continuesAfterCommentary,
         textPhase: undefined,
         commentaryText: "",
         finalAnswerText: "",

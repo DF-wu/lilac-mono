@@ -567,6 +567,7 @@ export const subagentTranscripts: Record<
 
 type WorkflowCardContent = {
   text: string;
+  format?: "markdown" | "html";
   actions: Extract<DisplayPart, { type: "data-actions" }>["data"]["actions"];
   attachments: [];
   workflow: WorkflowCard;
@@ -574,6 +575,7 @@ type WorkflowCardContent = {
 export const workflowProgress = {
   queued: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Queued** · 0s",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -601,6 +603,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 0s",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -628,6 +631,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Queued** · 0s",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -655,6 +659,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 0s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -683,6 +688,7 @@ export const workflowProgress = {
   },
   starting: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 2s\n\n0/2 steps complete · 1 queued · 1 active\n\n**Now**\n- Check the weather — starting\n- Check opening hours — queued\n\nAgents: 1 active · 1 queued · 1 used",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -713,6 +719,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 2s\n\n0/2 steps complete · 1 queued · 1 active\n\n**Now**\n- Check the weather — starting\n- Check opening hours — queued\n\nAgents: 1 active · 1 queued · 1 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -743,6 +750,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 2s\n\n0/2 steps complete · 1 queued · 1 active\n\n**Now**\n- Check the weather — starting\n- Check opening hours — queued\n\nAgents: 1 active · 1 queued · 1 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -773,6 +781,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 2s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n0/2 steps complete · 2 stopped\n\nAgents: 1 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -801,6 +810,7 @@ export const workflowProgress = {
   },
   parallel: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 12s\n\n0/2 steps complete · 2 active\n\n**Now**\n- Check the weather — running\n- Check opening hours — running\n\nAgents: 2 active · 2 used",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -831,6 +841,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 12s\n\n0/2 steps complete · 2 active\n\n**Now**\n- Check the weather — running\n- Check opening hours — running\n\nAgents: 2 active · 2 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -861,6 +872,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 12s\n\n0/2 steps complete · 2 active\n\n**Now**\n- Check the weather — running\n- Check opening hours — running\n\nAgents: 2 active · 2 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -891,6 +903,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 12s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n0/2 steps complete · 2 stopped\n\nAgents: 2 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -919,6 +932,7 @@ export const workflowProgress = {
   },
   partial: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 1m 24s\n\n1/3 steps complete · 1 active · 1 stopped\n\n**Now**\n- Check the weather — complete\n- Check opening hours — running\n- Check the alternate museum — stopped\n\nAgents: 1 active · 3 used",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -950,6 +964,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 24s\n\n1/3 steps complete · 1 active · 1 stopped\n\n**Now**\n- Check the weather — complete\n- Check opening hours — running\n- Check the alternate museum — stopped\n\nAgents: 1 active · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -981,6 +996,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 1m 24s\n\n1/3 steps complete · 1 active · 1 stopped\n\n**Now**\n- Check the weather — complete\n- Check opening hours — running\n- Check the alternate museum — stopped\n\nAgents: 1 active · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1012,6 +1028,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 24s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n1/3 steps complete · 2 stopped\n\nAgents: 3 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -1040,6 +1057,7 @@ export const workflowProgress = {
   },
   running: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 1m 24s\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1092,6 +1110,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 24s\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1144,6 +1163,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 1m 24s\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1196,6 +1216,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 24s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n2/4 steps complete · 2 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 2 stopped\n\nAgents: 3 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -1245,6 +1266,7 @@ export const workflowProgress = {
   },
   blocked: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Blocked** · 1m 24s\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — blocked\n\nAgents: 1 queued · 3 used",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1293,6 +1315,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 24s\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — blocked\n\nAgents: 1 queued · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1341,6 +1364,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Blocked** · 1m 24s\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — blocked\n\nAgents: 1 queued · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1389,6 +1413,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 24s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n2/4 steps complete · 2 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 2 stopped\n\nAgents: 3 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -1438,6 +1463,7 @@ export const workflowProgress = {
   },
   waiting: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Waiting** · 1m 24s\n\nResumes 2026-09-19T09:03:00.000Z.\n\n2/3 steps complete · 1 waiting\n\n**Progress**\n- Research: 2/2 complete\n- Refresh: 0/1 complete · 1 waiting\n\nAgents: 2 used",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1493,6 +1519,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 24s\n\n2/3 steps complete · 1 waiting\n\n**Progress**\n- Research: 2/2 complete\n- Refresh: 0/1 complete · 1 waiting\n\nAgents: 2 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1541,6 +1568,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Waiting** · 1m 24s\n\nResumes 2026-09-19T09:03:00.000Z.\n\n2/3 steps complete · 1 waiting\n\n**Progress**\n- Research: 2/2 complete\n- Refresh: 0/1 complete · 1 waiting\n\nAgents: 2 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1596,6 +1624,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 24s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n2/3 steps complete · 1 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Refresh: 0/1 complete · 1 stopped\n\nAgents: 2 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -1645,6 +1674,7 @@ export const workflowProgress = {
   },
   reply: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Waiting for your reply** · 1m 24s\n\n**Action required:** Choose the riverside walk or museum\nReply to the original prompt message in the originating Discord channel to continue.\nResponse deadline: 2026-09-19T09:10:00.000Z\n\n2/3 steps complete · 1 waiting\n\n**Progress**\n- Research: 2/2 complete\n- Choice: 0/1 complete · 1 waiting\n\nAgents: 2 used",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1700,6 +1730,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 24s\n\n2/3 steps complete · 1 waiting\n\n**Progress**\n- Research: 2/2 complete\n- Choice: 0/1 complete · 1 waiting\n\nAgents: 2 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1748,6 +1779,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Waiting for your reply** · 1m 24s\n\n**Action required:** Choose the riverside walk or museum\nReply to the original prompt message in the originating Discord channel to continue.\nResponse deadline: 2026-09-19T09:10:00.000Z\n\n2/3 steps complete · 1 waiting\n\n**Progress**\n- Research: 2/2 complete\n- Choice: 0/1 complete · 1 waiting\n\nAgents: 2 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1803,6 +1835,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 24s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n2/3 steps complete · 1 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Choice: 0/1 complete · 1 stopped\n\nAgents: 2 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -1852,6 +1885,7 @@ export const workflowProgress = {
   },
   paused: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 24s\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1904,6 +1938,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 24s\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -1956,6 +1991,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 1m 24s\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -2008,6 +2044,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 24s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n2/4 steps complete · 2 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 2 stopped\n\nAgents: 3 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -2057,6 +2094,7 @@ export const workflowProgress = {
   },
   resumed: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 1m 40s\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -2109,6 +2147,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 40s\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -2161,6 +2200,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 1m 40s\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -2213,6 +2253,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 40s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n2/4 steps complete · 2 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 2 stopped\n\nAgents: 3 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -2262,6 +2303,7 @@ export const workflowProgress = {
   },
   succeeded: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Succeeded** · 1m 50s\n\n**Result**\n```text\nStart at Sanjo Station. Walk the river loop for 45 minutes, then stop at Chapter House for coffee.\n```\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\nAgents: 4 used",
+    format: "markdown",
     actions: [],
     attachments: [],
     workflow: {
@@ -2313,6 +2355,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 50s\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -2366,6 +2409,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Succeeded** · 1m 50s\n\n**Result**\n```text\nStart at Sanjo Station. Walk the river loop for 45 minutes, then stop at Chapter House for coffee.\n```\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -2420,6 +2464,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 50s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -2469,6 +2514,7 @@ export const workflowProgress = {
   },
   failed: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Failed** · 1m 24s\n\n**Reason**\n```text\nThe route service returned an error. The weather and opening-hours checks completed.\n```\n\n2/4 steps complete · 1 failed · 1 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 failed · 1 stopped\n\nAgents: 3 used",
+    format: "markdown",
     actions: [],
     attachments: [],
     workflow: {
@@ -2517,6 +2563,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 24s\n\n2/4 steps complete · 1 failed · 1 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 failed · 1 stopped\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -2570,6 +2617,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Failed** · 1m 24s\n\n**Reason**\n```text\nThe route service returned an error. The weather and opening-hours checks completed.\n```\n\n2/4 steps complete · 1 failed · 1 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 failed · 1 stopped\n\nAgents: 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -2621,6 +2669,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 24s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n2/4 steps complete · 1 failed · 1 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 failed · 1 stopped\n\nAgents: 3 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -2670,6 +2719,7 @@ export const workflowProgress = {
   },
   timeout: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 1m 24s\n\n2/4 steps complete · 1 active · 1 failed\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 active · 1 failed\n\n**Now**\n- Choose the walking route — timed out\n- Try the shorter river loop — running\n\nAgents: 1 active · 4 used",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -2721,6 +2771,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 24s\n\n2/4 steps complete · 1 active · 1 failed\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 active · 1 failed\n\n**Now**\n- Choose the walking route — timed out\n- Try the shorter river loop — running\n\nAgents: 1 active · 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -2772,6 +2823,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 1m 24s\n\n2/4 steps complete · 1 active · 1 failed\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 active · 1 failed\n\n**Now**\n- Choose the walking route — timed out\n- Try the shorter river loop — running\n\nAgents: 1 active · 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -2823,6 +2875,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 24s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n2/4 steps complete · 1 failed · 1 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 failed · 1 stopped\n\nAgents: 4 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -2872,6 +2925,7 @@ export const workflowProgress = {
   },
   stepFailed: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 1m 24s\n\n2/4 steps complete · 1 active · 1 failed\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 active · 1 failed\n\n**Now**\n- Choose the walking route — failed\n- Try the shorter river loop — running\n\nAgents: 1 active · 4 used",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -2923,6 +2977,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 24s\n\n2/4 steps complete · 1 active · 1 failed\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 active · 1 failed\n\n**Now**\n- Choose the walking route — failed\n- Try the shorter river loop — running\n\nAgents: 1 active · 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -2974,6 +3029,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 1m 24s\n\n2/4 steps complete · 1 active · 1 failed\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 active · 1 failed\n\n**Now**\n- Choose the walking route — failed\n- Try the shorter river loop — running\n\nAgents: 1 active · 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -3025,6 +3081,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 24s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n2/4 steps complete · 1 failed · 1 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 failed · 1 stopped\n\nAgents: 4 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -3074,6 +3131,7 @@ export const workflowProgress = {
   },
   cancelled: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 24s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n2/4 steps complete · 2 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 2 stopped\n\nAgents: 3 used",
+    format: "markdown",
     actions: [],
     attachments: [],
     workflow: {
@@ -3121,6 +3179,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 24s\n\n2/4 steps complete · 2 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 2 stopped\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -3174,6 +3233,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 24s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n2/4 steps complete · 2 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 2 stopped\n\nAgents: 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -3224,6 +3284,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 24s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n2/4 steps complete · 2 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 2 stopped\n\nAgents: 3 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -3273,6 +3334,7 @@ export const workflowProgress = {
   },
   attention: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Needs attention** · 1m 24s\n\nThe workflow could not confirm an operation's outcome. Cancel it and start a new run.\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+    format: "markdown",
     actions: [{ actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" }],
     attachments: [],
     workflow: {
@@ -3322,6 +3384,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Needs attention** · 1m 24s\n\nThe workflow could not confirm an operation's outcome. Cancel it and start a new run.\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -3374,6 +3437,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Needs attention** · 1m 24s\n\nThe workflow could not confirm an operation's outcome. Cancel it and start a new run.\n\n2/4 steps complete · 1 queued · 1 active\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 1 queued · 1 active\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -3426,6 +3490,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Needs attention** · 1m 24s\n\nThe workflow could not confirm an operation's outcome. Cancel it and start a new run.\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n2/4 steps complete · 2 stopped\n\n**Progress**\n- Research: 2/2 complete\n- Route: 0/2 complete · 2 stopped\n\nAgents: 3 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -3475,6 +3540,7 @@ export const workflowProgress = {
   },
   scheduled: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Queued** · 0s\nNext run: 2026-09-20T09:00:00.000Z",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -3503,6 +3569,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 0s\nNext run: 2026-09-20T09:00:00.000Z",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -3531,6 +3598,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Queued** · 0s\nNext run: 2026-09-20T09:00:00.000Z",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -3559,6 +3627,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 0s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\nNext run: 2026-09-20T09:00:00.000Z",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -3588,6 +3657,7 @@ export const workflowProgress = {
   },
   largeResult: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Succeeded** · 1m 50s\n\n**Result**\nThe result is too large to display here. Ask Lilac for the full workflow result.\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\nAgents: 4 used",
+    format: "markdown",
     actions: [],
     attachments: [],
     workflow: {
@@ -3635,6 +3705,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 50s\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -3688,6 +3759,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Succeeded** · 1m 50s\n\n**Result**\nThe result is too large to display here. Ask Lilac for the full workflow result.\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -3738,6 +3810,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 50s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -3787,6 +3860,7 @@ export const workflowProgress = {
   },
   noResult: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Succeeded** · 1m 50s\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\nAgents: 4 used",
+    format: "markdown",
     actions: [],
     attachments: [],
     workflow: {
@@ -3833,6 +3907,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 50s\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -3886,6 +3961,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Succeeded** · 1m 50s\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -3935,6 +4011,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 50s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -3984,6 +4061,7 @@ export const workflowProgress = {
   },
   shortenedResult: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Succeeded** · 1m 50s\n\n**Result**\n```text\nRoute notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: R...\n```\nResult shortened for this card. Ask Lilac for the full workflow result.\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\nAgents: 4 used",
+    format: "markdown",
     actions: [],
     attachments: [],
     workflow: {
@@ -4035,6 +4113,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 50s\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -4088,6 +4167,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Succeeded** · 1m 50s\n\n**Result**\n```text\nRoute notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: Route notes: R...\n```\nResult shortened for this card. Ask Lilac for the full workflow result.\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -4142,6 +4222,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 50s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n4/4 steps complete\n\n**Progress**\n- Research: 2/2 complete\n- Route: 2/2 complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -4191,6 +4272,7 @@ export const workflowProgress = {
   },
   sensitive: {
     text: "## weekend-route\nWorkflow\n\n**Succeeded** · 1m 50s\n\n4/4 steps complete\n\nAgents: 4 used",
+    format: "markdown",
     actions: [],
     attachments: [],
     workflow: {
@@ -4227,6 +4309,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nWorkflow\n\n**Paused** · 1m 50s\n\n4/4 steps complete\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -4270,6 +4353,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nWorkflow\n\n**Succeeded** · 1m 50s\n\n4/4 steps complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -4309,6 +4393,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nWorkflow\n\n**Cancelled** · 1m 50s\n\n4/4 steps complete\n\nAgents: 4 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {
@@ -4347,6 +4432,7 @@ export const workflowProgress = {
   },
   manyPhases: {
     text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 1m 24s\n\n4/6 steps complete · 1 queued · 1 active\n\n**Progress**\n- Weather: 1/1 complete\n- Opening hours: 1/1 complete\n- Starting point: 1/1 complete\n- Walking distance: 1/1 complete\n- 2 more phases\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+    format: "markdown",
     actions: [
       { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
       { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -4439,6 +4525,7 @@ export const workflowProgress = {
     transitions: {
       paused: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Paused** · 1m 24s\n\n4/6 steps complete · 1 queued · 1 active\n\n**Progress**\n- Weather: 1/1 complete\n- Opening hours: 1/1 complete\n- Starting point: 1/1 complete\n- Walking distance: 1/1 complete\n- 2 more phases\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_resume", label: "Resume", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -4531,6 +4618,7 @@ export const workflowProgress = {
       },
       resumed: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Running** · 1m 24s\n\n4/6 steps complete · 1 queued · 1 active\n\n**Progress**\n- Weather: 1/1 complete\n- Opening hours: 1/1 complete\n- Starting point: 1/1 complete\n- Walking distance: 1/1 complete\n- 2 more phases\n\n**Now**\n- Choose the walking route — running\n- Pick a coffee stop — queued\n- Check opening hours — complete\n\nAgents: 1 active · 1 queued · 3 used",
+        format: "markdown",
         actions: [
           { actionId: "demo_workflow_pause", label: "Pause", style: "secondary" },
           { actionId: "demo_workflow_cancel", label: "Cancel", style: "danger" },
@@ -4623,6 +4711,7 @@ export const workflowProgress = {
       },
       cancelled: {
         text: "## weekend-route\nCheck the weather, compare routes, and plan a coffee stop\\.\n\n**Cancelled** · 1m 24s\n\n**Reason**\n```text\nCancelled by the user. Completed research remains available.\n```\n\n4/6 steps complete · 2 stopped\n\n**Progress**\n- Weather: 1/1 complete\n- Opening hours: 1/1 complete\n- Starting point: 1/1 complete\n- Walking distance: 1/1 complete\n- 2 more phases\n\nAgents: 3 used",
+        format: "markdown",
         actions: [],
         attachments: [],
         workflow: {

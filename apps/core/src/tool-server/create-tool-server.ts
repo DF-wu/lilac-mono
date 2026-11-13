@@ -56,7 +56,10 @@ import {
 import type { RequestContext, ServerTool } from "./types";
 import { bindRequestInvocationCwd } from "./request-invocation-cwd";
 import type { AuthenticatedSurfaceOrigin, SurfacePrincipal } from "../surface/types";
-import { resolveAuthenticatedRequestSafetyMode } from "../surface/builtin-surface-protocols";
+import {
+  getBuiltinSurfaceProtocol,
+  resolveAuthenticatedRequestSafetyMode,
+} from "../surface/builtin-surface-protocols";
 import { resolveSessionSafetyMode } from "../surface/session-policy";
 import type { AuthenticatedRequestOrigin } from "./request-message-cache";
 
@@ -150,6 +153,7 @@ type ToolRequestHeaders = {
   readonly requestId?: string;
   readonly requestDeliveryId?: string;
   readonly sessionId?: string;
+  readonly originSessionId?: string;
   readonly requestClient?: string;
   readonly cwd?: string;
   readonly toolCallId?: string;
@@ -180,6 +184,7 @@ const toolRequestHeadersSchema = z.object({
   "x-lilac-request-id": z.string().optional(),
   "x-lilac-request-delivery-id": z.string().optional(),
   "x-lilac-session-id": z.string().optional(),
+  "x-lilac-origin-session-id": z.string().optional(),
   "x-lilac-request-client": z.string().optional(),
   "x-lilac-cwd": z.string().optional(),
   "x-lilac-tool-call-id": z.string().optional(),
@@ -301,6 +306,7 @@ function decodeToolRequestHeaders(
     requestId: headerStr(decoded.data["x-lilac-request-id"]),
     requestDeliveryId: headerStr(decoded.data["x-lilac-request-delivery-id"]),
     sessionId: headerStr(decoded.data["x-lilac-session-id"]),
+    originSessionId: headerStr(decoded.data["x-lilac-origin-session-id"]),
     requestClient: headerStr(decoded.data["x-lilac-request-client"]),
     cwd: headerStr(decoded.data["x-lilac-cwd"]),
     toolCallId: headerStr(decoded.data["x-lilac-tool-call-id"]),
@@ -324,6 +330,7 @@ function parseRequestContext(headers: ToolRequestHeaders): RequestContext {
     requestId: headers.requestId,
     requestDeliveryId: headers.requestDeliveryId,
     sessionId: headers.sessionId,
+    originSessionId: headers.originSessionId,
     requestClient: headers.requestClient,
     cwd: headers.cwd,
     toolCallId: headers.toolCallId,
@@ -394,11 +401,20 @@ function isCurrentSessionScopedSurfaceCall(params: {
   if (!params.sessionId) return false;
   if (!params.input || typeof params.input !== "object" || Array.isArray(params.input)) return true;
 
+  const inputClient = Reflect.get(params.input, "client");
+  if (inputClient !== undefined && inputClient !== params.requestClient) return false;
   const inputSessionId = Reflect.get(params.input, "sessionId");
   if (inputSessionId === undefined || inputSessionId === null || inputSessionId === "") return true;
   if (typeof inputSessionId !== "string") return false;
-  if (params.requestClient === "native" && params.sessionId.startsWith("native:")) {
-    return inputSessionId === params.sessionId || inputSessionId === params.sessionId.slice(7);
+  if (
+    params.requestClient === "native" &&
+    (inputClient === undefined || inputClient === "native")
+  ) {
+    const refs = getBuiltinSurfaceProtocol("native").refs;
+    return (
+      refs.createSessionRef(inputSessionId).channelId ===
+      refs.createSessionRef(params.sessionId).channelId
+    );
   }
   return inputSessionId === params.sessionId;
 }
@@ -412,8 +428,10 @@ function isRestrictedCallableAllowed(params: {
   return isCurrentSessionScopedSurfaceCall({
     callableId: params.callableId,
     input: params.input,
-    sessionId: params.ctx.sessionId,
-    requestClient: params.ctx.requestClient,
+    sessionId: params.ctx.requestInitiator
+      ? params.ctx.requestInitiatorSessionId
+      : params.ctx.sessionId,
+    requestClient: params.ctx.requestInitiator?.platform ?? params.ctx.requestClient,
   });
 }
 
@@ -449,6 +467,7 @@ export type ToolServerOptions = {
     now: number;
   }) => {
     kind: "primary" | "heartbeat";
+    originSessionId?: string;
     principal: SurfacePrincipal | null;
     authenticatedOrigin: AuthenticatedSurfaceOrigin | null;
     allowedCallables: readonly string[] | null;
@@ -1122,6 +1141,7 @@ export function createToolServer(options: ToolServerOptions) {
           }),
         );
       }
+      context.originSessionId = authorized.originSessionId;
       const cachedOrigin = options.requestMessageCache?.getOrigin?.(requestId);
       if (authorized.kind === "heartbeat") {
         if (authorized.authenticatedOrigin !== null || authorized.principal !== null) {

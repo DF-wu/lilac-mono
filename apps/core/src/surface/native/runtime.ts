@@ -32,7 +32,11 @@ import {
   type NativeOutputEvent,
 } from "@stanley2058/lilac-event-bus";
 import { discoverSkills, type DiscoveredSkill } from "@stanley2058/lilac-utils/skills";
-import { toDurableResolvedModelPlan, type CoreConfig } from "@stanley2058/lilac-utils";
+import {
+  resolveDiscordTokenResult,
+  toDurableResolvedModelPlan,
+  type CoreConfig,
+} from "@stanley2058/lilac-utils";
 import type { CustomCommandManager } from "../../custom-commands/manager";
 import type { ConversationThreadToolService } from "../../conversation/thread-service";
 import type { McpRegistryApi } from "../../mcp/registry-types";
@@ -72,6 +76,7 @@ import {
 import { hydrateNativeConversationAttachments } from "./conversation-attachments";
 import { NativeSearchStore } from "./store-search";
 import { NativeSurfaceStore } from "./store-surface";
+import { createNativeDiscordMirror } from "./discord-mirror";
 
 export function nativeRuntimeFailureToHost(error: Error): never {
   throw error;
@@ -446,6 +451,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   let workflowOutput: NativeOutputSubscription | undefined;
   let sendOutput: NativeOutputSubscription | undefined;
   let outputStopping = false;
+  let discordMirror: ReturnType<typeof createNativeDiscordMirror> | undefined;
   let unsubscribe: (() => void) | undefined;
   const nativeAdapterForContext: NonNullable<CoreToolPluginRuntime["nativeAdapterForContext"]> = (
     context,
@@ -835,6 +841,19 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   }
 
   function startIngress() {
+    discordMirror ??= createNativeDiscordMirror({
+      store,
+      resources,
+      webhookUrl: process.env.LILAC_NATIVE_DISCORD_WEBHOOK_URL,
+      routing: process.env.LILAC_NATIVE_DISCORD_ROUTING,
+      botToken: () =>
+        resolveDiscordTokenResult(options.getConfig()).match({
+          ok: (token) => token,
+          err: () => undefined,
+        }),
+      warn: (message) =>
+        options.warn(message, new Error("Native Discord mirror delivery is best-effort")),
+    });
     return Result.gen(function* () {
       const publicAddress = nativeConfig.enabled ? yield* gateway.start() : undefined;
       const operatorAddress = operatorGateway ? yield* operatorGateway.start() : undefined;
@@ -862,6 +881,8 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   }
   async function stopOutput() {
     outputStopping = true;
+    await discordMirror?.stop();
+    discordMirror = undefined;
     const active = output;
     output = undefined;
     const workflowActive = workflowOutput;

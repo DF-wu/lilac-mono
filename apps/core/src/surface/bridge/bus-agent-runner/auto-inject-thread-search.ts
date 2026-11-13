@@ -6,6 +6,8 @@ import { Result, type Result as ResultType } from "better-result";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 import { env, isRecord, opaqueErrorMessage } from "@stanley2058/lilac-utils";
 import { buildSyntheticToolCallId } from "@stanley2058/lilac-agent";
+import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
+import type { ConversationSurface } from "../../../conversation/thread-store";
 import {
   createConversationThreadAutoInjectUsageAccumulator,
   type ConversationThreadAutoInjectUsageAccumulator,
@@ -47,7 +49,7 @@ const AUTO_INJECTED_THREAD_BRIEF_FULL_THRESHOLD = Math.floor(
 
 export type AutoInjectedThreadSearchPayload = {
   entries: Array<{
-    surface: "discord" | "native";
+    surface: ConversationSurface;
     threadId: string;
     /** The `conversation.thread.read` offset where the recalled subject starts. */
     offset?: number;
@@ -229,6 +231,16 @@ function formatInjectedThreadTimeRange(input: { start: string; end: string }): s
   return `${start} - ${end}`;
 }
 
+/**
+ * Surface label for conversation recall. Only surfaces with an indexed history
+ * are named; everything else searches as Discord, the un-prefixed default.
+ */
+export function conversationSurfaceOfRequestClient(client: AdapterPlatform): ConversationSurface {
+  if (client === "native") return "native";
+  if (client === "telegram") return "telegram";
+  return "discord";
+}
+
 async function publishAutoInjectToolStatusBestEffort(
   params: {
     publishToolStatus: (update: AutoInjectToolStatusUpdate) => Promise<void>;
@@ -266,7 +278,7 @@ function notifyAutoInjectObserverBestEffort(
 }
 
 type AutoInjectedThreadSearchParams = {
-  surface?: "discord" | "native";
+  surface?: ConversationSurface;
   cfg: CoreConfig;
   conversationThreads?: ConversationThreadToolService;
   requestId: string;

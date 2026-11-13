@@ -1216,7 +1216,7 @@ export class WorkflowEngine {
           );
         }
         if (
-          platform !== "discord" ||
+          (platform !== "discord" && platform !== "telegram") ||
           platform !== run.origin.client ||
           channelId !== run.origin.sessionId ||
           !run.origin.userId ||
@@ -1224,7 +1224,7 @@ export class WorkflowEngine {
         ) {
           return Result.err(
             workflowExecutionFailure(
-              "waitForReply is limited to the authenticated originating Discord session and user",
+              "waitForReply is limited to the authenticated originating Discord or Telegram session and user",
             ),
           );
         }

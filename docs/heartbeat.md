@@ -15,8 +15,9 @@ In a trusted conversation, say:
 > Use the heartbeat skill to set up proactive follow-ups. Migrate any old heartbeat notes, preserve my
 > existing instructions, and verify the setup.
 
-If no default exists, the agent asks where heartbeat output should go. Choose any supported destination
-it can access, such as a Discord channel, a thread, or your native DM. The agent resolves the concrete
+If no default exists, the agent asks where heartbeat output should go. The default supports Discord,
+GitHub, and native destinations, including your native DM; Telegram is not supported by this setting.
+Choose a destination the agent can access. The agent resolves the concrete
 ID, validates and reloads the existing configuration, and reconciles the active workflow. It should
 report configuration, actual execution, and delivery verification separately. Setup is incomplete when
 an expected stage has not been observed.

@@ -1,6 +1,7 @@
 import type { StoredMessageV1 } from "@stanley2058/lilac-event-bus";
 
 import type { TranscriptSnapshot } from "../../../transcript/transcript-store";
+import type { RoutedSurfacePlatform } from "../../types";
 import { formatSurfaceMetadataLine, stripSurfaceMetadataLines } from "../surface-metadata";
 
 export function normalizeText(text: string, _ctx: {}): string {
@@ -101,7 +102,8 @@ function formatMessageTime(messageTs: number | undefined): string | undefined {
   return new Date(messageTs).toISOString();
 }
 
-export function formatDiscordAttributionHeader(params: {
+export function formatSurfaceAttributionHeader(params: {
+  platform: RoutedSurfacePlatform;
   authorId: string;
   authorName: string;
   userAlias?: string;
@@ -113,7 +115,7 @@ export function formatDiscordAttributionHeader(params: {
   const messageTime = formatMessageTime(params.messageTs);
 
   return formatSurfaceMetadataLine({
-    platform: "discord",
+    platform: params.platform,
     user_id: params.authorId,
     user_name: params.authorName || `user_${params.authorId}`,
     ...(params.userAlias ? { user_alias: params.userAlias } : {}),
@@ -121,4 +123,10 @@ export function formatDiscordAttributionHeader(params: {
     ...(messageTime ? { message_time: messageTime } : {}),
     ...(reactions ? { reactions } : {}),
   });
+}
+
+export function formatDiscordAttributionHeader(
+  params: Omit<Parameters<typeof formatSurfaceAttributionHeader>[0], "platform">,
+): string {
+  return formatSurfaceAttributionHeader({ platform: "discord", ...params });
 }

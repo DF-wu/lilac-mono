@@ -21,6 +21,7 @@ jobs:
       version: ${{ steps.info.outputs.version }}
       owner: ${{ steps.info.outputs.owner }}
       should-release: ${{ steps.check.outputs.should-release }}
+      upstream-ref: ${{ steps.info.outputs.upstream-ref }}
     steps:
       - name: Check for changes since the last successful run
         id: check
@@ -42,29 +43,27 @@ jobs:
           fi
           echo "should-release=true" >> "$GITHUB_OUTPUT"
 
-      - name: Require successful CI for this exact commit
-        if: steps.check.outputs.should-release == 'true'
+      - name: Select one release identity
+        id: info
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          count=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
-            -f head_sha="$GITHUB_SHA" -f status=success -f event=push -f per_page=100 \
-            --jq '[.workflow_runs[] | select(.head_sha == env.GITHUB_SHA and .conclusion == "success")] | length')
-          if [ "$count" -eq 0 ]; then
-            echo "Release requires successful push CI for $GITHUB_SHA." >&2
-            exit 1
-          fi
-
-      - name: Select one release identity
-        id: info
-        shell: bash
-        run: |
           echo "version=build-${GITHUB_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
           echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+          upstream_ref=$(gh api repos/stanley2058/lilac-mono/commits/main --jq .sha)
+          echo "upstream-ref=$upstream_ref" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: release-info
+    if: needs.release-info.outputs.should-release == 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ github.sha }}
+      upstream_ref: ${{ needs.release-info.outputs.upstream-ref }}
 
   images:
-    needs: release-info
+    needs: [release-info, verify]
     if: needs.release-info.outputs.should-release == 'true'
     permissions:
       contents: read
@@ -339,5 +338,9 @@ jobs:
           RUNNER: ${{ needs.image-manifests.outputs.runner }}
         run: |
           for image in "$CORE" "$GATEWAY" "$RUNNER"; do
+            # The fork's Catalina publication owns its Core latest tag.
+            if [ "$GITHUB_REPOSITORY" = "DF-wu/lilac-mono" ] && [ "$image" = "$CORE" ]; then
+              continue
+            fi
             docker buildx imagetools create --tag "${image%@*}:latest" "$image"
           done

@@ -5,9 +5,21 @@ on:
     branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+  # 同步流程驗證固定候選 SHA；重用所有既有 gate，不複製 CI 實作。
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit SHA to verify
+        required: true
+        type: string
+      upstream_ref:
+        description: Pinned upstream commit for the footprint gate
+        required: true
+        type: string
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ inputs.ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -51,6 +63,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -96,14 +110,58 @@ jobs:
       - name: Run end-to-end agent scenarios
         run: bun run test:e2e
 
-  docker-image:
-    name: Docker image smoke
+  fork-footprint:
+    name: Upstream footprint
     runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Fetch upstream main
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+        run: |
+          git remote add upstream https://github.com/stanley2058/lilac-mono.git
+          git fetch --no-tags upstream "$UPSTREAM_REF"
+
+      - name: Check modified upstream files against the allowlist
+        env:
+          LILAC_UPSTREAM_REF: FETCH_HEAD
+        run: bun run fork:footprint -- --strict
+
+  docker-image:
+    name: Docker image smoke (${{ matrix.variant.name }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: default
+            container_user: lilac
+            container_uid: 1000
+          - name: catalina
+            container_user: Catalina
+            container_uid: 3000
+          - name: claudia
+            container_user: Claudia
+            container_uid: 3000
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
@@ -113,12 +171,21 @@ jobs:
         with:
           context: .
           load: true
-          tags: lilac:ci
-          cache-from: type=gha,scope=ci-lilac-mono-amd64
-          cache-to: type=gha,mode=max,scope=ci-lilac-mono-amd64
+          build-args: |
+            CONTAINER_USER=${{ matrix.variant.container_user }}
+            CONTAINER_UID=${{ matrix.variant.container_uid }}
+            LILAC_BUILD_COMMIT=${{ inputs.ref || github.sha }}
+            LILAC_BUILD_DIRTY=false
+          tags: lilac:ci-${{ matrix.variant.name }}
+          cache-from: type=gha,scope=ci-lilac-mono-amd64-${{ matrix.variant.name }}
+          cache-to: type=gha,mode=max,scope=ci-lilac-mono-amd64-${{ matrix.variant.name }}
 
       - name: Verify image
-        run: bash docker/verify-image.sh lilac:ci
+        run: |
+          bash docker/verify-image.sh \
+            "lilac:ci-${{ matrix.variant.name }}" \
+            "${{ matrix.variant.container_user }}" \
+            "${{ matrix.variant.container_uid }}"
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -129,7 +196,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Verify installer-written deployment
-        run: bun run docker:verify-installation lilac:ci
+        run: bun run docker:verify-installation lilac:ci-${{ matrix.variant.name }}
 
   computer-use:
     name: Computer-use Docker integration
@@ -138,6 +205,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:

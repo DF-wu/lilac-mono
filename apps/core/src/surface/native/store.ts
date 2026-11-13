@@ -75,6 +75,12 @@ type ReplayConversation = Pick<
 
 type StoredRow = NativePersistedRow & { id: string; position: number };
 
+export type NativeDisplayCommit = {
+  threadId: string;
+  reset: boolean;
+  changes: LiveUpdate["changes"];
+};
+
 function nativeSqliteFailure(cause: Error): NativeStoreFailure | undefined {
   const classified = classifyBunSqliteError(cause);
   if (!classified) return undefined;
@@ -181,6 +187,13 @@ function notificationBody(thread: NativeThread, preview: string) {
 }
 
 export class NativeStore {
+  private readonly displayListeners = new Set<(commit: NativeDisplayCommit) => void>();
+  private readonly displayCommits = new Map<
+    string,
+    { revision: number; data: string; commit: NativeDisplayCommit }
+  >();
+  private displayBytes = 0;
+  private displayCommitScheduled = false;
   private readonly listeners = new Set<(threadId: string) => void>();
   private readonly pendingNotifications = new Set<string>();
   private notificationScheduled = false;
@@ -200,6 +213,48 @@ export class NativeStore {
   }
   subscribeChanges(listener: (threadId: string) => void): () => void {
     return this.subscribe(listener);
+  }
+  // Process-local and bounded: the persisted replay row proves the outer transaction committed.
+  subscribeCommittedDisplay(listener: (commit: NativeDisplayCommit) => void): () => void {
+    this.displayListeners.add(listener);
+    return () => {
+      this.displayListeners.delete(listener);
+    };
+  }
+
+  private queueDisplayCommit(revision: number, data: string, commit: NativeDisplayCommit): void {
+    if (this.displayListeners.size === 0) return;
+    const key = `${commit.threadId}:${revision}`;
+    const previous = this.displayCommits.get(key);
+    const bytes = this.displayBytes - (previous?.data.length ?? 0) + data.length;
+    if ((!previous && this.displayCommits.size >= 128) || bytes > 2 * 1024 * 1024) return;
+    this.displayCommits.set(key, { revision, data, commit });
+    this.displayBytes = bytes;
+    if (this.displayCommitScheduled) return;
+    this.displayCommitScheduled = true;
+    queueMicrotask(() => this.flushDisplayCommits());
+  }
+
+  private flushDisplayCommits(): void {
+    const pending = [...this.displayCommits.values()];
+    this.displayCommits.clear();
+    this.displayBytes = 0;
+    this.displayCommitScheduled = false;
+    if (this.displayListeners.size === 0) return;
+    for (const entry of pending) {
+      const persisted = Result.try({
+        try: () =>
+          this.db
+            .query<{ data_json: string }, [string, number]>(
+              "SELECT data_json FROM native_changes WHERE thread_id=? AND revision=?",
+            )
+            .get(entry.commit.threadId, entry.revision),
+        catch: () => null,
+      }).match({ ok: (value) => value, err: () => null });
+      if (persisted?.data_json !== entry.data) continue;
+      for (const listener of this.displayListeners)
+        Result.try({ try: () => listener(entry.commit), catch: () => null });
+    }
   }
   notifyDisplayChanged(threadId: string): void {
     this.notify(threadId);
@@ -240,7 +295,7 @@ export class NativeStore {
     return nativeStoreTransaction(this.db, () => {
       const version =
         this.db.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version ?? 0;
-      if (version > 7)
+      if (version > 8)
         return Result.err(
           nativeFailure("invalid", "Native store version is newer than this build"),
         );
@@ -267,7 +322,8 @@ export class NativeStore {
         CREATE TABLE IF NOT EXISTS native_push_keys (id INTEGER PRIMARY KEY CHECK(id=1),public_key TEXT NOT NULL,private_key TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS native_push_subscriptions (endpoint TEXT PRIMARY KEY,user_id TEXT NOT NULL,p256dh TEXT NOT NULL,auth TEXT NOT NULL,completion INTEGER NOT NULL,failure INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS native_model_favorites (user_id TEXT NOT NULL,model_id TEXT NOT NULL,PRIMARY KEY(user_id,model_id));
-        PRAGMA user_version = 7;`);
+        CREATE TABLE IF NOT EXISTS native_discord_threads (destination_key TEXT NOT NULL,native_thread_id TEXT NOT NULL,discord_thread_id TEXT,PRIMARY KEY(destination_key,native_thread_id));
+        PRAGMA user_version = 8;`);
       this.db.run(`
         CREATE TEMP TABLE IF NOT EXISTS native_pending_questions (turn_id TEXT NOT NULL,thread_id TEXT NOT NULL,respondent_id TEXT NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(thread_id,respondent_id,generation,turn_id));
         DELETE FROM native_pending_questions;
@@ -286,6 +342,8 @@ export class NativeStore {
 
   close(): void {
     this.listeners.clear();
+    this.displayListeners.clear();
+    this.displayCommits.clear();
     this.db.close();
   }
 
@@ -315,6 +373,56 @@ export class NativeStore {
         "INSERT INTO native_records(kind,id,thread_id,position,updated_at,format_version,data_json) VALUES(?,?,?,?,?,1,?) ON CONFLICT(kind,id) DO UPDATE SET thread_id=excluded.thread_id,position=excluded.position,updated_at=excluded.updated_at,data_json=excluded.data_json",
       )
       .run(record.kind, id, threadId ?? null, position, this.now(), JSON.stringify(record));
+  }
+
+  readDiscordMirrorThread(
+    destination: string,
+    threadId: string,
+  ): NativeStoreResult<{ discordThreadId: string | null } | null> {
+    return nativeStoreTransaction(this.db, () => {
+      const row = this.db
+        .query<{ discordThreadId: string | null }, [string, string]>(
+          "SELECT discord_thread_id AS discordThreadId FROM native_discord_threads WHERE destination_key=? AND native_thread_id=?",
+        )
+        .get(destination, threadId);
+      return Result.ok(row);
+    });
+  }
+
+  reserveDiscordMirrorThread(destination: string, threadId: string): NativeStoreResult<boolean> {
+    return nativeStoreTransaction(this.db, () => {
+      const inserted = this.db
+        .query(
+          "INSERT OR IGNORE INTO native_discord_threads(destination_key,native_thread_id) VALUES(?,?)",
+        )
+        .run(destination, threadId);
+      return Result.ok(inserted.changes === 1);
+    });
+  }
+
+  settleDiscordMirrorThread(
+    destination: string,
+    threadId: string,
+    discordThreadId: string | null,
+  ): NativeStoreResult<void> {
+    return nativeStoreTransaction(this.db, () => {
+      if (discordThreadId === null) {
+        this.db
+          .query(
+            "DELETE FROM native_discord_threads WHERE destination_key=? AND native_thread_id=? AND discord_thread_id IS NULL",
+          )
+          .run(destination, threadId);
+        return Result.ok();
+      }
+      if (!/^\d{1,20}$/.test(discordThreadId))
+        return Result.err(nativeFailure("invalid", "Invalid Discord mirror thread identity"));
+      this.db
+        .query(
+          "UPDATE native_discord_threads SET discord_thread_id=? WHERE destination_key=? AND native_thread_id=? AND discord_thread_id IS NULL",
+        )
+        .run(discordThreadId, destination, threadId);
+      return Result.ok();
+    });
   }
 
   initializeDeployment(settings: NativeDeploymentSettings): NativeStoreResult<void> {
@@ -1245,6 +1353,12 @@ export class NativeStore {
         data,
       );
     this.notify(thread.id);
+    if (!("parentThreadId" in thread))
+      this.queueDisplayCommit(next.revision, data, {
+        threadId: next.id,
+        reset: kind === "rewind" || kind === "delete" || boundedChanges !== changes,
+        changes: boundedChanges,
+      });
     return next;
   }
 

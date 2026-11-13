@@ -276,7 +276,10 @@ import {
   maybeMarkOldToolOutputsCompacted,
   scrubLargeBinaryForModelView,
 } from "./bus-agent-runner/tool-output-policy";
-import { maybeBuildAutoInjectedThreadSearchMessages } from "./bus-agent-runner/auto-inject-thread-search";
+import {
+  conversationSurfaceOfRequestClient,
+  maybeBuildAutoInjectedThreadSearchMessages,
+} from "./bus-agent-runner/auto-inject-thread-search";
 import {
   appendAutoInjectedThreadSearchLineage,
   corePrimaryLineageHasCompactionCheckpoint,
@@ -322,6 +325,7 @@ export {
   AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH,
   type AutoInjectedThreadSearchPayload,
   buildAutoInjectedThreadSearchMessages,
+  conversationSurfaceOfRequestClient,
   maybeBuildAutoInjectedThreadSearchMessages,
 } from "./bus-agent-runner/auto-inject-thread-search";
 export {
@@ -5167,6 +5171,9 @@ export async function startBusAgentRunner(params: {
                 agent.state.modelSpecifier ?? activeBinding.resolved.spec,
               prepareFullModelView: toolPruneTransform,
               prepareFullBudgetView: fullBudgetTransform,
+              resolveCurrentInputCanonicalStart: () =>
+                (state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage)
+                  ?.currentCanonicalStart ?? null,
               baseTurnErrorHandler: turnErrorHandler,
               onServerCompactionError: reportServerCompactionError,
               onUnknownCapability: ({ spec, reason }) => {
@@ -6384,7 +6391,7 @@ export async function startBusAgentRunner(params: {
               !control.requiresActive
                 ? await waitForPreAgent(
                     maybeBuildAutoInjectedThreadSearchMessages({
-                      surface: next.requestClient === "native" ? "native" : "discord",
+                      surface: conversationSurfaceOfRequestClient(next.requestClient),
                       cfg,
                       conversationThreads:
                         next.requestClient === "native"

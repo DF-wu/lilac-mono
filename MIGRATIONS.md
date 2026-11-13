@@ -6,6 +6,24 @@ day-to-day behavior are in [Native surface](docs/native-surface.md). Git history
 of feature introductions. This file keeps the cutover steps and compatibility constraints that still
 matter when upgrading an older installation.
 
+<a id="automatic-transcript-and-workflow-blob-migration"></a>
+
+## Offline transcript and workflow blob cutover
+
+Current Core requires managed-blob transcript schema 6 or later and workflow schema 26 or later.
+The Docker entrypoint no longer migrates legacy data or creates a migration backup. The old
+`LILAC_AUTO_MIGRATE_BLOB_STORAGE` opt-out and startup migration wrappers have been retired.
+
+Legacy transcript schema 5 with workflow schema 25 must cross the offline migration at upstream
+commit `f2c90667ac5616796c992602ca5fb5be726cf40d` before starting this build. Stop producers,
+create and verify a coordinated database/blob/state backup, run the historical command's dry-run,
+then apply and verify it offline. Mixed, corrupt, drifted or future states require diagnosis;
+no deployed baseline is assumed. Other legacy combinations need their matching historical path.
+
+See the [verified offline procedure, support boundary and rollback instructions](docs/fork-integration-20261111/migration.md).
+Restore matching pre-upgrade databases and blob storage together when rolling back or recovering
+from a partially applied migration. Starting an older binary alone does not undo the cutover.
+
 ## Plan the cutover
 
 1. Identify the installed build, config version, and database schema versions. Configuration,
@@ -23,7 +41,7 @@ matter when upgrading an older installation.
    Verify native deployment settings and subagent authority after adopting v3.
 
 Rollback uses the matching pre-upgrade databases and blob storage together. Current workflow schema
-28, transcript schema 14, and native schema 7 are not readable by older builds. Strict record codecs
+28, transcript schema 14, and native schema 8 are not readable by older builds. Strict record codecs
 can also change within a schema version; a matching version number alone does not establish downgrade
 compatibility. Keep producers stopped while restoring. Never remove migration markers to force an
 older binary to open current data.
@@ -125,7 +143,7 @@ readable; no stored-data or configuration version changes are needed.
 `generate.image` now accepts only `{ code: string }`, with JavaScript executed by Bun in the calling
 CLI's cwd and Core's inherited container environment. Replace calls using `prompt`, `model`, `size`,
 `aspectRatio`, `inputImages`, `maskImage`, or `outputDir` with scripts. The injected global `providers`
-maps configured `openai`, `openrouter`, and `xai` connections to `{ baseURL, apiKey? }`. Tool discovery
+maps configured `openai`, `openrouter`, and `xai` connections (plus the fork's `openaiCompatible` endpoint when configured) to `{ baseURL, apiKey? }`. Tool discovery
 advertises configured provider names; model choices and request examples live in the built-in
 `image-generation` skill.
 
@@ -179,6 +197,27 @@ Docker writes version metadata only in `/app/build/build-info.json` and links th
 metadata file to it. Local tool builds write their metadata beside the executables.
 Metadata changes no longer change the worker ID or require recompiling either executable.
 
+## Downstream Core Config Extensions
+
+Manual v1-to-v2 upgrades follow [`docs/core-config-migrations.md`](docs/core-config-migrations.md). The
+DF-wu fork adds these downstream-only v2/v3 contracts:
+
+- `surface.discord.outputPreviewPlainFinalStats` was removed. Discord preview plus plain final output
+  appends the stats footer whenever stats metadata is produced.
+- `surface.telegram` is disabled by default and requires `configVersion: 2` or `3` to enable or configure. Frozen
+  v1 configs receive the disabled universal fallback. Existing v2 configs using `tokenEnv` are rejected;
+  copy the secret to `token` in `core-config.yaml`. `allowedChatIds` fails closed, `streamEditIntervalMs`
+  defaults to `1500`, and `parseMode` defaults to `html`. See
+  [`docs/telegram-surface.md`](docs/telegram-surface.md).
+- `tools.generate` was removed together with the structured `generate.image` tool; the fork now uses
+  upstream's script runner. A leftover `tools.generate` block parses with an `unknown core-config key
+  ignored` warning and no effect. Scripts reach an OpenAI-compatible endpoint as
+  `providers.openaiCompatible` when `OPENAI_COMPATIBLE_BASE_URL` is set. See
+  [`docs/generate-image-openai-compatible.md`](docs/generate-image-openai-compatible.md).
+- `surface.telegram.inboundMedia` delivers inbound Telegram photos and documents to the model. It is
+  enabled by default with `maxBytesPerAttachment: 5MiB` and `maxBytesPerRequest: 10MiB`; set
+  `inboundMedia.enabled: false` to restore caption-only routing.
+
 ## Native deployment upgrade
 
 Native uses protocol version 1 with strict display and RPC codecs. Deploy Core and clients together
@@ -187,7 +226,7 @@ by installation and principal; canonical conversation history remains on the ser
 conversation views after upgrading. Old standalone terminal binaries and their credential/cache files
 are no longer used; run the container-local operator console and remove obsolete local files if unwanted.
 
-Native schema migrations run automatically. The current schema is 7:
+Native schema migrations run automatically. The current schema is 8:
 
 - Schema 1 establishes the native store. Record additions include deployment settings, DMs,
   temporary operator conversations, HTML previews, identity, and title-generation metadata.
@@ -200,6 +239,12 @@ Native schema migrations run automatically. The current schema is 7:
 - Schema 6 adds native questions and optional question-reply references. Existing records are retained.
 - Schema 7 adds per-user model favorites, optional reasoning on threads/inputs, and child task/model
   display metadata. Existing aliases and old completion targets remain valid.
+- Schema 8 adds `native_discord_threads`: one routing reservation/mapping per webhook ID,
+  parent-channel ID, and Native conversation ID. A NULL Discord thread ID means creation is unresolved;
+  it blocks another create across restart. No credentials or message correspondence are stored.
+  Existing records are retained. Back up `native-surface.db` consistently before upgrading; older builds
+  reject schema 8. Restore the matching pre-upgrade backup for rollback. See
+  [mirror recovery](docs/native-discord-mirror.md#thread-routing-recovery) before changing a reservation.
 
 Before moving customized native settings to config v3, start with v2 and verify the one-time import
 of `titleModel`, `outputStreaming`, `oldMessageSelectionMaxAgeMs`, `storageRetentionMaxAgeMs`, and
@@ -574,6 +619,15 @@ its retained message content or history generation changes, including edits, rew
 Model selection, titles, archiving, and grant changes preserve existing summaries. Downgrading requires
 rebuilding the derived index for the older runtime; do not reuse cross-surface derived rows with an older binary.
 
+This fork additionally attaches `telegram-surface.db` as a conversation source when the Telegram
+surface is usable. Telegram sessions are projected into the same derived tables as `telegram_thread`
+rows with thread references `telegram:<sessionId>`, one thread per chat or forum topic, and are
+subject to `surface.telegram.allowedChatIds` on every read. Retained Telegram messages are unchanged;
+derived Telegram rows are rebuilt whenever a session's message count, latest timestamp, latest edit, or
+deletion count changes. Removing the Telegram surface leaves stale `telegram_thread` rows that the
+next materialization pass deletes. Downgrading to a runtime without the Telegram source requires the
+same derived-index rebuild as above.
+
 ### Conversation memory entries and DM context windows
 
 A conversation thread can now hold several summary entries, one per distinct subject. Summary, facet,
@@ -581,11 +635,11 @@ and embedding rows are keyed by thread and entry ordinal. The first open without
 `conversation_index_v3` marker drops and recreates the derived thread, summary, facet, FTS, and
 embedding tables, as the `conversation_index_v2` cutover did. No summaries are copied. Core then
 rematerializes every Discord channel once in the background; the marker keeps that rebuild pending
-across restarts until it finishes. Native threads are projected from retained turns on the first
-refresh. Recall is incomplete until the summarization worker has regenerated every quiet eligible
+across restarts until it finishes. Native threads and Telegram sessions are projected from their retained
+sources on the first refresh. Recall is incomplete until the summarization worker has regenerated every quiet eligible
 thread and its embeddings. The worker handles `conversation.thread.summarization.batchSize` threads
 every ten minutes; manual `conversation.thread.runSummarization` has no batch limit. Retained Discord messages,
-native records, and canonical transcripts are unchanged.
+native records, retained Telegram messages, and canonical transcripts are unchanged.
 
 Search and automatic recall return one result per entry. A result keeps its `threadId` and adds
 `offset` when the entry's subject starts after the first message; pass it to
@@ -741,17 +795,18 @@ taking the first 128 bits, and setting the UUID version/variant bits. The exact 
 | Workflow cancellation with a non-UUID stored key | `["workflow-cancel", original delivery_id]` |
 | Workflow cancellation with an already-valid UUID key | Preserve that UUID exactly |
 
-GitHub requests without a nonempty delivery header retain generated UUIDs. Different delivery/operation
-tuples and cancellation keys, including different dispatch epochs, derive separate identities. UUID
-validation, actor permissions, correlation headers and transport fencing are unchanged.
+GitHub requests without a nonempty delivery header retain generated UUIDs. The shared mapping keeps
+GitHub identities from the first UUID repair unchanged. Different delivery/operation tuples and
+cancellation keys, including different dispatch epochs, derive separate identities. UUID validation,
+actor permissions, correlation headers and transport fencing are unchanged.
 
 The workflow schema-28 trigger still stores its original text key. The engine normalizes at the wire
 boundary and calls completion/deletion with the **original stored key**, only after durable publication
 returns success. Existing persisted legacy intents therefore work without a new schema version, SQL
 migration or data rewrite. Already-admitted valid request records retain their identities. The rejected
 non-UUID producer envelopes never reached durable preparation, so they have no admitted records to
-convert. Deploy the updated Core normally. Rolling back the producer fix reintroduces rejection for
-pending legacy cancellation keys.
+convert. Deploy the updated Core normally; no production replay is part of this repair. Rolling back
+the producer fix reintroduces rejection for pending legacy cancellation keys.
 
 Cancellation's request ID, session, queue, empty messages and cancel flags remain fixed across attempts.
 An acquisition/publication failure leaves the intent pending and its prepared envelope reusable across
@@ -762,9 +817,10 @@ this change adds no recovery worker or queue and does not promise retries after 
 terminal contract failures. Interrupt publication is not proof that an agent has already stopped.
 
 Prepared-envelope conflict checks remain strict. A GitHub redelivery rebuilding changed issue/review
-context after a failed claim can conflict with its unpublished prepared envelope. This repair leaves
-that recovery policy unchanged. Prompt/interrupt replacement publication also remains nontransactional;
-this repair does not add cross-command recovery guarantees.
+context after a failed claim can conflict with its unpublished prepared envelope; that recovery-policy
+limitation is tracked in [#110](https://github.com/DF-wu/lilac-mono/issues/110). The fixed cancellation
+envelope does not need that policy change. Prompt/interrupt replacement publication also remains
+nontransactional; this repair does not add cross-command recovery guarantees.
 
 ### GitHub acknowledgements and bounded media failures
 

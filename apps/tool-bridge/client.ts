@@ -221,6 +221,7 @@ function lilacRequestHeaders(includeJson = false): Record<string, string> {
     ["x-lilac-request-id", runtimeEnv("LILAC_REQUEST_ID")],
     ["x-lilac-request-delivery-id", runtimeEnv("LILAC_REQUEST_DELIVERY_ID")],
     ["x-lilac-session-id", runtimeEnv("LILAC_SESSION_ID")],
+    ["x-lilac-origin-session-id", runtimeEnv("LILAC_ORIGIN_SESSION_ID")],
     ["x-lilac-request-client", runtimeEnv("LILAC_REQUEST_CLIENT")],
     ["x-lilac-cwd", runtimeCwd()],
     ["x-lilac-tool-call-id", runtimeEnv("LILAC_TOOL_CALL_ID")],

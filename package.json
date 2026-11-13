@@ -48,10 +48,10 @@
     "typecheck:codegen": "bunx tsc --ignoreConfig --noEmit --strict --skipLibCheck --target ESNext --module Preserve --moduleResolution bundler --types bun scripts/generate-provider-option-shapes.ts",
     "typecheck:lint-plugins": "bunx tsc --ignoreConfig --noEmit --strict --skipLibCheck --target ESNext --module Preserve --moduleResolution bundler --allowImportingTsExtensions --types bun scripts/oxlint-plugins/*.mts",
     "typecheck:root": "bunx tsc -p tsconfig.json --noEmit",
-    "typecheck:extras": "bun run --parallel --no-exit-on-error typecheck:root typecheck:codegen typecheck:lint-plugins typecheck:architecture",
+    "typecheck:extras": "bun run --parallel --no-exit-on-error typecheck:root typecheck:codegen typecheck:lint-plugins typecheck:architecture typecheck:fork",
     "typecheck:workspaces": "bun scripts/typecheck-workspaces.ts",
-    "fmt": "oxfmt --write \"apps/**/*.{ts,tsx,js,cjs,mjs,json}\" \"packages/**/*.{ts,tsx,js,cjs,mjs,json}\" \"scripts/*.{ts,mts,json}\" \"scripts/architecture/**/*.{ts,mts,json}\" \"scripts/oxlint-plugins/**/*.{ts,mts}\" \"examples/**/*.{ts,tsx,js,cjs,mjs,json}\" \"__tests__/**/*.{ts,tsx,js,cjs,mjs,json}\" \"*.json\"",
-    "fmt:check": "oxfmt --check \"apps/**/*.{ts,tsx,js,cjs,mjs,json}\" \"packages/**/*.{ts,tsx,js,cjs,mjs,json}\" \"scripts/*.{ts,mts,json}\" \"scripts/architecture/**/*.{ts,mts,json}\" \"scripts/oxlint-plugins/**/*.{ts,mts}\" \"examples/**/*.{ts,tsx,js,cjs,mjs,json}\" \"__tests__/**/*.{ts,tsx,js,cjs,mjs,json}\" \"*.json\"",
+    "fmt": "oxfmt --write \"apps/**/*.{ts,tsx,js,cjs,mjs,json}\" \"packages/**/*.{ts,tsx,js,cjs,mjs,json}\" \"scripts/*.{ts,mts,json}\" \"scripts/fork/**/*.ts\" \"scripts/architecture/**/*.{ts,mts,json}\" \"scripts/oxlint-plugins/**/*.{ts,mts}\" \"examples/**/*.{ts,tsx,js,cjs,mjs,json}\" \"__tests__/**/*.{ts,tsx,js,cjs,mjs,json}\" \"*.json\"",
+    "fmt:check": "oxfmt --check \"apps/**/*.{ts,tsx,js,cjs,mjs,json}\" \"packages/**/*.{ts,tsx,js,cjs,mjs,json}\" \"scripts/*.{ts,mts,json}\" \"scripts/fork/**/*.ts\" \"scripts/architecture/**/*.{ts,mts,json}\" \"scripts/oxlint-plugins/**/*.{ts,mts}\" \"examples/**/*.{ts,tsx,js,cjs,mjs,json}\" \"__tests__/**/*.{ts,tsx,js,cjs,mjs,json}\" \"*.json\"",
     "ci": "bun scripts/run-gates.ts ci",
     "docker:build:computer-use": "docker build -t lilac-computer:local packages/computer-use-runner && docker build -t lilac-computer-gateway:local -f apps/computer-use-gateway/Dockerfile .",
     "test:computer-use": "bun run --filter='@stanley2058/lilac-computer-use-gateway' --filter='@stanley2058/lilac-computer-use-runner' test",
@@ -67,7 +67,10 @@
     "build:model-catalog": "bun run codegen:model-catalog",
     "codegen:model-catalog": "bun scripts/build-model-catalog.ts",
     "codegen:client-protocol-compat": "bun apps/core/scripts/generate-client-protocol-compat.ts",
-    "codegen:client-protocol-compat:check": "bun apps/core/scripts/generate-client-protocol-compat.ts --check"
+    "codegen:client-protocol-compat:check": "bun apps/core/scripts/generate-client-protocol-compat.ts --check",
+    "fork:footprint": "bun scripts/fork/check-upstream-footprint.ts",
+    "typecheck:fork": "bunx tsc --ignoreConfig --noEmit --strict --skipLibCheck --target ESNext --module Preserve --moduleResolution bundler --allowImportingTsExtensions --types bun scripts/fork/*.ts",
+    "test:custom-media": "bun install --cwd=examples/plugins/custom-media --frozen-lockfile && bun run --cwd=examples/plugins/custom-media test && bun run --cwd=examples/plugins/custom-media typecheck"
   },
   "devDependencies": {
     "@oxlint/plugins": "1.75.0",
