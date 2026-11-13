@@ -133,6 +133,8 @@ scripts/architecture/precise-exception-identities.ts  # registers fork module ex
 scripts/run-gates.ts  # runs external custom-media source/bundle regression and typecheck in the repository gate
 
 # --- PR113 integration regressions
+apps/installer/src/data-files.ts  # preserves the existing image runtime identity when preparing private bind-mounted data
+apps/installer/tests/integration/verify-installation.ts  # verifies private installer ownership against each image's actual account
 apps/core/src/surface/native/execution.test.ts  # guards revoked automatic-steer admission and busy-send assistant attribution
 apps/installer/tests/runtime-contract.test.ts  # resolves existing fork Docker ARG defaults without weakening runtime environment assertions
 DEVELOPMENT.md  # records changed runner fingerprints before npm publication
