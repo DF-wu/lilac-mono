@@ -170,6 +170,8 @@ export type OrchestrateToolOptions = {
 };
 
 const logger = createLogger({ module: "tool:orchestrate" });
+// Only serializes live decisions within one runtime; existing receipts own durable replay.
+const keyedSubagentSends = new WeakMap<DurableWorkflowStore, Map<string, Promise<void>>>();
 
 function invalid(message: string) {
   return Result.err(new OrchestrateInputInvalid({ message }));
@@ -719,6 +721,34 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
   async function sendSubagent(run: WorkflowRun, input: OrchestrateInput, toolCallId: string) {
     return Result.gen(async function* () {
       yield* authorizeSubagentControl(run);
+      if (!input.commandId)
+        return Result.ok(yield* Result.await(decideSubagentSend(run, input, toolCallId)));
+      const workflows = yield* requireWorkflows();
+      let pending = keyedSubagentSends.get(workflows);
+      if (!pending) {
+        pending = new Map();
+        keyedSubagentSends.set(workflows, pending);
+      }
+      const childSessionId =
+        run.completionTarget.kind === "live_parent"
+          ? run.completionTarget.childSessionId
+          : run.runId;
+      const key = JSON.stringify([requestContext.sessionId, childSessionId, input.commandId]);
+      const previous = pending.get(key);
+      const released = Promise.withResolvers<void>();
+      pending.set(key, released.promise);
+      using cleanup = new DisposableStack();
+      cleanup.defer(() => {
+        if (pending.get(key) === released.promise) pending.delete(key);
+        released.resolve();
+      });
+      await previous;
+      return Result.ok(yield* Result.await(decideSubagentSend(run, input, toolCallId)));
+    });
+  }
+
+  async function decideSubagentSend(run: WorkflowRun, input: OrchestrateInput, toolCallId: string) {
+    return Result.gen(async function* () {
       const message = input.message!;
       const mode = input.mode ?? "auto";
       const operation = yield* latestAgentOperation(run);
