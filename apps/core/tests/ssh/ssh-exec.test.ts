@@ -700,6 +700,69 @@ wait "$witness_pid"
     }
   }, 20_000);
 
+  it("settles a terminated SSH run while a detached process keeps its output open", async () => {
+    // Models an OpenSSH ControlMaster: the master receives the client's stdio descriptors,
+    // lives in its own session, and keeps stderr open until the remote command finishes.
+    const holderPath = path.join(tempDir, "ssh-output-holder");
+    const readyFifoPath = path.join(tempDir, "ssh-output-holder-ready");
+    await writeFile(
+      sshPath,
+      `#!/usr/bin/env bash
+set -uo pipefail
+
+HOLDER=${JSON.stringify(holderPath)}
+READY_FIFO=${JSON.stringify(readyFifoPath)}
+
+mkfifo "$READY_FIFO"
+setsid bash -c 'printf "%s\\n" "$$" > "$1"; exec sleep 600' _ "$READY_FIFO" >/dev/null </dev/null &
+read -r holder_pid < "$READY_FIFO"
+rm -f "$READY_FIFO"
+printf '%s\\n' "$holder_pid" > "$HOLDER.tmp"
+mv "$HOLDER.tmp" "$HOLDER"
+printf 'ready\\n'
+exec sleep 600
+`,
+      "utf8",
+    );
+    await chmod(sshPath, 0o755);
+
+    const controller = new AbortController();
+    let holderPid: number | undefined;
+    let reportActivity: () => void = () => undefined;
+    const activity = new Promise<void>((resolve) => {
+      reportActivity = resolve;
+    });
+
+    try {
+      const execution = sshExecBash({
+        host: "fakehost",
+        cmd: "true",
+        timeoutMs: 60_000,
+        signal: controller.signal,
+        maxOutputChars: 10_000,
+        onActivity: () => reportActivity(),
+      });
+
+      await withRejectionTimeout(activity, 2_000, "SSH subprocess did not start");
+      holderPid = Number((await readFile(holderPath, "utf8")).trim());
+      expect(Number.isInteger(holderPid) && holderPid > 0).toBeTrue();
+
+      controller.abort(new DOMException("owned cancellation", "AbortError"));
+      const result = await withRejectionTimeout(
+        execution,
+        5_000,
+        "terminated SSH did not settle while its output stayed open",
+      );
+
+      expect(result.aborted).toBeTrue();
+      expect(result.stdout).toBe("ready\n");
+      expect(isProcessRunning(holderPid)).toBeTrue();
+    } finally {
+      controller.abort(new DOMException("test cleanup", "AbortError"));
+      if (holderPid) signalProcessBestEffort(holderPid, "SIGKILL");
+    }
+  }, 20_000);
+
   it("returns an owned serialization error for a cyclic runner request", async () => {
     const input = testRemoteRunnerRequest();
     Object.defineProperty(input.input, "patchText", { value: input, enumerable: true });
