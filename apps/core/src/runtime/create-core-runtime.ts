@@ -1926,7 +1926,8 @@ export async function createCoreRuntime(
                     .map((record) => {
                       if (record.state !== "terminal") return "owned" as const;
                       const kind = record.outcome.kind;
-                      if (kind === "completed" || kind === "cancelled") return kind;
+                      if (kind === "completed" || kind === "cancelled" || kind === "abandoned")
+                        return kind;
                       return "failed" as const;
                     })
                     .tryRecover((error) =>
@@ -1964,6 +1965,8 @@ export async function createCoreRuntime(
             subscriptionPrefix,
             webhookSecret: env.github.webhookSecret,
             githubAppCredentialsAvailable,
+            hasPublishedRequest: (requestDeliveryId) =>
+              requestDeliveryStore!.hasReceipt(requestDeliveryId),
             getTranscriptStore: () => activeTranscriptStore,
             logger,
             reportFatalError,
@@ -2545,6 +2548,10 @@ export async function createCoreRuntime(
               blobStore: activeBlobStore,
               attachmentOutputLifecycle,
               surfaceAdapterResolver: registry.adapterResolver(),
+              threadControl: registry.threadControlResolver(),
+              subagentSnapshots: () => stopAgentRunner ?? undefined,
+              requestDeliveryKnown: (id) =>
+                requestDeliveryStore?.load(id).match({ ok: () => true, err: () => false }) ?? false,
               getConfig: () => getCoreConfig(),
               discovery: discoveryService ?? undefined,
               nativeSearch: nativeRuntime?.search,
@@ -3118,6 +3125,8 @@ export async function createCoreRuntime(
       hasResidualRouter: residualRouter !== null,
     });
     if (stopPass === "none") return;
+    const wasFullyStarted = runtimeFullyStarted;
+    runtimeFullyStarted = false;
     started = false;
     conversationThreadSummarizationStopping = true;
     const cleanup = createCoreRuntimeCleanupSupervisor(priorPanic);
@@ -3129,7 +3138,7 @@ export async function createCoreRuntime(
     const gracefulSurfaceRegistry = surfaceRuntimeRegistry;
     const gracefulDrainRequired =
       stopPass === "full" &&
-      runtimeFullyStarted &&
+      wasFullyStarted &&
       gracefulAgentRunner !== null &&
       gracefulSurfaceRegistry !== null;
     const blobStoreClose = ownedBlobStore

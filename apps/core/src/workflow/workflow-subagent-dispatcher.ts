@@ -356,11 +356,21 @@ export class WorkflowSubagentDispatcher {
           async () => (await this.input.getMaxActiveRuns?.()) ?? DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
         ),
       );
+      const invocationIdentity = canonicalJsonSha256([
+        definitions.canonicalProjectId,
+        registration.parentSessionId,
+        registration.childSessionId,
+        registration.childRequestId,
+      ]);
       const invocation = yield* this.input.store
         .createInvocation({
           revision,
           run: requestedRun,
           maxActiveRuns,
+          idempotency: {
+            key: `subagent:${invocationIdentity}`,
+            fingerprintSha256: invocationIdentity,
+          },
         })
         .mapError((error) => subagentDispatchFailure(error.message));
       if (invocation.status === "rejected_capacity") {
@@ -374,16 +384,16 @@ export class WorkflowSubagentDispatcher {
       yield* Result.await(captureSubagentExternal(async () => this.input.onRunCreated?.(run)));
       const waitForCompletion = async () =>
         adaptWorkflowSubagentResultToHost(
-          await this.waitForCompletion(runId, registration.mode === "sync"),
+          await this.waitForCompletion(run.runId, registration.mode === "sync"),
         );
 
       return Result.ok({
-        runId,
+        runId: run.runId,
         get completion() {
           return waitForCompletion();
         },
         cancel: async (detail: string) => {
-          adaptWorkflowSubagentResultToHost(await this.cancel(runId, detail));
+          adaptWorkflowSubagentResultToHost(await this.cancel(run.runId, detail));
         },
       });
     }, this);

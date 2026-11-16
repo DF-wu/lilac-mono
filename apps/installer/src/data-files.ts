@@ -13,23 +13,40 @@ const fs = await import("node:fs/promises");
 const path = await import("node:path");
 const root = process.argv[1];
 const request = await Bun.stdin.json();
+let owner = { uid: 1000, gid: 1000 };
+const runtimeOwner = async () => {
+  const user = await fs.readFile("/etc/lilac-runtime-user", "utf8").catch((error) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  // Upstream images without the fork's identity record use UID/GID 1000.
+  if (user === undefined) return owner;
+  const username = user.trim();
+  if (!/^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(username)) throw new Error("Invalid runtime user");
+  const accounts = await fs.readFile("/etc/passwd", "utf8");
+  const account = accounts.split("\n").find((line) => line.split(":")[0] === username)?.split(":");
+  const uid = Number(account?.[2]);
+  const gid = Number(account?.[3]);
+  if (!Number.isInteger(uid) || !Number.isInteger(gid) || uid < 1000 || uid > 60000 || gid !== uid) throw new Error("Invalid runtime identity");
+  return { uid, gid };
+};
 const target = (relative) => {
   if (typeof relative !== "string" || path.isAbsolute(relative) || relative.split(/[\\/]/).some((part) => !part || part === "..")) throw new Error("Invalid data path");
   return path.join(root, relative);
 };
 const ownTree = async (directory) => {
-  await fs.chown(directory, 1000, 1000);
+  await fs.chown(directory, owner.uid, owner.gid);
   for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
     const filename = path.join(directory, entry.name);
     if (entry.isSymbolicLink()) {
-      await fs.lchown(filename, 1000, 1000);
+      await fs.lchown(filename, owner.uid, owner.gid);
       continue;
     }
     if (entry.isDirectory()) {
       await ownTree(filename);
       continue;
     }
-    await fs.chown(filename, 1000, 1000);
+    await fs.chown(filename, owner.uid, owner.gid);
   }
 };
 const staged = [];
@@ -41,19 +58,20 @@ const run = async () => {
     return;
   }
   if (request.action !== "write" || !Array.isArray(request.files)) throw new Error("Invalid data operation");
+  owner = await runtimeOwner();
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
   await fs.mkdir(path.join(root, "secret"), { recursive: true, mode: 0o700 });
   await fs.mkdir(path.join(root, "workspace"), { recursive: true, mode: 0o700 });
   await fs.chmod(root, 0o700);
   await fs.chmod(path.join(root, "secret"), 0o700);
-  await fs.chown(root, 1000, 1000);
-  await fs.chown(path.join(root, "secret"), 1000, 1000);
-  await fs.chown(path.join(root, "workspace"), 1000, 1000);
+  await fs.chown(root, owner.uid, owner.gid);
+  await fs.chown(path.join(root, "secret"), owner.uid, owner.gid);
+  await fs.chown(path.join(root, "workspace"), owner.uid, owner.gid);
   for (const file of request.files) {
     const filename = target(file.relativePath);
     await fs.mkdir(path.dirname(filename), { recursive: true, mode: 0o700 });
     for (let parent = path.dirname(filename); parent !== root; parent = path.dirname(parent)) {
-      await fs.chown(parent, 1000, 1000);
+      await fs.chown(parent, owner.uid, owner.gid);
     }
     const temporary = filename + "." + crypto.randomUUID() + ".tmp";
     const previous = await fs.readFile(filename).catch((error) => {
@@ -64,7 +82,7 @@ const run = async () => {
     staged.push({ filename, temporary, previous, mode, published: false });
     await fs.writeFile(temporary, file.content, { mode: file.mode ?? 0o600 });
     await fs.chmod(temporary, file.mode ?? 0o600);
-    await fs.chown(temporary, 1000, 1000);
+    await fs.chown(temporary, owner.uid, owner.gid);
   }
   await ownTree(root);
   for (const file of staged) {
@@ -76,7 +94,7 @@ const run = async () => {
 const restorePrevious = async (file) => {
   await fs.writeFile(file.temporary, file.previous, { mode: file.mode });
   await fs.chmod(file.temporary, file.mode);
-  await fs.chown(file.temporary, 1000, 1000);
+  await fs.chown(file.temporary, owner.uid, owner.gid);
   await fs.rename(file.temporary, file.filename);
 };
 const rollback = async () => {
@@ -275,7 +293,7 @@ export async function writeDataFiles(
       return Result.err(
         new InstallerDataFailed({
           message:
-            "Could not prepare Lilac data for container UID 1000. Check Docker access and data directory permissions.",
+            "Could not prepare Lilac data for the container runtime user. Check Docker access and data directory permissions.",
         }),
       );
     return Result.ok(undefined);

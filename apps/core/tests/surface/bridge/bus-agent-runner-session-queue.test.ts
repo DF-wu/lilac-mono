@@ -14,6 +14,7 @@ import {
   shouldCancelRunPolicyRequest,
   shouldCancelIdleOnlyGlobalRequest,
   type BusAgentRunnerRequestDelivery,
+  unconsumedControlDisposition,
 } from "../../../src/surface/bridge/bus-agent-runner";
 import { CustomCommandManager } from "../../../src/custom-commands/manager";
 import type { JobService } from "../../../src/jobs/job-service";
@@ -1152,12 +1153,14 @@ describe("session queue admission", () => {
     }
   });
   /**
-   * Starts a runner whose first model call blocks until `releaseFirst`, then fails, so controls
-   * published meanwhile stay queued in the agent. Later calls record their last user message.
+   * Starts a runner whose first model call blocks until `releaseFirst`, then fails (or answers
+   * with `firstCallSucceeds`), so controls published meanwhile stay queued in the agent. Later
+   * calls record their user messages.
    */
   async function startUnconsumedControlRunner(hooks: {
     readonly beforeTerminalize?: (requestDeliveryId: string) => Promise<void>;
     readonly beforeQuestionCancel?: () => Promise<void>;
+    readonly firstCallSucceeds?: boolean;
   }) {
     const baseBus = createLilacBus(createInMemoryRawBus());
     const handled = new Map<string, ReturnType<typeof deferred<void>>>();
@@ -1244,6 +1247,7 @@ describe("session queue admission", () => {
               if (modelCalls === 1) {
                 firstStarted.resolve(undefined);
                 await releaseFirst.promise;
+                if (hooks.firstCallSucceeds) return level1TextStep("first answer");
                 throw new Error("provider rejected the request");
               }
               prompts.push(userTexts(prompt));
@@ -1257,6 +1261,7 @@ describe("session queue admission", () => {
       readonly queue: "prompt" | "followUp" | "steer";
       readonly text: string;
       readonly requestId?: string;
+      readonly raw?: unknown;
     }): Promise<string> => {
       const delivery = acceptedRunnerDelivery({
         requestDeliveryId: crypto.randomUUID(),
@@ -1264,6 +1269,7 @@ describe("session queue admission", () => {
         sessionId,
         queue: input.queue,
         messages: [{ role: "user", content: input.text }],
+        raw: input.raw,
       });
       accepted.set(delivery.requestDeliveryId, delivery);
       return publishRunnerRequest({
@@ -1273,6 +1279,7 @@ describe("session queue admission", () => {
         sessionId,
         queue: input.queue,
         text: input.text,
+        raw: input.raw,
       });
     };
     /** Publishes a Cancel and resolves once the runner has handled it. */
@@ -1291,6 +1298,7 @@ describe("session queue admission", () => {
     return {
       runner,
       publish,
+      handled: (requestDeliveryId: string) => handledDelivery(requestDeliveryId).promise,
       cancel,
       terminalized,
       prompts,
@@ -1381,6 +1389,101 @@ describe("session queue admission", () => {
     }
   });
 
+  /** Starts the harness with a first run that answers, then holds it in cleanup. */
+  async function startFinalizingRun() {
+    const cleanupReached = deferred<void>();
+    const releaseCleanup = deferred<void>();
+    const harness = await startUnconsumedControlRunner({
+      firstCallSucceeds: true,
+      beforeQuestionCancel: async () => {
+        cleanupReached.resolve(undefined);
+        await releaseCleanup.promise;
+      },
+    });
+    const first = await harness.publish({ queue: "prompt", text: "first request" });
+    await harness.firstStarted.promise;
+    harness.releaseFirst.resolve(undefined);
+    await cleanupReached.promise;
+    return { harness, first, releaseCleanup };
+  }
+
+  it("ends a steer that needs its run once the run is finalizing, without a model call", async () => {
+    const { harness, first, releaseCleanup } = await startFinalizingRun();
+    try {
+      // Native steers require their run, so one that misses it ends instead of starting a run.
+      const steer = await harness.publish({
+        queue: "steer",
+        text: "late steer",
+        raw: { requiresActive: true },
+      });
+      await harness.handled(steer);
+      releaseCleanup.resolve(undefined);
+
+      await harness.runner.waitForIdle();
+
+      expect(harness.modelCalls()).toBe(1);
+      expect(harness.terminalized).toEqual([
+        { requestDeliveryId: steer, kind: "abandoned", code: "active-request-mismatch" },
+        { requestDeliveryId: first, kind: "completed", code: undefined },
+      ]);
+    } finally {
+      releaseCleanup.resolve(undefined);
+      await harness.close();
+    }
+  });
+
+  it("queues a late steer while a failed run is terminalizing", async () => {
+    let first = "";
+    const reached = deferred<void>();
+    const release = deferred<void>();
+    const harness = await startUnconsumedControlRunner({
+      beforeTerminalize: async (id) => {
+        if (id !== first) return;
+        reached.resolve(undefined);
+        await release.promise;
+      },
+    });
+    try {
+      first = await harness.publish({ queue: "prompt", text: "first" });
+      await harness.firstStarted.promise;
+      harness.releaseFirst.resolve(undefined);
+      await reached.promise;
+      const steer = await harness.publish({ queue: "steer", text: "late after failure" });
+      await harness.handled(steer);
+      expect(harness.modelCalls()).toBe(1);
+      release.resolve(undefined);
+      await harness.runner.waitForIdle();
+      expect(harness.prompts).toEqual([["late after failure"]]);
+      expect(harness.terminalized).toEqual([
+        { requestDeliveryId: first, kind: "failed", code: undefined },
+        { requestDeliveryId: steer, kind: "completed", code: undefined },
+      ]);
+    } finally {
+      release.resolve(undefined);
+      await harness.close();
+    }
+  });
+
+  it("runs a steer that reaches a finalizing run as the next prompt", async () => {
+    const { harness, first, releaseCleanup } = await startFinalizingRun();
+    try {
+      const steer = await harness.publish({ queue: "steer", text: "late steer" });
+      await harness.handled(steer);
+      releaseCleanup.resolve(undefined);
+
+      await harness.runner.waitForIdle();
+
+      expect(harness.prompts).toEqual([["late steer"]]);
+      expect(harness.terminalized).toEqual([
+        { requestDeliveryId: first, kind: "completed", code: undefined },
+        { requestDeliveryId: steer, kind: "completed", code: undefined },
+      ]);
+    } finally {
+      releaseCleanup.resolve(undefined);
+      await harness.close();
+    }
+  });
+
   it("cancels transferred controls when a cancel lands during run finalization", async () => {
     let first = "";
     const terminalizeReached = deferred<void>();
@@ -1413,6 +1516,32 @@ describe("session queue admission", () => {
     } finally {
       releaseTerminalize.resolve(undefined);
       await harness.close();
+    }
+  });
+});
+
+describe("unconsumedControlDisposition", () => {
+  const ended = { terminalPanic: false, terminalized: true, cancelled: false };
+
+  it("runs a primary run's unconsumed controls as the next prompts", () => {
+    expect(unconsumedControlDisposition({ ...ended, workflowRequest: false })).toBe("requeue");
+  });
+
+  it("ends a workflow request's unconsumed controls with it", () => {
+    expect(unconsumedControlDisposition({ ...ended, workflowRequest: true })).toBe("abandon");
+  });
+
+  it("releases controls after a panic, a cancel, or a run left for recovery", () => {
+    for (const workflowRequest of [false, true]) {
+      expect(unconsumedControlDisposition({ ...ended, terminalPanic: true, workflowRequest })).toBe(
+        "release",
+      );
+      expect(unconsumedControlDisposition({ ...ended, cancelled: true, workflowRequest })).toBe(
+        "release",
+      );
+      expect(unconsumedControlDisposition({ ...ended, terminalized: false, workflowRequest })).toBe(
+        "release",
+      );
     }
   });
 });

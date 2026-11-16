@@ -56,7 +56,7 @@ export function createNativeExecution(options: {
   now?: () => number;
   deliveryState?: (
     deliveryId: string,
-  ) => ResultType<"missing" | "owned" | "completed" | "failed" | "cancelled", Error>;
+  ) => ResultType<"missing" | "owned" | "completed" | "failed" | "cancelled" | "abandoned", Error>;
   jobs?: Pick<JobService, "stopSession" | "stopSessionJobsSince">;
 }) {
   const { store } = options;
@@ -97,7 +97,9 @@ export function createNativeExecution(options: {
           nativeFailure("stale", "Native request no longer matches its accepted intent"),
         );
       if (input.mode === "steer" && thread.activeRunId !== input.runId) {
-        yield* store.settleInput(input.id, "target-ended");
+        // The steer continues as a follow-up when it still can; this delivery is stale either way.
+        if (!(yield* store.requeueMissedSteer(input.id, "any")))
+          yield* store.settleInput(input.id, "target-ended");
         return Result.err(nativeFailure("stale", "The steering target has ended"));
       }
       const previousRequestId = yield* store.getLatestCanonicalRequestId(input.threadId);
@@ -601,14 +603,24 @@ export function createNativeExecution(options: {
         pending.filter((input) => input.state === "queued").length,
         pending.filter((input) => input.state === "admitted").length,
       );
-      for (const candidate of pending) {
+      for (const listed of pending) {
         const thread = yield* store.getThreadRecord(threadId);
         if (thread.mutationPending || thread.deleted) return Result.ok(undefined);
-        if (candidate.state === "admitted" && options.deliveryState) {
-          const state = yield* options.deliveryState(candidate.deliveryId);
+        let candidate = listed;
+        if (listed.state === "admitted" && options.deliveryState) {
+          const state = yield* options.deliveryState(listed.deliveryId);
           if (state === "owned") continue;
-          if (state !== "missing") {
-            yield* completeInput(candidate, state);
+          // A steer the runner abandoned missed its run and is admitted below as a follow-up.
+          const requeued =
+            state === "abandoned" ? yield* store.requeueMissedSteer(listed.id, "any") : null;
+          if (requeued) candidate = requeued;
+          // A steer that can no longer be requeued, such as after a rewind, ends as target-ended.
+          if (!requeued && state === "abandoned" && listed.mode === "steer") {
+            yield* store.settleInput(listed.id, "target-ended");
+            continue;
+          }
+          if (!requeued && state !== "missing") {
+            yield* completeInput(listed, state === "abandoned" ? "failed" : state);
             continue;
           }
         }

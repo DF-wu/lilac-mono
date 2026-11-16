@@ -26,6 +26,7 @@ import {
   claimGithubAcknowledgement,
   getGithubLatestRequestForSession,
   getGithubRequestMeta,
+  hasGithubPendingReviewInterrupt,
   restoreGithubLatestRequestForSession,
   rollbackGithubAcknowledgementClaim,
   setGithubAck,
@@ -40,6 +41,7 @@ import { NO_REPLY_TOKEN } from "../../surface/bridge/reply-directive";
 import { parseGithubWorkflowActionReply } from "../../surface/github/github-actions";
 import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
 import { adaptToolResultToHost } from "../../tools/tool-result-adapters";
+import type { RequestDeliveryStoreError } from "../../surface/bridge/request-delivery/types";
 
 export const githubWebhookApi = {
   addEyesReactionToIssue,
@@ -54,10 +56,16 @@ export const githubWebhookApi = {
 };
 type GithubWebhookApi = typeof githubWebhookApi;
 
+/** Reports whether a request with this delivery ID was published within the retention window. */
+export type GithubPublishedRequestLookup = (
+  requestDeliveryId: string,
+) => ResultType<boolean, RequestDeliveryStoreError>;
+
 type GithubWebhookOptions = {
   bus: LilacBus;
   subscriptionId: string;
   reportFatalError: (error: Error) => void;
+  hasPublishedRequest: GithubPublishedRequestLookup;
 };
 
 const githubRepositorySchema = z.object({ full_name: z.string().min(1) });
@@ -529,6 +537,7 @@ export async function startGithubWebhookServer(options: GithubWebhookOptions): P
     path,
     logger,
     reportFatalError: options.reportFatalError,
+    hasPublishedRequest: options.hasPublishedRequest,
     handle: (event, projected, deliveryId) =>
       handleEvent({ bus: options.bus, logger, event, projected, botLogins, deliveryId }),
   });
@@ -548,6 +557,7 @@ export function createGithubWebhookApp(options: {
   path: string;
   logger: Logger;
   reportFatalError: (error: Error) => void;
+  hasPublishedRequest?: GithubPublishedRequestLookup;
   handle: (
     event: string,
     projected: ProjectedGithubWebhookEvent,
@@ -555,18 +565,35 @@ export function createGithubWebhookApp(options: {
   ) => Promise<Awaited<ReturnType<typeof handleEvent>> | void>;
 }) {
   const { secret, path, logger } = options;
+  // Covers handled deliveries that publish no request, such as workflow action replies, within
+  // one process. Deliveries that publish a request are deduplicated across restarts below.
   const seen = new Map<string, number>();
   const DEDUPE_TTL_MS = 10 * 60 * 1000;
 
   function dedupe(deliveryId: string | undefined): boolean {
     if (!deliveryId) return false;
+    if (hasGithubPendingReviewInterrupt(githubDeliveryId(deliveryId, "interrupt"))) return false;
     const now = Date.now();
     for (const [k, exp] of seen) {
       if (exp <= now) seen.delete(k);
     }
     const exp = seen.get(deliveryId);
     if (exp && exp > now) return true;
-    return false;
+    if (!options.hasPublishedRequest) return false;
+    // Every handler publishes its first request under the delivery's "prompt" identity, and the
+    // request-delivery store keeps a receipt for it after the request completes.
+    return options.hasPublishedRequest(githubDeliveryId(deliveryId, "prompt")).match({
+      ok: (published) => published,
+      err: (error) => {
+        // Handling the delivery keeps it at least once; the durable publisher still rejects a
+        // duplicate while its delivery record exists.
+        logger.warn("github.webhook.dedupe_unavailable", {
+          deliveryId,
+          ...formatTaggedErrorForLog(error),
+        });
+        return false;
+      },
+    });
   }
 
   const queued = new WeakMap<
@@ -1130,6 +1157,38 @@ async function onReviewRequested(input: {
   });
 }
 
+async function publishGithubReviewInterrupt(input: {
+  bus: LilacBus;
+  sessionId: string;
+  requestId: string;
+  requestDeliveryId: string;
+}): Promise<void> {
+  adaptEventPublishResultToHost(
+    await input.bus.publish(
+      lilacEventTypes.CmdRequestMessage,
+      {
+        requestDeliveryId: input.requestDeliveryId,
+        queue: "interrupt",
+        messages: [
+          {
+            role: "user",
+            content:
+              "Branch updated (new commits pushed). Cancel the current review immediately and stop producing output.",
+          },
+        ],
+        raw: { cancel: true, requiresActive: true },
+      },
+      {
+        headers: {
+          request_id: input.requestId,
+          session_id: input.sessionId,
+          request_client: "github",
+        },
+      },
+    ),
+  );
+}
+
 async function onPullRequestSynchronize(input: {
   bus: LilacBus;
   logger: Logger;
@@ -1152,6 +1211,16 @@ async function onPullRequestSynchronize(input: {
     if (ageMs > 30 * 60 * 1000) {
       // Avoid surprise reruns long after a review completed.
       return null;
+    }
+
+    if (meta.pr.pendingInterrupt) {
+      await publishGithubReviewInterrupt({
+        bus: input.bus,
+        sessionId,
+        ...meta.pr.pendingInterrupt,
+      });
+      delete meta.pr.pendingInterrupt;
+      if (meta.pr.headSha === headSha) return meta.requestId;
     }
 
     if (meta.pr.headSha === headSha) return null;
@@ -1242,31 +1311,15 @@ async function onPullRequestSynchronize(input: {
       // Once the replacement is durable, retaining its ownership is safer than reviving stale output.
       replacementPublished = true;
 
-      // This interrupt is only applied if the old request is still active.
-      adaptEventPublishResultToHost(
-        await input.bus.publish(
-          lilacEventTypes.CmdRequestMessage,
-          {
-            requestDeliveryId: githubDeliveryId(input.deliveryId, "interrupt"),
-            queue: "interrupt",
-            messages: [
-              {
-                role: "user",
-                content:
-                  "Branch updated (new commits pushed). Cancel the current review immediately and stop producing output.",
-              },
-            ],
-            raw: { cancel: true, requiresActive: true },
-          },
-          {
-            headers: {
-              request_id: meta.requestId,
-              session_id: sessionId,
-              request_client: "github",
-            },
-          },
-        ),
-      );
+      const pendingInterrupt = {
+        requestId: meta.requestId,
+        requestDeliveryId: githubDeliveryId(input.deliveryId, "interrupt"),
+      };
+      const replacementMeta = getGithubRequestMeta(requestId);
+      // Retain the unfinished stage so webhook redelivery can pass the same-head guard.
+      if (replacementMeta?.pr) replacementMeta.pr.pendingInterrupt = pendingInterrupt;
+      await publishGithubReviewInterrupt({ bus: input.bus, sessionId, ...pendingInterrupt });
+      if (replacementMeta?.pr) delete replacementMeta.pr.pendingInterrupt;
 
       return requestId;
     })().finally(async () => {

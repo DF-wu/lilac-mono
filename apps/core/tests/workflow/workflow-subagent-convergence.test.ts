@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, jest, spyOn } from "bun:test";
 import { Result } from "better-result";
 import { Logger } from "@stanley2058/simple-module-logger";
 import path from "node:path";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { z } from "zod";
 import {
@@ -39,6 +39,10 @@ import { WorkflowSubagentDispatcher } from "../../src/workflow/workflow-subagent
 import { WorkflowEngine } from "../../src/workflow/workflow-engine";
 import { readWorkflowSourceArtifact } from "../../src/workflow/workflow-artifact-store";
 import { createToolResultArtifactStore } from "../../src/artifacts/tool-result-artifact-store";
+import { parseCoreConfigV3ToUniversal } from "@stanley2058/lilac-utils";
+import { createOrchestrateTool } from "../../src/tools/orchestrate";
+import { createRealCoreBusFixture, requireBusOk, withBusDeadline } from "../helpers/real-core-bus";
+
 const blobStore = await createWorkflowTestBlobStore();
 const roots: string[] = [];
 const AUTHENTICATED_PARENT = { platform: "discord", userId: "user-1" } as const;
@@ -196,6 +200,34 @@ function registration(
         },
   };
 }
+it("reuses a durable subagent invocation across concurrent dispatch and store reopen", async () => {
+  const f = await setup();
+  const child = registration(f.projectRoot, "parent:keyed-replay");
+  const [first, concurrent] = await Promise.all([
+    f.dispatcher.delegate(child),
+    f.dispatcher.delegate(child),
+  ]);
+  expect(concurrent.runId).toBe(first.runId);
+  expect(workflowStoreValue(f.store.listSubagentRuns(child.parentSessionId))).toHaveLength(1);
+  const reopened = new DurableWorkflowStore(f.dbPath);
+  try {
+    const dispatcher = await WorkflowSubagentDispatcher.create({
+      store: reopened,
+      blobStore,
+      dataDir: f.dataDir,
+    });
+    const replay = await dispatcher.delegate(child);
+    expect(replay.runId).toBe(first.runId);
+    expect(workflowStoreValue(reopened.listSubagentRuns(child.parentSessionId))).toHaveLength(1);
+    await replay.cancel("cancel the stored run");
+    expect(workflowStoreValue(reopened.getRun(first.runId))?.state).toBe("cancelled");
+    await expect(replay.completion).resolves.toMatchObject({ status: "cancelled" });
+  } finally {
+    reopened.close();
+    f.store.close();
+  }
+});
+
 async function createRun(parentRequestId = "parent:1", heartbeat = false) {
   const setupResult = await setup();
   const handle = await setupResult.dispatcher.delegate(
@@ -205,6 +237,43 @@ async function createRun(parentRequestId = "parent:1", heartbeat = false) {
   if (!run) throw new Error("generated subagent run not found");
   return { ...setupResult, handle, run };
 }
+
+it("reuses a missed-steer invocation after a hard exit before intake terminalization", async () => {
+  const f = await createRun("parent:crash");
+  const run = workflowStoreValue(f.store.getRun(f.handle.runId))!;
+  const revision = workflowStoreValue(f.store.getRevision(run.revisionId))!;
+  const root = path.join(f.root, "crash");
+  await mkdir(root);
+  await writeFile(
+    path.join(root, "input.json"),
+    JSON.stringify({
+      run,
+      revision,
+      policy: null,
+      task: "Continue after the missed steer",
+      idleTimeoutMs: 2000,
+      sender: { parentRequestId: "parent:retry", parentToolCallId: "tool:retry" },
+      requestDeliveryId: "fd17729a-f812-44de-857f-4174fcd57451",
+    }),
+  );
+  const worker = path.join(import.meta.dir, "fixtures/subagent-invocation-crash.ts");
+  for (const mode of ["crash", "replay"]) {
+    const child = Bun.spawn([process.execPath, "--no-env-file", worker, root, mode], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+    if (mode === "crash") expect(child.signalCode, stderr).toBe("SIGKILL");
+    else expect(code, stderr).toBe(0);
+  }
+  expect(await readFile(path.join(root, "replayed-run"), "utf8")).toBe(
+    await readFile(path.join(root, "committed-run"), "utf8"),
+  );
+  const reopened = new DurableWorkflowStore(path.join(root, "workflow.db"));
+  expect(workflowStoreValue(reopened.listSubagentRuns("channel:1"))).toHaveLength(1);
+  reopened.close();
+  f.store.close();
+}, 20_000);
 async function waitFor(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 3000;
   while (!predicate()) {
@@ -321,9 +390,12 @@ describe("workflow subagent convergence", () => {
   it("rejects delegation at global capacity without creating partial durable state", async () => {
     const { projectRoot, store, dispatcher } = await setup(1);
     const first = await dispatcher.delegate(registration(projectRoot, "parent:first"));
-    await expect(dispatcher.delegate(registration(projectRoot, "parent:rejected"))).rejects.toThrow(
-      "global workflow capacity is full (1/1 active runs)",
-    );
+    await expect(
+      dispatcher.delegate({
+        ...registration(projectRoot, "parent:rejected"),
+        childRequestId: "sub:child:rejected",
+      }),
+    ).rejects.toThrow("global workflow capacity is full (1/1 active runs)");
     expect(workflowStoreValue(store.listRuns()).map((item) => item.runId)).toEqual([first.runId]);
     expect([...workflowStoreValue(store.listActiveLiveParentRuns("parent:rejected"))]).toEqual([]);
     expect(workflowStoreValue(store.listRevisions())).toHaveLength(1);
@@ -353,6 +425,121 @@ describe("workflow subagent convergence", () => {
       workflowStoreValue(store.listActiveLiveParentRuns("parent:1")).map((item) => item.runId),
     ).toEqual([handle.runId]);
     expect(store.getLiveParentDeliverySnapshot("parent:1")).toEqual({
+      pendingCompletionCount: 0,
+      outstandingRunCount: 1,
+    });
+    store.close();
+  });
+  it("deduplicates keyed tool calls across parent requests and dispatcher restart", async () => {
+    const f = await createRun("parent:original");
+    f.store.cancelRunAndChildren({ runId: f.handle.runId, now: Date.now(), detail: "finished" });
+    function tool(
+      requestId: string,
+      store: DurableWorkflowStore,
+      dispatcher: WorkflowSubagentDispatcher,
+    ) {
+      return createOrchestrateTool({
+        config: parseCoreConfigV3ToUniversal({ configVersion: 3 }),
+        cwd: f.projectRoot,
+        runProfile: "primary",
+        canControl: true,
+        idleTimeoutMs: 2000,
+        maxDepth: 1,
+        workflows: store,
+        requestContext: {
+          requestId,
+          sessionId: "channel:1",
+          requestClient: "discord",
+          subagentDepth: 0,
+          subagentProfile: "primary",
+          requestInitiator: AUTHENTICATED_PARENT,
+          requestInitiatorSessionId: "channel:1",
+        },
+        delegate: (registration) =>
+          dispatcher.delegate({
+            ...registration,
+            projectRoot: f.projectRoot,
+            fallbackSurface: { ...AUTHENTICATED_PARENT, sessionId: "channel:1" },
+          }),
+      });
+    }
+    const send = (built: ReturnType<typeof tool>) =>
+      built.execute!(
+        {
+          action: "send",
+          id: f.handle.runId,
+          mode: "queue",
+          message: "Next",
+          commandId: "stable-command",
+        } as never,
+        { toolCallId: "tool:keyed", messages: [] } as never,
+      );
+    const [first, concurrent] = await Promise.all([
+      send(tool("parent:retry-1", f.store, f.dispatcher)),
+      send(tool("parent:retry-2", f.store, f.dispatcher)),
+    ]);
+    expect(concurrent).toEqual(first);
+    expect(workflowStoreValue(f.store.listSubagentRuns("channel:1"))).toHaveLength(2);
+    f.store.close();
+    const store = new DurableWorkflowStore(f.dbPath);
+    try {
+      const dispatcher = await WorkflowSubagentDispatcher.create({
+        store,
+        blobStore,
+        dataDir: f.dataDir,
+      });
+      expect(await send(tool("parent:retry-3", store, dispatcher))).toEqual(first);
+      expect(workflowStoreValue(store.listSubagentRuns("channel:1"))).toHaveLength(2);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("continues a finished child through orchestrate and parks the later parent turn", async () => {
+    const { projectRoot, store, dispatcher, handle } = await createRun("parent:first-turn");
+    store.cancelRunAndChildren({ runId: handle.runId, now: Date.now(), detail: "finished" });
+    const tool = createOrchestrateTool({
+      config: parseCoreConfigV3ToUniversal({ configVersion: 3 }),
+      cwd: projectRoot,
+      runProfile: "primary",
+      canControl: true,
+      idleTimeoutMs: 2000,
+      maxDepth: 1,
+      workflows: store,
+      requestContext: {
+        requestId: "parent:second-turn",
+        sessionId: "channel:1",
+        requestClient: "discord",
+        subagentDepth: 0,
+        subagentProfile: "primary",
+        requestInitiator: AUTHENTICATED_PARENT,
+        requestInitiatorSessionId: "channel:1",
+      },
+      delegate: (followUp) =>
+        dispatcher.delegate({
+          ...followUp,
+          projectRoot,
+          fallbackSurface: { ...AUTHENTICATED_PARENT, sessionId: "channel:1" },
+        }),
+    });
+
+    const sent = (await tool.execute!(
+      { action: "send", id: handle.runId, message: "Now check the session cookies" } as never,
+      { toolCallId: "tool:follow-up", messages: [] } as never,
+    )) as { disposition: string; runId: string };
+
+    expect(sent.disposition).toBe("started");
+    expect(sent.runId).not.toBe(handle.runId);
+    expect(workflowStoreValue(store.getRun(sent.runId))?.completionTarget).toMatchObject({
+      kind: "live_parent",
+      parentRequestId: "parent:second-turn",
+      parentToolCallId: "tool:follow-up",
+      childSessionId: "sub:channel:1:named:audit",
+      sessionName: "audit",
+      profile: "explore",
+    });
+    expect(workflowStoreValue(store.getRun(handle.runId))?.state).toBe("cancelled");
+    expect(store.getLiveParentDeliverySnapshot("parent:second-turn")).toEqual({
       pendingCompletionCount: 0,
       outstandingRunCount: 1,
     });
@@ -1456,3 +1643,146 @@ describe("workflow subagent convergence", () => {
     }
   });
 });
+
+it("replays child tools, forwards live updates and wakes the parent from Redis workflow completion", async () => {
+  const { store, run } = await createRun("parent:redis");
+  const f = await createRealCoreBusFixture();
+  const bridge = new WorkflowLiveParentBridge({
+    bus: f.bus,
+    blobStore,
+    store,
+    subscriptionId: "live-parent-redis",
+  });
+  const parentUpdates: string[] = [];
+  const replayed = Promise.withResolvers<void>();
+  const updated = Promise.withResolvers<void>();
+  const subscription = requireBusOk(
+    await f.bus.subscribeTopic(
+      outReqTopic("parent:redis"),
+      { mode: "tail", offset: { type: "begin" } },
+      async (message) => {
+        if (message.type === lilacEventTypes.EvtAgentOutputToolCall) {
+          parentUpdates.push(message.data.display);
+          if (message.data.display.includes("[read] before registration")) replayed.resolve();
+          if (message.data.display.includes("[read] complete")) updated.resolve();
+        }
+        return Result.ok(undefined);
+      },
+      () => "stop",
+    ),
+  );
+  const childHeaders = {
+    request_id: "sub:child:1",
+    session_id: "sub:channel:1:named:audit",
+    request_client: "unknown" as const,
+  };
+  requireBusOk(
+    await f.bus.publish(
+      lilacEventTypes.EvtAgentOutputToolCall,
+      { toolCallId: "child:read", status: "start", display: "[read] before registration" },
+      { headers: childHeaders },
+    ),
+  );
+  await bridge.start();
+  const parent = bridge.registerParent({ parentRequestId: "parent:redis" });
+  try {
+    await parent.ready;
+    await withBusDeadline(replayed.promise, "replayed child tool activity");
+    requireBusOk(
+      await f.bus.publish(
+        lilacEventTypes.EvtAgentOutputToolCall,
+        { toolCallId: "child:read", status: "end", display: "[read] complete", ok: true },
+        { headers: childHeaders },
+      ),
+    );
+    await withBusDeadline(updated.promise, "live child tool completion");
+    expect(parentUpdates.at(-1)).toContain("1/1 done");
+    expect(store.transitionRun({ runId: run.runId, from: "queued", to: "running", now: 10 })).toBe(
+      true,
+    );
+    expect(
+      store.transitionRun({
+        runId: run.runId,
+        from: "running",
+        to: "succeeded",
+        now: 20,
+        result: "audit complete",
+      }),
+    ).toBe(true);
+    const version = parent.snapshot().signalVersion;
+    const signalled = parent.waitForSignalSince(version);
+    const completion = requireBusOk(
+      await f.bus.publish(lilacEventTypes.EvtWorkflowResultReady, {
+        runId: run.runId,
+        revisionId: run.revisionId,
+        state: "succeeded",
+        summary: "audit complete",
+        ts: 20,
+      }),
+    );
+    await withBusDeadline(signalled, "parent workflow completion signal");
+    await f.waitForCommit(completion.cursor, "evt.workflow");
+    expect(parent.listPending()).toMatchObject([
+      { runId: run.runId, status: "resolved", finalText: "audit complete" },
+    ]);
+    await parent.acknowledge([run.runId]);
+    expect(parent.listPending()).toEqual([]);
+  } finally {
+    await parent.close();
+    await bridge.stop();
+    requireBusOk(await subscription.stop());
+    store.close();
+    await f.close();
+  }
+}, 20_000);
+
+it("publishes parent cancellation transitions through Redis", async () => {
+  const { store, run } = await createRun("parent:redis-cancel");
+  const f = await createRealCoreBusFixture();
+  const bridge = new WorkflowLiveParentBridge({
+    bus: f.bus,
+    blobStore,
+    store,
+    subscriptionId: "live-parent-redis-cancel",
+  });
+  const received: string[] = [];
+  const delivered = Promise.withResolvers<void>();
+  const subscription = requireBusOk(
+    await f.bus.subscribeTopic(
+      "evt.workflow",
+      { mode: "fanout", subscriptionId: "parent-cancel-observer", startFrom: "beginning" },
+      async (message) => {
+        if (
+          message.type === lilacEventTypes.EvtWorkflowRunChanged ||
+          message.type === lilacEventTypes.EvtWorkflowResultReady
+        ) {
+          expect(message.data).toMatchObject({ runId: run.runId, state: "cancelled" });
+          received.push(message.type);
+          if (received.length === 2) delivered.resolve();
+        }
+        return Result.ok(undefined);
+      },
+      () => "stop",
+    ),
+  );
+  const parent = bridge.registerParent({ parentRequestId: "parent:redis-cancel" });
+  try {
+    await parent.ready;
+    await parent.cancelAll("parent request cancelled");
+    await withBusDeadline(delivered.promise, "parent cancellation events");
+    expect(received).toEqual([
+      lilacEventTypes.EvtWorkflowRunChanged,
+      lilacEventTypes.EvtWorkflowResultReady,
+    ]);
+    expect(parent.snapshot()).toMatchObject({
+      hasPendingCompletions: false,
+      hasOutstandingRuns: false,
+    });
+  } finally {
+    await parent.close();
+    await bridge.stop();
+    requireBusOk(await subscription.stop());
+    store.close();
+    await f.close();
+  }
+}, 20_000);

@@ -1324,7 +1324,7 @@ describe("createToolServer", () => {
       "x-lilac-control-capability": "unguessable-primary-token",
     };
     try {
-      expect((await server.app.handle(new Request("http://localhost/list"))).status).toBe(500);
+      expect((await server.app.handle(new Request("http://localhost/list"))).status).toBe(403);
       expect(
         (await server.app.handle(new Request("http://localhost/list", { headers }))).status,
       ).toBe(200);
@@ -1354,7 +1354,34 @@ describe("createToolServer", () => {
             }),
           )
         ).status,
-      ).toBe(500);
+      ).toBe(403);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("keeps authentication dependency failures retryable", async () => {
+    const server = createToolServer({
+      tools: [],
+      requestMessageCache: {
+        get: () => {
+          throw new Error("cache unavailable");
+        },
+      },
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/list", {
+          headers: {
+            "x-lilac-request-id": "request-1",
+            "x-lilac-session-id": "channel-1",
+            "x-lilac-request-client": "discord",
+            "x-lilac-cwd": "/workspace",
+          },
+        }),
+      );
+      expect(response.status).toBe(503);
     } finally {
       await server.stop();
     }
@@ -1408,7 +1435,7 @@ describe("createToolServer", () => {
           },
         }),
       );
-      expect(response.status).toBe(500);
+      expect(response.status).toBe(403);
     } finally {
       await server.stop();
     }
@@ -1451,7 +1478,7 @@ describe("createToolServer", () => {
           },
         }),
       );
-      expect(response.status).toBe(500);
+      expect(response.status).toBe(403);
     } finally {
       await server.stop();
     }
@@ -1691,7 +1718,7 @@ describe("createToolServer", () => {
             }),
           )
         ).status,
-      ).toBe(500);
+      ).toBe(403);
       expect(
         await (await server.app.handle(new Request("http://localhost/list", { headers }))).json(),
       ).toMatchObject({ tools: [{ callableId: "workflow.operator-test" }] });
