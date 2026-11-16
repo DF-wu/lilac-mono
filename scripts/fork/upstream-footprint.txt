@@ -29,6 +29,7 @@ apps/core/src/github/webhook/github-webhook-server.ts  # final publication polic
 apps/core/src/runtime/compose-builtin-surface-runtimes.ts  # includes the Telegram runtime descriptor entry
 apps/core/src/runtime/create-core-runtime.ts  # constructs and registers the Telegram surface module
 apps/core/src/runtime/main.ts  # settles Core creation/start Results through the fork-owned startCoreRuntime helper
+apps/core/src/ssh/ssh-exec.ts  # bounds output draining after a terminated client exits while a ControlMaster holds stdio (#117)
 apps/core/src/surface/adapter.ts  # adds the optional attachment-resolver capability and resolve-attachment operation
 apps/core/src/surface/bridge/bus-agent-runner.ts  # labels telegram requests for conversation recall
 apps/core/src/surface/bridge/bus-agent-runner/auto-inject-thread-search.ts  # F01–F08/F14/F15: Surface registration/origin/resource seams on current upstream shared owners
@@ -69,6 +70,7 @@ apps/core/tests/github/github-webhook-dispatch.test.ts  # F19: Final publication
 apps/core/tests/heartbeat/heartbeat-service.test.ts  # machine-independent quiet-hours timezone test
 apps/core/tests/runtime/compose-builtin-surface-runtimes.test.ts  # covers the Telegram runtime entry
 apps/core/tests/runtime/config-schemas.test.ts  # verifies fork editor schema acceptance and removed image config diagnostics
+apps/core/tests/ssh/ssh-exec.test.ts  # covers settling a terminated SSH run whose output a detached process keeps open (#117)
 apps/core/tests/surface/authenticated-request.test.ts  # Telegram principals
 apps/core/tests/surface/bridge/adapter-event-projection.test.ts  # Telegram adapter events
 apps/core/tests/surface/bridge/bus-agent-runner-auto-inject.test.ts  # F01–F08/F14/F15: Surface registration/origin/resource seams on current upstream shared owners

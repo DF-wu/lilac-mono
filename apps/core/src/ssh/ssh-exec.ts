@@ -91,7 +91,7 @@ export class SshStreamReadError extends TaggedError("SshStreamReadError")<{
 }> {}
 
 export class SshStreamCleanupError extends TaggedError("SshStreamCleanupError")<{
-  readonly operation: "release_reader";
+  readonly operation: "release_reader" | "cancel_reader";
   readonly cause: unknown;
   readonly message: string;
 }> {}
@@ -275,6 +275,25 @@ function releaseStreamReader(
         message: "Failed to release the SSH output stream reader",
       }),
   });
+}
+
+function cancelStreamReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  void captureSshPromise({
+    run: () => reader.cancel(),
+    fallback: "Opaque SSH stream reader cancellation failure",
+    mapError: (cause) =>
+      new SshStreamCleanupError({
+        operation: "cancel_reader",
+        cause,
+        message: "Failed to cancel the SSH output stream reader",
+      }),
+  }).then((cancelled) =>
+    cancelled.match({
+      ok: () => undefined,
+      err: (error) =>
+        logger.debug("SSH stream reader cancellation failed", formatTaggedErrorForLog(error)),
+    }),
+  );
 }
 
 function reportStreamActivity(onActivity: () => void): ResultType<void, SshStreamReadError> {
@@ -543,13 +562,17 @@ function combineStreamReadAndCleanup(
 async function readReadableStreamTextCapped(
   stream: ReadableStream<Uint8Array>,
   maxChars: number,
-  options?: { overflowFilePath?: string; onActivity?: () => void },
+  options?: { overflowFilePath?: string; onActivity?: () => void; stopSignal?: AbortSignal },
 ): Promise<ResultType<StreamTextResult, SshStreamTextError>> {
   const acquired = acquireStreamReader(stream);
   return acquired.match({
     err: (error) => async () => Result.err(error),
     ok: (reader) => async () => {
       let releaseAttempted = false;
+      // A cancelled reader resolves its pending read as done, so the captured prefix is returned.
+      const stopReading = () => cancelStreamReader(reader);
+      if (options?.stopSignal?.aborted) stopReading();
+      options?.stopSignal?.addEventListener("abort", stopReading, { once: true });
 
       const outcome = await (async () => {
         const decoder = new TextDecoder();
@@ -670,6 +693,7 @@ async function readReadableStreamTextCapped(
           value: combineStreamReadAndCleanup(primary, releaseStreamReader(reader)),
         } as const;
       })().finally(() => {
+        options?.stopSignal?.removeEventListener("abort", stopReading);
         if (!releaseAttempted) {
           const released = releaseStreamReader(reader);
           released.match({
@@ -737,7 +761,7 @@ async function readBodyTextCapped(
 export async function readStreamTextCapped(
   stream: SshStreamTextSource,
   maxChars: number,
-  options?: { overflowFilePath?: string; onActivity?: () => void },
+  options?: { overflowFilePath?: string; onActivity?: () => void; stopSignal?: AbortSignal },
 ): Promise<ResultType<StreamTextResult, SshStreamTextError>> {
   if (stream === null || stream === undefined || typeof stream === "number") {
     return Result.ok({ text: "", totalChars: 0, capped: false });
@@ -923,7 +947,23 @@ export async function sshExecBash(params: {
   let child: ReturnType<typeof Bun.spawn> | null = null;
 
   const HARD_KILL_DELAY_MS = 2000;
+  // An OpenSSH ControlMaster holds the client's stdio descriptors in its own session, so they can
+  // stay open until the remote command ends even after the terminated client has exited.
+  const OUTPUT_DRAIN_AFTER_TERMINATION_MS = 2000;
   let hardKillTimer: ReturnType<typeof setTimeout> | null = null;
+  let childExited = false;
+  let outputDrainTimer: ReturnType<typeof setTimeout> | null = null;
+  const outputStop = new AbortController();
+  const scheduleOutputStop = () => {
+    if (!termination || !childExited || outputDrainTimer) return;
+    outputDrainTimer = setTimeout(() => {
+      logger.debug("SSH output stayed open after the terminated client exited; stopping capture", {
+        termination,
+      });
+      outputStop.abort();
+    }, OUTPUT_DRAIN_AFTER_TERMINATION_MS);
+    outputDrainTimer.unref?.();
+  };
   const scheduleHardKill = () => {
     if (hardKillTimer) return;
     hardKillTimer = setTimeout(() => {
@@ -944,6 +984,7 @@ export async function sshExecBash(params: {
       observeBestEffortProcessCleanup(killProcessGroupBestEffort(pid, "SIGTERM"));
       scheduleHardKill();
     }
+    scheduleOutputStop();
   };
 
   let abortListener: (() => void) | null = null;
@@ -968,6 +1009,10 @@ export async function sshExecBash(params: {
     if (hardKillTimer && !termination) {
       clearTimeout(hardKillTimer);
       hardKillTimer = null;
+    }
+    if (outputDrainTimer) {
+      clearTimeout(outputDrainTimer);
+      outputDrainTimer = null;
     }
   };
 
@@ -1024,14 +1069,20 @@ export async function sshExecBash(params: {
           ? `${params.overflowOutputPath}.stdout.part`
           : undefined,
         onActivity: params.onActivity,
+        stopSignal: outputStop.signal,
       }),
       readStreamTextCapped(child.stderr, params.maxOutputChars, {
         overflowFilePath: params.overflowOutputPath
           ? `${params.overflowOutputPath}.stderr.part`
           : undefined,
         onActivity: params.onActivity,
+        stopSignal: outputStop.signal,
       }),
-      waitForSshExit(child.exited),
+      waitForSshExit(child.exited).then((exit) => {
+        childExited = true;
+        scheduleOutputStop();
+        return exit;
+      }),
     ]);
     stopWatchingExecution();
 
