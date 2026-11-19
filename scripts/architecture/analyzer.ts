@@ -2665,9 +2665,13 @@ function handlerObjectConsumers(
   checker: ts.TypeChecker,
   packageRoots: readonly WorkspacePackageRoot[],
 ): ts.CallExpression[] {
-  const parent = handlers.parent;
+  let parent = handlers.parent;
+  while (ts.isExpression(parent) && unwrapExpression(parent) === handlers) {
+    parent = parent.parent;
+  }
   if (ts.isCallExpression(parent)) {
-    return resultContinuationMatch(parent, checker, packageRoots) === handlers ? [parent] : [];
+    const argument = resultContinuationMatch(parent, checker, packageRoots);
+    return argument && unwrapExpression(argument) === handlers ? [parent] : [];
   }
   if (!ts.isVariableDeclaration(parent) || !ts.isIdentifier(parent.name)) return [];
   const symbol = checker.getSymbolAtLocation(parent.name);

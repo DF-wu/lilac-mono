@@ -51,6 +51,7 @@ export interface WorkflowProgressCardService {
   resolveTarget(platform: string): RegisteredSurfacePlatform | null;
   ensureInitialCard(runId: string): Promise<MsgRef>;
   requestProjection(runId: string): void;
+  isTargetAuthorized?(target: WorkflowProgressTarget): Promise<boolean>;
 }
 
 type CachedActions = {
@@ -269,9 +270,25 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       retryIntervalMs?: number;
       reconciliationBatchSize?: number;
       scheduleTimeout?: (callback: () => void, delayMs: number) => WorkflowProgressScheduledTimeout;
+      isTargetAuthorized?: (target: WorkflowProgressTarget) => boolean | Promise<boolean>;
       reportFatalPanic: (panic: Panic) => void;
     },
   ) {}
+
+  async isTargetAuthorized(target: WorkflowProgressTarget): Promise<boolean> {
+    return (await this.input.isTargetAuthorized?.(target)) ?? true;
+  }
+
+  private async targetAuthorizationResult(
+    target: WorkflowProgressTarget,
+  ): Promise<WorkflowProgressProjectionResult<void>> {
+    if (await this.isTargetAuthorized(target)) return Result.ok(undefined);
+    return Result.err(
+      workflowProgressProjectionFailure(
+        `Workflow progress target is no longer authorized: ${target.platform}:${target.channelId}`,
+      ),
+    );
+  }
 
   private superviseDetached(effect: () => Promise<void>, event: string): void {
     const operation = Promise.resolve().then(effect);
@@ -838,6 +855,12 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         ),
       );
     }
+    const initiallyAuthorized = await this.targetAuthorizationResult(target);
+    const initialAuthorizationError = initiallyAuthorized.match({
+      ok: () => null,
+      err: (error) => error,
+    });
+    if (initialAuthorizationError) return Result.err(initialAuthorizationError);
     const registration = findWorkflowProgressPort(this.input.ports, target.platform);
     const existingResult = this.input.store.getSurfaceBinding(runId);
     const existingOutcome = existingResult.match<
@@ -1028,6 +1051,9 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
 
     let projected: ResultType<MsgRef, WorkflowProgressSurfaceFailure>;
     if (messageRef) {
+      const authorized = await this.targetAuthorizationResult(target);
+      const authorizationError = authorized.match({ ok: () => null, err: (error) => error });
+      if (authorizationError) return Result.err(authorizationError);
       const edited = await port.edit(
         { channelId: messageRef.channelId, messageId: messageRef.messageId },
         content,
@@ -1057,6 +1083,9 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
         },
       });
     } else {
+      const authorized = await this.targetAuthorizationResult(target);
+      const authorizationError = authorized.match({ ok: () => null, err: (error) => error });
+      if (authorizationError) return Result.err(authorizationError);
       const sent: ResultType<
         MsgRef,
         WorkflowProgressSendFailure<RegisteredSurfacePlatform>

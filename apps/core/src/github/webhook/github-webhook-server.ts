@@ -26,6 +26,7 @@ import {
   claimGithubAcknowledgement,
   getGithubLatestRequestForSession,
   getGithubRequestMeta,
+  hasGithubPendingReviewInterrupt,
   restoreGithubLatestRequestForSession,
   rollbackGithubAcknowledgementClaim,
   setGithubAck,
@@ -36,6 +37,7 @@ import {
   getGithubAck,
 } from "../github-state";
 import { isMarkedGithubAgentComment, markGithubAgentComment } from "../github-comment-marker";
+import { NO_REPLY_TOKEN } from "../../surface/bridge/reply-directive";
 import { parseGithubWorkflowActionReply } from "../../surface/github/github-actions";
 import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
 import { adaptToolResultToHost } from "../../tools/tool-result-adapters";
@@ -380,7 +382,11 @@ function buildIssuePrompt(input: {
     comments ? "Recent comments:" : "Recent comments: (none)",
     comments || "",
     "",
-    "Reply in this thread with the final answer.",
+    "Response publication policy:",
+    "- Lilac automatically publishes your final response in this GitHub thread.",
+    "- Do not use `gh`, GitHub APIs, or `surface.messages.send` to publish the same final answer.",
+    "- You may still perform GitHub write operations required by the user's task.",
+    `- If you intentionally publish the final answer directly as a GitHub comment or review, return exactly ${NO_REPLY_TOKEN} and nothing else.`,
   ]
     .filter((l) => l !== "")
     .join("\n");
@@ -420,8 +426,11 @@ function buildPrReviewPrompt(input: {
     `   - Approve: gh pr review ${input.prNumber} --repo ${input.repoFullName} --approve --body "..."`,
     `   - Request changes: gh pr review ${input.prNumber} --repo ${input.repoFullName} --request-changes --body "..."`,
     "",
-    "Output:",
-    "- Post a single comment in the PR conversation with your review.",
+    "Response publication policy:",
+    "- The `gh pr review` submission is the only GitHub publication for a completed review.",
+    `- After a successful review submission, return exactly ${NO_REPLY_TOKEN} and nothing else so Lilac does not publish a duplicate comment.`,
+    "- If the head SHA changed or no review was submitted, return an explanatory final response; Lilac will publish it automatically.",
+    "- Do not also publish the review with `gh pr comment`, the issue comment API, or `surface.messages.send`.",
   ].join("\n");
 }
 
@@ -563,6 +572,7 @@ export function createGithubWebhookApp(options: {
 
   function dedupe(deliveryId: string | undefined): boolean {
     if (!deliveryId) return false;
+    if (hasGithubPendingReviewInterrupt(githubDeliveryId(deliveryId, "interrupt"))) return false;
     const now = Date.now();
     for (const [k, exp] of seen) {
       if (exp <= now) seen.delete(k);

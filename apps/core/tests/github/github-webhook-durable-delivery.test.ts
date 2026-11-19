@@ -65,6 +65,7 @@ async function fixture(dbPath = ":memory:") {
   });
   const publications: CorePreparedRequestEnvelope[] = [];
   let failPublication = false;
+  let failedQueue: string | undefined;
   const unexpected = async (): Promise<never> => {
     throw new Error("Unexpected external operation");
   };
@@ -74,11 +75,12 @@ async function fixture(dbPath = ":memory:") {
       return { status: "acquired", claim: { requestDeliveryId, token: crypto.randomUUID() } };
     },
     async publishClaimedRequest(message, options, claim) {
-      if (failPublication) throw new Error("Synthetic transport failure");
       const envelope = corePreparedRequestEnvelopeSchema.parse({
         headers: options.headers,
         data: message.data,
       });
+      if (failPublication && (!failedQueue || failedQueue === envelope.data.queue))
+        throw new Error("Synthetic transport failure");
       expect(value(store.load(claim.requestDeliveryId)).state).toBe("prepared");
       publications.push(envelope);
       const id = `${publications.length}-0`;
@@ -154,8 +156,12 @@ async function fixture(dbPath = ":memory:") {
     api,
     session,
     run,
-    failPublication: () => {
+    failPublication: (queue?: string) => {
       failPublication = true;
+      failedQueue = queue;
+    },
+    allowPublication: () => {
+      failPublication = false;
     },
     changeHead: () => {
       sha = "head-2";
@@ -253,6 +259,73 @@ describe("GitHub webhook durable delivery", () => {
     expect(getGithubAck(replacement.requestId!)?.reactionId).toBe(42);
     expect(getGithubLatestRequestForSession(f.session)).toBe(replacement.requestId);
     expect(f.deleted).toEqual([]);
+  });
+
+  it("retries a pending review interrupt after the prompt receipt is durable", async () => {
+    const f = await fixture();
+    await f.run("pull_request", f.review, "pending-first");
+    f.changeHead();
+    f.failPublication("interrupt");
+    const attempts = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+    let calls = 0;
+    const app = createGithubWebhookApp({
+      secret: "test-secret",
+      path: "/webhook",
+      logger: createLogger({ module: "pending-interrupt-test" }),
+      hasPublishedRequest: (id) => f.store.hasReceipt(id),
+      reportFatalError: (error) => {
+        throw error;
+      },
+      handle: async (event, _projected, deliveryId) => {
+        const attempt = calls++;
+        try {
+          await f.run(
+            event,
+            {
+              ...f.review,
+              action: "synchronize",
+              pull_request: { number: 1, head: { sha: "head-2" } },
+            },
+            deliveryId,
+          );
+        } finally {
+          attempts[attempt]?.resolve();
+        }
+      },
+    }).compile();
+    const body = JSON.stringify({
+      ...f.review,
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "head-2" } },
+    });
+    const send = async () => {
+      const response = await app.handle(
+        new Request("http://localhost/webhook", {
+          method: "POST",
+          body,
+          headers: {
+            "content-type": "application/json",
+            "x-github-event": "pull_request",
+            "x-github-delivery": "pending-retry",
+            "x-hub-signature-256": `sha256=${createHmac("sha256", "test-secret").update(body).digest("hex")}`,
+          },
+        }),
+      );
+      return response.json();
+    };
+    expect(await send()).toEqual({ ok: true });
+    await attempts[0]!.promise;
+    expect(f.publications.map((entry) => entry.data.queue)).toEqual(["prompt", "prompt"]);
+    f.allowPublication();
+    expect(await send()).toEqual({ ok: true });
+    await attempts[1]!.promise;
+    expect(f.publications.map((entry) => entry.data.queue)).toEqual([
+      "prompt",
+      "prompt",
+      "interrupt",
+    ]);
+    expect(await send()).toEqual({ ok: true, deduped: true });
+    expect(calls).toBe(2);
   });
 
   it("keeps generated UUIDs for missing and empty delivery headers", async () => {

@@ -14,6 +14,9 @@ import type { RegisteredSurfacePlatform } from "../../src/surface/types";
 import { createOrchestrateTool, type OrchestrateToolOptions } from "../../src/tools/orchestrate";
 import type { SubagentDelegationRegistration } from "../../src/tools/subagent";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
+import { WorkflowSubagentDispatcher } from "../../src/workflow/workflow-subagent-dispatcher";
+import { subagentFollowUpRegistration } from "../../src/workflow/subagent-follow-up";
+import { createDurableCoreRequestBus } from "../../src/surface/bridge/request-delivery";
 import {
   canonicalJsonSha256,
   sha256,
@@ -24,7 +27,10 @@ import type {
   WorkflowRevision,
   WorkflowRun,
 } from "../../src/workflow/workflow-domain";
-import { workflowSourceArtifactReferenceForTest } from "../workflow/workflow-test-blob-store";
+import {
+  createWorkflowTestBlobStore,
+  workflowSourceArtifactReferenceForTest,
+} from "../workflow/workflow-test-blob-store";
 import { workflowStoreValue } from "../workflow/workflow-store-test-helpers";
 import { createRealCoreBusFixture, requireBusOk, withBusDeadline } from "../helpers/real-core-bus";
 
@@ -697,6 +703,109 @@ describe("orchestrate tool", () => {
 
     expect(await call(built, send)).toMatchObject({ disposition: "steered", runId: child.runId });
     expect(launches).toHaveLength(0);
+  });
+
+  it("keeps concurrent keyed auto sends on one outcome while the child ends", async () => {
+    const child = seedRun({ id: "keyed-ending", subagent: { parentSessionId: PARENT_SESSION } });
+    const fixture = await createRealCoreBusFixture();
+    const blobStore = await createWorkflowTestBlobStore();
+    const dispatcher = WorkflowSubagentDispatcher.create({ store, blobStore, dataDir: dir });
+    let live = true;
+    const acquire = fixture.publisher.acquire.bind(fixture.publisher);
+    fixture.publisher.acquire = async (...args) => {
+      live = false;
+      store.cancelRunAndChildren({ runId: child.runId, now: Date.now(), detail: "child ended" });
+      return acquire(...args);
+    };
+    const options: Partial<OrchestrateToolOptions> = {
+      bus: createDurableCoreRequestBus({
+        transportBus: fixture.transportBus,
+        coordinator: fixture.coordinator,
+        publisher: fixture.publisher,
+      }),
+      requestDeliveryKnown: (id) =>
+        fixture.store.load(id).match({ ok: () => true, err: () => false }),
+      liveSubagents: () => ({
+        readSubagentSnapshot: () =>
+          live ? { messages: [], streaming: true, title: "Working" } : undefined,
+      }),
+      delegate: (registration) =>
+        dispatcher.delegate({
+          ...registration,
+          projectRoot: dir,
+          fallbackSurface: { platform: "native", userId: "owner", sessionId: PARENT_SESSION },
+        }),
+    };
+    try {
+      const command = { action: "send", id: child.runId, message: "once", commandId: "ending" };
+      const results = await Promise.all([
+        call(build(options), command),
+        call(build(options), command),
+      ]);
+      const requests = requireBusOk(
+        await fixture.bus.fetchTopic("cmd.request", {
+          offset: { type: "begin" },
+          limit: 10,
+        }),
+      ).messages;
+      expect(requests).toHaveLength(1);
+      const envelope = corePreparedRequestEnvelopeSchema.parse({
+        data: requests[0]!.msg.data,
+        headers: requests[0]!.msg.headers,
+      });
+      const run = workflowStoreValue(store.getRun(child.runId))!;
+      const revision = workflowStoreValue(store.getRevision(run.revisionId))!;
+      const registration = subagentFollowUpRegistration({
+        run,
+        revision,
+        policy: null,
+        task: "once",
+        idleTimeoutMs: 60_000,
+        requestDeliveryId: envelope.data.requestDeliveryId,
+        sender: { parentRequestId: primaryContext().requestId, parentToolCallId: "tool-call" },
+      })!;
+      await dispatcher.delegate(registration);
+      expect(results[1]).toEqual(results[0]);
+      expect(results[0]).toMatchObject({ disposition: "steered", runId: child.runId });
+      expect(await call(build(options), command)).toEqual(results[0]);
+      expect(workflowStoreValue(store.listSubagentRuns(PARENT_SESSION))).toHaveLength(2);
+    } finally {
+      await fixture.close();
+      await blobStore.close({ deadlineAtMs: Date.now() + 5000 });
+    }
+  });
+
+  it("lets a queued keyed retry proceed after delegation fails", async () => {
+    const child = seedRun({
+      id: "keyed-failure",
+      subagent: { parentSessionId: PARENT_SESSION },
+      finished: { result: "done" },
+    });
+    let attempts = 0;
+    const options: Partial<OrchestrateToolOptions> = {
+      delegate: async () => {
+        if (++attempts === 1) throw new Error("invocation was not accepted");
+        return {
+          runId: "wfrun:subagent:retried",
+          completion: new Promise(() => {}),
+          cancel: async () => {},
+        };
+      },
+    };
+    const command = { action: "send", id: child.runId, message: "retry", commandId: "failure" };
+    const results = await Promise.allSettled([
+      call(build(options), command),
+      call(build(options), command),
+    ]);
+    expect(results[0]).toMatchObject({
+      status: "rejected",
+      reason: expect.objectContaining({ message: "invocation was not accepted" }),
+    });
+    expect(results[1]).toMatchObject({
+      status: "fulfilled",
+      value: { disposition: "started", runId: "wfrun:subagent:retried" },
+    });
+    expect(attempts).toBe(2);
   });
 
   it("finds a keyed follow-up beyond the newest page of subagent runs", async () => {

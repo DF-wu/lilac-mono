@@ -78,3 +78,29 @@ export function rejectNestedContinuationThroughNamedHandlers(text: string): numb
   };
   return readCount(text).match<() => number>(handlers)();
 }
+
+export function rejectNestedContinuationThroughParenthesizedHandlers(text: string): number {
+  // Keep parentheses to exercise handler initializer wrappers.
+  // oxfmt-ignore
+  const handlers = ({
+    err: () => stop,
+    ok: (first: number) => () =>
+      readCount(String(first)).match<() => number>({
+        err: () => stop,
+        ok: (second) => () => first + second,
+      })(),
+  });
+  return readCount(text).match<() => number>(handlers)();
+}
+
+export function rejectNestedContinuationThroughSatisfiesHandlers(text: string): number {
+  const handlers = {
+    err: () => stop,
+    ok: (first: number) => () =>
+      readCount(String(first)).match<() => number>({
+        err: () => stop,
+        ok: (second) => () => first + second,
+      })(),
+  } satisfies { err: (error: Error) => () => number; ok: (value: number) => () => number };
+  return readCount(text).match<() => number>(handlers)();
+}

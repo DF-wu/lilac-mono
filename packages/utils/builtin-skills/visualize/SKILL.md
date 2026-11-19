@@ -20,7 +20,22 @@ Lilac saves a copy of that one file when your response ends, so the reader sees 
 
 ## Output location
 
-Save previews at `<DATA_DIR>/outputs/visualize/<unique-name>/index.html`, with any source assets beside the HTML. Resolve the active Core `DATA_DIR` from its runtime environment; `/data` above is an example. Use the absolute path as seen by Core, which may differ from the host path when Core runs in a container. When your file tools are limited to `/tmp`, as in restricted mode, save under `/tmp/outputs/visualize/<unique-name>/index.html` and put that `/tmp` path in the fence.
+For a trusted run in a thread started by a trusted user, save previews at `<DATA_DIR>/outputs/visualize/<unique-name>/index.html`, with any source assets beside the HTML. Resolve the active Core `DATA_DIR` from its runtime environment; `/data` above is an example. Use the absolute path as seen by Core, which may differ from the host path when Core runs in a container.
+
+For a restricted run, or any thread started by a restricted user, the preview reader uses the producing run's session `/tmp`. Put `/tmp/outputs/visualize/<unique-name>/index.html` in the fence. Restricted file tools already map that virtual path to the session directory, so write it directly with those tools.
+
+A trusted shell in a restricted-started thread sees host `/tmp` instead. It must write into the session's backing directory. Run this in the producing run's local Core shell to find that directory using the injected session ID:
+
+```sh
+bun -e '
+import { createHash } from "node:crypto";
+const session = process.env.LILAC_SESSION_ID?.trim();
+if (!session) throw new Error("The producing run must supply LILAC_SESSION_ID");
+console.log("/tmp/lilac-restricted/" + createHash("sha256").update(session).digest("hex").slice(0, 32));
+'
+```
+
+Write to `<printed-directory>/outputs/visualize/<unique-name>/index.html`, but keep the virtual `/tmp/outputs/visualize/<unique-name>/index.html` path in the fence. Neither a `DATA_DIR` path nor a file written directly to host `/tmp/outputs` works for this case. Bun availability alone does not identify the thread starter's access policy.
 
 Create a directory with a descriptive name and a unique suffix for each new visualization. Reuse that directory for revisions of the same visualization. Editing the source after a reply ends does not update its saved preview; reference the file in a new reply to capture the revision. Keep these sources together in this output directory unless the user explicitly chooses another destination.
 
@@ -39,7 +54,16 @@ The [Bun helper](scripts/build.ts) is in the `scripts` directory beside this `SK
 bun <skill-dir>/scripts/build.ts <preview-dir>/page.html <preview-dir>/index.html
 ```
 
-The helper replaces the URL in `<script src>`, `<link rel="stylesheet">`, and `<img src>` with a `data:` URL when it is a relative or absolute local path. Other attributes, such as `defer` and `media`, stay. Remote `https:` URLs, `data:` URLs, `file:` URLs, `srcset`, and HTML entities stay as written. It stops without writing when a referenced local file is missing. It does not rewrite `url()` inside CSS, so put CSS images and fonts in `data:` URLs. Preview the output file, not the source page.
+The helper replaces the URL in `<script src>`, `<link rel="stylesheet">`, and `<img src>` with a `data:` URL when it is a relative or absolute local path. Other attributes, such as `defer` and `media`, stay. It decodes HTML character references, such as `&amp;`, `&#32;`, and `&#x20;`, before interpreting the URL, trims surrounding URL whitespace, then percent-decodes the local filename. Percent-encoded filename spaces survive. Recognized named character references without semicolons are rejected; terminate them with `;`, write literal ampersands as `&amp;`, or percent-encode the filename instead.
+
+Remote `https:` URLs, `data:` URLs, `file:` URLs, and `srcset` stay as written. The helper stops without writing when a referenced local file is missing or the page contains `<base href>`. Remove every `<base href>` and make local paths relative to the source HTML before building.
+
+The helper only replaces those HTML attribute URLs; prepare nested dependencies first:
+
+- **JavaScript modules:** bundle local static imports, re-exports, and dynamic imports into one browser script before referencing it with `<script src>`. For example, use `bun build <preview-dir>/app.ts --target=browser --outfile=<preview-dir>/app.js` without code splitting, then reference `app.js`. The helper does not follow imports or rewrite import specifiers inside scripts. A relative import inside a `data:` module cannot resolve against the original source file.
+- **CSS:** flatten local `@import` rules into the stylesheet first. Put images and fonts used by CSS `url()` into `data:` URLs, or use absolute remote `https:` URLs. The helper does not follow `@import` or rewrite `url()`; relative URLs inside the resulting `data:` stylesheet have no local file base.
+
+Preview the output file, not the source page.
 
 ## Inline constraints
 

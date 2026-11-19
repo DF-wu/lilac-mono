@@ -281,7 +281,10 @@ import {
   maybeMarkOldToolOutputsCompacted,
   scrubLargeBinaryForModelView,
 } from "./bus-agent-runner/tool-output-policy";
-import { maybeBuildAutoInjectedThreadSearchMessages } from "./bus-agent-runner/auto-inject-thread-search";
+import {
+  conversationSurfaceOfRequestClient,
+  maybeBuildAutoInjectedThreadSearchMessages,
+} from "./bus-agent-runner/auto-inject-thread-search";
 import {
   appendAutoInjectedThreadSearchLineage,
   corePrimaryLineageHasCompactionCheckpoint,
@@ -327,6 +330,7 @@ export {
   AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH,
   type AutoInjectedThreadSearchPayload,
   buildAutoInjectedThreadSearchMessages,
+  conversationSurfaceOfRequestClient,
   maybeBuildAutoInjectedThreadSearchMessages,
 } from "./bus-agent-runner/auto-inject-thread-search";
 export {
@@ -2371,16 +2375,6 @@ export async function startBusAgentRunner(params: {
               if (state.running) return routeBehindOtherRequest();
               return routeToIdleSession();
             };
-            const dropControlForEndedRun = async (): Promise<void> => {
-              logQueueTransition({
-                action: "drop",
-                queueDepthBefore: state.queue.length,
-                queueDepthAfter: state.queue.length,
-                reason: "target_run_ended",
-              });
-              if (await terminalizeProjectedDelivery("abandoned", "control-target-absent")) return;
-              if (intakeError) signalBusAgentRunnerHostFailure(intakeError);
-            };
             const controlTargetFor = (
               runningAgent: AiSdkPiAgent<ToolSet>,
             ): RunningAgentControlTarget => {
@@ -2388,7 +2382,7 @@ export async function startBusAgentRunner(params: {
               return {
                 isCurrent: () => state.activeRun === targetRun && state.agent === runningAgent,
                 acceptsInput: () => targetRun?.acceptsInput === true,
-                dropEnded: dropControlForEndedRun,
+                dropEnded: routeAfterTargetEnded,
               };
             };
 
@@ -3085,6 +3079,7 @@ export async function startBusAgentRunner(params: {
           revision,
           policy,
           task,
+          requestDeliveryId: entry.requestDeliveryId ?? entry.queueEntryId,
           idleTimeoutMs: deriveSubagentIdleTimeoutMs(cfg.agent.idleTimeoutMs),
           sender,
         }),
@@ -5154,6 +5149,9 @@ export async function startBusAgentRunner(params: {
                 agent.state.modelSpecifier ?? activeBinding.resolved.spec,
               prepareFullModelView: toolPruneTransform,
               prepareFullBudgetView: fullBudgetTransform,
+              resolveCurrentInputCanonicalStart: () =>
+                (state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage)
+                  ?.currentCanonicalStart ?? null,
               baseTurnErrorHandler: turnErrorHandler,
               onServerCompactionError: reportServerCompactionError,
               onUnknownCapability: ({ spec, reason }) => {
@@ -6355,7 +6353,7 @@ export async function startBusAgentRunner(params: {
               !control.requiresActive
                 ? await waitForPreAgent(
                     maybeBuildAutoInjectedThreadSearchMessages({
-                      surface: next.requestClient === "native" ? "native" : "discord",
+                      surface: conversationSurfaceOfRequestClient(next.requestClient),
                       cfg,
                       conversationThreads:
                         next.requestClient === "native"
@@ -7005,6 +7003,7 @@ export async function startBusAgentRunner(params: {
         err: (error) => error,
       });
       if (runFailure) {
+        if (state.activeRun) state.activeRun.acceptsInput = false;
         if (requiresAgentRecovery()) {
           shouldTerminalizeRequest = false;
           preserveWorkflowClaim = true;

@@ -5,7 +5,11 @@ import {
 } from "@stanley2058/lilac-utils";
 
 import { Result } from "better-result";
+import { MockLanguageModelV4 } from "ai/test";
+import { createMemoryBlobStore } from "@stanley2058/lilac-blob-storage";
 
+import { prepareCoreProviderBinding } from "../../../src/agent/agent-composition";
+import { buildAgentRunSystemPrompt } from "../../../src/surface/bridge/bus-agent-runner/system-prompt";
 import {
   buildSystemPromptForProfile,
   resolveSubagentConversation,
@@ -120,6 +124,45 @@ describe("subagent permission profile prompts", () => {
     });
     expect(nested).toContain("The subagent run that delegated this task is wfrun:subagent:parent.");
   });
+
+  it.each(["claude-code", "openai"])(
+    "includes origin context in the %s provider prompt",
+    async (provider) => {
+      const resolved = {
+        provider,
+        modelId: "test",
+        spec: `${provider}/test`,
+        model: new MockLanguageModelV4({ modelId: "test" }),
+      };
+      const systemPrompt = buildAgentRunSystemPrompt({
+        cfg: config,
+        runProfile: "full",
+        requestClient: "native",
+        resolved,
+        editingToolMode: "apply_patch",
+        skillsSection: null,
+        additionalSessionPrompts: [],
+        messages: [],
+        safetyMode: "trusted",
+        sessionId: "child-session",
+        subagentConversation: { threadId: "origin-thread", parentRunId: "wfrun:subagent:parent" },
+      });
+      const blobStore = (await createMemoryBlobStore()).unwrap();
+      const binding = prepareCoreProviderBinding({
+        resolved,
+        reasoningDisplay: config.agent.reasoningDisplay,
+        systemPrompt,
+        sessionId: "child-session",
+        blobStore,
+      });
+      await blobStore.close({ deadlineAtMs: Date.now() + 1_000 });
+
+      expect(binding.agentSystem).toContain("The user's conversation thread id is origin-thread.");
+      expect(binding.agentSystem).toContain(
+        "The subagent run that delegated this task is wfrun:subagent:parent.",
+      );
+    },
+  );
 
   it("finds the parent run only when another subagent delegated", () => {
     const parentRequests: Record<string, string> = {

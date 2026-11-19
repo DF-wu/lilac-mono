@@ -59,41 +59,41 @@ describe("heartbeat through the production Redis bus", () => {
       requireBusOk(
         await fixture.bus.fetchTopic("cmd.request", { offset: { type: "begin" }, limit: 10 }),
       ).messages;
-    try {
-      await lifecycle("external", "discord-channel", "running");
-      await service.tick("interval");
-      expect(await requests()).toHaveLength(0);
-      await lifecycle("external", "discord-channel", "resolved");
-      now += 10;
-      await service.tick("retry");
-      await withBusDeadline(arrivals[0]!.promise, "first heartbeat request");
-      expect(received[0]).toMatchObject({
-        queue: "prompt",
-        runPolicy: "idle_only_global",
-        origin: { kind: "heartbeat", reason: "retry" },
-      });
-      expect(
-        requireBusOk(fixture.store.load(received[0]!.requestDeliveryId)).publication?.streamId,
-      ).toBeString();
-      await service.tick("interval");
-      expect(await requests()).toHaveLength(1);
-      const first = (await requests())[0]!;
-      expect(first.msg.headers).toMatchObject({
-        session_id: "__heartbeat__",
-        request_client: "unknown",
-      });
-      await lifecycle(first.msg.headers!.request_id!, "__heartbeat__", "resolved");
-      now += 10;
-      await service.tick("interval");
-      await withBusDeadline(arrivals[1]!.promise, "heartbeat after completion");
-      expect(received[1]!.requestDeliveryId).not.toBe(received[0]!.requestDeliveryId);
-      expect(await requests()).toHaveLength(2);
-    } finally {
+    await using cleanup = new AsyncDisposableStack();
+    cleanup.defer(async () => {
       const stopped = await service.stopOutcome();
       if (stopped.kind === "panic") throw stopped.panic;
       requireBusOk(stopped.result);
       requireBusOk(await subscription.stop());
       await fixture.close();
-    }
+    });
+    await lifecycle("external", "discord-channel", "running");
+    await service.tick("interval");
+    expect(await requests()).toHaveLength(0);
+    await lifecycle("external", "discord-channel", "resolved");
+    now += 10;
+    await service.tick("retry");
+    await withBusDeadline(arrivals[0]!.promise, "first heartbeat request");
+    expect(received[0]).toMatchObject({
+      queue: "prompt",
+      runPolicy: "idle_only_global",
+      origin: { kind: "heartbeat", reason: "retry" },
+    });
+    expect(
+      requireBusOk(fixture.store.load(received[0]!.requestDeliveryId)).publication?.streamId,
+    ).toBeString();
+    await service.tick("interval");
+    expect(await requests()).toHaveLength(1);
+    const first = (await requests())[0]!;
+    expect(first.msg.headers).toMatchObject({
+      session_id: "__heartbeat__",
+      request_client: "unknown",
+    });
+    await lifecycle(first.msg.headers!.request_id!, "__heartbeat__", "resolved");
+    now += 10;
+    await service.tick("interval");
+    await withBusDeadline(arrivals[1]!.promise, "heartbeat after completion");
+    expect(received[1]!.requestDeliveryId).not.toBe(received[0]!.requestDeliveryId);
+    expect(await requests()).toHaveLength(2);
   });
 });

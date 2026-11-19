@@ -1293,6 +1293,95 @@ it("lists bounded subagent pages for only the requested parent session, includin
 });
 
 describe("workflow audit recovery invariants", () => {
+  it("upgrades and reopens Telegram targets and atomic reply waits with durable cancellation", () => {
+    const file = dbPath("telegram-schema28");
+    let store = new DurableWorkflowStore(file);
+    const db = new Database(file);
+    const sessionId = "-100123:7";
+    const target = { platform: "telegram" as const, channelId: sessionId, replyToMessageId: "42" };
+    const match = {
+      kind: "reply" as const,
+      platform: "telegram" as const,
+      channelId: sessionId,
+      messageId: "42",
+      fromUserId: "user-1",
+    };
+    try {
+      workflowStoreValue(
+        store.createInvocation({
+          revision: revision(),
+          run: {
+            ...run(),
+            origin: { ...run().origin, client: "telegram", sessionId },
+            progressTarget: target,
+          },
+        }),
+      );
+      expect(store.tryClaimRun({ runId: "run-1", claimerId: "worker", now: 20 })).not.toBeNull();
+      expect(
+        store.createOperationAndWait(
+          { ...operation("run-1", "reply"), kind: "wait", state: "blocked" },
+          {
+            runId: "run-1",
+            operationId: "reply",
+            state: "pending",
+            match,
+            matchKey: `telegram:${sessionId}`,
+            dueAt: null,
+            deadlineAt: 1000,
+            resolverCursor: null,
+            result: null,
+            resolvedBy: null,
+            claimedBy: null,
+            claimedAt: null,
+            createdAt: 20,
+            updatedAt: 20,
+            resolvedAt: null,
+          },
+          "worker",
+        ),
+      ).toBe(true);
+      store.close();
+      db.run("DROP TRIGGER workflow_operation_cancellation_intent");
+      db.run("DROP TABLE workflow_cancellation_outbox");
+      db.run("DROP INDEX idx_workflow_runs_claim");
+      db.run("DROP INDEX idx_workflow_waits_deadline");
+      db.run("DELETE FROM workflow_schema_migrations WHERE version = 28");
+      store = new DurableWorkflowStore(file);
+      expect(store.listMigrations().at(-1)?.version).toBe(28);
+      expect(workflowStoreValue(store.getRun("run-1"))?.progressTarget).toEqual(target);
+      expect(workflowStoreValue(store.getWait("run-1", "reply"))?.match).toEqual(match);
+      expect(store.createOperation(operation("run-1", "agent"), "worker")).toBe(true);
+      db.run(
+        `INSERT INTO workflow_request_dispatches (request_id, run_id, operation_id, session_id, platform, policy_json, active, created_at, updated_at, dispatch_epoch)
+         VALUES ('telegram-request', 'run-1', 'agent', ?, 'telegram', '{}', 1, 20, 20, 'epoch')`,
+        [sessionId],
+      );
+      expect(
+        store.cancelRunAndChildren({ runId: "run-1", now: 30, detail: "cancelled" })?.state,
+      ).toBe("cancelled");
+      store.close();
+      store = new DurableWorkflowStore(file);
+      expect(workflowStoreValue(store.getWait("run-1", "reply"))).toMatchObject({
+        state: "cancelled",
+        match,
+      });
+      expect(store.pendingCancellations()).toEqual([
+        {
+          requestId: "telegram-request",
+          sessionId,
+          deliveryId: "workflow-cancel:telegram-request:epoch",
+        },
+      ]);
+      store.completeCancellation("workflow-cancel:telegram-request:epoch");
+      expect(store.pendingCancellations()).toEqual([]);
+    } finally {
+      db.close();
+      store.close();
+      rmSync(file, { force: true });
+    }
+  });
+
   it("enforces the revision agent budget in the insert and sums usage past a page", () => {
     const store = new DurableWorkflowStore(":memory:");
     const rev = revision();

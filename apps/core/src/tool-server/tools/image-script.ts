@@ -8,6 +8,10 @@ import { readSanitizedStreamTextCappedResult } from "../../tools/bash-output-san
 import { redactSecrets } from "../../tools/bash-safety/format";
 import { preserveToolPanic } from "../../tools/tool-result-adapters";
 import type { ServerToolCallOptions } from "../types";
+import {
+  configuredOpenAICompatibleImageProvider,
+  OPENAI_COMPATIBLE_IMAGE_PROVIDER,
+} from "./image-script-openai-compatible";
 
 const IMAGE_PROVIDER_DEFAULT_URLS = {
   openai: "https://api.openai.com/v1",
@@ -16,7 +20,12 @@ const IMAGE_PROVIDER_DEFAULT_URLS = {
 } as const;
 
 type ImageProviderName = keyof typeof IMAGE_PROVIDER_DEFAULT_URLS;
-type ImageProviders = Partial<Record<ImageProviderName, { baseURL: string; apiKey?: string }>>;
+type ImageProviders = Partial<
+  Record<
+    ImageProviderName | typeof OPENAI_COMPATIBLE_IMAGE_PROVIDER,
+    { baseURL: string; apiKey?: string }
+  >
+>;
 
 export function configuredImageProviders(): ImageProviders {
   const providers: ImageProviders = {};
@@ -30,6 +39,8 @@ export function configuredImageProviders(): ImageProviders {
       ...(apiKey ? { apiKey } : {}),
     };
   }
+  const compatible = configuredOpenAICompatibleImageProvider();
+  if (compatible) providers[OPENAI_COMPATIBLE_IMAGE_PROVIDER] = compatible;
   return providers;
 }
 

@@ -109,37 +109,43 @@ describe("applyToRunningAgent", () => {
     expect([...cancelled]).toEqual(["request"]);
   });
 
-  it("drops a deferred idle interrupt whose run ended before it ran", async () => {
-    const { agent, calls } = countingAgent();
-    let current = true;
-    let dropped = 0;
-    const retained: string[] = [];
-    const pending: { operation?: () => Promise<void> } = {};
-    const applied = await applyToRunningAgent(
-      agent,
-      controlEntry("interrupt", "late interrupt"),
-      new Set(),
-      fakeActiveRun(null),
-      (checkpoint) => retained.push(checkpoint.kind),
-      (operation) => {
-        pending.operation = operation;
-      },
-      {
-        isCurrent: () => current,
-        acceptsInput: () => true,
-        dropEnded: async () => {
-          dropped += 1;
+  it.each(["ended", "finalizing"])(
+    "routes deferred idle interrupt input after its run is %s",
+    async (phase) => {
+      const { agent, calls } = countingAgent();
+      let current = true;
+      const routed: Enqueued[] = [];
+      let accepting = true;
+      const retained: string[] = [];
+      const pending: { operation?: () => Promise<void> } = {};
+      const entry = controlEntry("interrupt", "late interrupt");
+      const applied = await applyToRunningAgent(
+        agent,
+        entry,
+        new Set(),
+        fakeActiveRun(null),
+        (checkpoint) => retained.push(checkpoint.kind),
+        (operation) => {
+          pending.operation = operation;
         },
-      },
-    );
-    current = false;
-    expect(pending.operation).toBeDefined();
-    await pending.operation?.();
-    await agent.waitForIdle();
+        {
+          isCurrent: () => current,
+          acceptsInput: () => accepting,
+          dropEnded: async () => {
+            routed.push(entry);
+          },
+        },
+      );
+      if (phase === "ended") current = false;
+      else accepting = false;
+      expect(pending.operation).toBeDefined();
+      await pending.operation?.();
+      await agent.waitForIdle();
 
-    expect(calls.count).toBe(0);
-    expect(retained).toEqual([]);
-    expect(dropped).toBe(1);
-    expect(applied).toBe("applied");
-  });
+      expect(calls.count).toBe(0);
+      expect(retained).toEqual([]);
+      expect(routed).toEqual([entry]);
+      expect(applied).toBe("applied");
+    },
+  );
 });

@@ -382,6 +382,49 @@ describe("flat control flow syntax", () => {
     expect(violations.map(({ kind, line }) => [kind, line])).toEqual([["repeated-condition", 22]]);
   });
 
+  it("keeps repeated conditions after initialized function-scoped var writes", () => {
+    const violations = findRedundantBranchViolations(
+      `
+        function reassigned() {
+          var ready = true;
+          if (ready) { var ready = false; }
+          if (ready) second();
+        }
+        function destructured() {
+          var ready = true;
+          if (ready) { var { ready } = { ready: false }; }
+          if (ready) second();
+        }
+        function uninitialized() {
+          var ready = true;
+          if (ready) { var ready; }
+          if (ready) second();
+        }
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind, line }) => [kind, line])).toEqual([["repeated-condition", 15]]);
+  });
+
+  it("keeps repeated member reads that can invoke changing getters", () => {
+    const violations = findRedundantBranchViolations(
+      `
+        let reads = 0;
+        const state = { get ready() { return ++reads === 1; } };
+        if (state.ready) { const first = true; }
+        if (state.ready) second();
+        if (state["ready"]) { const first = true; }
+        if (state["ready"]) second();
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations).toEqual([]);
+  });
+
   it("removes else branches after direct terminal statements", () => {
     const violations = findElseAfterTerminalViolations(
       `

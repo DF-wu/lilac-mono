@@ -1,3 +1,5 @@
+import { expandTilde } from "@stanley2058/lilac-fs";
+
 import { DEFAULT_FS_DENY_PATHS } from "../fs/deny-paths";
 
 import { createRemoteFileSystemHost } from "../../ssh/remote-filesystem-host";
@@ -30,7 +32,9 @@ export async function remoteApplyPatch(params: {
   const parsed = hunks.value;
   if (!host) return { ok: false, error: "remote host unavailable" };
 
-  const applied = await applyHunksResult(params.cwd, parsed, {
+  const canonical = await host.realpath(expandTilde(params.cwd, host.homeDir));
+  if (canonical.isErr()) return { ok: false, error: canonical.error.message };
+  const applied = await applyHunksResult(canonical.value, parsed, {
     denyPaths,
     signal: params.signal,
     host,

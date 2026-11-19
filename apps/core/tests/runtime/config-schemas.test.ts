@@ -83,6 +83,25 @@ test("Core schemas accept both versions, friendly units, and legacy web inputs",
     { configVersion: 2, tools: { web: { firecrawl: { queueTtl: "2s" } } } },
     { configVersion: 2, tools: { web: { search: { provider: "exa" } } } },
     { configVersion: 1, tools: { web: { extract: { provider: "exa" } } } },
+    {
+      configVersion: 2,
+      surface: {
+        telegram: {
+          enabled: true,
+          allowedChatIds: ["-100123"],
+          inboundMedia: { enabled: true, maxBytesPerRequest: "4MiB" },
+        },
+      },
+    },
+    {
+      configVersion: 2,
+      tools: {
+        web: {
+          extract: { providers: ["openai"] },
+          openai: { model: "openai/gpt-5-mini", searchContextSize: "high" },
+        },
+      },
+    },
     { configVersion: 2, plugins: { config: { test: { arbitrary: [1, true, null] } } } },
     { configVersion: 3 },
     {
@@ -107,6 +126,21 @@ test("Core schemas accept both versions, friendly units, and legacy web inputs",
 });
 
 test("Core editor diagnostics reject wrong versions, fields, types, and units", () => {
+  const leftoverImageConfig = {
+    configVersion: 2,
+    tools: {
+      generate: {
+        image: {
+          provider: "openai-compatible",
+          models: ["nanobanana-2"],
+          routes: { "nanobanana-2": "openai/gpt-image-2" },
+        },
+      },
+    },
+  };
+  expect(validateCore(leftoverImageConfig), JSON.stringify(validateCore.errors)).toBe(false);
+  expect(parseCoreConfigResult(leftoverImageConfig).isOk()).toBe(true);
+
   for (const input of [
     { configVersion: 4 },
     { configVersion: "2" },
@@ -121,6 +155,52 @@ test("Core editor diagnostics reject wrong versions, fields, types, and units", 
     { configVersion: 2, tools: { web: { firecrawl: { maxConcurrency: "two" } } } },
   ])
     expect(validateCore(input), JSON.stringify(input)).toBe(false);
+});
+
+test("Core editor web provider aliases use the selected config version's provider enum", () => {
+  for (const section of ["extract", "search"]) {
+    for (const selection of [{ provider: "openai" }, { providers: ["openai"] }]) {
+      for (const configVersion of [1, 2, 3]) {
+        const input = { configVersion, tools: { web: { [section]: selection } } };
+        const accepted =
+          configVersion === 2 ||
+          (configVersion === 3 && section === "extract" && "providers" in selection);
+        expect(parseCoreConfigResult(input).isOk()).toBe(accepted);
+        expect(validateCore(input), JSON.stringify(validateCore.errors)).toBe(accepted);
+      }
+    }
+  }
+});
+
+test("V3 editor and runtime retain Telegram and hosted search without extending frozen V1", () => {
+  const fields = {
+    surface: {
+      telegram: {
+        enabled: true,
+        allowedChatIds: ["-100123"],
+        inboundMedia: { maxBytesPerAttachment: "2MiB" },
+      },
+    },
+    tools: {
+      web: {
+        extract: { providers: ["openai", "tavily", "openai"] },
+        openai: { model: "openai-compatible/search-model", searchContextSize: "high" as const },
+      },
+    },
+  };
+  for (const configVersion of [2, 3]) {
+    const input = { configVersion, ...fields };
+    const parsed = parseCoreConfigResult(input).unwrap();
+    expect(validateCore(input), JSON.stringify(validateCore.errors)).toBe(true);
+    expect(parsed.surface.telegram.inboundMedia.maxBytesPerAttachment).toBe(2 * 1024 * 1024);
+    expect(parsed.tools.web.extract.providers).toEqual(["openai", "tavily"]);
+    expect(parsed.tools.web.openai).toEqual(fields.tools.web.openai);
+  }
+  expect(validateCore({ configVersion: 1, ...fields })).toBe(false);
+  expect(parseCoreConfigResult({ configVersion: 1, ...fields }).isErr()).toBe(true);
+  const v1 = coreSchema.anyOf.find((schema) => schema.properties.configVersion.const === 1);
+  expect(v1?.properties.surface.properties).not.toHaveProperty("telegram");
+  expect(v1?.properties.tools.properties.web.properties).not.toHaveProperty("openai");
 });
 
 test("MCP schema validates transport-specific fields and credential source shapes", () => {

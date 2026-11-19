@@ -11,6 +11,8 @@ test("previous-release clients decode real Core replies, events and cache writes
   const validators = await loadCompatValidators();
   const captured: { kind: string; payload: unknown }[] = [];
   const capture = (kind: string, payload: unknown) => {
+    // This RPC did not exist in the released client; retain validation for every old endpoint.
+    if (kind === "workflows.list" && !validators.has(kind)) return;
     // Keep a copy before the client can transform or mutate a reply.
     captured.push({ kind, payload: JSON.parse(JSON.stringify(payload)) });
   };

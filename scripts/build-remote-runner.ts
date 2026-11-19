@@ -11,6 +11,7 @@ import {
 } from "../apps/remote-runner/index";
 
 const RUNNER_DIR = path.resolve(import.meta.dir, "../apps/remote-runner");
+const TARGET_DIR = path.join(RUNNER_DIR, "target");
 
 function usage(): never {
   throw new Error("Usage: bun scripts/build-remote-runner.ts [--all | --target <triple>...]");
@@ -119,13 +120,23 @@ function build(target: Target) {
   if (hasCommand("rustup")) run("rustup", ["target", "add", target]);
   run(
     "cargo",
-    ["build", "--release", "--locked", "--target", target, "--bin", BINARY_NAME],
+    [
+      "build",
+      "--release",
+      "--locked",
+      "--target-dir",
+      TARGET_DIR,
+      "--target",
+      target,
+      "--bin",
+      BINARY_NAME,
+    ],
     linkerEnv(target),
   );
   const outputDir = path.join(DIST_DIR, target);
   mkdirSync(outputDir, { recursive: true });
   const output = path.join(outputDir, BINARY_NAME);
-  copyFileSync(path.join(RUNNER_DIR, "target", target, "release", BINARY_NAME), output);
+  copyFileSync(path.join(TARGET_DIR, target, "release", BINARY_NAME), output);
   chmodSync(output, 0o755);
   console.log(`built ${path.relative(process.cwd(), output)}`);
 }

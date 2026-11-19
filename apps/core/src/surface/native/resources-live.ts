@@ -1,9 +1,10 @@
 import { nativeSessionId } from "./native-protocol";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import type { Root, RootContent } from "mdast";
-import { realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, realpath, type FileHandle } from "node:fs/promises";
 import { basename, posix } from "node:path";
-import type { FileSystem } from "@stanley2058/lilac-fs";
+import { expandTilde, nodeFileSystemHost, type FileSystem } from "@stanley2058/lilac-fs";
 import type { PersistedDataError } from "@stanley2058/lilac-utils";
 import { Result, type Result as ResultType } from "better-result";
 import { RESOURCE_MAX_BYTES } from "../../resource/contracts";
@@ -28,6 +29,7 @@ export class NativeLiveFileService {
   // The filesystem checks the revision and then writes asynchronously, so competing editor saves
   // for one file must run one at a time or both can pass the same revision check.
   private readonly saves = new Map<string, Promise<void>>();
+  private readonly runFileDenyPaths: readonly string[];
 
   constructor(
     readonly dependencies: {
@@ -51,7 +53,11 @@ export class NativeLiveFileService {
       toolRoot: string;
       remoteDenyPaths: readonly string[];
     },
-  ) {}
+  ) {
+    this.runFileDenyPaths = dependencies.remoteDenyPaths.flatMap((path) =>
+      nodeFileSystemHost.canonicalizeDenyPath(posix.resolve(expandTilde(path))),
+    );
+  }
 
   async resolve(actorId: string, threadId: string, inputPath: string, signal?: AbortSignal) {
     return Result.gen(async function* () {
@@ -85,12 +91,30 @@ export class NativeLiveFileService {
         inputPath,
         context: { sessionId: run.sessionId, safetyMode: restricted ? "restricted" : "trusted" },
       }).mapError(() => nativeFailure("forbidden", "File path is outside this thread's access"));
-      if (restricted) yield* Result.await(this.canonicalPath(resolved, run.sessionId));
-      // The reader checks deny paths against both the requested and the canonical path.
-      const read = await this.dependencies.filesystem.readFileBytes({ path: resolved, maxBytes });
-      if (!read.success && read.error.code === "MEDIA_TOO_LARGE")
+      const canonical = yield* Result.await(
+        this.canonicalPath(resolved, restricted ? run.sessionId : undefined).then((result) =>
+          result.mapError((error) =>
+            error.code === "not-found"
+              ? nativeFailure("not-found", "File is missing or unreadable")
+              : error,
+          ),
+        ),
+      );
+      if (
+        this.runFileDenyPaths.some(
+          (deny) => isPathInside(deny, resolved) || isPathInside(deny, canonical),
+        )
+      )
+        return Result.err(nativeFailure("forbidden", "File path is outside this thread's access"));
+      const read = yield* Result.await(
+        Result.tryPromise({
+          try: () => readRunPreviewBytes(canonical, maxBytes),
+          catch: () => nativeFailure("not-found", "File is missing or unreadable"),
+        }),
+      );
+      if (read.kind === "oversized")
         return Result.err(nativeFailure("invalid", "File exceeds the preview size limit"));
-      if (!read.success)
+      if (read.kind === "not-file")
         return Result.err(nativeFailure("not-found", "File is missing or unreadable"));
       return Result.ok({ bytes: read.bytes, path: resolved });
     }, this);
@@ -384,6 +408,45 @@ export class NativeLiveFileService {
         ),
     });
   }
+}
+
+async function readRunPreviewBytes(path: string, maxBytes: number) {
+  await using file = await openRunPreviewFile(path);
+  if (file === undefined) return { kind: "not-file" } as const;
+  if (!(await file.stat()).isFile()) return { kind: "not-file" } as const;
+  const bytes = Buffer.alloc(maxBytes + 1);
+  let length = 0;
+  while (length < bytes.length) {
+    const read = await file.read(bytes, length, bytes.length - length, length);
+    if (read.bytesRead === 0) break;
+    length += read.bytesRead;
+  }
+  if (length > maxBytes) return { kind: "oversized" } as const;
+  return { kind: "read", bytes: bytes.subarray(0, length) } as const;
+}
+
+async function openRunPreviewFile(path: string): Promise<FileHandle | undefined> {
+  const flags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+  // Darwin's O_NOFOLLOW_ANY rejects symlinks in every component, including a raced ancestor.
+  if (process.platform === "darwin") return open(path, flags | 0x20000000);
+  if (process.platform !== "linux") return undefined;
+  return openRunPreviewSegment("/", path.split("/").filter(Boolean), flags);
+}
+
+async function openRunPreviewSegment(
+  path: string,
+  segments: readonly string[],
+  flags: number,
+): Promise<FileHandle> {
+  if (segments.length === 0) return open(path, flags);
+  await using directory = await open(path, flags | constants.O_DIRECTORY);
+  // The only followed link is the kernel-owned descriptor; each caller-controlled component
+  // is opened with O_NOFOLLOW relative to an already open directory.
+  return await openRunPreviewSegment(
+    `/proc/self/fd/${directory.fd}/${segments[0]}`,
+    segments.slice(1),
+    flags,
+  );
 }
 
 export function rewriteNativePublishedFileLinks(input: {

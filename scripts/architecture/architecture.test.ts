@@ -2638,6 +2638,7 @@ describe("permanent architecture governance", () => {
     );
     for (const required of [
       "src/surface/bridge/bus-agent-runner.ts#startBusAgentRunner:subscribeTopic",
+      "src/surface/telegram/telegram-request-router.ts#startTelegramRequestRouter:subscribeTopic",
       "src/workflow/workflow-engine.ts#WorkflowEngine.waitForAgentRequest:fetchTopic,subscribeTopic",
       "src/workflow/workflow-progress-projector.ts#WorkflowProgressProjector.startWorkflowProgressSubscriptionResult:subscribeTopic",
     ]) {
@@ -2942,6 +2943,8 @@ describe("real declaration integration", () => {
       ["architecture/no-repeated-result-match", 49],
       ["architecture/no-nested-result-continuation", 63],
       ["architecture/no-nested-result-continuation", 74],
+      ["architecture/no-nested-result-continuation", 88],
+      ["architecture/no-nested-result-continuation", 100],
     ]);
   });
 

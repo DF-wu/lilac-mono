@@ -31,10 +31,17 @@ import {
   type ToolResultArtifactStore,
 } from "../../src/artifacts/tool-result-artifact-store";
 
-// uutils `cat` (the default on Ubuntu 26.04) exits 0 on an unreadable stdin, so probe with the
-// `read` builtin. It returns 1 for both EOF and a read error, and only the error prints a message.
-const STDIN_PROBE_COMMAND =
-  'if [ -z "$(read -r _ 2>&1)" ]; then echo stdin_read_ok; else echo stdin_read_err; exit 7; fi';
+// Probe fd 0 directly instead of relying on an external cat implementation.
+const STDIN_PROBE_COMMAND = `'${process.execPath.replaceAll("'", "'\\''")}' -e '
+  const { readSync } = require("node:fs");
+  try {
+    console.log("stdin_bytes=" + readSync(0, Buffer.alloc(1), 0, 1, null));
+  } catch (error) {
+    if (error.code !== "EBADF") throw error;
+    console.log("stdin_read_err:EBADF");
+    process.exit(7);
+  }
+'`;
 
 type MockFetch = (
   input: Parameters<typeof fetch>[0],
@@ -314,8 +321,7 @@ rmdir "$media_dir"`,
 
     expect(res.exitCode).toBe(7);
     expect(res.executionError).toBeUndefined();
-    expect(res.stdout).toContain("stdin_read_err");
-    expect(res.stdout).not.toContain("stdin_read_ok");
+    expect(res.stdout).toBe("stdin_read_err:EBADF\n");
   });
 
   it("supports stdinMode=eof as a compatibility fallback", async () => {
@@ -323,7 +329,7 @@ rmdir "$media_dir"`,
 
     expect(res.exitCode).toBe(0);
     expect(res.executionError).toBeUndefined();
-    expect(res.stdout).toContain("stdin_read_ok");
+    expect(res.stdout).toBe("stdin_bytes=0\n");
   });
 
   it("stores large output as an artifact without changing execution success", async () => {

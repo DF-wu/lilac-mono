@@ -1,8 +1,9 @@
 import { nativeSessionId } from "../../../src/surface/native/native-protocol";
 import { resolveRestrictedSessionTmpDir } from "../../../src/shared/attachment-utils";
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import * as fsPromises from "node:fs/promises";
 import { Database } from "bun:sqlite";
-import { mkdtemp, mkdir, open, readFile, symlink, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readFile, symlink, writeFile, rm, rename } from "node:fs/promises";
 import { join, relative as relativePath } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { FileSystem } from "@stanley2058/lilac-fs";
@@ -251,6 +252,17 @@ test("restricted file resolution uses the thread's virtual tmp directory exactly
   expect(await response?.text()).toBe("session file");
   for (const path of ["~/.bashrc", "/etc/passwd", "../example.txt", "/tmp/../etc/passwd"])
     expect((await service.resolve("limited", thread.id, path)).status).toBe("error");
+  expect(
+    (
+      await service.readRunFile(
+        "limited",
+        thread.id,
+        "/etc/passwd",
+        { sessionId: nativeSessionId(thread.id), safetyMode: "trusted" },
+        1024,
+      )
+    ).isErr(),
+  ).toBe(true);
   native.close();
 });
 
@@ -372,8 +384,9 @@ test("competing saves against one revision let exactly one write land", async ()
     remoteDenyPaths: [],
   });
   const { revision } = value(await service.document("owner", thread.id, file));
+  const texts = ["first\n", "second\n"];
   const results = await Promise.all(
-    ["first\n", "second\n"].map((text) =>
+    texts.map((text) =>
       service.saveDocument("owner", {
         threadId: thread.id,
         path: file,
@@ -388,6 +401,7 @@ test("competing saves against one revision let exactly one write land", async ()
   expect(conflicts).toHaveLength(1);
   expect(conflicts[0]?.error).toMatchObject({ code: "conflict" });
   expect(saved.map((result) => result.value.text)).toEqual([await readFile(file, "utf8")]);
+  expect(await readFile(file, "utf8")).toBe(texts[results.findIndex((result) => result.isOk())]!);
   native.close();
 });
 
@@ -484,6 +498,11 @@ test("run file reads use the run's access, not the thread starter's", async () =
   const workspace = await mkdtemp(join(tmpdir(), "lilac-run-file-"));
   directories.push(workspace);
   await writeFile(join(workspace, "page.html"), "<p>workspace</p>");
+  const denied = join(workspace, "private");
+  await mkdir(denied);
+  await writeFile(join(denied, "page.html"), "private");
+  await symlink(join(denied, "page.html"), join(workspace, "hidden.html"));
+  await symlink(join(workspace, "page.html"), join(denied, "link.html"));
   const native = new NativeStore(new Database(":memory:"));
   value(native.initialize());
   value(
@@ -504,9 +523,9 @@ test("run file reads use the run's access, not the thread starter's", async () =
   await symlink(join(workspace, "page.html"), join(sessionRoot, "link.html"));
   const service = new NativeLiveFileService({
     native,
-    filesystem: new FileSystem(workspace),
+    filesystem: new FileSystem(workspace, { denyPaths: [denied] }),
     toolRoot: workspace,
-    remoteDenyPaths: [],
+    remoteDenyPaths: [denied],
   });
   const read = (path: string, safetyMode: "trusted" | "restricted", maxBytes = 1024) =>
     service.readRunFile("owner", thread.id, path, { sessionId, safetyMode }, maxBytes);
@@ -518,9 +537,152 @@ test("run file reads use the run's access, not the thread starter's", async () =
   expect(await text(read("page.html", "restricted"))).toBe("<p>session</p>");
   for (const path of [join(workspace, "page.html"), "/tmp/link.html", "~/page.html"])
     expect((await read(path, "restricted")).status).toBe("error");
+  for (const path of ["private/page.html", "private/link.html", "hidden.html", ".", "/dev/null"])
+    expect((await read(path, "trusted")).status).toBe("error");
   const oversized = await read("page.html", "trusted", 4);
   expect(oversized.match({ ok: () => "", err: (error) => error.message })).toBe(
     "File exceeds the preview size limit",
   );
   native.close();
 });
+
+test.each(["file", "directory"])(
+  "run file reads reject a %s symlink swapped after containment validation",
+  async (component) => {
+    const outside = await mkdtemp(join(tmpdir(), "lilac-run-race-outside-"));
+    const sessionId = `run-race-${crypto.randomUUID()}`;
+    const root = resolveRestrictedSessionTmpDir(sessionId);
+    directories.push(outside, root);
+    await mkdir(join(root, "pages"), { recursive: true });
+    await writeFile(join(root, "pages", "page.html"), "inside");
+    await writeFile(join(outside, "page.html"), "outside secret");
+    const native = new NativeStore(new Database(":memory:"));
+    value(native.initialize());
+    value(
+      native.upsertUser({
+        id: "owner",
+        providerId: "owner",
+        role: "owner",
+        toolMode: "full",
+        displayName: "Owner",
+      }),
+    );
+    const thread = value(native.createThread("owner", { commandId: "run-race" }));
+    const service = new NativeLiveFileService({
+      native,
+      filesystem: new FileSystem(root),
+      toolRoot: root,
+      remoteDenyPaths: [],
+    });
+    const file = join(root, "pages", "page.html");
+    const actualRealpath = fsPromises.realpath;
+    let swapped = false;
+    const lookup = spyOn(fsPromises, "realpath").mockImplementation((async (path: string) => {
+      const canonical = await actualRealpath(path);
+      if (path === file && !swapped) {
+        swapped = true;
+        if (component === "file") {
+          await rename(file, join(root, "original-page.html"));
+          await symlink(join(outside, "page.html"), file);
+        } else {
+          await rename(join(root, "pages"), join(root, "original-pages"));
+          await symlink(outside, join(root, "pages"));
+        }
+      }
+      return canonical;
+    }) as typeof fsPromises.realpath);
+    try {
+      const result = await service.readRunFile(
+        "owner",
+        thread.id,
+        "/tmp/pages/page.html",
+        { sessionId, safetyMode: "restricted" },
+        1024,
+      );
+      expect(swapped).toBe(true);
+      expect(result.isErr()).toBe(true);
+    } finally {
+      lookup.mockRestore();
+      native.close();
+    }
+  },
+);
+
+test.each(["replace", "grow"])(
+  "run file reads retain the opened file and bound reads when files %s",
+  async (change) => {
+    const root = await mkdtemp(join(tmpdir(), "lilac-run-open-"));
+    directories.push(root);
+    const file = join(root, "page.html");
+    const secret = join(root, "secret.html");
+    await writeFile(file, "safe");
+    await writeFile(secret, "outside secret");
+    const native = new NativeStore(new Database(":memory:"));
+    value(native.initialize());
+    value(
+      native.upsertUser({
+        id: "owner",
+        providerId: "owner",
+        role: "owner",
+        toolMode: "full",
+        displayName: "Owner",
+      }),
+    );
+    const thread = value(native.createThread("owner", { commandId: "run-open" }));
+    const service = new NativeLiveFileService({
+      native,
+      filesystem: new FileSystem(root),
+      toolRoot: root,
+      remoteDenyPaths: [],
+    });
+    const actualOpen = fsPromises.open;
+    let changed = false;
+    const byteBudgets: number[] = [];
+    const opened = spyOn(fsPromises, "open").mockImplementation(async (path, flags, mode) => {
+      const handle = await actualOpen(path, flags, mode);
+      if (!String(path).endsWith("/page.html")) return handle;
+      const actualStat = handle.stat.bind(handle);
+      spyOn(handle, "stat").mockImplementation((async () => {
+        const stats = await actualStat();
+        changed = true;
+        if (change === "replace") {
+          await rename(file, join(root, "original.html"));
+          await symlink(secret, file);
+        } else {
+          await writeFile(file, "x".repeat(100));
+        }
+        return stats;
+      }) as typeof handle.stat);
+      const actualRead = handle.read.bind(handle);
+      spyOn(handle, "read").mockImplementation((async (
+        buffer: Buffer,
+        offset: number,
+        length: number,
+        position: number,
+      ) => {
+        byteBudgets.push(length);
+        return actualRead(buffer, offset, length, position);
+      }) as typeof handle.read);
+      return handle;
+    });
+    try {
+      const result = await service.readRunFile(
+        "owner",
+        thread.id,
+        file,
+        { sessionId: "trusted-run", safetyMode: "trusted" },
+        4,
+      );
+      expect(changed).toBe(true);
+      expect(Math.max(...byteBudgets)).toBe(5);
+      if (change === "replace") expect(new TextDecoder().decode(value(result).bytes)).toBe("safe");
+      else
+        expect(result.match({ ok: () => "", err: (error) => error.message })).toBe(
+          "File exceeds the preview size limit",
+        );
+    } finally {
+      opened.mockRestore();
+      native.close();
+    }
+  },
+);

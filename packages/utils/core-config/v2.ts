@@ -16,10 +16,11 @@ import {
   migrateWebConfigValue,
   routerSchema,
   statsForNerdsSchema,
-  webExtractConfigValueSchema,
   webFetchModeSchema,
 } from "./v1";
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
+import { openaiWebSearchSchema, webExtractConfigValueSchemaV2 } from "./openai-web-search";
+import { cloneDefaultTelegramSurface, telegramSurfaceSchema } from "./telegram-surface";
 import { defaultNativeSurfaceConfig } from "./types";
 
 import type {
@@ -677,12 +678,10 @@ const webConfigSchemaV2 = z
   .preprocess(
     migrateWebConfigValue,
     z.object({
-      extract: webExtractConfigValueSchema
-        .default({
-          providers: ["tavily"],
-        })
+      extract: webExtractConfigValueSchemaV2
+        .default({ providers: ["tavily"] })
         .describe(
-          "Provider-backed web extraction settings. Configure the ordered provider list under providers.",
+          "Ordered web search and extraction providers. The openai provider supports search only.",
         ),
       fetch: z
         .object({
@@ -713,6 +712,11 @@ const webConfigSchemaV2 = z
         .optional()
         .describe(
           "Optional independent process-local concurrency and queue limits for Firecrawl fetch and search calls. Omit to leave these optional limits unconfigured.",
+        ),
+      openai: openaiWebSearchSchema
+        .optional()
+        .describe(
+          "OpenAI Responses hosted web search settings; used only when openai is listed in extract.providers.",
         ),
     }),
   )
@@ -1702,7 +1706,7 @@ export const coreConfigInputSchemaV2 = z.object({
       workingIndicators: z
         .array(z.string().trim().min(1))
         .min(1)
-        .default(cloneDefaultWorkingIndicators())
+        .default(() => cloneDefaultWorkingIndicators())
         .describe(
           'Non-empty status phrases rotated while a request runs. Native web uses these instead of "Working" and their past tense instead of "Worked". Omit to use Lilac\'s built-in phrases.',
         ),
@@ -1715,41 +1719,47 @@ export const coreConfigInputSchemaV2 = z.object({
       discord: discordSurfaceSchema.describe(
         "Discord credentials, ingress allowlists, attachment caching, and output rendering.",
       ),
+      telegram: telegramSurfaceSchema.describe(
+        "Telegram bot, chat/user allowlists, local history, and streamed output. Disabled by default.",
+      ),
       heartbeat: heartbeatSchema.describe(
         "Autonomous heartbeat lane. Disabled by default; configure its model through `surface.router.sessionModes.__heartbeat__.model`.",
       ),
     })
-    .default({
+    // Lazy: a literal default object is built once at module load and handed
+    // out by reference, so every config would share the same nested arrays.
+    .default(() => ({
       workingIndicators: cloneDefaultWorkingIndicators(),
       native: defaultNativeSurfaceConfig(),
       router: {
-        defaultMode: "mention",
+        defaultMode: "mention" as const,
         sessionModes: {},
         activeDebounceMs: 3000,
         activeGate: { enabled: false, timeoutMs: 2500 },
       },
       discord: {
         tokenEnv: "DISCORD_TOKEN",
-        allowedChannelIds: [],
-        allowedGuildIds: [],
+        allowedChannelIds: [] as string[],
+        allowedGuildIds: [] as string[],
         botName: "lilac",
-        outputMode: "preview",
-        outputPreviewModeFinalStyle: "plain",
-        outputPreviewModeFinalText: "flat",
+        outputMode: "preview" as const,
+        outputPreviewModeFinalStyle: "plain" as const,
+        outputPreviewModeFinalText: "flat" as const,
         outputNotification: true,
         attachmentCache: { ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
         markdownTableRender: {
           enabled: true,
-          style: "unicode",
+          style: "unicode" as const,
           maxWidth: 50,
-          fallbackMode: "list",
+          fallbackMode: "list" as const,
         },
         markdownMathRender: {
           enabled: false,
           maxWidth: 50,
-          fallbackMode: "source",
+          fallbackMode: "source" as const,
         },
       },
+      telegram: cloneDefaultTelegramSurface(),
       heartbeat: {
         enabled: false,
         cron: "*/30 * * * *",
@@ -1758,7 +1768,7 @@ export const coreConfigInputSchemaV2 = z.object({
         defaultOutputSession: undefined,
         softQuietHours: undefined,
       },
-    })
+    }))
     .describe("Communication surfaces, request routing, and autonomous heartbeat settings."),
 
   agent: z

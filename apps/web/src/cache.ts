@@ -225,6 +225,34 @@ function decodeThreadUsage(value: unknown): z.infer<typeof threadUsageSchema> | 
   const parsed = threadUsageSchema.safeParse(value);
   return parsed.success ? parsed.data : undefined;
 }
+async function rebaseThreadRecency(
+  threads: IDBObjectStore,
+  metadata: z.infer<typeof threadUsageSchema>[],
+  touchedKey: string,
+): Promise<number> {
+  for (const [index, usage] of metadata.entries()) {
+    usage.updatedAt = index;
+    if (usage.key === touchedKey) continue;
+    const row = await idbRequest(threads.get(usage.key));
+    if (!row || typeof row !== "object") continue;
+    threads.put({ ...row, updatedAt: index });
+  }
+  return metadata.length - 1;
+}
+async function threadRecency(threads: IDBObjectStore, touchedKey: string) {
+  const all = await idbRequest(threads.getAll());
+  const metadata = Array.isArray(all)
+    ? all
+        .map(decodeThreadUsage)
+        .filter((row) => row !== undefined)
+        .sort((a, b) => a.updatedAt - b.updatedAt)
+    : [];
+  let newest = metadata.at(-1)?.updatedAt ?? 0;
+  // Rebase only at integer exhaustion, preserving legacy ties in primary-key order.
+  if (newest === Number.MAX_SAFE_INTEGER)
+    newest = await rebaseThreadRecency(threads, metadata, touchedKey);
+  return { metadata, updatedAt: Math.max(Date.now(), newest + 1) };
+}
 /** Folds a later patch into one still waiting to be written, as if both were applied in order. */
 type QueuedWrite = {
   scope: CacheScope;
@@ -391,7 +419,9 @@ export class WebNativeCache implements NativeCache {
         }
         slots.push(slot.data);
       }
-      tx.objectStore("threads").put({ ...row, updatedAt: Date.now() });
+      const threads = tx.objectStore("threads");
+      const { updatedAt } = await threadRecency(threads, key);
+      threads.put({ ...row, updatedAt });
       await assertCommitted(done);
       return {
         checkpoint: row.checkpoint,
@@ -490,7 +520,8 @@ export class WebNativeCache implements NativeCache {
       const done = completed(tx);
       const threads = tx.objectStore("threads");
       const slots = tx.objectStore("slots");
-      const previous = decodeThreadUsage(await idbRequest(threads.get(key)));
+      const { metadata, updatedAt } = await threadRecency(threads, key);
+      const previous = metadata.find((row) => row.key === key);
       if (!previous && !patch.replace) {
         await assertCommitted(done);
         return "missing" as const;
@@ -513,21 +544,15 @@ export class WebNativeCache implements NativeCache {
         scopeKey,
         threadId,
         checkpoint: patch.checkpoint,
-        updatedAt: Date.now(),
+        updatedAt,
         bytes: total,
       });
-      const all = await idbRequest(threads.getAll());
-      const metadata = Array.isArray(all)
-        ? all
-            .map(decodeThreadUsage)
-            .filter((row) => row !== undefined)
-            .sort(
-              (a, b) => a.updatedAt - b.updatedAt || Number(a.key === key) - Number(b.key === key),
-            )
-        : [];
-      let retainedBytes = metadata.reduce((sum, row) => sum + row.bytes, 0);
-      let retainedCount = metadata.length;
-      for (const row of metadata) {
+      const candidates = metadata.filter((row) => row.key !== key);
+      candidates.push({ key, updatedAt, bytes: total });
+      candidates.sort((a, b) => a.updatedAt - b.updatedAt);
+      let retainedBytes = candidates.reduce((sum, row) => sum + row.bytes, 0);
+      let retainedCount = candidates.length;
+      for (const row of candidates) {
         if (retainedCount <= this.maxThreads && retainedBytes <= this.maxBytes) break;
         threads.delete(row.key);
         await deleteIndex(slots, "thread", row.key);

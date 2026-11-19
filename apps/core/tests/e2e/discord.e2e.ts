@@ -39,12 +39,12 @@ afterAll(async () => {
 
 /** A FIFO the agent's bash command blocks on until the test writes to it. */
 async function barrier() {
-  const directory = await mkdtemp(path.join(e2e.layout.directory, "barrier-"));
+  const directory = await mkdtemp(path.join(e2e.layout.directory, "barrier with spaces-"));
   const fifo = path.join(directory, "go");
   const made = Bun.spawnSync(["mkfifo", fifo]);
   if (made.exitCode !== 0) throw new Error("mkfifo failed");
   return {
-    command: `read line < ${fifo}; echo "released:$line"`,
+    command: `read line < '${fifo.replaceAll("'", "'\\''")}' ; echo "released:$line"`,
     async release(value = "ok") {
       const handle = await open(fifo, "w");
       await handle.write(`${value}\n`);

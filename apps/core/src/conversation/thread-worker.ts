@@ -171,6 +171,8 @@ export function startConversationThreadSummarizationWorker(params: {
   searchDbPath: string;
   surfaceDbPath?: string;
   nativeDbPath?: string;
+  telegramDbPath?: string;
+  telegramBotName?: string;
   adapter?: Pick<SurfaceAdapter, "readMsg">;
   attachmentHydrator?: ConversationThreadAttachmentHydrator;
   createWorker?: () => ConversationThreadSummarizationWorkerTransport;
@@ -275,9 +277,10 @@ export function startConversationThreadSummarizationWorker(params: {
               message: "native attachment hydrator unavailable",
             }),
           );
+        const platform = ref.surface === "telegram" ? ("telegram" as const) : ("discord" as const);
         const message = yield* Result.await(
           adapter
-            .readMsg({ platform: "discord", channelId: ref.channelId, messageId: ref.messageId })
+            .readMsg({ platform, channelId: ref.channelId, messageId: ref.messageId })
             .then((result) =>
               result.mapError(
                 (error) =>
@@ -474,6 +477,8 @@ export function startConversationThreadSummarizationWorker(params: {
         searchDbPath: params.searchDbPath,
         surfaceDbPath: params.surfaceDbPath,
         nativeDbPath: params.nativeDbPath,
+        telegramDbPath: params.telegramDbPath,
+        telegramBotName: params.telegramBotName,
       } satisfies ThreadSummarizationWorkerRequest;
       if (wait) {
         return await new Promise<

@@ -52,7 +52,7 @@ export function normalizeResponses(
         error: `Previous response with id '${previous}' not found.`,
         code: "previous_response_not_found",
       };
-    messages.push(...prior.filter((message) => message.role !== "system"));
+    messages.push(...structuredClone(prior.filter((message) => message.role !== "system")));
   }
   const input =
     typeof body.input === "string"

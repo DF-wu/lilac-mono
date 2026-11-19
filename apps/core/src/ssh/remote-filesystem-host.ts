@@ -247,7 +247,7 @@ function remoteSearchBackend(context: CallContext): SearchBackend {
         accepts(entry.path),
       );
       return {
-        paths: entries ? entries.map((entry) => entry.path) : value.paths.filter(accepts),
+        paths: value.paths.filter(accepts),
         entries,
         truncated: value.truncated,
         effectiveBackend: "native",

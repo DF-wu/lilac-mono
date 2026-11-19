@@ -7,6 +7,7 @@ import {
 } from "../tools/subagent";
 import type { WorkflowRevision, WorkflowRun } from "./workflow-domain";
 import type { WorkflowRequestPolicy } from "./workflow-request-authority";
+import { sha256 } from "./workflow-definition";
 
 /**
  * Builds a deferred follow-up for a subagent from its own durable records, keeping its profile,
@@ -19,6 +20,7 @@ export function subagentFollowUpRegistration(input: {
   readonly policy: WorkflowRequestPolicy | null;
   readonly task: string;
   readonly idleTimeoutMs: number;
+  readonly requestDeliveryId: string;
   /** The request and tool call that sent the message, in the same parent session. */
   readonly sender: { readonly parentRequestId: string; readonly parentToolCallId: string };
 }): TrustedSubagentDelegationRegistration | null {
@@ -45,6 +47,7 @@ export function subagentFollowUpRegistration(input: {
     profile: target.profile,
     sessionName: target.sessionName,
     task: input.task,
+    childRequestId: `sub:missed-steer:${sha256(input.requestDeliveryId)}`,
     ...(target.title ? { title: target.title } : {}),
     idleTimeoutMs: input.idleTimeoutMs,
     depth: target.depth,

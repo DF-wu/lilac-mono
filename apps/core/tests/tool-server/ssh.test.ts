@@ -35,19 +35,20 @@ function mockSshProcess(input: {
   stdout?: ReadableStream<Uint8Array>;
   stderr?: ReadableStream<Uint8Array>;
   exited?: Promise<number>;
-}): Bun.Subprocess<Blob, "pipe", "pipe"> {
+}): Bun.Subprocess<"pipe", "pipe", "pipe"> {
   return {
+    stdin: { write: () => 0, flush: () => 0, end: () => 0 },
     stdout: input.stdout ?? textStream(),
     stderr: input.stderr ?? textStream(),
     exited: input.exited ?? Promise.resolve(0),
-  } as unknown as Bun.Subprocess<Blob, "pipe", "pipe">;
+  } as unknown as Bun.Subprocess<"pipe", "pipe", "pipe">;
 }
 
 /**
  * Answers Core's runner deployment probe with an unsupported platform, so the call takes the shell
  * path and the mocked `child` stands in for the command's own SSH process.
  */
-function spawnCommandAs(child: Bun.Subprocess<Blob, "pipe", "pipe">) {
+function spawnCommandAs(child: Bun.Subprocess<"pipe", "pipe", "pipe">) {
   return (command: string[] | object) =>
     Array.isArray(command) && command.some((part) => String(part).includes("lilac-probe"))
       ? mockSshProcess({ stdout: textStream("platform Plan9 x86_64\nbase /tmp/lilac\n") })

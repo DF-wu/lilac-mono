@@ -4,7 +4,6 @@ import {
   coreConfigInputSchemaV1,
   migrateWebConfigValue,
   migrateWebExtractConfigValue,
-  webExtractProviderSchema,
 } from "@stanley2058/lilac-utils/core-config/v1";
 import { coreConfigInputSchemaV2 } from "@stanley2058/lilac-utils/core-config/v2";
 import { coreConfigInputSchemaV3 } from "@stanley2058/lilac-utils/core-config/v3";
@@ -55,19 +54,56 @@ function applyPreprocessorSchema(
     jsonSchema.properties.search = jsonSchema.properties.extract;
   }
   if (transform === migrateWebExtractConfigValue && jsonSchema.properties) {
-    jsonSchema.properties.provider = toEditorSchema(webExtractProviderSchema);
+    const providers = jsonSchema.properties.providers;
+    if (typeof providers !== "object") return;
+    const items = providers.items;
+    if (items && !Array.isArray(items)) jsonSchema.properties.provider = items;
   }
 }
 
-function toEditorSchema(schema: z.core.$ZodType): z.core.JSONSchema.JSONSchema {
+export function toEditorSchema(
+  schema: z.core.$ZodType,
+  errors: string[] = unsupportedPreprocessors,
+): z.core.JSONSchema.JSONSchema {
   return z.toJSONSchema(schema, {
     target: "draft-7",
     io: "input",
+    unrepresentable: "any",
     override: ({ zodSchema, jsonSchema }) => {
       if (jsonSchema.description) {
         Object.assign(jsonSchema, { markdownDescription: jsonSchema.description });
       }
       const def = (zodSchema as z.core.$ZodTypes)._zod.def;
+      if (def.type === "undefined") {
+        Object.assign(jsonSchema, { not: {} });
+        return;
+      }
+      if (
+        [
+          "bigint",
+          "symbol",
+          "void",
+          "date",
+          "nan",
+          "custom",
+          "function",
+          "map",
+          "set",
+          "transform",
+        ].includes(def.type)
+      ) {
+        errors.push(`Config input ${def.type} needs an editor schema`);
+        return;
+      }
+      if (
+        def.type === "literal" &&
+        def.values.some(
+          (value) => value === undefined || typeof value === "bigint" || typeof value === "symbol",
+        )
+      ) {
+        errors.push("Config input literal needs an editor schema");
+        return;
+      }
       if (def.type === "pipe" && def.in._zod.def.type === "transform") {
         applyPreprocessorSchema(def, jsonSchema);
         return;
@@ -119,4 +155,4 @@ async function generateConfigSchemas(): Promise<void> {
   }
 }
 
-await generateConfigSchemas();
+if (import.meta.main) await generateConfigSchemas();

@@ -1,5 +1,7 @@
 import type { CoreConfig } from "@stanley2058/lilac-utils";
-import { Result } from "better-result";
+import { Panic, Result } from "better-result";
+
+import { captureError } from "../../shared/error-capture";
 
 import {
   SurfaceInvalidInput,
@@ -56,6 +58,21 @@ function timelineItem(
   };
 }
 
+async function captureDiscordThreadReadOperation<T>(
+  effect: () => Promise<T>,
+  message: string,
+): Promise<Result<T, SurfaceUnavailable>> {
+  const captured = await Result.tryPromise({ try: effect, catch: captureError });
+  if (captured.isErr()) {
+    const cause = captured.error.cause;
+    if (Panic.is(cause)) throw cause;
+    return Result.err(
+      new SurfaceUnavailable({ platform: "discord", operation: "list-messages", message }),
+    );
+  }
+  return Result.ok(captured.value);
+}
+
 /**
  * Read-only thread control for Discord. Reads use the same channel allowlist as the surface
  * message tools, because Lilac has no per-user Discord read access to check.
@@ -66,11 +83,11 @@ export function createDiscordThreadControl(input: {
 }): SurfaceThreadControlPort {
   const { adapter, getConfig } = input;
 
-  async function resolveChannel(threadId: string) {
+  async function resolveChannel(threadId: string, config: CoreConfig) {
     const resolved = await discordTargets.resolveSession({
       selector: threadId,
       adapter,
-      getConfig,
+      getConfig: async () => config,
     });
     return resolved.mapError(
       (error) =>
@@ -83,51 +100,44 @@ export function createDiscordThreadControl(input: {
     );
   }
 
-  async function selfUserId() {
-    const self = await Result.tryPromise({
-      try: () => adapter.getSelf(),
-      catch: (cause) =>
-        new SurfaceUnavailable({
-          platform: "discord",
-          operation: "list-messages",
-          message: `Discord identity is unavailable: ${String(cause)}`,
-        }),
-    });
-    return self.map((value) => value.userId);
-  }
-
   return {
     async read(_caller, threadId, read) {
-      return Result.gen(async function* () {
-        const target = yield* Result.await(resolveChannel(threadId));
-        const { channelId } = target.sessionRef;
-        const messages = yield* Result.await(
-          adapter.listMsg(target.sessionRef, {
-            limit: read.limit,
-            ...(read.before ? { beforeMessageId: read.before } : {}),
-            ...(read.after ? { afterMessageId: read.after } : {}),
-          }),
-        );
-        const self = yield* Result.await(selfUserId());
-        // Discord returns pages newest first; agents read oldest first, as on native.
-        const ordered = [...messages].sort(bySnowflake);
-        const first = ordered[0]?.ref.messageId;
-        const last = ordered.at(-1)?.ref.messageId ?? read.after;
-        const alias = target.config
-          ? bestEffortAliasForDiscordChannelId({ channelId, cfg: target.config })
-          : undefined;
-        return Result.ok({
-          threadId: channelId,
-          title: alias ? `#${alias}` : channelId,
-          activeRunId: null,
-          // Discord keeps only posted messages, so both views return the same text items.
-          items: ordered.flatMap(
-            (message) => timelineItem(message, self, read.maxCharsPerItem) ?? [],
-          ),
-          hasMore: Boolean(first && messages.length >= read.limit),
-          ...(first && messages.length >= read.limit ? { before: first } : {}),
-          ...(last ? { after: last } : {}),
-        });
+      const config = await captureDiscordThreadReadOperation(
+        getConfig,
+        "Discord configuration is unavailable",
+      );
+      if (config.isErr()) return Result.err(config.error);
+      const target = await resolveChannel(threadId, config.value);
+      if (target.isErr()) return Result.err(target.error);
+      const { sessionRef } = target.value;
+      const { channelId } = sessionRef;
+      const messages = await adapter.listMsg(sessionRef, {
+        limit: read.limit,
+        ...(read.before ? { beforeMessageId: read.before } : {}),
+        ...(read.after ? { afterMessageId: read.after } : {}),
+      });
+      if (messages.isErr()) return Result.err(messages.error);
+      const self = await captureDiscordThreadReadOperation(
+        () => adapter.getSelf(),
+        "Discord identity is unavailable",
+      );
+      if (self.isErr()) return Result.err(self.error);
+      // Discord returns pages newest first; agents read oldest first, as on native.
+      const ordered = [...messages.value].sort(bySnowflake);
+      const first = ordered[0]?.ref.messageId;
+      const last = ordered.at(-1)?.ref.messageId ?? read.after;
+      const alias = bestEffortAliasForDiscordChannelId({ channelId, cfg: config.value });
+      return Result.ok({
+        threadId: channelId,
+        title: alias ? `#${alias}` : channelId,
+        activeRunId: null,
+        // Discord keeps only posted messages, so both views return the same text items.
+        items: ordered.flatMap(
+          (message) => timelineItem(message, self.value.userId, read.maxCharsPerItem) ?? [],
+        ),
+        hasMore: Boolean(first && messages.value.length >= read.limit),
+        ...(first && messages.value.length >= read.limit ? { before: first } : {}),
+        ...(last ? { after: last } : {}),
       });
     },
     async send() {

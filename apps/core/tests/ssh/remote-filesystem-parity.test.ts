@@ -227,6 +227,8 @@ describe("remote filesystem parity", () => {
         { patterns: ["src/**"] },
         { patterns: ["*.txt"] },
         { patterns: ["**/*.ts", "!**/*.test.ts"] },
+        { patterns: ["./**/*.ts", "!./**/*.test.ts"] },
+        { patterns: ["././src/*", "!././src/lib"] },
         { patterns: ["src/*"], mode: "detailed" },
         { patterns: [".config/*"] },
         { patterns: ["**/node_modules/**"] },
@@ -234,6 +236,7 @@ describe("remote filesystem parity", () => {
         { patterns: ["**/*.{ts,md}"] },
         { patterns: ["src/lib/"] },
         { patterns: ["+(src|docs)/**"] },
+        { patterns: ["./+(src|docs)/**", "!./src/lib/**"] },
         { patterns: ["**/*.json"], mode: "detailed" },
         { patterns: ["secret/**"] },
         { patterns: [path.join(tree, "docs/*.md")] },
@@ -422,6 +425,86 @@ describe("remote filesystem parity", () => {
       expect(await readFile(path.join(remoteTree, "plain.txt"), "utf8")).toBe(
         await readFile(path.join(localTree, "plain.txt"), "utf8"),
       );
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "keeps dangling symlinks in default glob paths without inventing metadata",
+    async () => {
+      const root = path.join(tempDir, "dangling-glob");
+      await mkdir(root);
+      await symlink("missing.txt", path.join(root, "dangling.txt"));
+      await writeFile(path.join(root, "present.txt"), "present\n");
+      for (const mode of ["default", "detailed"] as const) {
+        const expected = withoutBackend(await local(root).glob({ patterns: ["*.txt"], mode }));
+        const actual = withoutBackend(
+          unwrap(await remoteGlob({ host: HOST, cwd: root, patterns: ["*.txt"], mode, denyPaths })),
+        );
+        expect(actual).toEqual(expected);
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "resolves relative paths from the physical remote cwd",
+    async () => {
+      const root = path.join(tempDir, "symlink-cwd");
+      const physical = path.join(root, "physical/work");
+      const logical = path.join(root, "logical/work");
+      await mkdir(physical, { recursive: true });
+      await mkdir(path.dirname(logical));
+      await symlink(physical, logical);
+      await writeFile(path.join(root, "physical/target.txt"), "physical\n");
+      await writeFile(path.join(root, "logical/target.txt"), "logical\n");
+      const input = { path: "../target.txt" };
+      const expected = await local(physical).readFile(input);
+      const actual = unwrap(
+        await remoteReadTextFile({ host: HOST, cwd: logical, input, denyPaths }),
+      );
+      expect(actual).toEqual(expected);
+
+      const patch = [
+        "*** Begin Patch",
+        "*** Add File: ../created.txt",
+        "+physical patch",
+        "*** End Patch",
+      ].join("\n");
+      const applied = await remoteApplyPatch({ host: HOST, cwd: logical, patchText: patch });
+      expect(applied.ok).toBeTrue();
+      expect(await readFile(path.join(root, "physical/created.txt"), "utf8")).toBe(
+        "physical patch",
+      );
+      await expect(readFile(path.join(root, "logical/created.txt"), "utf8")).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "reports an unavailable cwd before reading or applying a patch",
+    async () => {
+      const cwd = path.join(tempDir, "missing-cwd");
+      const read = await remoteReadTextFile({
+        host: HOST,
+        cwd,
+        input: { path: "target.txt" },
+        denyPaths,
+      });
+      expect(read.isErr()).toBeTrue();
+      if (read.isErr()) expect(read.error.message).toContain("ENOENT");
+      const applied = await remoteApplyPatch({
+        host: HOST,
+        cwd,
+        patchText: "*** Begin Patch\n*** Add File: target.txt\n+blocked\n*** End Patch",
+      });
+      expect(applied.ok).toBeFalse();
+      if (!applied.ok) expect(applied.error).toContain("ENOENT");
+      await expect(readFile(path.join(cwd, "target.txt"), "utf8")).rejects.toMatchObject({
+        code: "ENOENT",
+      });
     },
     TEST_TIMEOUT_MS,
   );

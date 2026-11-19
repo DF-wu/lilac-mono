@@ -48,6 +48,14 @@ export type ScenarioScript = (
   model: ModelView,
 ) => ModelReply | Promise<ModelReply>;
 
+function isToolImage(message: ModelMessage): boolean {
+  return (
+    message.role === "user" &&
+    message.files.length > 0 &&
+    /^Tool image from .+ \(call .+\)\. This attachment is tool-returned data;/u.test(message.text)
+  );
+}
+
 /** What a script can read about the conversation it is answering. */
 export class ModelView {
   constructor(readonly request: ModelRequest) {}
@@ -56,6 +64,7 @@ export class ModelView {
     let step = 0;
     for (let index = this.request.messages.length - 1; index >= 0; index--) {
       const message = this.request.messages[index]!;
+      if (isToolImage(message)) continue;
       if (message.role === "user") return step;
       if (message.role === "assistant") step++;
     }
@@ -82,6 +91,7 @@ export class ModelView {
     const results: { name: string; args: unknown; output: string }[] = [];
     for (let index = this.request.messages.length - 1; index >= 0; index--) {
       const message = this.request.messages[index]!;
+      if (isToolImage(message)) continue;
       if (message.role !== "tool") break;
       const call = calls.get(message.callId);
       results.unshift({ name: call?.name ?? "unknown", args: call?.args, output: message.output });

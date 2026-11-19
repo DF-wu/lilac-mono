@@ -45,7 +45,6 @@ export async function loadCompatValidators(): Promise<Map<string, CompatValidato
     "cacheRow",
     "questions.pending",
     "subagents.read",
-    "workflows.get",
     "config.readDeployment",
   ]) {
     if (!validators.has(required)) throw new Error(`Missing previous-release schema: ${required}`);

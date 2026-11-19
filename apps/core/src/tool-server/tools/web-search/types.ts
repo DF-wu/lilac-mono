@@ -29,18 +29,22 @@ export const webSearchInputSchema = z.object({
     .enum(WEB_SEARCH_TIME_RANGES)
     .optional()
     .describe(
-      "The time range back from the current date based on publish date or last updated date.",
+      "The time range back from the current date based on publish date or last updated date. With the OpenAI provider this is model guidance, not a hard date filter.",
     ),
   startDate: z
     .string()
     .regex(/^\d{4}-\d{2}-\d{2}$/)
     .optional()
-    .describe("Start date. Must be in YYYY-MM-DD format."),
+    .describe(
+      "Start date. Must be in YYYY-MM-DD format. With OpenAI this is model guidance, not a hard filter.",
+    ),
   endDate: z
     .string()
     .regex(/^\d{4}-\d{2}-\d{2}$/)
     .optional()
-    .describe("End date. Must be in YYYY-MM-DD format."),
+    .describe(
+      "End date. Must be in YYYY-MM-DD format. With OpenAI this is model guidance, not a hard filter.",
+    ),
 });
 
 export type WebSearchInput = z.infer<typeof webSearchInputSchema>;
@@ -54,7 +58,7 @@ export type WebSearchResult = {
   score: number | null;
 };
 
-export type WebSearchProviderId = "exa" | "firecrawl" | "tavily" | (string & {});
+export type WebSearchProviderId = "exa" | "firecrawl" | "openai" | "tavily" | (string & {});
 
 export interface WebSearchProvider {
   readonly id: WebSearchProviderId;

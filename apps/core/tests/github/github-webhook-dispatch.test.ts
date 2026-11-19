@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import { createLogger } from "@stanley2058/lilac-utils";
 import { Result } from "better-result";
+import { NO_REPLY_TOKEN } from "../../src/surface/bridge/reply-directive";
 import {
   decodeGithubWebhookEvent,
   githubWebhookApi,
@@ -102,6 +103,34 @@ function fixture() {
 }
 
 describe("GitHub webhook dispatch", () => {
+  it("explains automatic issue replies and the successful manual publication sentinel", async () => {
+    const f = fixture();
+    const result = await f.run("issue_comment", f.comment);
+    const prompt = JSON.stringify(f.publications[0]?.payload.messages);
+    expect(prompt).toContain("Lilac automatically publishes your final response");
+    expect(prompt).toContain(
+      "You may still perform GitHub write operations required by the user's task",
+    );
+    expect(prompt).toContain(
+      "Do not use `gh`, GitHub APIs, or `surface.messages.send` to publish the same final answer",
+    );
+    expect(prompt).toContain(`return exactly ${NO_REPLY_TOKEN} and nothing else`);
+    clearGithubRequest(result.requestId!);
+  });
+
+  it("suppresses successful manual review echoes and keeps fallback replies", async () => {
+    const f = fixture();
+    const result = await f.run("pull_request", f.review);
+    const prompt = JSON.stringify(f.publications[0]?.payload.messages);
+    expect(prompt).toContain("After a successful review submission");
+    expect(prompt).toContain(`return exactly ${NO_REPLY_TOKEN} and nothing else`);
+    expect(prompt).toContain(
+      "If the head SHA changed or no review was submitted, return an explanatory final response",
+    );
+    expect(prompt).toContain("Do not also publish the review");
+    clearGithubRequest(result.requestId!);
+  });
+
   it("selects the recent comment page and owns the latest issue request", async () => {
     const f = fixture();
     const result = await f.run("issue_comment", f.comment, "delivery-one");

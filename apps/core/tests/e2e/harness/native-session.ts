@@ -183,8 +183,13 @@ export class NativeSession {
       options.observePayload,
     );
     const session = new NativeSession(nativeUrl, credentials, initial, options);
-    await session.client.start();
-    await session.online();
+    try {
+      await session.client.start();
+      await session.online();
+    } catch (error) {
+      await session.close().catch(() => undefined);
+      throw error;
+    }
     return session;
   }
 

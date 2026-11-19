@@ -2541,6 +2541,14 @@ function writtenRootNames(statement: ts.Statement): Set<string> {
     if (isUpdateExpression(node)) addTarget(node.operand);
     if (ts.isDeleteExpression(node)) addTarget(node.expression);
     if (
+      ts.isVariableDeclaration(node) &&
+      node.initializer &&
+      ts.isVariableDeclarationList(node.parent) &&
+      (node.parent.flags & ts.NodeFlags.BlockScoped) === 0
+    ) {
+      for (const name of bindingNames(node.name)) names.add(name);
+    }
+    if (
       (ts.isForOfStatement(node) || ts.isForInStatement(node)) &&
       !ts.isVariableDeclarationList(node.initializer)
     ) {
@@ -2589,15 +2597,11 @@ function repeatsUnchangedCondition(previous: ts.IfStatement, next: ts.IfStatemen
   ) {
     return false;
   }
-  if (hasEffect(previous.expression)) return false;
+  if (hasEffect(previous.expression) || readsMember(previous.expression)) return false;
   const read = referencedRootNames(previous.expression);
   if ([...writtenRootNames(previous.thenStatement)].some((name) => read.has(name))) return false;
   if (!hasEffect(previous.thenStatement)) return true;
-  return (
-    !read.has("this") &&
-    !readsMember(previous.expression) &&
-    [...read].every((name) => isConstBinding(name, previous))
-  );
+  return !read.has("this") && [...read].every((name) => isConstBinding(name, previous));
 }
 
 function readsMember(node: ts.Node): boolean {

@@ -5,5 +5,12 @@
   "semi": true,
   "singleQuote": false,
   "experimentalSortPackageJson": false,
-  "ignorePatterns": ["ref/**", "node_modules/**", "data/**", "**/dist/**", "**/vendor/**"]
+  "ignorePatterns": [
+    "ref/**",
+    "node_modules/**",
+    "data/**",
+    ".omo/**",
+    "**/dist/**",
+    "**/vendor/**"
+  ]
 }

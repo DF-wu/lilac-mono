@@ -623,6 +623,8 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         "readBodyTextCapped",
         "readStreamTextCapped",
         "waitForSshExit",
+        "closeJobStdin",
+        "writeJobRequest",
       ].map((exportName) => ({ module: "src/ssh/ssh-exec.ts", exportName })),
     ],
   ],
@@ -989,6 +991,19 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     category: "wire",
   },
   ...[
+    "decodeOpenAIWebSearchResponse",
+    "decodeOutputItems",
+    "decodeOutputTexts",
+    "decodeUrlCitations",
+    "decodeWebSearchSources",
+  ].map((exportName) => ({
+    identity: {
+      module: "src/tool-server/tools/web-search/openai-web-search-provider.ts",
+      exportName,
+    },
+    category: "wire" as const,
+  })),
+  ...[
     "captureWebConfigFailure",
     "getNumericField",
     "getErrorStatus",
@@ -1320,6 +1335,13 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
     "apps/core",
     [
       ...CORE_TOOL_SERVER_BOUNDARY_DECODERS,
+      {
+        identity: {
+          module: "src/surface/native/discord-mirror-webhook.ts",
+          exportName: "decodeDiscordMirrorReply",
+        },
+        category: "wire" as const,
+      },
       ...CORE_FINAL_BOUNDARY_IDENTITIES.map(([module, exportName]) => ({
         identity: { module, exportName },
         category: "projection" as const,
@@ -3213,6 +3235,14 @@ const CORE_EVENT_DELIVERY_CONSUMERS = [
   },
   {
     identity: {
+      module: "src/surface/telegram/telegram-request-router.ts",
+      exportName: "startTelegramRequestRouter",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
+  {
+    identity: {
       module: "src/surface/bridge/subscribe-from-bus.ts",
       exportName: "bridgeBusToAdapter",
     },
@@ -3735,7 +3765,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : []),
       ...(root === "apps/core"
-        ? [
+        ? ([
             ...[
               "decodeSentAttachmentMetadata",
               "decodeSentAttachmentStdout",
@@ -3761,6 +3791,17 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "decodeNativeAttachmentProjection",
             ].map((exportName) => ({
               identity: { module: "src/surface/native/conversation-source.ts", exportName },
+              category: "projection" as const,
+            })),
+            ...[
+              "decodeTelegramThreadProjection",
+              "decodeTelegramMessageProjection",
+              "decodeTelegramAttachmentProjection",
+            ].map((exportName) => ({
+              identity: {
+                module: "src/surface/telegram/telegram-conversation-source.ts",
+                exportName,
+              },
               category: "projection" as const,
             })),
             ...["decodeSearchRows", "decodeSearchCount"].map((exportName) => ({
@@ -3837,7 +3878,26 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               },
               category: "wire" as const,
             },
-          ]
+            ...["parseStoredAdapterEvent", "parseStoredTelegramRaw"].map((exportName) => ({
+              identity: {
+                module: "src/surface/telegram/telegram-ingress.ts",
+                exportName,
+              },
+              category: "persistence" as const,
+            })),
+            ...(
+              [
+                ["src/surface/telegram/telegram-raw.ts", "normalizeTelegramReplyReference"],
+                ["src/surface/telegram/telegram-error-projection.ts", "projectTelegramError"],
+                ["src/surface/telegram/telegram-error-projection.ts", "projectTelegramBotFailure"],
+                ["src/surface/telegram/telegram-request-router-composition.ts", "telegramFlags"],
+                ["src/surface/telegram/telegram-inbound-media.ts", "telegramInboundMediaFromRaw"],
+              ] as const
+            ).map(([module, exportName]) => ({
+              identity: { module, exportName },
+              category: "projection" as const,
+            })),
+          ] satisfies readonly BoundaryDecoder[])
         : []),
       ...(root === "apps/computer-use-gateway"
         ? [
@@ -4322,6 +4382,20 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
     ],
     exceptionAdapters: [
       ...(REVIEWED_EXCEPTION_ADAPTERS[root] ?? []),
+      ...(root === "apps/core"
+        ? ([
+            {
+              identity: {
+                module: "src/surface/telegram/telegram-error-projection.ts",
+                exportName: "projectTelegramError",
+              },
+              category: "defect-supervisor" as const,
+              externalApi: { package: "better-result", exportName: "Panic.is" },
+              direction: "observe-panic" as const,
+              reason: "Preserves exact Panic identity while projecting ordinary Telegram failures.",
+            },
+          ] satisfies readonly ExceptionAdapter[])
+        : []),
       ...(PRECISE_EXCEPTION_IDENTITIES[root] ?? []).map(([module, exportName]) => ({
         identity: { module, exportName },
         category: "compatibility" as const,
@@ -4413,6 +4487,17 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "readNativeConversationAttachments",
             ].map((exportName) => ({
               module: "src/surface/native/conversation-source.ts",
+              exportName,
+            })),
+            ...[
+              "decodeTelegramThreadProjection",
+              "decodeTelegramMessageProjection",
+              "decodeTelegramAttachmentProjection",
+              "readTelegramConversationThreads",
+              "readTelegramConversationMessages",
+              "readTelegramConversationAttachments",
+            ].map((exportName) => ({
+              module: "src/surface/telegram/telegram-conversation-source.ts",
               exportName,
             })),
             { module: "src/surface/native/gateway.ts", exportName: "validateNativeFrame" },
@@ -4556,6 +4641,9 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               exportName,
             })),
             ...[
+              "NativeStore.readDiscordMirrorThread",
+              "NativeStore.reserveDiscordMirrorThread",
+              "NativeStore.settleDiscordMirrorThread",
               "NativeStore.initialize",
               "NativeStore.initializeDeployment",
               "NativeStore.getDeployment",
@@ -4792,6 +4880,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             {
               module: "src/tool-server/tools/web-search/firecrawl-web-search-provider.ts",
               exportName: "decodeFirecrawlSearchResponse",
+            },
+            {
+              module: "src/tool-server/tools/web-search/openai-web-search-provider.ts",
+              exportName: "decodeOpenAIWebSearchResponse",
             },
             {
               module: "src/tool-server/tools/web-search/firecrawl-permit-pool.ts",
@@ -5256,7 +5348,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "b751f428d40e3def4236b2cdbd98fb97066c11606ae80f423ae03da9f67a13be";
+  "dcf7a17723c086f069b2def6cd3993fb93e6297d5d00e8601be4975b2ca36f8f";
 
 export const architectureManifest = {
   version: 1,

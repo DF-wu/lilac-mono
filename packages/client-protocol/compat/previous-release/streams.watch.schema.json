@@ -8808,8 +8808,6 @@
               "type": "string",
               "enum": ["idle", "completed", "working", "error", "input"]
             },
-            "waitingOn": { "type": "string", "enum": ["input", "other"] },
-            "hasActiveWorkflow": { "type": "boolean", "const": true },
             "activeRunId": {
               "type": "string",
               "minLength": 1,

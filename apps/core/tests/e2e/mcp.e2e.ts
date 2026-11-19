@@ -64,9 +64,28 @@ test("the agent finds and calls tools from stdio and HTTP MCP servers", async ()
         // The fixture mirrors its structured output as JSON text, so the model gets it once.
         expect(model.result("mcp_fixture_weather").split('\\"celsius\\":21')).toHaveLength(2);
         return { toolCalls: [{ name: "mcp_fixture_pixel", args: {} }] };
-      case 4:
-        expect(model.result("mcp_fixture_pixel")).toContain('"mediaType":"image/png"');
+      case 4: {
+        const parts = JSON.parse(model.result("mcp_fixture_pixel")) as {
+          type: string;
+          text: string;
+        }[];
+        const prefix = "Local MCP binary materializations:\n";
+        const materialization = parts.find(
+          (part) => part.type === "text" && part.text.startsWith(prefix),
+        );
+        expect(materialization).toBeDefined();
+        expect(JSON.parse(materialization!.text.slice(prefix.length))).toMatchObject({
+          mcpBinaryFiles: [{ mediaType: "image/png", source: "image", bytes: 70 }],
+        });
+        expect(
+          request.messages.some(
+            (message) =>
+              message.role === "user" &&
+              message.files.some((file) => file.startsWith("data:image/png;")),
+          ),
+        ).toBe(true);
         return { toolCalls: [{ name: "mcp_fixture_explode", args: {} }] };
+      }
       case 5:
         expect(model.result("mcp_fixture_explode")).toContain("mcp-failure: fixture refused");
         return { toolCalls: [{ name: "mcp_remote_echo", args: { message: "over http" } }] };

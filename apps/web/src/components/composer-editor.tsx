@@ -31,6 +31,7 @@ import {
   useRef,
   useState,
   type Ref,
+  type RefObject,
 } from "react";
 import {
   Bold,
@@ -338,13 +339,23 @@ export type ComposerEditorProps = {
 // the editor from the current draft when the composer is revealed, before stale effects can run.
 const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) {
   const [generation, setGeneration] = useState(0);
+  const selection = useRef<{ documentKey?: string; text: string; from: number; to: number }>(
+    undefined,
+  );
   useLayoutEffect(() => () => setGeneration((value) => value + 1), []);
-  return <ComposerEditorInstance key={generation} {...props} />;
+  return <ComposerEditorInstance key={generation} {...props} savedSelection={selection} />;
 });
-const ComposerEditorInstance = memo(function ComposerEditorInstance(props: ComposerEditorProps) {
+const ComposerEditorInstance = memo(function ComposerEditorInstance(
+  props: ComposerEditorProps & {
+    savedSelection: RefObject<
+      { documentKey?: string; text: string; from: number; to: number } | undefined
+    >;
+  },
+) {
   // TipTap builds the editor once, and its callbacks read the latest props through a ref.
   "use no memo";
   const [openCitation, setOpenCitation] = useState<OpenCitation>();
+  const [initialSelection] = useState(() => props.savedSelection.current);
   const current = useRef(props);
   current.current = props;
   const lastText = useRef(props.text);
@@ -475,8 +486,30 @@ const ComposerEditorInstance = memo(function ComposerEditorInstance(props: Compo
       p.onPlainText(plain, text);
       p.onPrefix(composerCompletionPrefix(editor));
     },
-    onSelectionUpdate: ({ editor }) => current.current.onPrefix(composerCompletionPrefix(editor)),
+    onSelectionUpdate: ({ editor }) => {
+      const p = current.current;
+      p.savedSelection.current = {
+        documentKey: p.documentKey,
+        text: writeComposerDocument(editor.state.doc),
+        from: editor.state.selection.from,
+        to: editor.state.selection.to,
+      };
+      p.onPrefix(composerCompletionPrefix(editor));
+    },
   });
+  useLayoutEffect(() => {
+    if (
+      !editor ||
+      !initialSelection ||
+      initialSelection.documentKey !== props.documentKey ||
+      initialSelection.text !== props.text
+    )
+      return;
+    editor.commands.setTextSelection({
+      from: Math.min(initialSelection.from, editor.state.doc.content.size),
+      to: Math.min(initialSelection.to, editor.state.doc.content.size),
+    });
+  }, [editor]);
   useEffect(() => {
     if (!editor || !props.documentKey || props.disabled || props.loadingDraft) return;
     return registerCitationComposer(props.documentKey, (citation, anchor) => {
@@ -599,6 +632,15 @@ const ComposerEditorInstance = memo(function ComposerEditorInstance(props: Compo
     const focused = document.activeElement;
     if (focused instanceof Element && focused.closest('input, textarea, [contenteditable="true"]'))
       return;
+    const saved = initialSelection;
+    if (saved && saved.documentKey === props.documentKey && saved.text === props.text) {
+      editor.commands.setTextSelection({
+        from: Math.min(saved.from, editor.state.doc.content.size),
+        to: Math.min(saved.to, editor.state.doc.content.size),
+      });
+      editor.commands.focus();
+      return;
+    }
     editor.commands.focus("end");
   }, [editor, props.documentKey, props.loadingDraft, props.disabled, props.autoFocus]);
   return (

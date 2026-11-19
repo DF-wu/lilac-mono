@@ -177,17 +177,12 @@ impl GlobWalk<'_> {
         if !self.seen.insert(rel.to_string()) {
             return Ok(());
         }
-        let count = if self.with_stats {
-            self.entries.len()
-        } else {
-            self.paths.len()
-        } as u64;
-        if count >= self.max_entries {
+        if self.paths.len() as u64 >= self.max_entries {
             self.truncated = true;
             return Ok(());
         }
+        self.paths.push(rel.to_string());
         if !self.with_stats {
-            self.paths.push(rel.to_string());
             return Ok(());
         }
         match fs::metadata(abs) {
@@ -298,14 +293,7 @@ pub fn glob(request: &GlobRequest) -> Result<Option<GlobOutput>, FsError> {
         walk.walk(&root)?;
     }
     Ok(Some(GlobOutput {
-        paths: if request.with_stats {
-            walk.entries
-                .iter()
-                .map(|entry| entry.path.clone())
-                .collect()
-        } else {
-            walk.paths
-        },
+        paths: walk.paths,
         entries: request.with_stats.then_some(walk.entries),
         truncated: walk.truncated,
     }))
@@ -374,5 +362,51 @@ fn entry_for(rel: &str, abs: &Path, is_directory: bool) -> WalkEntry {
             .as_ref()
             .map(|metadata| file_kind(metadata.file_type())),
         size: metadata.as_ref().map(|metadata| metadata.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn glob_paths_do_not_depend_on_optional_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "lilac-glob-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        symlink("missing.txt", root.join("a-dangling.txt")).unwrap();
+        fs::write(root.join("b-present.txt"), "present\n").unwrap();
+        let mut request = GlobRequest {
+            cwd: root.to_str().unwrap().to_string(),
+            patterns: vec!["*.txt".to_string()],
+            max_entries: 10,
+            deny_paths: vec![],
+            dangerously_allow: false,
+            with_stats: false,
+        };
+        let without_stats = glob(&request).unwrap().unwrap();
+        request.with_stats = true;
+        let with_stats = glob(&request).unwrap().unwrap();
+        request.max_entries = 1;
+        let limited = glob(&request).unwrap().unwrap();
+        fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(without_stats.paths, ["a-dangling.txt", "b-present.txt"]);
+        assert!(without_stats.entries.is_none());
+        assert_eq!(with_stats.paths, without_stats.paths);
+        let entries = with_stats.entries.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "b-present.txt");
+        assert_eq!(limited.paths, ["a-dangling.txt"]);
+        assert!(limited.entries.unwrap().is_empty());
+        assert!(limited.truncated);
     }
 }

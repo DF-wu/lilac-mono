@@ -839,6 +839,7 @@ function buildBashChildEnv(params: {
     requestId: string;
     requestDeliveryId?: string;
     sessionId: string;
+    originSessionId?: string;
     requestClient: string;
     currentTurnUserId?: string;
   };
@@ -855,6 +856,7 @@ function buildBashChildEnv(params: {
     LILAC_REQUEST_ID: params.context?.requestId,
     LILAC_REQUEST_DELIVERY_ID: params.context?.requestDeliveryId,
     LILAC_SESSION_ID: params.context?.sessionId,
+    LILAC_ORIGIN_SESSION_ID: params.context?.originSessionId,
     LILAC_REQUEST_CLIENT: params.context?.requestClient,
     LILAC_CURRENT_TURN_USER_ID: params.context?.currentTurnUserId,
     LILAC_CWD: params.resolvedCwd,
@@ -996,6 +998,7 @@ export async function executeBash(
       requestId: string;
       requestDeliveryId?: string;
       sessionId: string;
+      originSessionId?: string;
       requestClient: string;
       currentTurnUserId?: string;
     };

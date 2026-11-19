@@ -94,7 +94,11 @@ ${"Complete instructions.\n".repeat(12_000)}Last instruction.
       });
       bindRequestInvocationCwd(opts.context, cwd);
       opts.context.cwd = path.join(cwd, "canonical-workspace");
-      expect(await tool.call("skills.list", { sources: "agent-project" }, opts)).toEqual(listed);
+      // Discovery warnings can change independently in operator-owned global skill directories.
+      expect(await tool.call("skills.list", { sources: "agent-project" }, opts)).toMatchObject({
+        status: "ok",
+        value: { skills: [{ name, location, source: "agent-project" }] },
+      });
       const read = await tool.call("skills.read", { name }, opts);
       expect(read.status).toBe("ok");
       if (read.status !== "ok") throw new Error(read.error.message);
@@ -115,7 +119,7 @@ ${"Complete instructions.\n".repeat(12_000)}Last instruction.
       });
       const elsewhere = await tool.call(
         "skills.list",
-        { query: name },
+        { query: name, sources: "agent-project" },
         {
           context: { cwd: path.join(cwd, "elsewhere") },
         },

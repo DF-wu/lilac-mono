@@ -16,6 +16,7 @@ Use the first configured provider in this order. Honor an explicit provider or m
 | `openai` | `gpt-image-2.5-sunburst` | [OpenAI generation and masked edits](references/openai.md) |
 | `openrouter` | `google/gemini-3.1-flash-image-preview` (Nano Banana 2) | [OpenRouter generation and reference images](references/openrouter.md) |
 | `xai` | `grok-imagine-image-2.0` | [xAI generation and edits](references/xai.md) |
+| `openaiCompatible` | Endpoint-specific; list its models first | [OpenAI-compatible generation and edits](references/openai-compatible.md) |
 
 For fast OpenAI drafts, `gpt-image-2.5-flare` is an alternative. Prefer Sunburst for precise edits. The catalog was checked on 2026-09-11. Read the selected provider's recipe; consult its upstream links for features outside the recipe, an explicit unlisted model, or a model/parameter rejection. A custom endpoint may expose a different catalog.
 

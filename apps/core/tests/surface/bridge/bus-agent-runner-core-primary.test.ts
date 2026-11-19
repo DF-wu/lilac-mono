@@ -343,7 +343,13 @@ describe("startBusAgentRunner prefix-lineage tool authority", () => {
       pluginManager,
       transcriptStore: store,
       issueControlCapability: () => ({ capability: "tool-compaction", principal: null }),
-      createAgent: (options) => new AiSdkPiAgent({ ...options, model }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          // Keep the compaction budget independent of globally discovered skills.
+          system: "Preserve loaded tool authority through compaction.",
+          model,
+        }),
     });
 
     const sessionId = "tool-compaction-channel";

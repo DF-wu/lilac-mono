@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { parseCoreConfigV1ToUniversal } from "@stanley2058/lilac-utils";
-import { Result } from "better-result";
+import { Panic, Result } from "better-result";
 
 import type { SurfaceAdapter } from "../../../src/surface/adapter";
 import { createDiscordThreadControl } from "../../../src/surface/discord/discord-thread-control";
@@ -67,11 +67,80 @@ function control(messages: readonly SurfaceMessage[]) {
   const { adapter, listed } = fakeAdapter(messages);
   return {
     port: createDiscordThreadControl({ adapter, getConfig: async () => config }),
+    adapter,
+    config,
     listed,
   };
 }
 
 describe("Discord thread control", () => {
+  it("returns a typed failure when configuration loading rejects", async () => {
+    const { adapter, listed } = control([]);
+    const port = createDiscordThreadControl({
+      adapter,
+      getConfig: async () => {
+        throw new Error("Invalid YAML");
+      },
+    });
+
+    const read = await port.read(CALLER, "#ops", READ);
+
+    expect(read.isErr() && read.error._tag).toBe("SurfaceUnavailable");
+    expect(listed).toEqual([]);
+  });
+
+  it("uses one configuration snapshot for alias resolution and the allowlist", async () => {
+    const { adapter, config } = control([]);
+    let configReads = 0;
+    const port = createDiscordThreadControl({
+      adapter,
+      getConfig: async () => {
+        configReads += 1;
+        if (configReads > 1) throw new Error("Config changed during the read");
+        return config;
+      },
+    });
+
+    const read = (await port.read(CALLER, "#ops", READ)).unwrap();
+
+    expect(read.title).toBe("#ops");
+    expect(configReads).toBe(1);
+  });
+
+  it("returns a typed failure when Discord identity is unavailable", async () => {
+    const { port, adapter } = control([]);
+    adapter.getSelf = async () => {
+      throw new Error("Discord disconnected");
+    };
+
+    const read = await port.read(CALLER, CHANNEL_ID, READ);
+
+    expect(read.isErr() && read.error._tag).toBe("SurfaceUnavailable");
+  });
+
+  it("preserves the original identity Panic", async () => {
+    const { port, adapter } = control([]);
+    const panic = new Panic({ message: "Discord identity invariant failed" });
+    adapter.getSelf = async () => {
+      throw panic;
+    };
+
+    await expect(port.read(CALLER, CHANNEL_ID, READ)).rejects.toBe(panic);
+  });
+
+  it("preserves the original configuration Panic", async () => {
+    const { adapter } = control([]);
+    const panic = new Panic({ message: "Config invariant failed" });
+    const port = createDiscordThreadControl({
+      adapter,
+      getConfig: async () => {
+        throw panic;
+      },
+    });
+
+    await expect(port.read(CALLER, CHANNEL_ID, READ)).rejects.toBe(panic);
+  });
+
   it("reads an allowed channel oldest first with authors and paging cursors", async () => {
     // Discord returns pages newest first.
     const { port, listed } = control([

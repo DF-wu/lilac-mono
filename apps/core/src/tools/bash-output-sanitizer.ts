@@ -758,6 +758,7 @@ export async function readSanitizedStreamTextCappedResult(
       if (sanitized.isErr()) return sanitized.error;
       await consumeSanitizedText(sanitized.value);
       if (capped && !overflowSink) await flushBufferedRaw();
+      if (deferredPanic) return "stop";
       return undefined;
     };
     while (true) {

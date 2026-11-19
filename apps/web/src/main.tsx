@@ -88,9 +88,11 @@ function Root() {
   const client = state.kind === "ready" ? state.session.client : undefined;
   useEffect(() => {
     if (!client) return;
-    return client.subscribe((event) => {
+    const stop = client.subscribe((event) => {
       if (event.kind === "connection" && event.state === "online") void authInfo.load();
     });
+    if (client.connectionState === "online") void authInfo.load();
+    return stop;
   }, [client]);
   useEffect(() => {
     let stop: (() => void) | undefined;

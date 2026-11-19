@@ -28,25 +28,45 @@ async function localTags(): Promise<string[]> {
   return listed ? listed.split("\n") : [];
 }
 
-/** The newest release tag that is not HEAD, fetching it shallowly when the clone lacks tags. */
-async function previousTag(): Promise<string> {
-  if (process.env.LILAC_E2E_PREVIOUS_TAG) return process.env.LILAC_E2E_PREVIOUS_TAG;
+/** Selects an actual ancestor release, including when local tags contain only HEAD. */
+export async function previousTag(): Promise<string> {
+  if ((await git(["rev-parse", "--is-shallow-repository"])) === "true")
+    await git(["fetch", "--unshallow", "--no-tags", "origin"]);
   const head = await git(["rev-parse", "HEAD"]);
-  let tags = (await localTags()).toSorted((left, right) => runId(right) - runId(left));
-  if (!tags.length) {
-    const remote = await git(["ls-remote", "--tags", "--refs", "origin", "build-*"]);
-    tags = remote
-      .split("\n")
-      .map((line) => line.split("refs/tags/")[1] ?? "")
-      .filter(Boolean)
-      .toSorted((left, right) => runId(right) - runId(left));
+  async function select(tags: string[]): Promise<string | undefined> {
+    const local = new Set(await localTags());
+    for (const tag of tags.toSorted((left, right) => runId(right) - runId(left))) {
+      if (!local.has(tag))
+        await git(["fetch", "--no-tags", "origin", `refs/tags/${tag}:refs/tags/${tag}`]);
+      if ((await git(["rev-list", "-n1", tag])) === head) continue;
+      const check = Bun.spawn(["git", "merge-base", "--is-ancestor", tag, "HEAD"], {
+        cwd: REPO_ROOT,
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      const [code, error] = await Promise.all([check.exited, new Response(check.stderr).text()]);
+      if (code === 0) return tag;
+      if (code !== 1) throw new Error(`Could not verify release ancestry: ${error}`);
+    }
+    return undefined;
   }
-  for (const tag of tags) {
-    if (!(await localTags()).includes(tag))
-      await git(["fetch", "--depth=1", "--no-tags", "origin", `refs/tags/${tag}:refs/tags/${tag}`]);
-    if ((await git(["rev-list", "-n1", tag])) !== head) return tag;
+  const pinned = process.env.LILAC_E2E_PREVIOUS_TAG;
+  if (pinned) {
+    const selected = await select([pinned]);
+    if (!selected) throw new Error(`${pinned} is not a predecessor of HEAD`);
+    return selected;
   }
-  throw new Error("No previous release tag (build-*) is available");
+  const local = await select(await localTags());
+  if (local) return local;
+  const remote = await git(["ls-remote", "--tags", "--refs", "origin", "build-*"]);
+  const selected = await select(
+    remote.split("\n").flatMap((line) => {
+      const tag = line.split("refs/tags/")[1];
+      return tag ? [tag] : [];
+    }),
+  );
+  if (!selected) throw new Error("No predecessor release tag (build-*) is available");
+  return selected;
 }
 
 async function run(command: string[], cwd: string): Promise<void> {

@@ -111,6 +111,30 @@ try {
       image,
     })
   ).unwrap();
+  const ownership = await run([
+    "docker",
+    "run",
+    "--rm",
+    "--network",
+    "none",
+    "--read-only",
+    "--user",
+    "0:0",
+    "--mount",
+    `type=bind,source=${join(root, "data")},target=/data,readonly`,
+    "--entrypoint",
+    "/bin/sh",
+    image,
+    "-ec",
+    'user=lilac; if [ -f /etc/lilac-runtime-user ]; then user=$(cat /etc/lilac-runtime-user); fi; id -u "$user"; id -g "$user"; stat -c "%u:%g:%a" /data /data/secret /data/workspace /data/core-config.yaml',
+  ]);
+  const [uid, gid, ...files] = ownership.split("\n");
+  assert.deepEqual(files, [
+    `${uid}:${gid}:700`,
+    `${uid}:${gid}:700`,
+    `${uid}:${gid}:700`,
+    `${uid}:${gid}:600`,
+  ]);
   await run([...compose, "config", "--quiet"]);
   await run([...compose, "up", "-d", "--wait", "--wait-timeout", "180"]);
   const container = await run([...compose, "ps", "-q", "lilac"]);

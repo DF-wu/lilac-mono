@@ -4,6 +4,15 @@ import path from "node:path";
 import { matchesGlobWithDotfiles } from "../src/glob-match";
 
 const cases = [
+  [".env", "[!.]*", false],
+  [".env", "[a-z]*", false],
+  [".env", "[a-z.]*", true],
+  [".env", "[.-0]*", true],
+  ["a/.env", "{a/*,b/*}", true],
+  ["a/.env", "{a/[!.]*,b/*}", false],
+  ["a/.env", "{other,{a/*,b/*}}", true],
+  ["{/.env", "[{},a]/*", true],
+  ["1/.env", "{1..2}/*", true],
   [".env", "**/*", true],
   [".env", "*", true],
   [".hidden/config.ts", "**/*.ts", true],

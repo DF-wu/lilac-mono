@@ -28,4 +28,4 @@ Keep a compact existence map for tools hidden behind the `tools` CLI. Add detail
 
 ## Conversation links
 
-Use conversation tools first for Lilac reference links (`/?ref=...`, including absolute links on this installation) and Discord message URLs. Load `surface.help` for URL parsing and retrieval rules.
+Use conversation tools first for Lilac reference links (`/?ref=...`, including absolute links on this installation), Discord message URLs, and Telegram `t.me/c/...` links. Load `surface.help` for URL parsing and retrieval rules.

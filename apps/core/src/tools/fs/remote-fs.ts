@@ -1,5 +1,6 @@
 import {
   FileSystem,
+  expandTilde,
   type EditFileResult,
   type FileEdit,
   type FuzzySearchResult,
@@ -13,7 +14,7 @@ import { Result, type Result as ResultType } from "better-result";
 
 import {
   createRemoteFileSystemHost,
-  type RemoteHostUnavailableError,
+  RemoteHostUnavailableError,
 } from "../../ssh/remote-filesystem-host";
 
 export type RemoteReadTextInput = {
@@ -87,13 +88,18 @@ async function withRemoteFileSystem<T>(
     timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     signal: params.signal,
   });
-  return await created.match<Promise<ResultType<T, RemoteFsExecutionError>>>({
-    err: async (error) => Result.err(error),
-    ok: async (host) =>
-      Result.ok(
-        await run(new FileSystem(params.cwd, { ...search, denyPaths: params.denyPaths, host })),
-      ),
-  });
+  if (created.isErr()) return Result.err(created.error);
+  const host = created.value;
+  const canonical = await host.realpath(expandTilde(params.cwd, host.homeDir));
+  if (canonical.isErr()) {
+    return Result.err(
+      new RemoteHostUnavailableError({ host: params.host, message: canonical.error.message }),
+    );
+  }
+  const cwd = canonical.value;
+  return Result.ok(
+    await run(new FileSystem(cwd, { ...search, denyPaths: params.denyPaths, host })),
+  );
 }
 
 /** Drops per-edit diagnostics, which the remote edit contract never carried. */
@@ -208,8 +214,6 @@ export async function remoteGrep(params: {
   return await withRemoteFileSystem(params, (fileSystem) =>
     fileSystem.grep({
       pattern: params.input.pattern,
-      baseDir: params.cwd,
-      reportedFilePath: params.cwd,
       regex: params.input.regex,
       maxResults: params.input.maxResults,
       fileExtensions: params.input.fileExtensions?.map((extension) => extension.replace(/^\./, "")),

@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
 import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/websocket";
@@ -7,6 +7,15 @@ import { nativeContract } from "@stanley2058/lilac-client-protocol";
 import { createNativeIntegrationFixture } from "./integration-fixture";
 
 test("operator console uses the existing runner alongside web login, then deletes its conversation", async () => {
+  const serve = Bun.serve;
+  let operatorUrl = "";
+  using _listener = spyOn(Bun, "serve").mockImplementation((options) => {
+    const operator = options.port === 8788;
+    if (operator) options.port = 0;
+    const server = serve(options);
+    if (operator) operatorUrl = server.url.toString();
+    return server;
+  });
   const token = randomBytes(32).toString("base64url");
   const fixture = await createNativeIntegrationFixture({
     operatorTokenSha256: createHash("sha256").update(token).digest("hex"),
@@ -15,7 +24,8 @@ test("operator console uses the existing runner alongside web login, then delete
     authorization: `Bearer ${token}`,
     "x-lilac-operator-session": crypto.randomUUID(),
   };
-  const endpoint = "http://127.0.0.1:8788/api/operator/session";
+  if (!operatorUrl) throw new Error("Operator fixture listener was not created");
+  const endpoint = new URL("api/operator/session", operatorUrl).href;
   let socket: WebSocket | undefined;
   try {
     expect(
@@ -27,7 +37,9 @@ test("operator console uses the existing runner alongside web login, then delete
     const NativeSocket = WebSocket as typeof WebSocket & {
       new (url: string, options: { headers: Record<string, string> }): WebSocket;
     };
-    socket = new NativeSocket("ws://127.0.0.1:8788/api/socket", { headers });
+    const socketUrl = new URL("api/socket", operatorUrl);
+    socketUrl.protocol = "ws:";
+    socket = new NativeSocket(socketUrl.href, { headers });
     const client = createORPCClient<ContractRouterClient<typeof nativeContract>>(
       new RPCLink({ websocket: socket }),
     );
