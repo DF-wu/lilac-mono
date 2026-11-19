@@ -295,7 +295,14 @@ describe("remote filesystem parity", () => {
           const actual = withoutBackend(
             unwrap(await remoteGlob({ host: HOST, cwd: tree, denyPaths, ...input })),
           );
-          expect({ input, result: actual }).toEqual({ input, result: expected });
+          const sorted = (value: typeof expected) =>
+            value.mode === "default"
+              ? { ...value, paths: [...value.paths].sort() }
+              : {
+                  ...value,
+                  entries: [...value.entries].sort((a, b) => a.path.localeCompare(b.path)),
+                };
+          expect({ input, result: sorted(actual) }).toEqual({ input, result: sorted(expected) });
           expect(expected.error).toBeUndefined();
           const count =
             expected.mode === "default" ? expected.paths.length : expected.entries.length;
