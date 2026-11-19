@@ -20,6 +20,7 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
   "apps/computer-use-gateway": [],
   "apps/installer": [],
   "apps/web": [],
+  "apps/remote-runner": [],
   "apps/tui": [],
   "packages/computer-use-runner": [],
   "packages/client": [],
@@ -63,16 +64,6 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ["src/runtime/core-config-watch.ts", "captureCoreConfigWatchRead", "signal"],
     [
       "src/runtime/core-event-bus.ts",
-      "setupCoreEventBusResources.try.ok.<callback>.err@7.<callback>@1",
-      "signal",
-    ],
-    [
-      "src/runtime/core-event-bus.ts",
-      "setupCoreEventBusResources.try.ok.<callback>.err@9.<callback>@2",
-      "signal",
-    ],
-    [
-      "src/runtime/core-event-bus.ts",
       "adaptCoreEventBusCleanupResultToHost.err.<callback>",
       "signal",
     ],
@@ -112,6 +103,11 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ["src/surface/bridge/subscribe-from-bus.ts", "rethrowBusToAdapterPanic", "signal"],
     ["src/surface/discord/discord-adapter.ts", "captureDiscordOperation", "signal"],
     [
+      "src/surface/discord/discord-thread-control.ts",
+      "captureDiscordThreadReadOperation",
+      "signal",
+    ],
+    [
       "src/surface/discord/discord-runtime-descriptor.ts",
       "adaptDiscordSkippedOutputCleanupResultToHost.err.<callback>",
       "signal",
@@ -143,7 +139,6 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
       "signal",
     ],
     ["src/github/webhook/github-webhook-server.ts", "superviseGithubWebhookHandler", "signal"],
-    ["src/mcp/config-file.ts", "writeMcpConfigFileAtomic.err@5.<callback>@4", "signal"],
     ["src/mcp/config.ts", "serializeMcpConfigYaml.err.<callback>", "signal"],
     ["src/mcp/credential-file.ts", "readMcpOAuthCredentialFile.err.<callback>", "signal"],
     ["src/mcp/credential-file.ts", "readMcpOAuthCredentialFileResult.ok.<callback>", "signal"],
@@ -157,7 +152,7 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ],
     [
       "src/mcp/credential-file.ts",
-      "updateMcpOAuthCredentialFileResult.ok.<callback>.then.<callback@1>@1.ok.<callback>",
+      "updateMcpOAuthCredentialFileResult.ok.<callback>.then.<callback@1>@1",
       "signal",
     ],
     [
@@ -607,15 +602,10 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ["src/filesystem-operation.ts", "captureFilesystemOperation", "signal"],
     ["src/filesystem-operation.ts", "captureFilesystemOperationSync", "signal"],
     ["src/fs-impl.ts", "compileEditRegex", "signal"],
-    ["src/remote-runner-protocol.ts", "decodeJson", "signal"],
     ["src/ripgrep.ts", "decodeRipgrepMatchLine", "signal"],
     ["src/ripgrep.ts", "ripgrep", "signal"],
     ["src/search-backend.ts", "captureFffOperation", "signal"],
     ["src/search-backend.ts", "captureFffSyncOperation", "signal"],
-  ],
-  "packages/remote-fs-runner": [
-    ["src/cli.ts", "preservePanic", "signal"],
-    ["src/cli.ts", "runWithStartupLockCleanup", "signal"],
   ],
   "packages/plugin-runtime": [
     ["capabilities.ts", "capturePluginInspection", "signal"],

@@ -50,6 +50,7 @@ import {
   CUSTOM_COMMAND_TOOL_NAME,
   deriveSubagentIdleTimeoutMs,
   env,
+  formatTaggedErrorForLog,
   getCoreConfig,
   isRecord,
   ModelCapability,
@@ -169,7 +170,11 @@ import { type AgentRunJournal, type AgentRunRecoveryHead } from "./agent-run-jou
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "./bridge-log";
 import { recordRequestLatencyStage } from "./request-latency-trace";
-import { selectWorkspaceSystemPrompt } from "./bus-agent-runner/subagent-prompt";
+import {
+  resolveSubagentConversation,
+  selectWorkspaceSystemPrompt,
+  type SubagentConversation,
+} from "./bus-agent-runner/subagent-prompt";
 import {
   formatToolLogPreview,
   summarizeToolFailure,
@@ -841,14 +846,10 @@ export function persistHeartbeatSurfaceHandoffs(params: {
     const handoffRequestId = buildHeartbeatHandoffRequestId(params.requestId, i);
 
     const storedHandoff = projectStoredMessagesV1(handoff.messages);
-    const storedHandoffError = storedHandoff.match({
-      ok: () => null,
-      err: (error) => error,
-    });
-    if (storedHandoffError) {
+    if (storedHandoff.isErr()) {
       params.logger.warn(
         "heartbeat handoff transcript projection failed",
-        formatBridgeTaggedErrorForLog(storedHandoffError, {
+        formatBridgeTaggedErrorForLog(storedHandoff.error, {
           requestId: handoffRequestId,
         }),
       );
@@ -858,10 +859,7 @@ export function persistHeartbeatSurfaceHandoffs(params: {
       requestId: handoffRequestId,
       sessionId: HEARTBEAT_HANDOFF_SESSION_ID,
       requestClient: params.requestClient,
-      messages: storedHandoff.match({
-        ok: (messages) => messages,
-        err: () => [],
-      }),
+      messages: storedHandoff.value,
       finalText: handoff.finalText,
       modelLabel: params.modelLabel,
     });
@@ -1306,6 +1304,13 @@ export function formatBusAgentRunnerDrainFailureForLog(
   });
 }
 
+function lastAssistantText(messages: readonly ModelMessage[]): string | undefined {
+  const last = messages.at(-1);
+  if (last?.role !== "assistant") return undefined;
+  if (typeof last.content === "string") return last.content;
+  return last.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n\n");
+}
+
 export async function startBusAgentRunner(params: {
   questions?: QuestionService;
   jobs?: JobService;
@@ -1315,6 +1320,7 @@ export async function startBusAgentRunner(params: {
   requestDelivery?: BusAgentRunnerRequestDelivery;
   onRequestSettled?: (requestDeliveryId: string) => void;
   createNativeOutput?: (input: {
+    readonly getSafetyMode: () => SessionSafetyMode | undefined;
     readonly requestId: string;
     readonly sessionId: string;
     readonly requestClient: AdapterPlatform;
@@ -1830,22 +1836,15 @@ export async function startBusAgentRunner(params: {
       blobStore: params.blobStore,
       identityProjection: storedMessageIdentity,
     });
-    const messageMaterializationError = materializedMessages.match({
-      ok: () => null,
-      err: (error) => error,
-    });
-    if (messageMaterializationError) {
+    if (materializedMessages.isErr()) {
       return reconcileAcceptedProjectionFailure(
         new BusAgentRunnerIntakeFailed({
-          cause: messageMaterializationError,
+          cause: materializedMessages.error,
           message: "Durable request message materialization failed",
         }),
       );
     }
-    const messages = materializedMessages.match({
-      ok: (value) => value,
-      err: () => [],
-    });
+    const messages = materializedMessages.value;
     const deliveryData = acceptedRecord?.work.data ?? msg.data;
 
     const projectedRequest = (params.projectAuthenticatedRequest ?? projectAuthenticatedRequest)(
@@ -2599,7 +2598,8 @@ export async function startBusAgentRunner(params: {
                       ownerId: alias.ownerId,
                     },
                   };
-                  if (acceptedRecord && params.requestDelivery) {
+                  const persistAliasProjection = () => {
+                    if (!acceptedRecord || !params.requestDelivery) return undefined;
                     const projectedWork = {
                       ...acceptedRecord.work,
                       requestId: aliasProjection.requestId,
@@ -2621,24 +2621,23 @@ export async function startBusAgentRunner(params: {
                       requestId: projectedWork.requestId,
                       work: projectedWork,
                     });
-                    const replaceError = replaced.match({
-                      ok: () => null,
-                      err: (error) => error,
+                    if (replaced.isErr()) return replaced.error;
+                    return undefined;
+                  };
+                  const replaceError = persistAliasProjection();
+                  if (replaceError) {
+                    requestMessageCache.releaseOwner({
+                      requestId: alias.requestId,
+                      ownerId: alias.ownerId,
                     });
-                    if (replaceError) {
-                      requestMessageCache.releaseOwner({
-                        requestId: alias.requestId,
-                        ownerId: alias.ownerId,
-                      });
-                      intakeError = new BusAgentRunnerOperationFailed({
-                        operation: "durable incompatible-model queue projection",
-                        cause: replaceError,
-                        failureKind: "other",
-                        displayMessage: replaceError.message,
-                        message: "Incompatible-model queue projection could not be persisted",
-                      });
-                      return;
-                    }
+                    intakeError = new BusAgentRunnerOperationFailed({
+                      operation: "durable incompatible-model queue projection",
+                      cause: replaceError,
+                      failureKind: "other",
+                      displayMessage: replaceError.message,
+                      message: "Incompatible-model queue projection could not be persisted",
+                    });
+                    return;
                   }
                   const queueDepthBefore = state.queue.length;
                   const enqueued = await enqueueWithLifecycle(
@@ -2718,6 +2717,12 @@ export async function startBusAgentRunner(params: {
                     controlApplied: false,
                   };
                   queueLifecycleAttempts.set(msg.id, attempt);
+                  const releaseBufferedPrompts = () => {
+                    for (const bufferedPrompt of bufferedPrompts) {
+                      reservedQueueEntries.delete(bufferedPrompt);
+                    }
+                    queueLifecycleAttempts.delete(msg.id);
+                  };
                   const applied = await captureBusAgentRunnerOperation(
                     "buffered prompt control application",
                     () =>
@@ -2737,22 +2742,12 @@ export async function startBusAgentRunner(params: {
                         controlTargetFor(runningAgent),
                       ),
                   );
-                  const applyError = applied.match({
-                    ok: () => null,
-                    err: (error) => error,
-                  });
-                  if (applyError) {
-                    for (const bufferedPrompt of bufferedPrompts) {
-                      reservedQueueEntries.delete(bufferedPrompt);
-                    }
-                    queueLifecycleAttempts.delete(msg.id);
-                    signalBusAgentRunnerHostFailure(applyError);
+                  if (applied.isErr()) {
+                    releaseBufferedPrompts();
+                    signalBusAgentRunnerHostFailure(applied.error);
                   }
-                  if (applied.match({ ok: (o) => o === "target-ended", err: () => false })) {
-                    for (const bufferedPrompt of bufferedPrompts) {
-                      reservedQueueEntries.delete(bufferedPrompt);
-                    }
-                    queueLifecycleAttempts.delete(msg.id);
+                  if (applied.value === "target-ended") {
+                    releaseBufferedPrompts();
                     await routeAfterTargetEnded();
                     return;
                   }
@@ -3217,9 +3212,8 @@ export async function startBusAgentRunner(params: {
         sessionId,
         raw: next.raw,
       });
-      const rejection = validated.match({ ok: () => null, err: (error) => error });
-      if (rejection) {
-        const rejected = await rejectNativeDelivery(next.requestDeliveryId ?? "", rejection);
+      if (validated.isErr()) {
+        const rejected = await rejectNativeDelivery(next.requestDeliveryId ?? "", validated.error);
         releaseDequeuedSession();
         const failure = rejected.match({ ok: () => null, err: (error) => error });
         if (failure) return signalBusAgentRunnerHostFailure(failure);
@@ -3227,18 +3221,9 @@ export async function startBusAgentRunner(params: {
         startSessionQueueDrain(sessionId, state);
         return;
       }
-      next.restoredSafetyMode = validated.match({
-        ok: (value) => value.safetyMode,
-        err: () => "restricted",
-      });
-      next.nativeHistoryProviderState = validated.match({
-        ok: (value) => value.historyProviderState,
-        err: () => undefined,
-      });
-      next.nativeResolvedModelRequest = validated.match({
-        ok: (value) => value.resolvedModelRequest,
-        err: () => undefined,
-      });
+      next.restoredSafetyMode = validated.value.safetyMode;
+      next.nativeHistoryProviderState = validated.value.historyProviderState;
+      next.nativeResolvedModelRequest = validated.value.resolvedModelRequest;
     }
     const mcpImages = new McpImageCheckpointRegistry();
     let recoveredQueuedControlStoredMessages: StoredMessageV1[] = [];
@@ -3249,20 +3234,13 @@ export async function startBusAgentRunner(params: {
         blobStore: params.blobStore,
         identityProjection: storedMessageIdentity,
       });
-      const materializationError = materialized.match({
-        ok: () => null,
-        err: (error) => error,
-      });
-      if (materializationError) {
+      if (materialized.isErr()) {
         releaseDequeuedSession();
-        await failUnmaterializableEntry(next, materializationError);
+        await failUnmaterializableEntry(next, materialized.error);
         startSessionQueueDrain(sessionId, state);
         return;
       }
-      next.messages = materialized.match({
-        ok: (value) => value,
-        err: () => [],
-      });
+      next.messages = materialized.value;
     }
     if (next.recovery && next.storedRecoveryCheckpoint) {
       const materialized = await materializeMcpImageCheckpoint({
@@ -3272,11 +3250,7 @@ export async function startBusAgentRunner(params: {
         blobStore: params.blobStore,
         identityProjection: storedMessageIdentity,
       });
-      const materializationError = materialized.match({
-        ok: () => null,
-        err: (error) => error,
-      });
-      if (materializationError) {
+      if (materialized.isErr()) {
         const previous = await materializePreviousRunCheckpoint({
           imageRegistry: mcpImages,
           entry: next,
@@ -3291,13 +3265,10 @@ export async function startBusAgentRunner(params: {
             handle: previous.handle,
           });
         } else {
-          fallBackRunCheckpointToAcceptedWork({ entry: next, error: materializationError });
+          fallBackRunCheckpointToAcceptedWork({ entry: next, error: materialized.error });
         }
       } else {
-        next.recovery.checkpointMessages = materialized.match({
-          ok: (value) => value,
-          err: () => [],
-        });
+        next.recovery.checkpointMessages = materialized.value;
       }
     }
     if (draining) {
@@ -3389,6 +3360,7 @@ export async function startBusAgentRunner(params: {
     let controlCapability: string | null = null;
     let trustedFallbackSurface: TrustedSubagentDelegationRegistration["fallbackSurface"] | null =
       null;
+    let subagentConversation: SubagentConversation | undefined;
     const subagents = cfg.agent.subagents;
 
     const routerSessionMode = parseRouterSessionModeFromRaw(next.raw);
@@ -3478,7 +3450,9 @@ export async function startBusAgentRunner(params: {
         }),
       );
     };
+    let runSafetyMode: SessionSafetyMode | undefined;
     const nativeOutput = params.createNativeOutput?.({
+      getSafetyMode: () => runSafetyMode,
       requestId: next.requestId,
       sessionId: next.sessionId,
       requestClient: next.requestClient,
@@ -4052,6 +4026,17 @@ export async function startBusAgentRunner(params: {
                     userId: authorized.policy.originSession.userId,
                   }
                 : null;
+            if (trustedFallbackSurface && runProfile !== "primary")
+              subagentConversation = resolveSubagentConversation({
+                workflows: params.durableWorkflowStore,
+                runId: authorized.policy.runId,
+                threadId: trustedFallbackSurface.sessionId,
+                onReadError: (error) =>
+                  logger.warn("subagent conversation ids unavailable", {
+                    requestId: next.requestId,
+                    ...formatTaggedErrorForLog(error),
+                  }),
+              });
             workflowClaimTimer = setInterval(() => {
               const refreshed = params.durableWorkflowStore?.refreshWorkflowRequestClaim(
                 next.requestId,
@@ -4456,6 +4441,7 @@ export async function startBusAgentRunner(params: {
               };
             }
           }
+          runSafetyMode = safetyMode;
 
           const additionalSessionPrompts = await waitForPreAgent(
             resolveSessionAdditionalPrompts({
@@ -4498,6 +4484,7 @@ export async function startBusAgentRunner(params: {
               safetyMode,
               sessionId: next.sessionId,
               heartbeatOverlay,
+              ...(subagentConversation ? { subagentConversation } : {}),
             });
 
           const workspaceSystemPrompt = selectWorkspaceSystemPrompt({
@@ -6156,15 +6143,13 @@ export async function startBusAgentRunner(params: {
                 startedAt,
               });
 
-              {
-                void publishAuxiliaryOutput("failed to publish tool start", () =>
-                  outputPublisher.publishToolCall({
-                    toolCallId: event.toolCallId,
-                    status: "start",
-                    display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event)}`,
-                  }),
-                );
-              }
+              void publishAuxiliaryOutput("failed to publish tool start", () =>
+                outputPublisher.publishToolCall({
+                  toolCallId: event.toolCallId,
+                  status: "start",
+                  display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event)}`,
+                }),
+              );
             }
 
             if (event.type === "tool_execution_end") {
@@ -6278,23 +6263,9 @@ export async function startBusAgentRunner(params: {
               );
             }
 
-            if (event.type === "agent_end") {
-              // Best-effort fallback: if deltas didn't populate finalText, take last assistant string.
-              if (!finalText) {
-                const last = event.messages[event.messages.length - 1];
-                if (last && last.role === "assistant") {
-                  if (typeof last.content === "string") {
-                    finalText = last.content;
-                  } else {
-                    const buf: string[] = [];
-                    for (const part of last.content) {
-                      if (part.type !== "text") continue;
-                      buf.push(part.text);
-                    }
-                    finalText = buf.join("\n\n");
-                  }
-                }
-              }
+            // Best-effort fallback: if deltas didn't populate finalText, take last assistant string.
+            if (event.type === "agent_end" && !finalText) {
+              finalText = lastAssistantText(event.messages) ?? finalText;
             }
           });
 
@@ -6595,8 +6566,10 @@ export async function startBusAgentRunner(params: {
           runIdleWatchdog?.stop();
 
           let isCancelled = cancelledByRequestId.has(headers.request_id);
-          if (isCancelled) coreNamedClaudeRuntime?.markTerminalFailure(true);
-          if (isCancelled) corePrimaryClaudeRuntime?.markTerminalFailure(true);
+          if (isCancelled) {
+            coreNamedClaudeRuntime?.markTerminalFailure(true);
+            corePrimaryClaudeRuntime?.markTerminalFailure(true);
+          }
           if (isCancelled && !finalText) {
             finalText = "Cancelled.";
           }
@@ -7199,33 +7172,16 @@ export async function startBusAgentRunner(params: {
               });
             },
           );
-          const reportPersistence = persistedFailure.match<() => void>({
-            err: (persistenceError) => () => {
-              logger.error(
-                "failed to persist transcript after error",
-                formatBridgeTaggedErrorForLog(persistenceError, {
-                  requestId: headers.request_id,
-                  sessionId: headers.session_id,
-                }),
-              );
-            },
-            ok: (saved) => () => {
-              const reportSave = saved.match<() => void>({
-                ok: () => () => undefined,
-                err: (saveError) => () => {
-                  logger.error(
-                    "failed to persist transcript after error",
-                    formatBridgeTaggedErrorForLog(saveError, {
-                      requestId: headers.request_id,
-                      sessionId: headers.session_id,
-                    }),
-                  );
-                },
-              });
-              reportSave();
-            },
-          });
-          reportPersistence();
+          const persistence = persistedFailure.andThen((saved) => saved);
+          if (persistence.isErr()) {
+            logger.error(
+              "failed to persist transcript after error",
+              formatBridgeTaggedErrorForLog(persistence.error, {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+              }),
+            );
+          }
         }
 
         if (liveParentSession) {

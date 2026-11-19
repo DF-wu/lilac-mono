@@ -1,3 +1,4 @@
+import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
 import { describe, expect, it } from "bun:test";
 import {
   createLilacBus,
@@ -74,6 +75,7 @@ function createComposition(input: {
   const created = composeBuiltinSurfaceRuntimes({
     discordAdapter,
     discordEnabled: input.discordEnabled,
+    getConfig: async () => parseCoreConfigV2ToUniversal({}),
     nativeDescriptor: input.nativeDescriptor,
     githubAdapter,
     descriptorBoundDiscordEventSource: createDescriptorBoundSurfaceEventSource(

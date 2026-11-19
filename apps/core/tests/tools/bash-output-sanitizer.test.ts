@@ -601,10 +601,14 @@ describe("bash output sanitizer stream", () => {
   it("cleans the raw spill before propagating an exact operation Panic", async () => {
     const panic = new Panic({ message: "spill write invariant" });
     const calls: string[] = [];
-    const stream = streamFromStrings(["output beyond cap"]);
+    const stream = streamFromStrings(["output beyond cap\n", "must not be consumed"]);
+    let activityCount = 0;
     let caught: unknown;
     try {
       await readSanitizedStreamTextCappedResult(stream, 4, {
+        onActivity: () => {
+          activityCount += 1;
+        },
         overflowFilePath: "/private/raw-spill",
         overflowOperations: {
           async open() {
@@ -633,6 +637,7 @@ describe("bash output sanitizer stream", () => {
 
     expect(caught).toBe(panic);
     expect(stream.locked).toBeFalse();
+    expect(activityCount).toBe(1);
     expect(calls).toEqual(["open", "write", "abort", "remove"]);
   });
 });

@@ -24,10 +24,7 @@ import {
   type WebSearchProvider,
   type WebSearchProviderId,
 } from "./web-search";
-import {
-  resolveOpenAIWebSearchModel,
-  type OpenAIWebSearchModelInvalid,
-} from "./web-search/openai-web-search-model";
+import { resolveOpenAIWebSearchModel } from "./web-search/openai-web-search-model";
 import {
   FirecrawlPermitPool,
   FirecrawlPermitQueueTimedOut,
@@ -426,25 +423,13 @@ export class Web implements ServerTool {
     this.logger.logDebug("Web extension initialized");
   }
 
-  private async refreshWebConfig(): Promise<void> {
+  private async loadWebToolConfig(): Promise<WebToolConfig | undefined> {
     const loaded = await Result.tryPromise({
       try: this.dependencies.loadWebToolConfig,
       catch: captureWebFailure,
     });
-    const config = loaded.match<WebToolConfig>({
-      ok: (value) => value,
-      err: () => ({
-        extractProviders: [],
-        fetchMode: "auto",
-        firecrawlPolicy: undefined,
-        openaiPolicy: undefined,
-      }),
-    });
-    const loadFailure = loaded.match<Error | Panic | null>({
-      ok: () => null,
-      err: ({ cause }) => cause,
-    });
-    if (loadFailure) {
+    if (loaded.isErr()) {
+      const loadFailure = loaded.error.cause;
       if (Panic.is(loadFailure)) preserveToolPanic(loadFailure);
       const failure = new WebProviderOperationFailed({
         cause: webFailure(loadFailure),
@@ -454,40 +439,44 @@ export class Web implements ServerTool {
         "Failed to read core-config.yaml for web tool config",
         formatTaggedErrorForLog(failure),
       );
+      return undefined;
     }
+    return loaded.value;
+  }
 
-    const normalizedRequested = config.extractProviders.map((providerId) =>
-      providerId.trim().toLowerCase(),
-    );
-    const environment = this.dependencies.getProviderEnvironment();
-    const searchModel = resolveOpenAIWebSearchModel({
+  private resolveOpenAISearchModel(config: WebToolConfig, environment: WebProviderEnvironment) {
+    const resolved = resolveOpenAIWebSearchModel({
       model: config.openaiPolicy?.model,
       environment: {
         openai: environment.openai,
         ...(environment.openaiCompatible ? { openaiCompatible: environment.openaiCompatible } : {}),
       },
     });
-    const openaiSearch = searchModel.match<
-      | {
-          readonly kind: "ready";
-          readonly modelId: string;
-          readonly apiKey?: string;
-          readonly baseUrl?: string;
-        }
-      | { readonly kind: "invalid" }
-    >({
-      ok: (value) => ({
-        kind: "ready",
-        modelId: value.modelId,
-        ...(value.apiKey === undefined ? {} : { apiKey: value.apiKey }),
-        ...(value.baseUrl === undefined ? {} : { baseUrl: value.baseUrl }),
-      }),
-      err: () => ({ kind: "invalid" }),
-    });
-    const openaiSearchFailure = searchModel.match<OpenAIWebSearchModelInvalid | null>({
-      ok: () => null,
-      err: (error) => error,
-    });
+    if (resolved.isErr()) {
+      if (config.extractProviders.some((id) => id.trim().toLowerCase() === "openai")) {
+        this.logger.logError(
+          "web.search provider 'openai' is unavailable: tools.web.openai.model cannot run web_search",
+          formatTaggedErrorForLog(resolved.error),
+        );
+      }
+      return undefined;
+    }
+    return resolved.value;
+  }
+
+  private async refreshWebConfig(): Promise<void> {
+    const loadedConfig = await this.loadWebToolConfig();
+    const config: WebToolConfig = loadedConfig ?? {
+      extractProviders: [],
+      fetchMode: "auto",
+      firecrawlPolicy: undefined,
+      openaiPolicy: undefined,
+    };
+
+    const normalizedRequested = config.extractProviders.map((providerId) =>
+      providerId.trim().toLowerCase(),
+    );
+    const environment = this.dependencies.getProviderEnvironment();
     const nextKey = JSON.stringify({
       requested: normalizedRequested,
       fetchMode: config.fetchMode,
@@ -506,11 +495,12 @@ export class Web implements ServerTool {
     });
     if (nextKey === this.webSearchProviderKey) return;
     this.webSearchProviderKey = nextKey;
-    if (!loadFailure) {
+    if (loadedConfig) {
       this.dependencies.firecrawlFetchPermits.configure(config.firecrawlPolicy);
       this.dependencies.firecrawlSearchPermits.configure(config.firecrawlPolicy);
     }
 
+    const openaiSearch = this.resolveOpenAISearchModel(config, environment);
     const previousIds = this.webSearchProviders.map((provider) => provider.id).join(" -> ") || null;
     const previousFetchMode = this.webFetchDefaultMode;
     const providers = this.dependencies.createSearchProviders({
@@ -522,7 +512,7 @@ export class Web implements ServerTool {
       tavilyApiKey: environment.tavily.apiKey,
       tavilyApiBaseUrl: environment.tavily.apiBaseUrl,
       openai:
-        openaiSearch.kind === "ready"
+        openaiSearch !== undefined
           ? {
               apiKey: openaiSearch.apiKey,
               baseUrl: openaiSearch.baseUrl,
@@ -531,12 +521,6 @@ export class Web implements ServerTool {
             }
           : { apiKey: undefined },
     });
-    if (openaiSearchFailure && normalizedRequested.includes("openai")) {
-      this.logger.logError(
-        "web.search provider 'openai' is unavailable: tools.web.openai.model cannot run web_search",
-        formatTaggedErrorForLog(openaiSearchFailure),
-      );
-    }
     const resolved = resolveWebSearchProvider({
       requested: config.extractProviders,
       providers,

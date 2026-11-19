@@ -24,6 +24,8 @@ import {
   findPresentationDecoderImportViolationsInSourceFile,
   findPreferSwitchTrueChainViolations,
   findPreferSwitchTrueChainViolationsInSourceFile,
+  findRedundantBranchViolations,
+  findRedundantBranchViolationsInSourceFile,
   findStoreInlineDecodingViolations,
   findStoreInlineDecodingViolationsInSourceFile,
   parseProductionSyntaxSource,
@@ -236,6 +238,9 @@ describe("parsed production syntax finders", () => {
     expect(
       findElseAfterTerminalViolationsInSourceFile(controlFlowSourceFile, controlFlowPath),
     ).toEqual(findElseAfterTerminalViolations(controlFlowSource, controlFlowPath));
+    expect(
+      findRedundantBranchViolationsInSourceFile(controlFlowSourceFile, controlFlowPath),
+    ).toEqual(findRedundantBranchViolations(controlFlowSource, controlFlowPath));
 
     const presentationSource = `import { z } from "zod"; z.string().parse("value");`;
     const presentationPath = "apps/example/src/render.ts";
@@ -311,6 +316,171 @@ describe("flat control flow syntax", () => {
       "prefer-switch-true-chain",
       "prefer-switch-true-chain",
     ]);
+  });
+
+  it("rejects repeated chain bodies and repeated unchanged adjacent conditions", () => {
+    const violations = findRedundantBranchViolations(
+      `
+        if (a) i += 2;
+        else if (b) i++;
+        else i++;
+
+        const ready = check();
+        if (ready) first();
+        if (ready) second();
+
+        if (this.pending.size > max) this.pending.clear();
+        if (this.pending.size > max) return fail();
+
+        if (state === "unchanged") state = "changed";
+        if (state === "unchanged") retain();
+
+        if (a) first();
+        else if (b) second();
+        else third();
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind, line }) => [kind, line])).toEqual([
+      ["repeated-condition", 8],
+      ["identical-branch", 4],
+    ]);
+  });
+
+  it("keeps branches whose literals, condition effects, or writes make them differ", () => {
+    const violations = findRedundantBranchViolations(
+      `
+        function literals(kind: boolean) {
+          if (kind) return "a b";
+          else return "ab";
+        }
+        function effects(queue: boolean[]) {
+          if (queue.shift()) first();
+          if (queue.shift()) second();
+        }
+        function destructured(ready: boolean) {
+          if (ready) { [ready] = [false]; }
+          if (ready) second();
+        }
+        function calls() {
+          let ready = true;
+          if (ready) reset();
+          if (ready) second();
+        }
+        function constant() {
+          const ready = check();
+          if (ready) reset();
+          if (ready) second();
+        }
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind, line }) => [kind, line])).toEqual([["repeated-condition", 22]]);
+  });
+
+  it("keeps repeated conditions after initialized function-scoped var writes", () => {
+    const violations = findRedundantBranchViolations(
+      `
+        function reassigned() {
+          var ready = true;
+          if (ready) { var ready = false; }
+          if (ready) second();
+        }
+        function destructured() {
+          var ready = true;
+          if (ready) { var { ready } = { ready: false }; }
+          if (ready) second();
+        }
+        function uninitialized() {
+          var ready = true;
+          if (ready) { var ready; }
+          if (ready) second();
+        }
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind, line }) => [kind, line])).toEqual([["repeated-condition", 15]]);
+  });
+
+  it("keeps repeated member reads that can invoke changing getters", () => {
+    const violations = findRedundantBranchViolations(
+      `
+        let reads = 0;
+        const state = { get ready() { return ++reads === 1; } };
+        if (state.ready) { const first = true; }
+        if (state.ready) second();
+        if (state["ready"]) { const first = true; }
+        if (state["ready"]) second();
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations).toEqual([]);
+  });
+
+  it("keeps repeated conditions whose destructured parameters shadow outer constants", () => {
+    const violations = findRedundantBranchViolations(
+      `
+        const ready = true;
+        function objectParameter({ ready }: { ready: boolean }) {
+          const reset = () => { ready = false; };
+          if (ready) reset();
+          if (ready) second();
+        }
+        function arrayParameter([ready]: boolean[]) {
+          const reset = () => { ready = false; };
+          if (ready) reset();
+          if (ready) second();
+        }
+        function localBinding() {
+          let { ready } = { ready: true };
+          const reset = () => { ready = false; };
+          if (ready) reset();
+          if (ready) second();
+        }
+        function constant() {
+          if (ready) first();
+          if (ready) second();
+        }
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind, line }) => [kind, line])).toEqual([["repeated-condition", 21]]);
+  });
+
+  it("keeps repeated conditions whose implicit coercion can change their value", () => {
+    const violations = findRedundantBranchViolations(
+      `
+        let reads = 0;
+        const value = { toString: () => String(++reads), valueOf: () => ++reads };
+        if (\`\${value}\` === "1") {}
+        if (\`\${value}\` === "1") second();
+        if (value + 0 === 1) {}
+        if (value + 0 === 1) second();
+        if (value < 2) {}
+        if (value < 2) second();
+        if (+value === 1) {}
+        if (+value === 1) second();
+        if (value == 1) {}
+        if (value == 1) second();
+        const ready = true;
+        if (ready === true) first();
+        if (ready === true) second();
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind, line }) => [kind, line])).toEqual([["repeated-condition", 16]]);
   });
 
   it("removes else branches after direct terminal statements", () => {
@@ -906,18 +1076,7 @@ describe("production exception syntax", () => {
       findExceptionFlowViolations(code, "apps/example/generated/output.js", policyWith()),
     ).toEqual([]);
     expect(
-      findExceptionFlowViolations(
-        code,
-        "apps/core/src/ssh/remote-js/remote-runner.cjs",
-        policyWith(),
-      ),
-    ).toEqual([]);
-    expect(
-      findExceptionFlowViolations(
-        code,
-        "apps/core/src/ssh/remote-js/remote-runner-entry.ts",
-        policyWith(),
-      ),
+      findExceptionFlowViolations(code, "apps/core/src/ssh/ssh-exec.ts", policyWith()),
     ).toHaveLength(1);
   });
 });
@@ -1240,12 +1399,7 @@ describe("Oxlint production syntax activation", () => {
     );
 
     expect(config.ignorePatterns).toEqual(
-      expect.arrayContaining([
-        "**/dist/**",
-        "**/generated/**",
-        "**/vendor/**",
-        "apps/core/src/ssh/remote-js/remote-runner.cjs",
-      ]),
+      expect.arrayContaining(["**/dist/**", "**/generated/**", "**/vendor/**"]),
     );
     expect(productionOverride).toMatchObject({
       files: expect.arrayContaining(["packages/**/*.{js,jsx,cjs,mjs,ts,tsx}"]),
@@ -1255,6 +1409,11 @@ describe("Oxlint production syntax activation", () => {
         "lilac/prefer-switch-true-chain": "error",
         "no-nested-ternary": "error",
         "lilac/no-local-is-record": "error",
+        "lilac/no-redundant-branch": "error",
+        "max-depth": ["error", { max: 4 }],
+        "max-nested-callbacks": ["error", { max: 4 }],
+        "no-lone-blocks": "error",
+        "no-dupe-else-if": "error",
       },
     });
     expect(testOverride).toMatchObject({
@@ -1263,6 +1422,8 @@ describe("Oxlint production syntax activation", () => {
         "lilac/no-fixed-test-wait": "error",
         "no-nested-ternary": "off",
         "lilac/no-local-is-record": "off",
+        "max-depth": "off",
+        "max-nested-callbacks": "off",
       },
     });
   });

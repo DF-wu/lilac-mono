@@ -3120,7 +3120,7 @@ describe("createToolServer", () => {
     await server.stop();
   });
 
-  it("times out tool calls and marks wedged calls unhealthy", async () => {
+  it("times out tool calls and marks wedged calls not ready without failing liveness", async () => {
     const started = Promise.withResolvers<void>();
     const tool: ServerTool = {
       id: "hang",
@@ -3190,13 +3190,16 @@ describe("createToolServer", () => {
       jest.advanceTimersByTime(11);
 
       const healthRes = await server.app.handle(new Request("http://localhost/healthz"));
-      expect(healthRes.status).toBe(503);
-      const healthBody = (await healthRes.json()) as {
-        checks: Array<{ name: string; ok: boolean }>;
+      expect(healthRes.status).toBe(200);
+      const readyRes = await server.app.handle(new Request("http://localhost/readyz"));
+      expect(readyRes.status).toBe(503);
+      const readyBody = (await readyRes.json()) as {
+        checks: Array<{ name: string; ok: boolean; impact?: string }>;
       };
-      expect(healthBody.checks.find((check) => check.name === "tool-calls.overdue")?.ok).toBe(
-        false,
-      );
+      expect(readyBody.checks.find((check) => check.name === "tool-calls.overdue")).toMatchObject({
+        ok: false,
+        impact: "ready",
+      });
     } finally {
       try {
         await server?.stop();
@@ -3249,9 +3252,9 @@ describe("createToolServer", () => {
     }
   });
 
-  it("reports an immediate Level 2 Panic to the fatal supervisor", async () => {
+  it("contains an immediate Level 2 Panic as a tool error", async () => {
     const panic = new Panic({ message: "immediate tool invariant" });
-    const observed = Promise.withResolvers<unknown>();
+    const reported: unknown[] = [];
     const chunks: string[] = [];
     const output = { write: (chunk: string) => chunks.push(chunk) };
     const tool: ServerTool = {
@@ -3280,7 +3283,7 @@ describe("createToolServer", () => {
         stdout: output,
         stderr: output,
       }),
-      reportFatalToolCallDefect: observed.resolve,
+      reportFatalToolCallDefect: (defect) => reported.push(defect),
     });
 
     await server.init();
@@ -3291,16 +3294,31 @@ describe("createToolServer", () => {
         body: JSON.stringify({ callableId: "immediate-panic.call", input: {} }),
       }),
     );
-    expect(response.status).toBe(500);
-    expect(await observed.promise).toBe(panic);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      status: "error",
+      error: {
+        kind: "internal",
+        code: "plugin_call_failed",
+        message: "Internal tool server failure",
+        retryable: false,
+      },
+    });
+    expect(reported).toEqual([]);
+    expect(chunks.join("\n")).toContain("tool call defect contained");
     await server.stop();
   });
 
-  it("invokes the fatal supervisor for a late Panic without changing the timeout response", async () => {
+  it("contains a late Panic without changing the timeout response", async () => {
     const panic = new Panic({ message: "late tool invariant" });
     const started = Promise.withResolvers<void>();
-    const observed = Promise.withResolvers<Panic>();
+    const contained = Promise.withResolvers<void>();
     let fatalReports = 0;
+    const output = {
+      write: (chunk: string) => {
+        if (chunk.includes("tool call defect contained")) contained.resolve();
+      },
+    };
     const tool: ServerTool = {
       id: "late-panic",
       async init() {},
@@ -3327,10 +3345,15 @@ describe("createToolServer", () => {
     try {
       server = createToolServer({
         tools: [tool],
+        logger: createLogger({
+          module: "late-panic-test",
+          outputFormat: "jsonl",
+          stdout: output,
+          stderr: output,
+        }),
         toolCallTimeouts: { defaultTimeoutMs: 10 },
-        reportFatalToolCallDefect: (reported) => {
+        reportFatalToolCallDefect: () => {
           fatalReports += 1;
-          if (Panic.is(reported)) observed.resolve(reported);
         },
       });
       await server.init();
@@ -3354,8 +3377,8 @@ describe("createToolServer", () => {
           retryable: true,
         },
       });
-      expect(await observed.promise).toBe(panic);
-      expect(fatalReports).toBe(1);
+      await contained.promise;
+      expect(fatalReports).toBe(0);
     } finally {
       try {
         await server?.stop();
@@ -3365,10 +3388,10 @@ describe("createToolServer", () => {
     }
   });
 
-  it("reports a late non-Panic rejection to the fatal supervisor", async () => {
+  it("contains a late non-Panic rejection without reporting it as fatal", async () => {
     const defect = new Error("late logging defect");
     const started = Promise.withResolvers<void>();
-    const observed = Promise.withResolvers<readonly Error[]>();
+    const contained = Promise.withResolvers<void>();
     const reported: Error[] = [];
     const chunks: string[] = [];
     const output = { write: (chunk: string) => chunks.push(chunk) };
@@ -3381,6 +3404,7 @@ describe("createToolServer", () => {
     Object.defineProperty(logger, "error", {
       value(message: string) {
         if (message === "tool plugin operation failed") throw defect;
+        if (message === "tool call defect contained") contained.resolve();
       },
     });
     const tool: ServerTool = {
@@ -3415,10 +3439,7 @@ describe("createToolServer", () => {
         tools: [tool],
         logger,
         toolCallTimeouts: { defaultTimeoutMs: 10 },
-        reportFatalToolCallDefect: (fatalDefect) => {
-          reported.push(fatalDefect);
-          if (reported.length === 1) observed.resolve(reported);
-        },
+        reportFatalToolCallDefect: (fatalDefect) => reported.push(fatalDefect),
       });
       await server.init();
       const responsePromise = server.app.handle(
@@ -3441,13 +3462,264 @@ describe("createToolServer", () => {
           retryable: true,
         },
       });
-      expect((await observed.promise).map((error) => error.message)).toEqual([defect.message]);
+      await contained.promise;
+      expect(reported).toEqual([]);
     } finally {
       try {
         await server?.stop();
       } finally {
         jest.useRealTimers();
       }
+    }
+  });
+
+  it("lets reloads and later calls proceed while a timed-out call never settles", async () => {
+    const started = Promise.withResolvers<void>();
+    const tool: ServerTool = {
+      id: "wedge",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          { callableId: "wedge.hang", name: "Hang", description: "never settles", shortInput: [] },
+          { callableId: "wedge.ok", name: "Ok", description: "settles", shortInput: [] },
+        ];
+      },
+      async call(callableId) {
+        if (callableId === "wedge.ok") return Result.ok({ ok: true });
+        started.resolve();
+        return await new Promise(() => {});
+      },
+    };
+    jest.useFakeTimers({ now: 0 });
+    let server: ReturnType<typeof createToolServer> | undefined;
+    try {
+      server = createToolServer({
+        pluginManager: {
+          init: async () => Result.ok(),
+          destroy: async () => Result.ok(),
+          reload: async () => Result.ok(),
+          getLevel2Tools: () => [tool],
+          acquireGeneration: () => ({ release: async () => Result.ok() }),
+        },
+        toolCallTimeouts: { defaultTimeoutMs: 10 },
+      });
+      await server.init();
+      const call = (callableId: string) =>
+        server!.app.handle(
+          new Request("http://localhost/call", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ callableId, input: {} }),
+          }),
+        );
+      const hung = call("wedge.hang");
+      await started.promise;
+      jest.advanceTimersByTime(10);
+      expect(await (await hung).json()).toMatchObject({
+        status: "error",
+        error: { kind: "timeout", code: "tool_timeout" },
+      });
+
+      await server.reload();
+      expect(await (await call("wedge.ok")).json()).toEqual({ status: "ok", value: { ok: true } });
+    } finally {
+      try {
+        await server?.stop();
+      } finally {
+        jest.useRealTimers();
+      }
+    }
+  });
+
+  it("keeps static tool resources alive until a timed-out invocation settles", async () => {
+    const started = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    let active = false;
+    let destroys = 0;
+    let destroyedWhileActive = false;
+    const tool: ServerTool = {
+      id: "static-resource",
+      async init() {},
+      async destroy() {
+        destroys++;
+        destroyedWhileActive ||= active;
+      },
+      async list() {
+        return [
+          {
+            callableId: "static-resource.call",
+            name: "Resource",
+            description: "Resource",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        active = true;
+        started.resolve();
+        await finish.promise;
+        active = false;
+        return Result.ok({ finished: true });
+      },
+    };
+    jest.useFakeTimers({ now: 0 });
+    const server = createToolServer({ tools: [tool], toolCallTimeouts: { defaultTimeoutMs: 10 } });
+    try {
+      await server.init();
+      const call = server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "static-resource.call", input: {} }),
+        }),
+      );
+      await started.promise;
+      jest.advanceTimersByTime(10);
+      expect(await (await call).json()).toMatchObject({
+        status: "error",
+        error: { code: "tool_timeout" },
+      });
+      const reload = server.reload();
+      // Health remains available while reload waits for the invocation's resource lease.
+      const health = await server.app.handle(new Request("http://localhost/healthz"));
+      expect(health.status).toBe(200);
+      expect(destroys).toBe(0);
+      finish.resolve();
+      await reload;
+      expect(destroys).toBe(1);
+      expect(destroyedWhileActive).toBe(false);
+    } finally {
+      finish.resolve();
+      await server.stop();
+      jest.useRealTimers();
+    }
+  });
+
+  it("returns the contained tool failure when logging the defect throws", async () => {
+    const logger = createLogger({ module: "throwing-logger-test" });
+    Object.defineProperty(logger, "error", {
+      value(message: string) {
+        if (message === "tool call defect contained") throw new Error("logger defect");
+      },
+    });
+    const tool: ServerTool = {
+      id: "panic-logger",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          { callableId: "panic-logger.call", name: "Panic", description: "Panic", shortInput: [] },
+        ];
+      },
+      async call() {
+        throw new Panic({ message: "tool invariant" });
+      },
+    };
+    const server = createToolServer({ tools: [tool], logger });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "panic-logger.call", input: {} }),
+        }),
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        status: "error",
+        error: { kind: "internal", code: "plugin_call_failed" },
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("refreshes routing when a committed reload then panics during cleanup", async () => {
+    const toolFor = (id: string): ServerTool => ({
+      id,
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [{ callableId: `${id}.call`, name: id, description: id, shortInput: [] }];
+      },
+      async call() {
+        return Result.ok({ tool: id });
+      },
+    });
+    const first = toolFor("first");
+    const second = toolFor("second");
+    let current = first;
+    const panic = new Panic({ message: "previous generation cleanup invariant" });
+    const pluginManager = {
+      init: async () => Result.ok(),
+      destroy: async () => Result.ok(),
+      ensureFresh: async () => Result.ok(),
+      async reload(): Promise<Result<void, never>> {
+        current = second;
+        throw panic;
+      },
+      getLevel2Tools: () => [current],
+    };
+    const server = createToolServer({ pluginManager });
+    await server.init();
+    try {
+      await expect(server.reload()).rejects.toBe(panic);
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "second.call", input: {} }),
+        }),
+      );
+      expect(await response.json()).toEqual({ status: "ok", value: { tool: "second" } });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("keeps routing when a reload fails before installing a new generation", async () => {
+    let lists = 0;
+    const tool: ServerTool = {
+      id: "stable",
+      async init() {},
+      async destroy() {},
+      async list() {
+        lists += 1;
+        if (lists > 1) throw new Error("transient list failure");
+        return [
+          { callableId: "stable.call", name: "Stable", description: "Stable", shortInput: [] },
+        ];
+      },
+      async call() {
+        return Result.ok({ stable: true });
+      },
+    };
+    const failure = new Error("reload failed before commit");
+    const pluginManager = {
+      init: async () => Result.ok(),
+      destroy: async () => Result.ok(),
+      ensureFresh: async () => Result.ok(),
+      async reload(): Promise<Result<void, never>> {
+        throw failure;
+      },
+      getLevel2Tools: () => [tool],
+    };
+    const server = createToolServer({ pluginManager });
+    await server.init();
+    try {
+      await expect(server.reload()).rejects.toBe(failure);
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "stable.call", input: {} }),
+        }),
+      );
+      expect(await response.json()).toEqual({ status: "ok", value: { stable: true } });
+    } finally {
+      await server.stop();
     }
   });
 

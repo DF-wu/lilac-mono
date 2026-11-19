@@ -588,12 +588,6 @@ function countLoadedExternalPlugins(statuses: readonly ToolPluginStatus[] | unde
 const TOOL_CALL_OUTPUT_CONTRACT_DEFECT_MESSAGE =
   "Plugin tool output violated the JSON wire contract";
 
-function projectFatalToolCallDefect(reason: unknown, opaque = false): FatalToolCallDefect {
-  if (isPluginPanic(reason)) return reason;
-  if (opaque) return new Error(TOOL_CALL_OUTPUT_CONTRACT_DEFECT_MESSAGE);
-  return safePluginExceptionCause(reason);
-}
-
 export function normalizeSuccessfulToolValue(
   value: unknown,
 ): ResultType<ToolJsonValue, ToolPayloadInvalid> {
@@ -661,39 +655,30 @@ function signalFatalToolCallDefectToProcess(defect: FatalToolCallDefect): void {
   });
 }
 
-function observeToolCallRejection(
-  context: {
-    readonly didTimeout: () => boolean;
-    readonly report: (defect: FatalToolCallDefect) => void;
-  },
-  defect: FatalToolCallDefect,
-): void {
-  if (!context.didTimeout() && !isPluginPanic(defect)) return;
-  context.report(defect);
+type ToolCallDefect = { readonly panic: boolean; readonly message: string };
+
+function projectToolCallDefect(reason: unknown): ToolCallDefect {
+  return { panic: isPluginPanic(reason), message: opaquePluginExceptionMessage(reason) };
 }
 
-function superviseToolCallRejections(context: {
-  readonly didTimeout: () => boolean;
-  readonly promise: Promise<unknown>;
-  readonly report: (defect: FatalToolCallDefect) => void;
-}): void {
-  void supervise();
-
-  async function supervise(): Promise<void> {
-    const captured = await Result.tryPromise({
-      try: () => context.promise,
-      catch: captureError,
-    });
-    const failure = captured.match({ ok: () => null, err: ({ cause }) => ({ cause }) });
-    if (!failure) return;
-    observeToolCallRejection(
-      {
-        didTimeout: context.didTimeout,
-        report: context.report,
+async function containToolCallDefect(
+  promise: Promise<ServerToolResult>,
+  report: (defect: ToolCallDefect) => void,
+  failure: ServerToolFailure,
+): Promise<ServerToolResult> {
+  const captured = await Result.tryPromise({
+    try: () => promise,
+    catch: captureError,
+  });
+  return captured.match<() => ServerToolResult>({
+    ok: (result) => () => result,
+    err:
+      ({ cause }) =>
+      () => {
+        Result.try({ try: () => report(projectToolCallDefect(cause)), catch: captureError });
+        return Result.err(failure);
       },
-      projectFatalToolCallDefect(failure.cause),
-    );
-  }
+  })();
 }
 
 export function createToolServer(options: ToolServerOptions) {
@@ -714,6 +699,7 @@ export function createToolServer(options: ToolServerOptions) {
   let callMapping = new Map<string, ServerTool>();
   let level2ContributionMapping = new Map<string, Level2ContributionInfo>();
   let toolCatalog: ServerToolListResult = [];
+  let mappedTools: readonly ServerTool[] = [];
   let toolReloadBarrier: Promise<void> | null = null;
   let activeToolCallLeases = 0;
   let toolCallsDrained: ReturnType<typeof Promise.withResolvers<void>> | null = null;
@@ -825,15 +811,21 @@ export function createToolServer(options: ToolServerOptions) {
     activeToolCallLeases++;
     let transferred = false;
     let released = false;
-    const release = async () => {
-      if (released) return;
-      released = true;
+    let blocksReload = true;
+    const stopBlockingReload = () => {
+      if (!blocksReload) return;
+      blocksReload = false;
       activeToolCallLeases--;
       if (activeToolCallLeases === 0 && toolCallsDrained) {
         const drained = toolCallsDrained;
         toolCallsDrained = null;
         drained.resolve();
       }
+    };
+    const release = async () => {
+      if (released) return;
+      released = true;
+      stopBlockingReload();
       const cleanup = await generation?.release();
       cleanup?.match({
         ok: () => undefined,
@@ -843,6 +835,10 @@ export function createToolServer(options: ToolServerOptions) {
     return {
       transfer() {
         transferred = true;
+      },
+      // Only a retained plugin generation can survive reload while its call is unfinished.
+      abandon() {
+        if (generation) stopBlockingReload();
       },
       release,
       async [Symbol.asyncDispose]() {
@@ -875,12 +871,11 @@ export function createToolServer(options: ToolServerOptions) {
     const contributionByTool = options.pluginManager?.getLevel2ContributionInfo?.();
     for (const tool of activeTools) {
       const listed = await listTool(tool);
-      const listError = listed.match({ ok: () => null, err: (error) => error });
-      if (listError) {
-        logPluginError("level2.list", listError, { toolId: toolId(tool) });
+      if (listed.isErr()) {
+        logPluginError("level2.list", listed.error, { toolId: toolId(tool) });
         continue;
       }
-      const entries = listed.match({ ok: (value) => value, err: () => [] });
+      const entries = listed.value;
       nextToolCatalog.push(...entries);
       for (const { callableId } of entries) {
         nextCallMapping.set(callableId, tool);
@@ -891,6 +886,15 @@ export function createToolServer(options: ToolServerOptions) {
     callMapping = nextCallMapping;
     level2ContributionMapping = nextContributionMapping;
     toolCatalog = nextToolCatalog;
+    mappedTools = activeTools;
+  }
+
+  async function activeToolsChanged(): Promise<boolean> {
+    const activeTools = await getActiveTools();
+    return (
+      activeTools.length !== mappedTools.length ||
+      activeTools.some((tool, index) => tool !== mappedTools[index])
+    );
   }
 
   async function captureSafetyModeProvider<TValue extends SafetyMode | CoreConfig>(
@@ -1102,9 +1106,8 @@ export function createToolServer(options: ToolServerOptions) {
     const cachedMessages = await captureAuthenticationOperation(() =>
       authenticateRequestContext(context, options.requestMessageCache),
     );
-    const cacheError = cachedMessages.match({ ok: () => null, err: (error) => error });
-    if (cacheError) return Result.err(cacheError);
-    const messages = cachedMessages.match({ ok: (value) => value, err: () => undefined });
+    if (cachedMessages.isErr()) return Result.err(cachedMessages.error);
+    const messages = cachedMessages.value;
     if (options.authorizeControlRequest) {
       const authorizeControlRequest = options.authorizeControlRequest;
       if (
@@ -1133,9 +1136,8 @@ export function createToolServer(options: ToolServerOptions) {
           now: Date.now(),
         }),
       );
-      const authorizationError = authorization.match({ ok: () => null, err: (error) => error });
-      if (authorizationError) return Result.err(authorizationError);
-      const authorized = authorization.match({ ok: (value) => value, err: () => null });
+      if (authorization.isErr()) return Result.err(authorization.error);
+      const authorized = authorization.value;
       if (!authorized) {
         return Result.err(
           new ToolRequestAuthenticationError({
@@ -1322,19 +1324,26 @@ export function createToolServer(options: ToolServerOptions) {
     },
   );
 
-  async function reloadTools(): Promise<void> {
-    using _reloadLease = await acquireToolReloadLease();
+  async function reloadToolGeneration(): Promise<void> {
     if (options.pluginManager) {
       const pluginManager = options.pluginManager;
       adaptPluginLifecycleResultToHost(
         "reload",
         await requirePluginLifecycle("reload", () => pluginManager.reload()),
       );
-    } else {
-      await runStaticToolLifecycle("level2.destroy");
-      await runStaticToolLifecycle("level2.init");
+      return;
     }
-    await refreshToolMapping();
+    await runStaticToolLifecycle("level2.destroy");
+    await runStaticToolLifecycle("level2.init");
+  }
+
+  async function reloadTools(): Promise<void> {
+    using _reloadLease = await acquireToolReloadLease();
+    const reloaded = await Result.tryPromise({ try: reloadToolGeneration, catch: captureError });
+    // A reload can install the new generation and then fail its cleanup, so routing must follow it.
+    const committed = reloaded.match({ ok: () => true, err: () => false });
+    if (committed || (await activeToolsChanged())) await refreshToolMapping();
+    adaptResultToHost(reloaded, ({ cause }) => cause);
   }
 
   async function completeServerOwnedPostCall(
@@ -1420,51 +1429,48 @@ export function createToolServer(options: ToolServerOptions) {
       }
 
       const decodedHeaders = decodeToolRequestHeaders(headers);
-      const headerError = decodedHeaders.match({ ok: () => null, err: (error) => error });
-      if (headerError) {
+      if (decodedHeaders.isErr()) {
         return {
           status: "error" as const,
           error: serverToolFailure({
             kind: "usage",
             code: "invalid_headers",
-            message: headerError.message,
+            message: decodedHeaders.error.message,
             retryable: false,
           }),
         };
       }
-      const decodedHeaderValues = decodedHeaders.match({ ok: (value) => value, err: () => null });
+      const decodedHeaderValues = decodedHeaders.value;
       const authenticated = await authenticateContext(decodedHeaderValues ?? {});
-      const authenticationError = authenticated.match({ ok: () => null, err: (error) => error });
-      if (authenticationError) {
+      if (authenticated.isErr()) {
         return {
           status: "error" as const,
           error: serverToolFailure({
             kind: "denied",
             code: "authentication_failed",
-            message: authenticationError.message,
+            message: authenticated.error.message,
             retryable: false,
           }),
         };
       }
-      const authenticatedRequest = authenticated.match({ ok: (value) => value, err: () => null });
+      const authenticatedRequest = authenticated.value;
       const { context: ctx, messages } = authenticatedRequest ?? {
         context: {},
         messages: undefined,
       };
       const decodedInput = decodeToolPayload(body.input);
-      const inputError = decodedInput.match({ ok: () => null, err: (error) => error });
-      if (inputError) {
+      if (decodedInput.isErr()) {
         return {
           status: "error" as const,
           error: serverToolFailure({
             kind: "usage",
             code: "invalid_input",
-            message: inputError.message,
+            message: decodedInput.error.message,
             retryable: false,
           }),
         };
       }
-      const input = decodedInput.match({ ok: (value) => value, err: () => null }) ?? {};
+      const input = decodedInput.value ?? {};
       const safetyModeResult = await resolveSafetyMode(ctx);
       const safetyModeOutcome = safetyModeResult.match<
         { readonly safetyMode: SafetyMode } | { readonly error: ToolSafetyModeResolutionError }
@@ -1676,21 +1682,29 @@ export function createToolServer(options: ToolServerOptions) {
           return toolCallLease.release();
         });
       toolCallLease.transfer();
-      const callResult = invocationResult
-        .then((result) => completeServerOwnedPostCall(body.callableId, result))
-        .finally(() => {
-          healthState.endToolCall(callToken, {
-            settled: true,
+      const callResult = containToolCallDefect(
+        invocationResult
+          .then((result) => completeServerOwnedPostCall(body.callableId, result))
+          .finally(() => {
+            healthState.endToolCall(callToken, {
+              settled: true,
+            });
+          })
+          .finally(() => {
+            timeoutSignal.cancel();
+          }),
+        (defect) => {
+          logger.error("tool call defect contained", {
+            callableId: body.callableId,
+            toolId: capturedToolId,
+            requestId: ctx.requestId,
+            afterTimeout: toolCallTimedOut,
+            panic: defect.panic,
+            errorMessage: defect.message,
           });
-        })
-        .finally(() => {
-          timeoutSignal.cancel();
-        });
-      superviseToolCallRejections({
-        didTimeout: () => toolCallTimedOut,
-        promise: callResult,
-        report: reportFatalToolCallDefect,
-      });
+        },
+        internalPluginCallFailure,
+      );
 
       const timeoutResult = new Promise<"timeout">((resolve) => {
         timeoutSignal.signal.addEventListener(
@@ -1706,6 +1720,7 @@ export function createToolServer(options: ToolServerOptions) {
       const result = await Promise.race([callResult, timeoutResult]);
 
       if (result === "timeout") {
+        toolCallLease.abandon();
         healthState.endToolCall(callToken, {
           settled: false,
           timedOut: true,
@@ -1746,8 +1761,7 @@ export function createToolServer(options: ToolServerOptions) {
         return toolFailureResponse(completedOutcome.failure);
       }
       const normalizedValue = normalizeSuccessfulToolValue(completedOutcome.value);
-      const outputDefect = normalizedValue.match({ ok: () => null, err: (error) => error });
-      if (outputDefect) {
+      if (normalizedValue.isErr()) {
         logger.error("tool plugin operation failed", {
           operation: "level2.call",
           toolId: capturedToolId,
@@ -1756,7 +1770,7 @@ export function createToolServer(options: ToolServerOptions) {
         });
         return toolFailureResponse(internalPluginCallFailure);
       }
-      const outputValue = normalizedValue.match({ ok: (value) => value, err: () => null });
+      const outputValue = normalizedValue.value;
       logger.info("tool.call.result", {
         callableId: body.callableId,
         requestId: ctx.requestId,

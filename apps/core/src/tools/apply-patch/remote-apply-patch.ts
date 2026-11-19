@@ -1,8 +1,9 @@
-import { DEFAULT_FS_DENY_PATHS } from "../fs/deny-paths";
-import { decodeRemoteApplyPatchResponseJson } from "@stanley2058/lilac-fs";
+import { expandTilde } from "@stanley2058/lilac-fs";
 
-import { sshExecScriptJson } from "../../ssh/ssh-exec";
-import { getRemoteRunnerJsText } from "../../ssh/remote-js";
+import { DEFAULT_FS_DENY_PATHS } from "../fs/deny-paths";
+
+import { createRemoteFileSystemHost } from "../../ssh/remote-filesystem-host";
+import { applyHunksResult, parsePatchResult } from "./apply-patch-core";
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const REMOTE_ALLOW_ALL_PATHS: readonly string[] = [];
@@ -15,30 +16,36 @@ export async function remoteApplyPatch(params: {
   signal?: AbortSignal;
   dangerouslyAllow?: boolean;
 }): Promise<{ ok: true; output: string } | { ok: false; error: string }> {
-  const source = await getRemoteRunnerJsText();
-  return source.match<() => Promise<{ ok: true; output: string } | { ok: false; error: string }>>({
-    err: (error) => async () => ({ ok: false, error: error.message }),
-    ok: (js) => async () => {
-      const res = await sshExecScriptJson({
-        host: params.host,
-        cwd: params.cwd,
-        js,
-        input: {
-          op: "apply_patch",
-          denyPaths: [
-            ...(params.dangerouslyAllow === true ? REMOTE_ALLOW_ALL_PATHS : DEFAULT_FS_DENY_PATHS),
-          ],
-          input: { patchText: params.patchText },
-        },
-        timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        signal: params.signal,
-        maxOutputChars: 1_000_000,
-        decodeResponse: decodeRemoteApplyPatchResponseJson,
-      });
-      return res.match<{ ok: true; output: string } | { ok: false; error: string }>({
-        err: (error) => ({ ok: false, error: error.message }),
-        ok: (output) => ({ ok: true, output }),
-      });
-    },
-  })();
+  const denyPaths =
+    params.dangerouslyAllow === true ? REMOTE_ALLOW_ALL_PATHS : DEFAULT_FS_DENY_PATHS;
+  const hunks = parsePatchResult(params.patchText);
+  if (hunks.isErr()) return { ok: false, error: hunks.error.message };
+
+  const created = await createRemoteFileSystemHost({
+    host: params.host,
+    denyPaths,
+    timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    signal: params.signal,
+  });
+  if (created.isErr()) return { ok: false, error: created.error.message };
+  const host = created.value;
+  const parsed = hunks.value;
+  if (!host) return { ok: false, error: "remote host unavailable" };
+
+  const canonical = await host.realpath(expandTilde(params.cwd, host.homeDir));
+  if (canonical.isErr()) return { ok: false, error: canonical.error.message };
+  const cwdStats = await host.stat(canonical.value);
+  if (cwdStats.isErr()) return { ok: false, error: cwdStats.error.message };
+  if (cwdStats.value.type !== "directory") {
+    return { ok: false, error: `ENOTDIR: not a directory, chdir '${params.cwd}'` };
+  }
+  const applied = await applyHunksResult(canonical.value, parsed, {
+    denyPaths,
+    signal: params.signal,
+    host,
+  });
+  return applied.match<{ ok: true; output: string } | { ok: false; error: string }>({
+    ok: (output) => ({ ok: true, output }),
+    err: (error) => ({ ok: false, error: error.message }),
+  });
 }

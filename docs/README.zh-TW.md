@@ -50,7 +50,7 @@
 | 文件 | 內容 |
 | --- | --- |
 | [`../AGENTS.md`](../AGENTS.md) | Repo commands、測試規則與 TypeScript conventions |
-| [`../packages/remote-fs-runner/README.md`](../packages/remote-fs-runner/README.md) | Core SSH tools 使用的 remote filesystem helper |
+| [`../DEVELOPMENT.md#remote-runner`](../DEVELOPMENT.md#remote-runner) | Core SSH tools 使用的原生 Rust runner：建置、工具鏈與一致性測試 |
 | [`agents/issue-tracker.md`](./agents/issue-tracker.md) | 以本地 Markdown 追蹤開放與延後工作的方式，以及何時移除 issue 文件 |
 
 > [!NOTE]

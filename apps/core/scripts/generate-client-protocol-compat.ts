@@ -31,14 +31,18 @@ if (import.meta.main) {
         );
     } else exported = await exportPreviousRelease(staged);
     if (!exported || !(await formatBaseline(staged))) process.exitCode = 1;
-    if (!process.exitCode) {
-      await mkdir(baselineDirectory, { recursive: true });
-      for (const name of await readdir(baselineDirectory))
-        if (name.endsWith(".schema.json")) await rm(path.join(baselineDirectory, name));
-      for (const name of await readdir(staged))
-        await copyFile(path.join(staged, name), path.join(baselineDirectory, name));
-    }
+    if (!process.exitCode) await replaceBaseline(staged);
   }
+}
+
+async function replaceBaseline(directory: string): Promise<void> {
+  await mkdir(baselineDirectory, { recursive: true });
+  for (const name of await readdir(baselineDirectory)) {
+    if (!name.endsWith(".schema.json")) continue;
+    await rm(path.join(baselineDirectory, name));
+  }
+  for (const name of await readdir(directory))
+    await copyFile(path.join(directory, name), path.join(baselineDirectory, name));
 }
 
 /** Formats every generated file like the repository so fmt:check accepts them. */

@@ -1358,14 +1358,9 @@ describe("Stage 2 union rules", () => {
     ).toThrow("reason must be nonempty");
   });
 
-  test("excludes the generated Core remote runner bundle but not its source", () => {
+  test("excludes tests and generated output but not sources", () => {
     const root = path.join(REPOSITORY_ROOT, "apps/core");
-    expect(
-      isProductionFileName(path.join(root, "src/ssh/remote-js/remote-runner.cjs"), root),
-    ).toBeFalse();
-    expect(
-      isProductionFileName(path.join(root, "src/ssh/remote-js/remote-runner-entry.ts"), root),
-    ).toBeTrue();
+    expect(isProductionFileName(path.join(root, "src/ssh/ssh-exec.ts"), root)).toBeTrue();
     expect(isProductionFileName(path.join(root, "test/support.ts"), root)).toBeFalse();
     expect(isProductionFileName(path.join(root, "tests/support.ts"), root)).toBeFalse();
     expect(isProductionFileName(path.join(root, "__tests__/support.ts"), root)).toBeFalse();
@@ -2686,7 +2681,6 @@ describe("permanent architecture governance", () => {
       "apps/core:src/surface/bridge/bus-agent-runner/raw.ts#parseRequestControlFromRaw:projection",
       "apps/core:src/workflow/workflow-action-resolver.ts#decodeWorkflowActionOutboxEvent:persistence",
       "apps/tool-bridge:client.ts#projectBridgeFailure:wire",
-      "packages/fs:src/remote-runner-protocol.ts#decodeJson:wire",
       "packages/plugin-runtime:server-tool-result.ts#decodeServerToolResult:plugin",
       "packages/plugin-runtime:server-tool-result.ts#transform.<callback@1>@2:plugin",
       "packages/utils:custom-commands.ts#decodeCustomCommandResult:plugin",
@@ -2881,7 +2875,7 @@ describe("real declaration integration", () => {
     );
   });
 
-  test("permits positive isErr guards only for direct local object-form captures", () => {
+  test("permits positive isErr guards on immutable locals and unchanged parameters", () => {
     const workspace = {
       ...BASE_WORKSPACE,
       name: "real-libraries-result-capture-settlement",
@@ -2901,7 +2895,7 @@ describe("real declaration integration", () => {
     );
   });
 
-  test("rejects other guards and non-local or non-object-form capture provenance", () => {
+  test("rejects other guards, nested guards, and reassigned receivers", () => {
     const workspace = {
       ...BASE_WORKSPACE,
       name: "real-libraries-invalid-result-capture-settlement",
@@ -2917,10 +2911,42 @@ describe("real declaration integration", () => {
     const workspaceProgram = createWorkspaceProgram(REPOSITORY_ROOT, workspace);
     const findings = analyzeWorkspace(workspace, workspaceProgram.root, workspaceProgram.program);
 
-    expect(findings).toHaveLength(9);
+    expect(findings).toHaveLength(10);
     expect(findings.every(({ rule }) => rule === "architecture/no-manual-result-branching")).toBe(
       true,
     );
+  });
+
+  test("rejects repeated Result matches and continuations nested in match continuations", () => {
+    const workspace = {
+      ...BASE_WORKSPACE,
+      name: "real-libraries-result-continuation",
+      packageName: "architecture-real-libraries",
+      root: "scripts/architecture/fixtures/real-libraries",
+      tsconfig: "scripts/architecture/fixtures/real-libraries/tsconfig.json",
+      ruleZones: {
+        "architecture/no-repeated-result-match": [{ include: "result-continuation.ts" }],
+        "architecture/no-nested-result-continuation": [{ include: "result-continuation.ts" }],
+      },
+    } satisfies WorkspaceArchitecture;
+    const workspaceProgram = createWorkspaceProgram(REPOSITORY_ROOT, workspace);
+    const findings = analyzeWorkspace(workspace, workspaceProgram.root, workspaceProgram.program);
+
+    expect(
+      findings
+        .map(({ rule, location }) => [rule, location?.line ?? 0] as const)
+        .toSorted(([, left], [, right]) => left - right),
+    ).toEqual([
+      ["architecture/no-repeated-result-match", 11],
+      ["architecture/no-repeated-result-match", 16],
+      ["architecture/no-nested-result-continuation", 23],
+      ["architecture/no-repeated-result-match", 49],
+      ["architecture/no-nested-result-continuation", 63],
+      ["architecture/no-nested-result-continuation", 74],
+      ["architecture/no-nested-result-continuation", 88],
+      ["architecture/no-nested-result-continuation", 100],
+      ["architecture/no-repeated-result-match", 127],
+    ]);
   });
 
   test("recognizes real installed zod and better-result 3.0 declarations", () => {

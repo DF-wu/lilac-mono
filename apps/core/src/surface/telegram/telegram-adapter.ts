@@ -802,13 +802,97 @@ export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolve
       catch: (cause) => captureError(cause, "Telegram getFile failed"),
     });
 
-    const continueResolve = file.match<
+    if (file.isErr()) {
+      const projection = projectTelegramError(file.error.cause, "Telegram getFile failed");
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "telegram",
+          operation: "resolve-attachment",
+          message: sanitize(projection.message),
+        }),
+      );
+    }
+    const fileInfo = file.value;
+    const filePath = fileInfo.file_path;
+    if (!filePath) {
+      return Result.err(
+        new SurfaceMessageNotFound({
+          platform: "telegram",
+          operation: "resolve-attachment",
+          message: "Telegram getFile returned no file_path",
+        }),
+      );
+    }
+    if (filePath.startsWith("/")) {
+      // A self-hosted Bot API server in --local mode returns an absolute
+      // filesystem path instead of a downloadable path; supporting that
+      // needs filesystem access, not HTTP, and is out of scope here.
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "telegram",
+          operation: "resolve-attachment",
+          message:
+            "Telegram getFile returned a local filesystem path; local-mode Bot API servers are not supported for inbound media",
+        }),
+      );
+    }
+    const apiRoot =
+      this.opts?.apiRoot ?? cfg.surface.telegram.apiRoot ?? "https://api.telegram.org";
+    const downloadUrl = `${apiRoot.replace(/\/+$/u, "")}/file/bot${token}/${filePath}`;
+
+    const downloaded = await Result.tryPromise({
+      // Never throws for expected outcomes: the union keeps over-budget
+      // and HTTP failures typed, so the catch below stays a plain
+      // registered error projection covering only transport exceptions.
+      try: async (): Promise<
+        | { kind: "bytes"; bytes: Uint8Array }
+        | { kind: "too-large" }
+        | { kind: "http-error"; status: number }
+      > => {
+        const response = await fetch(downloadUrl, {
+          redirect: "follow",
+          ...(opts.signal === undefined ? {} : { signal: opts.signal }),
+        });
+        if (!response.ok) {
+          return { kind: "http-error", status: response.status };
+        }
+        const body = response.body;
+        if (!body) return { kind: "bytes", bytes: new Uint8Array(0) };
+
+        const reader = body.getReader();
+        return await (async () => {
+          const chunks: Uint8Array[] = [];
+          let total = 0;
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            total += value.byteLength;
+            if (total > opts.maxBytes) {
+              await reader.cancel();
+              return { kind: "too-large" as const };
+            }
+            chunks.push(value);
+          }
+
+          const bytes = new Uint8Array(total);
+          let offset = 0;
+          for (const chunk of chunks) {
+            bytes.set(chunk, offset);
+            offset += chunk.byteLength;
+          }
+          return { kind: "bytes" as const, bytes };
+        })().finally(() => reader.releaseLock());
+      },
+      catch: (cause) => captureError(cause, "Telegram file download failed"),
+    });
+
+    const continueDownloaded = downloaded.match<
       () => Promise<ResultType<ResolvedSurfaceAttachment, SurfaceAttachmentResolveError>>
     >({
       err:
         ({ cause }) =>
         async () => {
-          const projection = projectTelegramError(cause, "Telegram getFile failed");
+          const projection = projectTelegramError(cause, "Telegram file download failed");
           return Result.err(
             new SurfaceUnavailable({
               platform: "telegram",
@@ -817,124 +901,32 @@ export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolve
             }),
           );
         },
-      ok: (fileInfo) => async () => {
-        const filePath = fileInfo.file_path;
-        if (!filePath) {
+      ok: (outcome) => async () => {
+        if (outcome.kind === "too-large") {
           return Result.err(
-            new SurfaceMessageNotFound({
+            new SurfaceAttachmentTooLarge({
               platform: "telegram",
-              operation: "resolve-attachment",
-              message: "Telegram getFile returned no file_path",
+              maxBytes: opts.maxBytes,
+              message: `Telegram file exceeds ${opts.maxBytes} bytes; download aborted`,
             }),
           );
         }
-        if (filePath.startsWith("/")) {
-          // A self-hosted Bot API server in --local mode returns an absolute
-          // filesystem path instead of a downloadable path; supporting that
-          // needs filesystem access, not HTTP, and is out of scope here.
+        if (outcome.kind === "http-error") {
           return Result.err(
             new SurfaceUnavailable({
               platform: "telegram",
               operation: "resolve-attachment",
-              message:
-                "Telegram getFile returned a local filesystem path; local-mode Bot API servers are not supported for inbound media",
+              message: `Telegram file download failed (${outcome.status})`,
             }),
           );
         }
-        const apiRoot =
-          this.opts?.apiRoot ?? cfg.surface.telegram.apiRoot ?? "https://api.telegram.org";
-        const downloadUrl = `${apiRoot.replace(/\/+$/u, "")}/file/bot${token}/${filePath}`;
-
-        const downloaded = await Result.tryPromise({
-          // Never throws for expected outcomes: the union keeps over-budget
-          // and HTTP failures typed, so the catch below stays a plain
-          // registered error projection covering only transport exceptions.
-          try: async (): Promise<
-            | { kind: "bytes"; bytes: Uint8Array }
-            | { kind: "too-large" }
-            | { kind: "http-error"; status: number }
-          > => {
-            const response = await fetch(downloadUrl, {
-              redirect: "follow",
-              ...(opts.signal === undefined ? {} : { signal: opts.signal }),
-            });
-            if (!response.ok) {
-              return { kind: "http-error", status: response.status };
-            }
-            const body = response.body;
-            if (!body) return { kind: "bytes", bytes: new Uint8Array(0) };
-
-            const reader = body.getReader();
-            return await (async () => {
-              const chunks: Uint8Array[] = [];
-              let total = 0;
-              for (;;) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                total += value.byteLength;
-                if (total > opts.maxBytes) {
-                  await reader.cancel();
-                  return { kind: "too-large" as const };
-                }
-                chunks.push(value);
-              }
-
-              const bytes = new Uint8Array(total);
-              let offset = 0;
-              for (const chunk of chunks) {
-                bytes.set(chunk, offset);
-                offset += chunk.byteLength;
-              }
-              return { kind: "bytes" as const, bytes };
-            })().finally(() => reader.releaseLock());
-          },
-          catch: (cause) => captureError(cause, "Telegram file download failed"),
-        });
-
-        const continueDownloaded = downloaded.match<
-          () => Promise<ResultType<ResolvedSurfaceAttachment, SurfaceAttachmentResolveError>>
-        >({
-          err:
-            ({ cause }) =>
-            async () => {
-              const projection = projectTelegramError(cause, "Telegram file download failed");
-              return Result.err(
-                new SurfaceUnavailable({
-                  platform: "telegram",
-                  operation: "resolve-attachment",
-                  message: sanitize(projection.message),
-                }),
-              );
-            },
-          ok: (outcome) => async () => {
-            if (outcome.kind === "too-large") {
-              return Result.err(
-                new SurfaceAttachmentTooLarge({
-                  platform: "telegram",
-                  maxBytes: opts.maxBytes,
-                  message: `Telegram file exceeds ${opts.maxBytes} bytes; download aborted`,
-                }),
-              );
-            }
-            if (outcome.kind === "http-error") {
-              return Result.err(
-                new SurfaceUnavailable({
-                  platform: "telegram",
-                  operation: "resolve-attachment",
-                  message: `Telegram file download failed (${outcome.status})`,
-                }),
-              );
-            }
-            const bytes = outcome.bytes;
-            const sniffed = await fileTypeFromBuffer(bytes);
-            const mediaType = sniffed?.mime ?? "application/octet-stream";
-            return Result.ok({ kind: "bytes" as const, bytes, mediaType });
-          },
-        });
-        return await continueDownloaded();
+        const bytes = outcome.bytes;
+        const sniffed = await fileTypeFromBuffer(bytes);
+        const mediaType = sniffed?.mime ?? "application/octet-stream";
+        return Result.ok({ kind: "bytes" as const, bytes, mediaType });
       },
     });
-    return await continueResolve();
+    return await continueDownloaded();
   }
 
   async listMsg(

@@ -270,12 +270,10 @@ export function collectOpenAIWebSearchResults(
         const snippet = citationSnippet(part.text, citation);
         const content = snippet ? `${GENERATED_SUMMARY_LABEL}${snippet}` : "";
         const existing = byUrl.get(url);
-        if (existing) {
-          if (existing.content.length === 0 && content.length > 0) {
-            byUrl.set(url, { ...existing, content });
-          }
-          continue;
+        if (existing?.content.length === 0 && content.length > 0) {
+          byUrl.set(url, { ...existing, content });
         }
+        if (existing) continue;
         byUrl.set(url, {
           url,
           title: citation.title?.trim() || url,

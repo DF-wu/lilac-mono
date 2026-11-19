@@ -1,27 +1,29 @@
-import crypto from "node:crypto";
-import os from "node:os";
-import path from "node:path";
-import { normalizeRemoteCwd } from "./ssh-cwd";
 import fs from "node:fs/promises";
+import { normalizeRemoteCwd } from "./ssh-cwd";
 
 import { BufferedFileSink } from "@stanley2058/lilac-coding-tools/buffered-file-sink";
-import type { BundledRemoteRunnerRequest, RemoteFsRequest } from "@stanley2058/lilac-fs";
 import { createLogger, formatTaggedErrorForLog, isPanic } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
-  captureRuntimeError,
-  projectCapturedRuntimeError,
-  projectRuntimeError,
-} from "../runtime/error-format";
-import { requireConfiguredSshHost } from "./ssh-config";
-import { preserveToolPanic } from "../tools/tool-result-adapters";
+  invalidateRemoteRunner,
+  REMOTE_RUNNER_MISSING_MARKER,
+  resolveRemoteRunner,
+  type RemoteRunnerDeployFailure,
+  type RemoteRunnerDeployment,
+} from "./remote-runner-deploy";
+import {
+  buildSshArgs,
+  buildSshChildEnv,
+  captureSshOperation,
+  captureSshPromise,
+  killProcessGroupBestEffort,
+  observeBestEffortProcessCleanup,
+} from "./ssh-command";
+import { requireConfiguredSshHost, requireConfiguredSshHostResult } from "./ssh-config";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
+import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
 
-const DEFAULT_CONNECT_TIMEOUT_SECS = 10;
-const DEFAULT_SSH_STDIN_MODE: SshBashStdinMode = "error";
-let sshControlDirectory: Promise<string> | undefined;
-const deployedRunners = new Set<string>();
-const runnerDeploymentGates = new Map<string, Promise<void>>();
 const logger = createLogger({ module: "ssh-exec" });
 
 export type SshBashStdinMode = "error" | "eof";
@@ -49,40 +51,6 @@ export type SshExecResult = {
   errors?: { stdoutRead?: string; stderrRead?: string; exitRead?: string };
 };
 
-export class SshExecutionCancelledError extends TaggedError("SshExecutionCancelledError")<{
-  readonly message: string;
-}> {}
-
-export class SshExecutionTimedOutError extends TaggedError("SshExecutionTimedOutError")<{
-  readonly timeoutMs: number;
-  readonly message: string;
-}> {}
-
-export class SshExecutionOutputCappedError extends TaggedError("SshExecutionOutputCappedError")<{
-  readonly message: string;
-}> {}
-
-export class SshExecutionTransportError extends TaggedError("SshExecutionTransportError")<{
-  readonly transportType: "hostkey" | "auth" | "connect" | "unknown";
-  readonly message: string;
-}> {}
-
-export class SshSubprocessExitError extends TaggedError("SshSubprocessExitError")<{
-  readonly exitCode: number;
-  readonly stderr: string;
-  readonly message: string;
-}> {}
-
-export class SshExecutionAdapterError extends TaggedError("SshExecutionAdapterError")<{
-  readonly cause: unknown;
-  readonly message: string;
-}> {}
-
-export class SshRequestSerializationError extends TaggedError("SshRequestSerializationError")<{
-  readonly cause: unknown;
-  readonly message: string;
-}> {}
-
 export class SshStreamReadError extends TaggedError("SshStreamReadError")<{
   readonly detail?: string;
   readonly operation: "acquire_reader" | "read_chunk" | "read_body" | "report_activity";
@@ -91,7 +59,7 @@ export class SshStreamReadError extends TaggedError("SshStreamReadError")<{
 }> {}
 
 export class SshStreamCleanupError extends TaggedError("SshStreamCleanupError")<{
-  readonly operation: "release_reader" | "cancel_reader";
+  readonly operation: "release_reader" | "cancel_reader" | "close_stdin" | "write_stdin";
   readonly cause: unknown;
   readonly message: string;
 }> {}
@@ -113,32 +81,10 @@ class SshOverflowCleanupError extends TaggedError("SshOverflowCleanupError")<{
   readonly message: string;
 }> {}
 
-class SshProcessSignalError extends TaggedError("SshProcessSignalError")<{
-  readonly target: "group" | "process";
-  readonly pid: number;
-  readonly signal: "SIGTERM" | "SIGKILL";
-  readonly cause: unknown;
-  readonly message: string;
-}> {}
-
-class SshProcessCleanupError extends TaggedError("SshProcessCleanupError")<{
-  readonly failures: readonly SshProcessSignalError[];
-  readonly message: string;
-}> {}
-
 class SshExitWaitError extends TaggedError("SshExitWaitError")<{
   readonly cause: unknown;
   readonly message: string;
 }> {}
-
-export type SshJsonExecutionError =
-  | SshExecutionCancelledError
-  | SshExecutionTimedOutError
-  | SshExecutionOutputCappedError
-  | SshExecutionTransportError
-  | SshSubprocessExitError
-  | SshExecutionAdapterError
-  | SshRequestSerializationError;
 
 export type StreamTextResult = {
   text: string;
@@ -173,62 +119,6 @@ type SshOverflowCleanupOutcome = {
   readonly result: ResultType<void, SshOverflowCleanupError>;
   readonly panic?: Panic;
 };
-
-function rethrowSshPanic(cause: Error | Panic): Error {
-  return preserveToolPanic(cause);
-}
-
-function captureSshOperation<T, E extends Error>(params: {
-  readonly run: () => Awaited<T>;
-  readonly fallback: string;
-  readonly mapError: (cause: Error) => E;
-}): ResultType<T, E> {
-  const captured = Result.try({
-    try: params.run,
-    catch: (cause) => new Error(params.fallback, { cause }),
-  }).mapError((captured) => projectRuntimeError(captured.cause, params.fallback));
-  return captured.match<() => ResultType<T, E>>({
-    ok: (value) => () => Result.ok(value),
-    err: (error) => () => Result.err(params.mapError(rethrowSshPanic(error))),
-  })();
-}
-
-async function captureSshPromise<T, E extends Error>(params: {
-  readonly run: () => Promise<T>;
-  readonly fallback: string;
-  readonly mapError: (cause: Error) => E;
-}): Promise<ResultType<T, E>> {
-  const captured = (
-    await Result.tryPromise({ try: params.run, catch: captureRuntimeError })
-  ).mapError((error) => projectCapturedRuntimeError(error, params.fallback));
-  return captured.match<() => ResultType<T, E>>({
-    ok: (value) => () => Result.ok(value),
-    err: (error) => () => Result.err(params.mapError(rethrowSshPanic(error))),
-  })();
-}
-
-export function serializeRemoteRunnerRequestJson(
-  request: BundledRemoteRunnerRequest | RemoteFsRequest,
-): ResultType<string, SshRequestSerializationError> {
-  return captureSshOperation({
-    run: () => JSON.stringify(request),
-    fallback: "Opaque SSH adapter failure",
-    mapError: (cause) =>
-      new SshRequestSerializationError({
-        cause,
-        message: "Remote runner request could not be serialized as JSON",
-      }),
-  }).andThen((serialized) =>
-    serialized !== undefined
-      ? Result.ok(serialized)
-      : Result.err(
-          new SshRequestSerializationError({
-            cause: new TypeError("JSON.stringify returned undefined for a remote runner request"),
-            message: "Remote runner request could not be serialized as JSON",
-          }),
-        ),
-  );
-}
 
 function acquireStreamReader(
   stream: ReadableStream<Uint8Array>,
@@ -492,33 +382,35 @@ async function disableOverflowCapture(
   });
 }
 
+/** Closes an open overflow sink and reports whether the overflow file is complete. */
+async function closeOverflowCapture(capture: OverflowCapture): Promise<boolean> {
+  const sink = capture.sink;
+  if (!sink) return false;
+  const closed = await settleOverflowOperation(() => closeOverflowSink(sink));
+  if (closed.isErr()) return propagateOverflowPanic(capture, closed.error);
+  const closeResult = closed.value;
+  if (closeResult.isErr()) {
+    await disableOverflowCapture(capture, closeResult.error);
+    return false;
+  }
+  capture.sink = undefined;
+  return true;
+}
+
 async function writeOverflowChunk(
   capture: OverflowCapture,
   chunk: Uint8Array,
 ): Promise<ResultType<void, SshOverflowOperationError>> {
   if (chunk.byteLength === 0 || capture.disabled) return Result.ok();
-  let sink = capture.sink;
-  if (!sink) {
+  if (!capture.sink) {
     const opened = await settleOverflowOperation(() => openOverflowSink(capture.target));
-    return opened.match({
-      err: (panic) => async () => propagateOverflowPanic(capture, panic),
-      ok: (result) => async () =>
-        result.match({
-          err: (error) => async () => Result.err(error),
-          ok: (openedSink) => async () => {
-            capture.sink = openedSink;
-            capture.fileCreated = true;
-            const written = await settleOverflowOperation(() =>
-              writeOverflowSink(openedSink, chunk),
-            );
-            return written.match({
-              err: (panic) => async () => propagateOverflowPanic(capture, panic),
-              ok: (value) => async () => value,
-            })();
-          },
-        })(),
-    })();
+    if (opened.isErr()) return propagateOverflowPanic(capture, opened.error);
+    const openResult = opened.value;
+    if (openResult.isErr()) return Result.err(openResult.error);
+    capture.sink = openResult.value;
+    capture.fileCreated = true;
   }
+  const sink = capture.sink;
   const written = await settleOverflowOperation(() => writeOverflowSink(sink, chunk));
   return written.match({
     err: (panic) => async () => propagateOverflowPanic(capture, panic),
@@ -565,147 +457,143 @@ async function readReadableStreamTextCapped(
   options?: { overflowFilePath?: string; onActivity?: () => void; stopSignal?: AbortSignal },
 ): Promise<ResultType<StreamTextResult, SshStreamTextError>> {
   const acquired = acquireStreamReader(stream);
-  return acquired.match({
-    err: (error) => async () => Result.err(error),
-    ok: (reader) => async () => {
-      let releaseAttempted = false;
-      // A cancelled reader resolves its pending read as done, so the captured prefix is returned.
-      const stopReading = () => cancelStreamReader(reader);
-      if (options?.stopSignal?.aborted) stopReading();
-      options?.stopSignal?.addEventListener("abort", stopReading, { once: true });
+  if (acquired.isErr()) return Result.err(acquired.error);
+  const reader = acquired.value;
+  let releaseAttempted = false;
+  // A cancelled reader resolves its pending read as done, so the captured prefix is returned.
+  const stopReading = () => cancelStreamReader(reader);
+  if (options?.stopSignal?.aborted) stopReading();
+  options?.stopSignal?.addEventListener("abort", stopReading, { once: true });
+  const overflowCapture: OverflowCapture | undefined = options?.overflowFilePath
+    ? {
+        target: options.overflowFilePath,
+        bufferedRawChunks: [],
+        fileCreated: false,
+        disabled: false,
+      }
+    : undefined;
 
-      const outcome = await (async () => {
-        const decoder = new TextDecoder();
-        let text = "";
-        let totalChars = 0;
-        let capped = false;
-        let overflowFilePath: string | undefined;
-        const overflowCapture: OverflowCapture | undefined = options?.overflowFilePath
-          ? {
-              target: options.overflowFilePath,
-              bufferedRawChunks: [],
-              fileCreated: false,
-              disabled: false,
-            }
-          : undefined;
+  const capture = (async () => {
+    const decoder = new TextDecoder();
+    let text = "";
+    let totalChars = 0;
+    let capped = false;
+    let overflowFilePath: string | undefined;
 
-        const consumeChunkText = async (
-          chunkText: string,
-        ): Promise<ResultType<void, SshOverflowOperationError>> => {
-          if (chunkText.length === 0) return Result.ok();
-          totalChars += chunkText.length;
-          if (capped) return Result.ok();
+    const consumeChunkText = async (
+      chunkText: string,
+    ): Promise<ResultType<void, SshOverflowOperationError>> => {
+      if (chunkText.length === 0) return Result.ok();
+      totalChars += chunkText.length;
+      if (capped) return Result.ok();
 
-          const previousText = text;
-          const nextLen = previousText.length + chunkText.length;
-          if (nextLen <= maxChars) {
-            text = previousText + chunkText;
-            return Result.ok();
-          }
+      const previousText = text;
+      const nextLen = previousText.length + chunkText.length;
+      if (nextLen <= maxChars) {
+        text = previousText + chunkText;
+        return Result.ok();
+      }
 
-          capped = true;
-          const remaining = Math.max(0, maxChars - previousText.length);
-          text = previousText + chunkText.slice(0, remaining);
-          if (!overflowCapture) return Result.ok();
-          return activateOverflowCapture(overflowCapture);
-        };
+      capped = true;
+      const remaining = Math.max(0, maxChars - previousText.length);
+      text = previousText + chunkText.slice(0, remaining);
+      if (!overflowCapture) return Result.ok();
+      return activateOverflowCapture(overflowCapture);
+    };
 
-        let primary: ResultType<StreamTextResult, SshStreamReadError>;
-        while (true) {
-          const read = await readStreamChunk(reader);
-          const readFailure = read.match({ ok: () => null, err: (error) => error });
-          if (readFailure) {
-            if (overflowCapture) {
-              const cleanup = await cleanupOverflowCapture(overflowCapture);
-              cleanup.match({
-                ok: () => undefined,
-                err: (error) =>
-                  logger.debug("SSH overflow cleanup incomplete", formatTaggedErrorForLog(error)),
-              });
-            }
-            primary = Result.err(readFailure);
-            break;
-          }
-          const chunk = read.match<SshStreamReadChunk>({
-            ok: (value) => value,
-            err: () => ({ done: true }),
+    let primary: ResultType<StreamTextResult, SshStreamReadError>;
+    while (true) {
+      const read = await readStreamChunk(reader);
+      if (read.isErr()) {
+        if (overflowCapture) {
+          const cleanup = await cleanupOverflowCapture(overflowCapture);
+          cleanup.match({
+            ok: () => undefined,
+            err: (error) =>
+              logger.debug("SSH overflow cleanup incomplete", formatTaggedErrorForLog(error)),
           });
-          const { done, value } = chunk;
-          if (done) {
-            const tail = decoder.decode();
-            if (tail.length > 0) {
-              const consumed = await consumeChunkText(tail);
-              const failure = consumed.match({ ok: () => null, err: (error) => error });
-              if (failure && overflowCapture)
-                await disableOverflowCapture(overflowCapture, failure);
-            }
-            if (overflowCapture?.sink) {
-              const overflowSink = overflowCapture.sink;
-              const closed = await settleOverflowOperation(() => closeOverflowSink(overflowSink));
-              await closed.match({
-                err: (panic) => async () => propagateOverflowPanic(overflowCapture, panic),
-                ok: (result) => async () =>
-                  result.match({
-                    err: (error) => async () => disableOverflowCapture(overflowCapture, error),
-                    ok: () => async () => {
-                      overflowCapture.sink = undefined;
-                      overflowFilePath = overflowCapture.target;
-                    },
-                  })(),
-              })();
-            }
-            primary = Result.ok({ text, totalChars, capped, overflowFilePath });
-            break;
-          }
-          if (!value || value.byteLength === 0) continue;
-
-          if (options?.onActivity) {
-            const activity = reportStreamActivity(options.onActivity);
-            const activityFailure = activity.match({ ok: () => null, err: (error) => error });
-            if (activityFailure) {
-              if (overflowCapture) {
-                const cleanup = await cleanupOverflowCapture(overflowCapture);
-                cleanup.match({
-                  ok: () => undefined,
-                  err: (error) =>
-                    logger.debug("SSH overflow cleanup incomplete", formatTaggedErrorForLog(error)),
-                });
-              }
-              primary = Result.err(activityFailure);
-              break;
-            }
-          }
-          if (capped && overflowCapture) {
-            const written = await writeOverflowChunk(overflowCapture, value);
-            const failure = written.match({ ok: () => null, err: (error) => error });
-            if (failure) await disableOverflowCapture(overflowCapture, failure);
-          } else if (overflowCapture) {
-            overflowCapture.bufferedRawChunks.push(Buffer.from(value));
-          }
-          const consumed = await consumeChunkText(decoder.decode(value, { stream: true }));
+        }
+        primary = Result.err(read.error);
+        break;
+      }
+      const { done, value } = read.value;
+      if (done) {
+        const tail = decoder.decode();
+        if (tail.length > 0) {
+          const consumed = await consumeChunkText(tail);
           const failure = consumed.match({ ok: () => null, err: (error) => error });
           if (failure && overflowCapture) await disableOverflowCapture(overflowCapture, failure);
         }
-
-        releaseAttempted = true;
-        return {
-          status: "return",
-          value: combineStreamReadAndCleanup(primary, releaseStreamReader(reader)),
-        } as const;
-      })().finally(() => {
-        options?.stopSignal?.removeEventListener("abort", stopReading);
-        if (!releaseAttempted) {
-          const released = releaseStreamReader(reader);
-          released.match({
-            ok: () => undefined,
-            err: (error) =>
-              logger.debug("SSH stream reader cleanup failed", formatTaggedErrorForLog(error)),
-          });
+        if (overflowCapture && (await closeOverflowCapture(overflowCapture))) {
+          overflowFilePath = overflowCapture.target;
         }
-      });
-      return outcome.value;
-    },
+        primary = Result.ok({ text, totalChars, capped, overflowFilePath });
+        break;
+      }
+      if (!value || value.byteLength === 0) continue;
+
+      if (options?.onActivity) {
+        const activity = reportStreamActivity(options.onActivity);
+        const activityFailure = activity.match({ ok: () => null, err: (error) => error });
+        if (activityFailure) {
+          if (overflowCapture) {
+            const cleanup = await cleanupOverflowCapture(overflowCapture);
+            cleanup.match({
+              ok: () => undefined,
+              err: (error) =>
+                logger.debug("SSH overflow cleanup incomplete", formatTaggedErrorForLog(error)),
+            });
+          }
+          primary = Result.err(activityFailure);
+          break;
+        }
+      }
+      if (capped && overflowCapture) {
+        const written = await writeOverflowChunk(overflowCapture, value);
+        const failure = written.match({ ok: () => null, err: (error) => error });
+        if (failure) await disableOverflowCapture(overflowCapture, failure);
+      } else if (overflowCapture) {
+        overflowCapture.bufferedRawChunks.push(Buffer.from(value));
+      }
+      const consumed = await consumeChunkText(decoder.decode(value, { stream: true }));
+      const failure = consumed.match({ ok: () => null, err: (error) => error });
+      if (failure && overflowCapture) await disableOverflowCapture(overflowCapture, failure);
+    }
+
+    releaseAttempted = true;
+    return {
+      status: "return",
+      value: combineStreamReadAndCleanup(primary, releaseStreamReader(reader)),
+    } as const;
   })();
+  const outcome = await Result.tryPromise({ try: () => capture, catch: captureRuntimeError });
+  const cleanup = await Result.tryPromise({
+    try: async () => {
+      // Only an unfinished sink belongs to this exceptional-exit cleanup.
+      if (overflowCapture?.sink) await cleanupOverflowCaptureOutcome(overflowCapture);
+      options?.stopSignal?.removeEventListener("abort", stopReading);
+      if (!releaseAttempted) {
+        const released = releaseStreamReader(reader);
+        released.match({
+          ok: () => undefined,
+          err: (error) =>
+            logger.debug("SSH stream reader cleanup failed", formatTaggedErrorForLog(error)),
+        });
+      }
+    },
+    catch: captureRuntimeError,
+  });
+  if (outcome.isErr()) {
+    return adaptToolResultToHost(
+      Result.err(projectCapturedRuntimeError(outcome.error, "SSH output capture failed")),
+    );
+  }
+  if (cleanup.isErr()) {
+    return adaptToolResultToHost(
+      Result.err(projectCapturedRuntimeError(cleanup.error, "SSH output cleanup failed")),
+    );
+  }
+  return outcome.value.value;
 }
 
 async function readBodyTextCapped(
@@ -714,48 +602,33 @@ async function readBodyTextCapped(
   overflowFilePath?: string,
 ): Promise<ResultType<StreamTextResult, SshStreamReadError>> {
   const read = await readResponseBody(body);
-  return read.match<() => Promise<ResultType<StreamTextResult, SshStreamReadError>>>({
-    err: (error) => async () => Result.err(error),
-    ok: (fullBytes) => async () => {
-      const full = new TextDecoder().decode(fullBytes);
-      const capped = full.length > maxChars;
-      let retainedOverflowPath: string | undefined;
-      if (capped && overflowFilePath) {
-        const capture: OverflowCapture = {
-          target: overflowFilePath,
-          bufferedRawChunks: [],
-          fileCreated: false,
-          disabled: false,
-        };
-        const written = await writeOverflowChunk(capture, fullBytes);
-        const writeFailure = written.match({ ok: () => null, err: (error) => error });
-        if (writeFailure) {
-          await disableOverflowCapture(capture, writeFailure);
-        } else if (capture.sink) {
-          const overflowSink = capture.sink;
-          const closed = await settleOverflowOperation(() => closeOverflowSink(overflowSink));
-          await closed.match({
-            err: (panic) => async () => propagateOverflowPanic(capture, panic),
-            ok: (result) => async () =>
-              result.match({
-                err: (error) => async () => disableOverflowCapture(capture, error),
-                ok: () => async () => {
-                  capture.sink = undefined;
-                  retainedOverflowPath = overflowFilePath;
-                },
-              })(),
-          })();
-        }
-      }
+  if (read.isErr()) return Result.err(read.error);
+  const fullBytes = read.value;
+  const full = new TextDecoder().decode(fullBytes);
+  const capped = full.length > maxChars;
+  let retainedOverflowPath: string | undefined;
+  if (capped && overflowFilePath) {
+    const capture: OverflowCapture = {
+      target: overflowFilePath,
+      bufferedRawChunks: [],
+      fileCreated: false,
+      disabled: false,
+    };
+    const written = await writeOverflowChunk(capture, fullBytes);
+    const writeFailure = written.match({ ok: () => null, err: (error) => error });
+    if (writeFailure) {
+      await disableOverflowCapture(capture, writeFailure);
+    } else if (await closeOverflowCapture(capture)) {
+      retainedOverflowPath = overflowFilePath;
+    }
+  }
 
-      return Result.ok({
-        text: full.length > maxChars ? full.slice(0, maxChars) : full,
-        totalChars: full.length,
-        capped,
-        overflowFilePath: retainedOverflowPath,
-      });
-    },
-  })();
+  return Result.ok({
+    text: full.length > maxChars ? full.slice(0, maxChars) : full,
+    totalChars: full.length,
+    capped,
+    overflowFilePath: retainedOverflowPath,
+  });
 }
 
 export async function readStreamTextCapped(
@@ -792,20 +665,21 @@ function inferTransportError(
   return undefined;
 }
 
-export function buildRemoteScript(params: {
-  cmd: string;
-  cwd?: string;
-  stdinMode?: SshBashStdinMode;
-}) {
-  const fields = [params.cwd ?? "", params.cmd, params.stdinMode ?? DEFAULT_SSH_STDIN_MODE];
+/**
+ * Shell fallback for hosts the native runner does not support. Core keeps stdin open while the call
+ * runs and closes it to cancel, so the command gets `/dev/null` as stdin in both stdin modes, as it
+ * did when the script itself was stdin. The whole script is one brace group: bash reads all of it
+ * before running anything, which leaves nothing on stdin for the watcher to consume.
+ */
+export function buildRemoteScript(params: { cmd: string; cwd?: string }) {
+  const fields = [params.cwd ?? "", params.cmd];
   const payload = Buffer.from(
     JSON.stringify(fields.map((field) => Buffer.from(field).toString("base64"))),
   ).toString("base64");
-  return `#!/usr/bin/env bash
+  return `{
 set -euo pipefail
-IFS='"' read -r _ CWD64 _ CMD64 _ MODE64 _ <<< "$(printf '%s' '${payload}' | base64 -d)"
+IFS='"' read -r _ CWD64 _ CMD64 _ <<< "$(printf '%s' '${payload}' | base64 -d)"
 CWD=$(printf '%s' "$CWD64" | base64 -d)
-MODE=$(printf '%s' "$MODE64" | base64 -d)
 TMP_CMD=$(mktemp)
 trap 'rm -f "$TMP_CMD"' EXIT
 printf '%s' "$CMD64" | base64 -d >"$TMP_CMD"
@@ -818,71 +692,19 @@ if [ -n "$CWD" ] && ! cd -- "$CWD"; then
   echo "Remote cwd does not exist or is not a directory" >&2
   exit 1
 fi
-if [ "$MODE" = "error" ]; then
-  bash --noprofile --norc "$TMP_CMD" </dev/null
-else
-  bash --noprofile --norc "$TMP_CMD"
-fi
+set -m
+bash --noprofile --norc "$TMP_CMD" </dev/null &
+JOB=$!
+{ cat >/dev/null; trap '' TERM; kill -TERM -- "-$JOB" 2>/dev/null; sleep 2; kill -KILL -- "-$JOB" 2>/dev/null; } &
+WATCHER=$!
+# bash 3.2, the macOS /bin/bash, reports the watcher's termination on stderr unless it is disowned.
+disown "$WATCHER"
+CODE=0
+wait "$JOB" 2>/dev/null || CODE=$?
+kill -- "-$WATCHER" 2>/dev/null || true
+exit "$CODE"
+}
 `;
-}
-
-function buildSshChildEnv(): NodeJS.ProcessEnv {
-  const childEnv: NodeJS.ProcessEnv = {
-    ...process.env,
-  };
-
-  delete childEnv.FORCE_COLOR;
-  childEnv.NO_COLOR = "1";
-
-  return childEnv;
-}
-
-function signalSshProcess(
-  pid: number,
-  signal: "SIGTERM" | "SIGKILL",
-  target: "group" | "process",
-): ResultType<void, SshProcessSignalError> {
-  const signalPid = target === "group" ? -pid : pid;
-  return captureSshOperation({
-    run: () => {
-      process.kill(signalPid, signal);
-    },
-    fallback: `Opaque SSH ${target} signal failure`,
-    mapError: (cause) =>
-      new SshProcessSignalError({
-        target,
-        pid,
-        signal,
-        cause,
-        message: `Failed to signal SSH ${target}`,
-      }),
-  });
-}
-
-function killProcessGroupBestEffort(
-  pid: number,
-  signal: "SIGTERM" | "SIGKILL",
-): ResultType<void, SshProcessCleanupError> {
-  const failures: SshProcessSignalError[] = [];
-  const group = signalSshProcess(pid, signal, "group");
-  group.match({ ok: () => undefined, err: (error) => failures.push(error) });
-  const processResult = signalSshProcess(pid, signal, "process");
-  processResult.match({ ok: () => undefined, err: (error) => failures.push(error) });
-  if (failures.length === 0) return Result.ok();
-  return Result.err(
-    new SshProcessCleanupError({
-      failures,
-      message: `Failed to fully signal SSH process group with ${signal}`,
-    }),
-  );
-}
-
-function observeBestEffortProcessCleanup(cleanup: ResultType<void, SshProcessCleanupError>): void {
-  cleanup.match({
-    ok: () => undefined,
-    err: (error) =>
-      logger.debug("SSH process-group cleanup incomplete", formatTaggedErrorForLog(error)),
-  });
 }
 
 function waitForSshExit(exit: Promise<number>): Promise<ResultType<number, SshExitWaitError>> {
@@ -910,81 +732,325 @@ function projectStreamCapture(
   });
 }
 
-export async function sshExecBash(params: {
+type SshExecBashParams = {
   host: string;
   cmd: string;
   cwd?: string;
+  /** Accepted for parity with local bash. Remote commands always read an empty stdin. */
   stdinMode?: SshBashStdinMode;
   timeoutMs?: number;
   signal?: AbortSignal;
   maxOutputChars: number;
   overflowOutputPath?: string;
   onActivity?: () => void;
-}): Promise<
-  SshExecResult & {
-    transportError?: { type: "hostkey" | "auth" | "connect" | "unknown"; message: string };
+};
+
+export type SshExecBashResult = SshExecResult & {
+  transportError?: { type: "hostkey" | "auth" | "connect" | "unknown"; message: string };
+};
+
+/** Deployment has no wall-clock limit from a call without a timeout, so it gets this one. */
+const UNBOUNDED_CALL_DEPLOY_WAIT_MS = 2 * 60 * 1000;
+
+function emptyExecResult(
+  startedAt: number,
+  overrides: Partial<SshExecBashResult>,
+): SshExecBashResult {
+  return {
+    stdout: "",
+    stderr: "",
+    exitCode: -1,
+    durationMs: Date.now() - startedAt,
+    timedOut: false,
+    aborted: false,
+    capped: { stdout: false, stderr: false },
+    overflowPaths: {},
+    ...overrides,
+  };
+}
+
+function deployFailureResult(
+  startedAt: number,
+  failure: RemoteRunnerDeployFailure,
+): SshExecBashResult {
+  switch (failure.kind) {
+    case "aborted":
+      return emptyExecResult(startedAt, { aborted: true });
+    case "timed_out":
+      return emptyExecResult(startedAt, { timedOut: true });
+    case "command":
+      return emptyExecResult(startedAt, {
+        stderr: failure.error.message,
+        errors: { exitRead: failure.error.message },
+      });
+    case "ssh": {
+      const { outcome } = failure;
+      return emptyExecResult(startedAt, {
+        stdout: outcome.stdout,
+        stderr: outcome.stderr,
+        exitCode: outcome.exitCode,
+        timedOut: outcome.timedOut,
+        aborted: outcome.aborted,
+        transportError: outcome.exitCode === 255 ? inferTransportError(outcome.stderr) : undefined,
+      });
+    }
   }
-> {
+}
+
+export async function sshExecBash(params: SshExecBashParams): Promise<SshExecBashResult> {
+  const startedAt = Date.now();
   if (params.cwd !== undefined) normalizeRemoteCwd(params.cwd);
   await requireConfiguredSshHost(params.host);
 
+  if (params.signal?.aborted) return emptyExecResult(startedAt, { aborted: true });
+  const outcome = await runWithRunner(params, startedAt, (deployment) =>
+    remoteJobInvocation(params, deployment),
+  );
+  return outcome.kind === "completed" ? outcome.result : emptyExecResult(startedAt, {});
+}
+
+export type SshRunnerCallOutcome =
+  | { readonly kind: "completed"; readonly result: SshExecBashResult }
+  | { readonly kind: "unsupported"; readonly reason: string }
+  | { readonly kind: "rejected"; readonly message: string };
+
+/**
+ * Sends one request to the native runner and returns its raw output. Unlike `sshExecBash`, it
+ * has no shell fallback: hosts without a runner report `unsupported`.
+ */
+export async function sshCallRunner(params: {
+  readonly host: string;
+  readonly request: Readonly<Record<string, unknown>>;
+  readonly timeoutMs: number;
+  readonly signal?: AbortSignal;
+  readonly maxOutputChars: number;
+}): Promise<SshRunnerCallOutcome> {
+  const startedAt = Date.now();
+  const configured = await requireConfiguredSshHostResult(params.host);
+  const hostError = configured.match({ ok: () => null, err: (error) => error });
+  if (hostError) return { kind: "rejected", message: hostError.message };
   if (params.signal?.aborted) {
-    return {
-      stdout: "",
-      stderr: "",
-      exitCode: -1,
-      durationMs: 0,
-      timedOut: false,
-      aborted: true,
-      capped: { stdout: false, stderr: false },
-      overflowPaths: {},
-    };
+    return { kind: "completed", result: emptyExecResult(startedAt, { aborted: true }) };
+  }
+  const requestLine = `${JSON.stringify(params.request)}\n`;
+  return await runWithRunner(
+    {
+      host: params.host,
+      cmd: "",
+      timeoutMs: params.timeoutMs,
+      signal: params.signal,
+      maxOutputChars: params.maxOutputChars,
+    },
+    startedAt,
+    (deployment) =>
+      deployment.kind === "runner"
+        ? { remoteArgs: deployment.command, stdin: requestLine }
+        : undefined,
+  );
+}
+
+async function runWithRunner(
+  params: SshExecBashParams,
+  startedAt: number,
+  invocationFor: (
+    deployment: RemoteRunnerDeployment,
+  ) => { readonly remoteArgs: readonly string[]; readonly stdin: string } | undefined,
+): Promise<SshRunnerCallOutcome> {
+  const deadline =
+    params.timeoutMs === undefined
+      ? startedAt + UNBOUNDED_CALL_DEPLOY_WAIT_MS
+      : startedAt + params.timeoutMs;
+  for (let attempt = 0; ; attempt++) {
+    if (Date.now() >= deadline) {
+      return { kind: "completed", result: emptyExecResult(startedAt, { timedOut: true }) };
+    }
+    const resolved = await resolveRemoteRunner({
+      host: params.host,
+      deadline,
+      signal: params.signal,
+    });
+    if (resolved.isErr()) {
+      return { kind: "completed", result: deployFailureResult(startedAt, resolved.error) };
+    }
+    const deployment = resolved.value;
+    const invocation = invocationFor(deployment);
+    if (!invocation) {
+      return {
+        kind: "unsupported",
+        reason: deployment.kind === "unsupported" ? deployment.reason : "unsupported host",
+      };
+    }
+    const token = crypto.randomUUID();
+    const launch =
+      deployment.kind === "runner"
+        ? { ...invocation, remoteArgs: [...invocation.remoteArgs, token] }
+        : invocation;
+    const { result, wrapperExitCode } = await runRemoteJob(
+      params,
+      launch,
+      startedAt,
+      params.timeoutMs === undefined ? undefined : deadline,
+    );
+    if (
+      attempt === 0 &&
+      deployment.kind === "runner" &&
+      runnerWentMissing(result, token, wrapperExitCode)
+    ) {
+      // The cached binary was removed after deployment, so the command never ran; redeploy once.
+      invalidateRemoteRunner(params.host);
+      continue;
+    }
+    return { kind: "completed", result };
+  }
+}
+
+function runnerWentMissing(
+  result: SshExecBashResult,
+  token: string,
+  wrapperExitCode: number | undefined,
+): boolean {
+  if (result.timedOut || result.aborted || wrapperExitCode !== 127) return false;
+  return result.stderr.trim() === `${REMOTE_RUNNER_MISSING_MARKER}:${token}`;
+}
+
+function remoteJobInvocation(
+  params: SshExecBashParams,
+  deployment: RemoteRunnerDeployment,
+): { readonly remoteArgs: readonly string[]; readonly stdin: string } {
+  if (deployment.kind === "runner") {
+    const request = { op: "exec", cwd: params.cwd ?? null, script: params.cmd };
+    return { remoteArgs: deployment.command, stdin: `${JSON.stringify(request)}\n` };
+  }
+  return {
+    remoteArgs: ["bash", "--noprofile", "--norc", "-s"],
+    stdin: buildRemoteScript({ cmd: params.cmd, cwd: params.cwd }),
+  };
+}
+
+async function closeJobStdin(
+  child: ReturnType<typeof Bun.spawn> | null,
+): Promise<ResultType<void, SshStreamCleanupError>> {
+  const stdin = child?.stdin;
+  if (!stdin || typeof stdin === "number") return Result.ok();
+  return captureSshPromise({
+    run: async () => {
+      await stdin.end();
+    },
+    fallback: "Opaque SSH stdin close failure",
+    mapError: (cause) =>
+      new SshStreamCleanupError({
+        operation: "close_stdin",
+        cause,
+        message: "Failed to close SSH stdin",
+      }),
+  });
+}
+
+async function writeJobRequest(
+  child: ReturnType<typeof Bun.spawn>,
+  text: string,
+): Promise<ResultType<void, SshStreamCleanupError>> {
+  const stdin = child.stdin;
+  if (!stdin || typeof stdin === "number") {
+    return Result.err(
+      new SshStreamCleanupError({
+        operation: "write_stdin",
+        cause: undefined,
+        message: "SSH stdin is not a pipe",
+      }),
+    );
+  }
+  return captureSshPromise({
+    run: async () => {
+      await stdin.write(text);
+      await stdin.flush();
+    },
+    fallback: "Opaque SSH stdin write failure",
+    mapError: (cause) =>
+      new SshStreamCleanupError({
+        operation: "write_stdin",
+        cause,
+        message: "Failed to send the remote command",
+      }),
+  });
+}
+
+async function runRemoteJob(
+  params: SshExecBashParams,
+  invocation: { readonly remoteArgs: readonly string[]; readonly stdin: string },
+  startedAt: number,
+  deadline: number | undefined,
+): Promise<{ readonly result: SshExecBashResult; readonly wrapperExitCode?: number }> {
+  let termination: "timeout" | "aborted" | "failed" | undefined;
+  let child: ReturnType<typeof Bun.spawn> | null = null;
+  let stdinFailure: SshStreamCleanupError | undefined;
+  let stdinClose: ReturnType<typeof startStdinClose> | undefined;
+  let wrapperExitCode: number | undefined;
+  const terminationBound = Promise.withResolvers<void>();
+
+  function startStdinClose() {
+    return Result.tryPromise({ try: () => closeJobStdin(child), catch: captureRuntimeError });
   }
 
-  const controller = new AbortController();
-  let termination: "timeout" | "aborted" | undefined;
+  const closeStdin = () => {
+    if (!child) return undefined;
+    stdinClose ??= startStdinClose();
+    return stdinClose;
+  };
 
-  let child: ReturnType<typeof Bun.spawn> | null = null;
-
+  // Closing stdin asks the remote side to stop the job; the runner waits two seconds before SIGKILL.
+  // Local escalation also covers helpers that survive after the SSH leader has exited.
+  const LOCAL_TERM_DELAY_MS = 5000;
   const HARD_KILL_DELAY_MS = 2000;
   // An OpenSSH ControlMaster holds the client's stdio descriptors in its own session, so they can
   // stay open until the remote command ends even after the terminated client has exited.
   const OUTPUT_DRAIN_AFTER_TERMINATION_MS = 2000;
-  let hardKillTimer: ReturnType<typeof setTimeout> | null = null;
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  const schedule = (delayMs: number, run: () => void) => {
+    const timer = setTimeout(run, delayMs);
+    timer.unref?.();
+    timers.push(timer);
+  };
+  // Cancellation owns this detached process group after its leader and capture have finished.
+  // Keep escalation outside the execution timers, without keeping Core alive for the grace period.
+  const scheduleGroupCleanup = (delayMs: number, run: () => void) => {
+    const timer = setTimeout(run, delayMs);
+    timer.unref?.();
+  };
   let childExited = false;
-  let outputDrainTimer: ReturnType<typeof setTimeout> | null = null;
+  let groupHardKilled = false;
+  let outputDrainScheduled = false;
   const outputStop = new AbortController();
   const scheduleOutputStop = () => {
-    if (!termination || !childExited || outputDrainTimer) return;
-    outputDrainTimer = setTimeout(() => {
+    if (!termination || !childExited || outputDrainScheduled) return;
+    outputDrainScheduled = true;
+    schedule(OUTPUT_DRAIN_AFTER_TERMINATION_MS, () => {
       logger.debug("SSH output stayed open after the terminated client exited; stopping capture", {
         termination,
       });
       outputStop.abort();
-    }, OUTPUT_DRAIN_AFTER_TERMINATION_MS);
-    outputDrainTimer.unref?.();
+    });
   };
-  const scheduleHardKill = () => {
-    if (hardKillTimer) return;
-    hardKillTimer = setTimeout(() => {
-      const pid = child?.pid;
-      if (typeof pid === "number" && pid > 0) {
-        observeBestEffortProcessCleanup(killProcessGroupBestEffort(pid, "SIGKILL"));
-      }
-    }, HARD_KILL_DELAY_MS);
-    hardKillTimer.unref?.();
+  const signalLocalClient = (signal: "SIGTERM" | "SIGKILL") => {
+    const pid = child?.pid;
+    if (typeof pid !== "number" || pid <= 0 || groupHardKilled) return;
+    if (signal === "SIGKILL") groupHardKilled = true;
+    observeBestEffortProcessCleanup(killProcessGroupBestEffort(pid, signal));
   };
 
-  const terminate = (reason: "timeout" | "aborted") => {
+  const terminate = (reason: "timeout" | "aborted" | "failed") => {
     if (termination) return;
     termination = reason;
-    controller.abort();
-    const pid = child?.pid;
-    if (pid) {
-      observeBestEffortProcessCleanup(killProcessGroupBestEffort(pid, "SIGTERM"));
-      scheduleHardKill();
-    }
+    closeStdin();
+    scheduleGroupCleanup(LOCAL_TERM_DELAY_MS, () => {
+      signalLocalClient("SIGTERM");
+      scheduleGroupCleanup(HARD_KILL_DELAY_MS, () => signalLocalClient("SIGKILL"));
+    });
     scheduleOutputStop();
+    schedule(LOCAL_TERM_DELAY_MS + HARD_KILL_DELAY_MS, () => {
+      signalLocalClient("SIGKILL");
+      terminationBound.resolve();
+    });
   };
 
   let abortListener: (() => void) | null = null;
@@ -997,334 +1063,169 @@ export async function sshExecBash(params: {
       abortListener = () => params.signal?.removeEventListener("abort", onAbort);
     }
   }
-
-  const timeout =
-    params.timeoutMs === undefined
-      ? undefined
-      : setTimeout(() => terminate("timeout"), params.timeoutMs);
+  const checkDeadline = () => {
+    if (deadline !== undefined && Date.now() >= deadline) terminate("timeout");
+  };
+  if (deadline !== undefined)
+    schedule(Math.max(0, deadline - Date.now()), () => terminate("timeout"));
   const stopWatchingExecution = () => {
-    if (timeout) clearTimeout(timeout);
     abortListener?.();
     abortListener = null;
-    if (hardKillTimer && !termination) {
-      clearTimeout(hardKillTimer);
-      hardKillTimer = null;
-    }
-    if (outputDrainTimer) {
-      clearTimeout(outputDrainTimer);
-      outputDrainTimer = null;
-    }
+    if (termination) return;
+    for (const timer of timers) clearTimeout(timer);
   };
 
-  const startedAt = Date.now();
-  const outcome = await (async () => {
-    sshControlDirectory ??= fs.mkdtemp(path.join(os.tmpdir(), "lilac-ssh-"));
-    const controlDirectory = await sshControlDirectory;
-    const sshArgs = [
-      "-o",
-      "ControlMaster=auto",
-      "-o",
-      "ControlPersist=60",
-      "-o",
-      `ControlPath=${controlDirectory}/%C`,
-      "-T",
-      "-o",
-      "BatchMode=yes",
-      "-o",
-      "StrictHostKeyChecking=yes",
-      "-o",
-      "ClearAllForwardings=yes",
-      "-o",
-      "ForwardAgent=no",
-      "-o",
-      `ConnectTimeout=${DEFAULT_CONNECT_TIMEOUT_SECS}`,
-      "-o",
-      "LogLevel=ERROR",
-      params.host,
-      "bash",
-      "--noprofile",
-      "--norc",
-      "-s",
-    ];
-
-    const script = buildRemoteScript({
-      cmd: params.cmd,
-      cwd: params.cwd,
-      stdinMode: params.stdinMode,
-    });
-
-    child = Bun.spawn(["ssh", ...sshArgs], {
-      stdout: "pipe",
-      stderr: "pipe",
-      stdin: new Blob([script]),
-      signal: controller.signal,
-      killSignal: "SIGTERM",
-      detached: true,
-      env: buildSshChildEnv(),
-    });
-
-    const [stdoutCapture, stderrCapture, exitResult] = await Promise.all([
-      readStreamTextCapped(child.stdout, params.maxOutputChars, {
-        overflowFilePath: params.overflowOutputPath
-          ? `${params.overflowOutputPath}.stdout.part`
-          : undefined,
-        onActivity: params.onActivity,
-        stopSignal: outputStop.signal,
-      }),
-      readStreamTextCapped(child.stderr, params.maxOutputChars, {
-        overflowFilePath: params.overflowOutputPath
-          ? `${params.overflowOutputPath}.stderr.part`
-          : undefined,
-        onActivity: params.onActivity,
-        stopSignal: outputStop.signal,
-      }),
-      waitForSshExit(child.exited).then((exit) => {
-        childExited = true;
-        scheduleOutputStop();
-        return exit;
-      }),
-    ]);
-    stopWatchingExecution();
-
-    const stdoutResult = projectStreamCapture("stdout", stdoutCapture);
-    const stderrResult = projectStreamCapture("stderr", stderrCapture);
-    exitResult.match({
-      ok: () => undefined,
-      err: (error) =>
-        logger.debug("SSH subprocess exit wait failed", formatTaggedErrorForLog(error)),
-    });
-    const stdout = stdoutResult.text;
-    const stderr = stderrResult.text;
-    const exitCode = exitResult.match({ ok: (value) => value, err: () => -1 });
-
-    const transportError = exitCode === 255 ? inferTransportError(stderr) : undefined;
-
-    return {
-      status: "return",
-      value: {
-        stdout,
-        stderr,
-        exitCode,
-        durationMs: Date.now() - startedAt,
-        timedOut: termination === "timeout",
-        aborted: termination === "aborted",
-        capped: {
-          stdout: stdoutResult.capped,
-          stderr: stderrResult.capped,
-        },
-        overflowPaths: {
-          stdout: stdoutResult.overflowFilePath,
-          stderr: stderrResult.overflowFilePath,
-        },
-        transportError,
-        errors: {
-          stdoutRead: stdoutCapture.match({
-            ok: () => undefined,
-            err: (error) =>
-              error._tag === "SshStreamReadError" ? (error.detail ?? error.message) : error.message,
+  const outcome = await Result.tryPromise({
+    try: async () => {
+      checkDeadline();
+      if (termination) {
+        return {
+          status: "return",
+          value: emptyExecResult(startedAt, {
+            aborted: termination === "aborted",
+            timedOut: termination === "timeout",
           }),
-          stderrRead: stderrCapture.match({
-            ok: () => undefined,
-            err: (error) =>
-              error._tag === "SshStreamReadError" ? (error.detail ?? error.message) : error.message,
+        } as const;
+      }
+      const sshArgs = await buildSshArgs(params.host, invocation.remoteArgs);
+      checkDeadline();
+      if (termination) {
+        return {
+          status: "return",
+          value: emptyExecResult(startedAt, {
+            aborted: termination === "aborted",
+            timedOut: termination === "timeout",
           }),
-          exitRead: exitResult.match({ ok: () => undefined, err: () => "exit status read failed" }),
-        },
-      },
-    } as const;
-  })().finally(stopWatchingExecution);
-  return outcome.value;
-}
+        } as const;
+      }
 
-function sshJsonExecutionFailure(
-  res: SshExecResult & {
-    transportError?: { type: "hostkey" | "auth" | "connect" | "unknown"; message: string };
-  },
-  timeoutMs: number,
-): SshJsonExecutionError | undefined {
-  if (res.aborted) {
-    return new SshExecutionCancelledError({ message: "aborted" });
-  }
-  if (res.timedOut) {
-    return new SshExecutionTimedOutError({
-      timeoutMs: timeoutMs,
-      message: `timeout:${timeoutMs}`,
-    });
-  }
-  if (res.capped.stdout || res.capped.stderr) {
-    return new SshExecutionOutputCappedError({
-      message: "remote output capped (response too large)",
-    });
-  }
-  if (res.transportError) {
-    return new SshExecutionTransportError({
-      transportType: res.transportError.type,
-      message: res.transportError.message,
-    });
-  }
-  if (res.exitCode !== 0) {
-    const detail = res.stderr.trim().length > 0 ? `: ${res.stderr.trim()}` : "";
-    return new SshSubprocessExitError({
-      exitCode: res.exitCode,
-      stderr: res.stderr,
-      message: `remote script exited with code ${res.exitCode}${detail}`,
-    });
-  }
-
-  return undefined;
-}
-
-async function waitForRunnerDeployment(
-  pending: Promise<void>,
-  signal: AbortSignal | undefined,
-  timeoutMs: number,
-): Promise<"ready" | "aborted" | "timeout"> {
-  if (signal?.aborted) return "aborted";
-  if (timeoutMs <= 0) return "timeout";
-  const settled = Promise.withResolvers<"ready" | "aborted" | "timeout">();
-  const onAbort = () => settled.resolve("aborted");
-  const timeout = setTimeout(() => settled.resolve("timeout"), timeoutMs);
-  signal?.addEventListener("abort", onAbort, { once: true });
-  void pending.then(() => settled.resolve("ready"));
-  return await settled.promise.finally(() => {
-    clearTimeout(timeout);
-    signal?.removeEventListener("abort", onAbort);
-  });
-}
-
-export async function sshExecScriptJson<T, TDecodeError>(params: {
-  host: string;
-  cwd: string;
-  js: string;
-  input: BundledRemoteRunnerRequest;
-  timeoutMs: number;
-  signal?: AbortSignal;
-  maxOutputChars: number;
-  onActivity?: () => void;
-  decodeResponse: (text: string) => ResultType<T, TDecodeError>;
-}): Promise<ResultType<T, SshJsonExecutionError | TDecodeError>> {
-  if (params.signal?.aborted) {
-    return Result.err(new SshExecutionCancelledError({ message: "aborted" }));
-  }
-  const serializedInput = serializeRemoteRunnerRequestJson(params.input);
-  const serializationFailure = serializedInput.match({
-    ok: () => null,
-    err: (error) => Result.err(error),
-  });
-  if (serializationFailure) return serializationFailure;
-  const inputJson = serializedInput.match({ ok: (value) => value, err: () => "" });
-
-  const deadline = Date.now() + params.timeoutMs;
-  const runnerHash = crypto.createHash("sha256").update(params.js).digest("hex");
-  const runnerKey = `${params.host}:${runnerHash}`;
-  while (!deployedRunners.has(runnerKey)) {
-    const pending = runnerDeploymentGates.get(runnerKey);
-    if (!pending) break;
-    const waited = await waitForRunnerDeployment(pending, params.signal, deadline - Date.now());
-    if (waited === "aborted")
-      return Result.err(new SshExecutionCancelledError({ message: "aborted" }));
-    if (waited === "timeout")
-      return Result.err(
-        new SshExecutionTimedOutError({
-          timeoutMs: params.timeoutMs,
-          message: `timeout:${params.timeoutMs}`,
-        }),
-      );
-  }
-  const deployment = deployedRunners.has(runnerKey) ? undefined : Promise.withResolvers<void>();
-  if (deployment) runnerDeploymentGates.set(runnerKey, deployment.promise);
-  return await (async () => {
-    if (!deployedRunners.has(runnerKey)) {
-      const probe = await captureSshPromise({
-        run: () =>
-          sshExecBash({
-            host: params.host,
-            cmd: `printf '%s  %s\\n' '${runnerHash}' "\${XDG_CACHE_HOME:-$HOME/.cache}/lilac/remote-runners/${runnerHash}.js" | sha256sum -c --status 2>/dev/null`,
-            timeoutMs: Math.max(1, deadline - Date.now()),
-            signal: params.signal,
-            maxOutputChars: 1000,
-            onActivity: params.onActivity,
-          }),
-        fallback: "SSH runner cache probe failed",
-        mapError: (cause) =>
-          new SshExecutionAdapterError({ cause, message: "SSH runner cache probe failed" }),
+      child = Bun.spawn(["ssh", ...sshArgs], {
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "pipe",
+        detached: true,
+        env: buildSshChildEnv(),
       });
-      const probeOutcome = probe.match<
-        { value: Awaited<ReturnType<typeof sshExecBash>> } | { error: SshExecutionAdapterError }
-      >({ ok: (value) => ({ value }), err: (error) => ({ error }) });
-      if ("error" in probeOutcome) return Result.err(probeOutcome.error);
-      const failure = sshJsonExecutionFailure(probeOutcome.value, params.timeoutMs);
-      if (failure && !(failure._tag === "SshSubprocessExitError" && failure.exitCode === 1))
-        return Result.err(failure);
-      if (!failure) deployedRunners.add(runnerKey);
-    }
-    const source = Buffer.from(params.js).toString("base64");
-    const install = deployedRunners.has(runnerKey)
-      ? ""
-      : `
-mkdir -p "$RUNNER_DIR"
-if ! test -f "$TMP_JS" || ! printf '%s  %s\\n' '${runnerHash}' "$TMP_JS" | sha256sum -c --status 2>/dev/null; then
-  UPLOAD=$(mktemp "$RUNNER_DIR/upload.XXXXXX")
-  trap 'rm -f "$UPLOAD"' EXIT
-  printf '%s' '${source}' | base64 -d >"$UPLOAD"
-  mv -f "$UPLOAD" "$TMP_JS"
-fi
-`;
-    if (Date.now() >= deadline)
-      return Result.err(
-        new SshExecutionTimedOutError({
-          timeoutMs: params.timeoutMs,
-          message: `timeout:${params.timeoutMs}`,
-        }),
-      );
-    const encodedInput = Buffer.from(inputJson).toString("base64");
-    const script = `set -euo pipefail
-umask 077
-RUNNER_DIR="\${XDG_CACHE_HOME:-$HOME/.cache}/lilac/remote-runners"
-TMP_JS="$RUNNER_DIR/${runnerHash}.js"
-${install}
-if command -v bun >/dev/null 2>&1; then
-  printf '%s' '${encodedInput}' | base64 -d | bun "$TMP_JS"
-elif command -v node >/dev/null 2>&1; then
-  printf '%s' '${encodedInput}' | base64 -d | node "$TMP_JS"
-else
-  echo '{"ok":false,"error":"Remote host has neither bun nor node in PATH"}'
-fi
-`;
+      checkDeadline();
+      if (termination) closeStdin();
+      const requestWrite = termination
+        ? Promise.resolve()
+        : writeJobRequest(child, invocation.stdin).then((written) => {
+            if (written.isErr()) {
+              stdinFailure = written.error;
+              terminate("failed");
+            }
+          });
 
-    const executed = await captureSshPromise({
-      run: () =>
-        sshExecBash({
-          host: params.host,
-          cmd: script,
-          cwd: params.cwd,
-          timeoutMs: Math.max(1, deadline - Date.now()),
-          signal: params.signal,
-          maxOutputChars: params.maxOutputChars,
+      const [stdoutCapture, stderrCapture, exitResult] = await Promise.all([
+        readStreamTextCapped(child.stdout, params.maxOutputChars, {
+          overflowFilePath: params.overflowOutputPath
+            ? `${params.overflowOutputPath}.stdout.part`
+            : undefined,
           onActivity: params.onActivity,
+          stopSignal: outputStop.signal,
         }),
-      fallback: "Opaque SSH execution adapter failure",
-      mapError: (cause) =>
-        new SshExecutionAdapterError({ cause, message: "SSH execution adapter failed" }),
-    });
-    const executionOutcome = executed.match<
-      { value: Awaited<ReturnType<typeof sshExecBash>> } | { error: SshExecutionAdapterError }
-    >({ ok: (value) => ({ value }), err: (error) => ({ error }) });
-    if ("error" in executionOutcome) return Result.err(executionOutcome.error);
-    const res = executionOutcome.value;
+        readStreamTextCapped(child.stderr, params.maxOutputChars, {
+          overflowFilePath: params.overflowOutputPath
+            ? `${params.overflowOutputPath}.stderr.part`
+            : undefined,
+          onActivity: params.onActivity,
+          stopSignal: outputStop.signal,
+        }),
+        waitForSshExit(child.exited).then((exit) => {
+          childExited = true;
+          scheduleOutputStop();
+          return exit;
+        }),
+        Promise.race([requestWrite, terminationBound.promise]),
+      ]);
+      const closed = await Promise.race([closeStdin(), terminationBound.promise]);
+      if (closed) {
+        const closeResult = adaptToolResultToHost(
+          closed.mapError((captured) =>
+            projectCapturedRuntimeError(captured, "Opaque SSH stdin close failure"),
+          ),
+        );
+        if (closeResult.isErr()) stdinFailure ??= closeResult.error;
+      }
 
-    const failure = sshJsonExecutionFailure(res, params.timeoutMs);
-    if (failure) {
-      if (failure._tag === "SshSubprocessExitError") deployedRunners.delete(runnerKey);
-      return Result.err(failure);
-    }
+      const stdoutResult = projectStreamCapture("stdout", stdoutCapture);
+      const stderrResult = projectStreamCapture("stderr", stderrCapture);
+      const stdout = stdoutResult.text;
+      const stderr = stderrResult.text;
+      const exit = exitResult.match<{ readonly code: number; readonly readFailure?: string }>({
+        ok: (code) => ({ code }),
+        err: (error) => {
+          logger.debug("SSH subprocess exit wait failed", formatTaggedErrorForLog(error));
+          return { code: -1, readFailure: "exit status read failed" };
+        },
+      });
+      const exitCode = stdinFailure ? -1 : exit.code;
+      wrapperExitCode = exit.code;
 
-    deployedRunners.add(runnerKey);
-    return params.decodeResponse(res.stdout.trim());
-  })().finally(() => {
-    if (!deployment) return;
-    if (runnerDeploymentGates.get(runnerKey) === deployment.promise)
-      runnerDeploymentGates.delete(runnerKey);
-    deployment.resolve();
+      const transportError = exitCode === 255 ? inferTransportError(stderr) : undefined;
+
+      return {
+        status: "return",
+        value: {
+          stdout,
+          stderr,
+          exitCode,
+          durationMs: Date.now() - startedAt,
+          timedOut: termination === "timeout",
+          aborted: termination === "aborted",
+          capped: {
+            stdout: stdoutResult.capped,
+            stderr: stderrResult.capped,
+          },
+          overflowPaths: {
+            stdout: stdoutResult.overflowFilePath,
+            stderr: stderrResult.overflowFilePath,
+          },
+          transportError,
+          errors: {
+            stdoutRead: stdoutCapture.match({
+              ok: () => undefined,
+              err: (error) =>
+                error._tag === "SshStreamReadError"
+                  ? (error.detail ?? error.message)
+                  : error.message,
+            }),
+            stderrRead: stderrCapture.match({
+              ok: () => undefined,
+              err: (error) =>
+                error._tag === "SshStreamReadError"
+                  ? (error.detail ?? error.message)
+                  : error.message,
+            }),
+            exitRead: stdinFailure?.message ?? exit.readFailure,
+          },
+        },
+      } as const;
+    },
+    catch: captureRuntimeError,
   });
+  if (outcome.isErr()) {
+    // Keep the original defect while EOF cancellation and bounded local escalation finish.
+    await Result.tryPromise({
+      try: async () => {
+        terminate("failed");
+        outputStop.abort();
+        if (!child) return;
+        await Promise.race([
+          Promise.allSettled([child.exited, closeStdin()]),
+          terminationBound.promise,
+        ]);
+      },
+      catch: captureRuntimeError,
+    });
+    stopWatchingExecution();
+    for (const timer of timers) clearTimeout(timer);
+    return adaptToolResultToHost(
+      Result.err(projectCapturedRuntimeError(outcome.error, "SSH job failed")),
+    );
+  }
+  stopWatchingExecution();
+  for (const timer of timers) clearTimeout(timer);
+  return { result: outcome.value.value, wrapperExitCode };
 }

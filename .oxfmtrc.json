@@ -11,7 +11,6 @@
     "data/**",
     ".omo/**",
     "**/dist/**",
-    "**/vendor/**",
-    "apps/core/src/ssh/remote-js/remote-runner.cjs"
+    "**/vendor/**"
   ]
 }

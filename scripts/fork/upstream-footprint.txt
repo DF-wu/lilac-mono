@@ -8,8 +8,9 @@
 .gitignore  # ignores local agent state directories
 .oxfmtrc.json  # ignores local agent state directories
 Dockerfile  # container identity variants (CONTAINER_USER/UID build args)
+DEVELOPMENT.md  # PR119: distinguishes bounded SSH stdin/process cleanup from output draining
 MIGRATIONS.md  # F16/F23: offline historical blob cutover, current compatibility and rollback boundaries
-PROJECT.md  # documents the Telegram surface and the OpenAI-compatible image script provider
+PROJECT.md  # documents fork surfaces/providers and aligns imported Result and tool-call containment guidance
 README.md  # fork entry point; describes fork features and maintenance
 __tests__/docker-build-script.test.ts  # covers the container identity variants
 __tests__/release-gate.test.ts  # F21: Verified candidate, publication freshness and single image-tag ownership
@@ -29,7 +30,7 @@ apps/core/src/github/webhook/github-webhook-server.ts  # final publication polic
 apps/core/src/runtime/compose-builtin-surface-runtimes.ts  # includes the Telegram runtime descriptor entry
 apps/core/src/runtime/create-core-runtime.ts  # constructs and registers the Telegram surface module
 apps/core/src/runtime/main.ts  # settles Core creation/start Results through the fork-owned startCoreRuntime helper
-apps/core/src/ssh/ssh-exec.ts  # bounds output draining after a terminated client exits while a ControlMaster holds stdio (#117)
+apps/core/src/ssh/ssh-exec.ts  # PR119: preserves bounded output drain and handles cancelled dispatch, async stdin failures, Panic cleanup, and surviving process-group helpers
 apps/core/src/surface/adapter.ts  # adds the optional attachment-resolver capability and resolve-attachment operation
 apps/core/src/surface/bridge/bus-agent-runner.ts  # labels telegram requests for conversation recall
 apps/core/src/surface/bridge/bus-agent-runner/auto-inject-thread-search.ts  # F01–F08/F14/F15: Surface registration/origin/resource seams on current upstream shared owners
@@ -138,7 +139,6 @@ apps/installer/src/data-files.ts  # preserves the existing image runtime identit
 apps/installer/tests/integration/verify-installation.ts  # verifies private installer ownership against each image's actual account
 apps/core/src/surface/native/execution.test.ts  # guards revoked automatic-steer admission and busy-send assistant attribution
 apps/installer/tests/runtime-contract.test.ts  # resolves existing fork Docker ARG defaults without weakening runtime environment assertions
-DEVELOPMENT.md  # records changed runner fingerprints before npm publication
 apps/core/scripts/generate-client-protocol-compat.ts  # stages historical schema export before replacing frozen fixtures
 apps/core/src/github/github-state.ts  # preserves unfinished interrupt retry after durable prompt publication
 apps/core/src/tools/orchestrate.ts  # stable keyed follow-up identity across parent request retries
@@ -158,7 +158,6 @@ apps/core/tests/e2e/recovery.e2e.ts  # observes completed durable replay from an
 apps/core/tests/github/github-webhook-durable-delivery.test.ts  # regression for unfinished interrupt-stage redelivery
 apps/core/tests/heartbeat/heartbeat-real-bus.test.ts  # retains body and cleanup failures with lexical disposal
 apps/core/tests/helpers/client-compat.ts  # historical integrity list excludes workflow endpoints absent from that release
-apps/core/tests/ssh/ssh-exec.test.ts  # expects the unpublished changed runner version; covers settling a terminated SSH run whose output a detached process keeps open (#117)
 apps/core/tests/surface/bridge/bus-agent-runner-controls.test.ts  # preserves deferred ordinary input after target finalization
 apps/core/tests/surface/bridge/bus-agent-runner-session-queue.test.ts  # fences late steering during failure finalization
 apps/core/tests/tools/orchestrate.test.ts  # real durable publication regression for keyed live-to-ended concurrency
@@ -187,10 +186,34 @@ packages/client-protocol/compat/previous-release/workflows.list.schema.json  # r
 packages/event-bus/tests/redis-load.test.ts  # observes actual post-commit burst completion before trim assertions
 packages/fs/src/glob-match.ts  # preserves character exclusions and ranges while matching dot-prefixed segments
 packages/fs/tests/glob-match.test.ts  # cross-runtime negated-class, range and brace regressions
-packages/remote-fs-runner/build.ts  # preserves source and unrelated output-directory contents
-packages/remote-fs-runner/package.json  # bumps changed runner to unpublished 0.0.8
-packages/remote-fs-runner/published-fingerprint.json  # records exact changed unpublished runner source fingerprint
-packages/remote-fs-runner/tests/published-fingerprint.test.ts  # enforces record-before-publish constraints
-packages/remote-fs-runner/tests/published-package.case.ts  # accepts npm12 pack JSON while retaining exact package-content assertions
-packages/remote-fs-runner/tests/version.test.ts  # verifies version and non-destructive build output
-scripts/remote-fs-runner-fingerprint.ts  # rejects recording any changed already-published version
+
+# PR #119 integration and verified upstream review fixes
+apps/core/src/ssh/remote-filesystem-host.ts  # PR119: preserves remote glob paths when optional metadata is unavailable
+apps/core/src/surface/discord/discord-thread-control.ts  # PR119: captures configuration errors and preserves identity Panics during thread reads
+apps/core/src/surface/native/resources-live.ts  # PR119: binds preview containment and bounded byte reads to one symlink-safe open handle
+apps/core/src/tools/apply-patch/remote-apply-patch.ts  # PR119: preserves physical remote cwd semantics before parent-relative patches
+apps/core/src/tools/bash-output-sanitizer.ts  # PR119: stops output reads after an overflow flush defers a Panic
+apps/core/src/tools/fs/remote-fs.ts  # PR119: canonicalizes remote cwd before filesystem path resolution
+apps/core/tests/ssh/remote-filesystem-parity.test.ts  # PR119: covers dangling links, normalized globs, and physical remote cwd parity
+apps/core/tests/surface/bridge/subagent-profile-parity.test.ts  # PR119: verifies conversation identifiers reach Claude Code and OpenAI provider prompts
+apps/core/tests/surface/discord/discord-thread-control.test.ts  # PR119: covers configuration failure and exact Panic identity on Discord reads
+apps/core/tests/tools/bash-output-sanitizer.test.ts  # PR119: verifies a spill Panic stops before another stream read
+apps/remote-runner/src/glob.rs  # PR119: preserves matched paths independently of successful metadata lookup
+apps/web/src/main.tsx  # PR119: reloads auth settings when the subscribed client is already online
+packages/utils/builtin-skills/visualize/SKILL.md  # PR119: documents run-scoped preview paths and required asset prebundling
+packages/utils/builtin-skills/visualize/scripts/build.ts  # PR119: decodes HTML asset URLs and rejects unsupported document bases
+scripts/architecture/analyzer.ts  # PR119: recognizes wrapped named Result continuation handlers
+scripts/architecture/fixtures/real-libraries/result-continuation.ts  # PR119: fixtures for parenthesized and satisfies-wrapped handlers
+scripts/build-remote-runner.ts  # PR119: aligns Cargo output and copy paths and keeps macOS linker inputs stable in the target cache
+scripts/oxlint-plugins/production-syntax.mts  # PR119: avoids redundant-condition false positives for initialized var and getter reads
+scripts/oxlint-plugins/production-syntax.test.mts  # PR119: covers var writes and unstable member conditions
+apps/core/tests/surface/bridge/bus-agent-runner-core-primary.test.ts  # PR119: isolates the compaction fixture system prompt from operator-owned global skills while retaining real compaction
+apps/core/tests/tool-server-skills.test.ts  # PR119: asserts invocation-cwd skill results independently of unrelated global discovery warnings
+apps/core/tests/tool-server/ssh.test.ts  # PR119: gives the SSH child fixture its real stdin pipe contract when testing stream and exit failures
+apps/core/tests/ssh/remote-runner-transport.test.ts  # PR119: synchronizes fallback PID readiness and observes bounded asynchronous process cleanup without fixed waits
+apps/core/tests/ssh/ssh-exec.test.ts  # PR119: covers overflow cleanup and exact supported SSH error paths
+packages/fs/src/fs-impl.ts  # PR119: carries glob detail mode to backends and enforces whole-file limits during bounded reads
+packages/fs/src/search-backend.ts  # PR119: carries requested metadata mode to the private remote glob backend
+packages/fs/tests/read-byte-prefix.test.ts  # PR119: rejects growth between whole-file size preflight and bounded read
+packages/fs/src/node-host.ts  # PR119: reads a bounded prefix from the opened handle without capping at stale metadata size
+apps/remote-runner/src/fsops.rs  # PR119: bounded prefix reads observe growth after opened-handle metadata

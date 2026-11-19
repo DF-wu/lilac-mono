@@ -9,6 +9,7 @@ import { NativeReferences } from "./references";
 import { nativeStoreTransaction, type NativeStoreError } from "./store";
 import { serverToolFailure } from "@stanley2058/lilac-plugin-runtime";
 import type { NativeAttachmentOutput } from "../../tool-server/tools/attachment";
+import type { SessionSafetyMode } from "../session-policy";
 import type { NativeOutputPublisher } from "./output";
 import { createNativeTitleGeneration, type NativeTitleGenerator } from "./title-generation";
 import { NativeSubagents, type SubagentReader } from "./subagents";
@@ -551,6 +552,38 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     return Result.gen(async function* () {
       yield* questions.recover();
       yield* linkProjectedMessages();
+      const projectOutputEvent =
+        (event: NativeOutputEvent): Parameters<typeof store.projectTurn>[4] =>
+        (slot, projection) =>
+          Result.gen(function* () {
+            if (event.payload.type === "model")
+              return Result.ok({
+                ...projectNativeOutput(slot, event, projection),
+                model: event.payload,
+              });
+            if (event.payload.type === "resource") {
+              const thread = yield* store.getDisplayThread(event.threadId);
+              yield* store.publishUpload(thread.starterId, event.payload.resourceId);
+            }
+            if (event.payload.type !== "text")
+              return Result.ok(projectNativeOutput(slot, event, projection));
+            const thread = yield* store.getDisplayThread(event.threadId);
+            const text = yield* rewriteNativePublishedFileLinks({
+              text: event.payload.text,
+              threadId: thread.id,
+              actorId: thread.starterId,
+              cwd: options.workspaceRoot,
+              register: (actorId, threadId, target, cwd) =>
+                store.registerPublishedPath(actorId, threadId, target, cwd),
+            });
+            return Result.ok(
+              projectNativeOutput(
+                slot,
+                { ...event, payload: { ...event.payload, text } },
+                projection,
+              ),
+            );
+          });
       const started = await options.bus.subscribeTopic(
         "evt.native.output",
         {
@@ -566,37 +599,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
               message.data.generation,
               message.data.eventId,
               message.data.turnId,
-              (slot, projection) =>
-                Result.gen(function* () {
-                  const event = message.data;
-                  if (event.payload.type === "model")
-                    return Result.ok({
-                      ...projectNativeOutput(slot, event, projection),
-                      model: event.payload,
-                    });
-                  if (event.payload.type === "resource") {
-                    const thread = yield* store.getDisplayThread(event.threadId);
-                    yield* store.publishUpload(thread.starterId, event.payload.resourceId);
-                  }
-                  if (event.payload.type !== "text")
-                    return Result.ok(projectNativeOutput(slot, event, projection));
-                  const thread = yield* store.getDisplayThread(event.threadId);
-                  const text = yield* rewriteNativePublishedFileLinks({
-                    text: event.payload.text,
-                    threadId: thread.id,
-                    actorId: thread.starterId,
-                    cwd: options.workspaceRoot,
-                    register: (actorId, threadId, target, cwd) =>
-                      store.registerPublishedPath(actorId, threadId, target, cwd),
-                  });
-                  return Result.ok(
-                    projectNativeOutput(
-                      slot,
-                      { ...event, payload: { ...event.payload, text } },
-                      projection,
-                    ),
-                  );
-                }),
+              projectOutputEvent(message.data),
             );
             const committedAt = performance.now();
             const committed = projected.match({ ok: () => true, err: () => false });
@@ -757,6 +760,8 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   }
 
   function createOutput(input: {
+    // Resolved after output starts, so it is read when the turn ends.
+    getSafetyMode: () => SessionSafetyMode | undefined;
     requestId: string;
     requestClient: string;
     recoveryOutputFrontier?: NativeOutputFrontier;
@@ -797,6 +802,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       await htmlPreviews.snapshot({
         threadId: attempt.parentThreadId,
         turnId: attempt.turnId,
+        run: { sessionId: input.sessionId, safetyMode: input.getSafetyMode() ?? "restricted" },
         texts: reply.texts(),
       });
     }
