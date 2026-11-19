@@ -209,3 +209,4 @@ scripts/oxlint-plugins/production-syntax.test.mts  # PR119: covers var writes an
 apps/core/tests/surface/bridge/bus-agent-runner-core-primary.test.ts  # PR119: isolates the compaction fixture system prompt from operator-owned global skills while retaining real compaction
 apps/core/tests/tool-server-skills.test.ts  # PR119: asserts invocation-cwd skill results independently of unrelated global discovery warnings
 apps/core/tests/tool-server/ssh.test.ts  # PR119: gives the SSH child fixture its real stdin pipe contract when testing stream and exit failures
+apps/core/tests/ssh/remote-runner-transport.test.ts  # PR119: synchronizes fallback PID readiness and observes bounded asynchronous process cleanup without fixed waits

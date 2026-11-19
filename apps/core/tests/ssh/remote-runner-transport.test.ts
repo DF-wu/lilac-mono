@@ -54,6 +54,14 @@ function isAlive(pid: number): boolean {
   return state !== "Z";
 }
 
+async function expectProcessExited(pid: number): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  while (isAlive(pid) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  expect(isAlive(pid)).toBeFalse();
+}
+
 // macOS has no `setsid` command.
 const SETSID =
   process.platform === "linux" ? "setsid" : `perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV'`;
@@ -313,13 +321,18 @@ describe("remote runner transport", () => {
       const pidFile = path.join(tempDir, `${host}.pids`);
       const cancelled = await runUntilReady({
         host,
-        // The child reports ready only after its trap is in place.
-        cmd: `bash -c "trap '' TERM; echo ready; exec sleep 300" & echo $! > ${pidFile}; wait`,
+        // The child records its PID before ready; cancellation can kill its parent immediately.
+        cmd: `bash -c 'trap "" TERM; echo $$ > ${pidFile}; echo ready; exec sleep 300' & wait`,
         abortAfterReady: true,
       });
       expect(cancelled.aborted).toBeTrue();
       const pid = Number((await readFile(pidFile, "utf8")).trim());
-      expect(isAlive(pid)).toBeFalse();
+      // Bounded output drain can finish before the remote watcher's SIGKILL is delivered.
+      try {
+        await expectProcessExited(pid);
+      } finally {
+        if (isAlive(pid)) process.kill(pid, "SIGKILL");
+      }
     },
     TEST_TIMEOUT_MS,
   );
