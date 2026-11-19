@@ -986,6 +986,7 @@ async function runRemoteJob(
   let stdinFailure: SshStreamCleanupError | undefined;
   let stdinClose: ReturnType<typeof startStdinClose> | undefined;
   let wrapperExitCode: number | undefined;
+  const terminationBound = Promise.withResolvers<void>();
 
   function startStdinClose() {
     return Result.tryPromise({ try: () => closeJobStdin(child), catch: captureRuntimeError });
@@ -1046,6 +1047,10 @@ async function runRemoteJob(
       scheduleGroupCleanup(HARD_KILL_DELAY_MS, () => signalLocalClient("SIGKILL"));
     });
     scheduleOutputStop();
+    schedule(LOCAL_TERM_DELAY_MS + HARD_KILL_DELAY_MS, () => {
+      signalLocalClient("SIGKILL");
+      terminationBound.resolve();
+    });
   };
 
   let abortListener: (() => void) | null = null;
@@ -1132,10 +1137,9 @@ async function runRemoteJob(
           scheduleOutputStop();
           return exit;
         }),
-        requestWrite,
+        Promise.race([requestWrite, terminationBound.promise]),
       ]);
-      stopWatchingExecution();
-      const closed = await closeStdin();
+      const closed = await Promise.race([closeStdin(), terminationBound.promise]);
       if (closed) {
         const closeResult = adaptToolResultToHost(
           closed.mapError((captured) =>
@@ -1210,12 +1214,7 @@ async function runRemoteJob(
         if (!child) return;
         await Promise.race([
           Promise.allSettled([child.exited, closeStdin()]),
-          new Promise<void>((resolve) =>
-            schedule(LOCAL_TERM_DELAY_MS + HARD_KILL_DELAY_MS, () => {
-              signalLocalClient("SIGKILL");
-              resolve();
-            }),
-          ),
+          terminationBound.promise,
         ]);
       },
       catch: captureRuntimeError,

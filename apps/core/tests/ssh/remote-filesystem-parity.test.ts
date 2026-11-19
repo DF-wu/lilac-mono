@@ -281,6 +281,32 @@ describe("remote filesystem parity", () => {
   );
 
   it(
+    "preserves literal-root exclude behavior across native and fallback globbing",
+    async () => {
+      for (const patterns of [
+        ["src/lib/*.ts", "!src"],
+        ["src/lib/+(util).ts", "!src"],
+        ["src/lib/*.ts", "!src/lib"],
+        ["src/lib/+(util).ts", "!src/lib"],
+      ]) {
+        for (const mode of ["default", "detailed"] as const) {
+          const input = { patterns, mode };
+          const expected = withoutBackend(await local().glob(input));
+          const actual = withoutBackend(
+            unwrap(await remoteGlob({ host: HOST, cwd: tree, denyPaths, ...input })),
+          );
+          expect({ input, result: actual }).toEqual({ input, result: expected });
+          expect(expected.error).toBeUndefined();
+          const count =
+            expected.mode === "default" ? expected.paths.length : expected.entries.length;
+          expect(count).toBe(patterns[1] === "!src/lib" ? 0 : patterns[0]?.includes("+(") ? 1 : 2);
+        }
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
     "caps explicit directory-symlink roots like the local walker in both modes",
     async () => {
       const root = path.join(tempDir, "capped-linked-glob");

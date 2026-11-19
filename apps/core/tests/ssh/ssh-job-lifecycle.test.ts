@@ -165,6 +165,53 @@ describe("SSH job lifecycle", () => {
     }
   }
 
+  for (const operation of ["write", "flush", "end"] as const) {
+    for (const reason of ["aborted", "timeout"] as const) {
+      it(`bounds a pending stdin ${operation} after ${reason}`, async () => {
+        configureRunner();
+        spyOn(Date, "now").mockReturnValue(1000);
+        const controller = new AbortController();
+        const { stdin, exit } = fakeChild({ running: operation !== "end" });
+        const pending = Promise.withResolvers<number>();
+        const entered = Promise.withResolvers<void>();
+        stdin[operation].mockImplementation(() => {
+          entered.resolve();
+          return pending.promise;
+        });
+        const bounded = Promise.withResolvers<() => void>();
+        const timers: { delay: number; run: () => void }[] = [];
+        spyOn(globalThis, "setTimeout").mockImplementation(((run: () => void, delay: number) => {
+          const timer = { delay, run, unref() {} };
+          timers.push(timer);
+          if (delay === 7000) bounded.resolve(run);
+          return timer;
+        }) as unknown as typeof setTimeout);
+        spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
+        const execution = sshExecBash({
+          host: "host",
+          cmd: "true",
+          timeoutMs: 1000,
+          signal: controller.signal,
+          maxOutputChars: 100,
+        });
+        try {
+          await entered.promise;
+          if (reason === "aborted") controller.abort();
+          else timers.find((timer) => timer.delay === 1000)!.run();
+          (await bounded.promise)();
+          const result = await execution;
+          expect(result.aborted).toBe(reason === "aborted");
+          expect(result.timedOut).toBe(reason === "timeout");
+          expect(result.errors?.exitRead).toBeUndefined();
+          expect(stdin.end).toHaveBeenCalledTimes(1);
+        } finally {
+          pending.resolve(0);
+          exit.resolve(0);
+        }
+      });
+    }
+  }
+
   it("does not start SSH argument setup after deployment resolves a cancelled call", async () => {
     const args = configureRunner();
     const controller = new AbortController();
@@ -235,9 +282,24 @@ describe("SSH job lifecycle", () => {
       stdin[operation].mockImplementation(() => handledRejection(new Error("broken pipe")));
       const result = await sshExecBash({ host: "host", cmd: "true", maxOutputChars: 100 });
       expect(result.exitCode).toBe(-1);
+      expect(result.aborted).toBeFalse();
+      expect(result.timedOut).toBeFalse();
       expect(result.errors?.exitRead).toContain(
         operation === "end" ? "Failed to close SSH stdin" : "Failed to send the remote command",
       );
+    });
+  }
+
+  for (const operation of ["write", "flush", "end"] as const) {
+    it(`preserves the original stdin ${operation} Panic`, async () => {
+      configureRunner();
+      const { stdin } = fakeChild({ running: operation !== "end" });
+      const panic = new Panic({ message: "stdin invariant" });
+      stdin[operation].mockImplementation(() => handledRejection(panic));
+      await expect(sshExecBash({ host: "host", cmd: "true", maxOutputChars: 100 })).rejects.toBe(
+        panic,
+      );
+      expect(stdin.end).toHaveBeenCalledTimes(1);
     });
   }
 

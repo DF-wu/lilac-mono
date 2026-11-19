@@ -242,8 +242,9 @@ function remoteSearchBackend(context: CallContext): SearchBackend {
       const excludes = options.patterns
         .filter((pattern) => pattern.startsWith("!"))
         .map((pattern) => pattern.slice(1));
+      // Traversal prunes excluded directories; literal roots may start below them, as locally.
       const accepts = (entryPath: string) =>
-        matchesAnyGlob(entryPath, includes) && !isExcludedPath(entryPath, excludes);
+        matchesAnyGlob(entryPath, includes) && !matchesAnyGlob(entryPath, excludes);
       const entries: HostGlobEntry[] | undefined = value.entries?.filter((entry) =>
         accepts(entry.path),
       );
@@ -278,17 +279,6 @@ function remoteSearchBackend(context: CallContext): SearchBackend {
       });
     },
   };
-}
-
-function isExcludedPath(entryPath: string, excludes: readonly string[]): boolean {
-  let candidate = entryPath;
-  while (candidate.length > 0) {
-    if (matchesAnyGlob(candidate, excludes)) return true;
-    const separator = candidate.lastIndexOf("/");
-    if (separator === -1) return false;
-    candidate = candidate.slice(0, separator);
-  }
-  return false;
 }
 
 /** Matches a remote listing the way `collectLocalGlobMatches` matches a local walk. */
