@@ -4,7 +4,7 @@ Language: [`English (primary / canonical)`](./fork-differences.md) · [`Traditio
 
 This document describes the current differences between [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) and [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono).
 
-The current integration baseline is upstream commit [`3493c0c6`](https://github.com/stanley2058/lilac-mono/commit/3493c0c6c06260e6c472bd230dc02d4b0308db43) in fork PR [#101](https://github.com/DF-wu/lilac-mono/pull/101). The [complete November integration inventory](./fork-integration-20261111/README.md) records F01–F23 dispositions, all changed paths, source ownership, migration support, regression evidence and limits. Older dated reports describe their own historical baselines.
+The current integration baseline is upstream commit [`90d71dbe`](https://github.com/stanley2058/lilac-mono/commit/90d71dbe9a2a86d8b0a39513e9eb67d65eb93683) in fork PR [#119](https://github.com/DF-wu/lilac-mono/pull/119), integrated with fork main `a246ffb6` while preserving both histories. The [November 11 integration inventory](./fork-integration-20261111/README.md) records the earlier PR #101 baseline, F01–F23 dispositions, source ownership and offline migration support. Older dated reports retain their historical baselines.
 
 > [!IMPORTANT]
 > This is a maintenance document, not a permanent compatibility commitment. After an upstream sync, differences that have been accepted upstream or no longer exist must be removed from this table or reclassified.
@@ -12,6 +12,22 @@ The current integration baseline is upstream commit [`3493c0c6`](https://github.
 The [2026-10-22 maintenance review](./fork-review-2026-10-22.md) records which extensions remain
 necessary, the integration defects corrected against its baseline, and the retired watchdog patch.
 The [PR #95 integration report](./fork-integration-pr95.md) records the later v3 migration and validation.
+
+## Inherited Native Runner and Preview Updates
+
+PR #119 adopts upstream's Rust SSH runner and retires the JavaScript runners and published runner
+package. Supported remote hosts no longer need a JavaScript runtime or registry access. SSH cancellation
+uses stdin EOF, with bounded output drain retained from fork PR #118 and bounded stdin/process cleanup.
+See [runner builds and cleanup](../DEVELOPMENT.md#remote-runner) and [upgrade and rollback](../MIGRATIONS.md#native-ssh-remote-runner).
+
+HTML previews capture the single named file using the writing run's file access. Local assets must be
+inlined before capture; the built-in visualize helper supports this. See [native previews](./native-surface.md#rich-content-and-previews).
+Discord read-only thread control, subagent conversation context, web connection recovery and the updated
+Result rules are also inherited upstream capabilities, rather than fork-only features.
+
+The sync preserves Telegram, OpenAI search, origin-session authority, S3 checks and the fork's container
+variants. Optional review suggestions that change existing policy or do not affect sync compatibility
+remain deferred; this integration does not introduce a new denied-symlink metadata policy.
 
 ## Inherited Native Chat and Heartbeat Updates
 

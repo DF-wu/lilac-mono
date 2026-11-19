@@ -275,6 +275,12 @@ does not link.
   link with `rust-lld`. macOS targets need `zig` on `PATH` when built off a Mac.
 - `bun --cwd=apps/remote-runner run test` runs `cargo fmt --check` and the crate's tests.
 
+Cancellation closes the runner's stdin. The local SSH process group receives SIGTERM after five seconds
+and SIGKILL two seconds later; pending stdin writes, flushes and closes share that seven-second cleanup
+bound. Abort and deadline monitoring remain active until stdin settles. If output stays open after the
+terminated SSH client exits, Core stops capture after two seconds. That output-drain limit does not mean
+the remote process has already exited. Normally completed commands may leave background processes running.
+
 The runner protocol is private to one Core build and the binaries built with it, so it needs no
 version bump or compatibility window. `apps/core/tests/ssh/remote-filesystem-parity.test.ts` runs
 every file operation locally and through the runner on the same fixtures and expects identical

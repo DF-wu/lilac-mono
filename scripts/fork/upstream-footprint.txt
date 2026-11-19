@@ -8,8 +8,9 @@
 .gitignore  # ignores local agent state directories
 .oxfmtrc.json  # ignores local agent state directories
 Dockerfile  # container identity variants (CONTAINER_USER/UID build args)
+DEVELOPMENT.md  # PR119: distinguishes bounded SSH stdin/process cleanup from output draining
 MIGRATIONS.md  # F16/F23: offline historical blob cutover, current compatibility and rollback boundaries
-PROJECT.md  # documents the Telegram surface and the OpenAI-compatible image script provider
+PROJECT.md  # documents fork surfaces/providers and aligns imported Result and tool-call containment guidance
 README.md  # fork entry point; describes fork features and maintenance
 __tests__/docker-build-script.test.ts  # covers the container identity variants
 __tests__/release-gate.test.ts  # F21: Verified candidate, publication freshness and single image-tag ownership

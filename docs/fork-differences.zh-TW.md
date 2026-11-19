@@ -2,17 +2,29 @@
 
 語言：[`English（主要／規範版本）`](./fork-differences.md) · [`繁體中文（翻譯）`](./fork-differences.zh-TW.md)
 
-Current integration: upstream `3493c0c6c06260e6c472bd230dc02d4b0308db43`, PR #101. The [English integration inventory](./fork-integration-20261111/README.md) owns the current feature dispositions, offline migration support and verification; older dated baselines below are historical.
-
 本文件描述 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) 相對於 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的現行差異。
 
-比較基準為 upstream commit [`4f7eedb8`](https://github.com/stanley2058/lilac-mono/commit/4f7eedb80dece58c79369b62210574ea869bbae6)，透過 fork PR [#92](https://github.com/DF-wu/lilac-mono/pull/92) 整合。本 fork 在其上保留下列功能與維運修改。
+目前整合基準為 upstream commit [`90d71dbe`](https://github.com/stanley2058/lilac-mono/commit/90d71dbe9a2a86d8b0a39513e9eb67d65eb93683)，透過 fork PR [#119](https://github.com/DF-wu/lilac-mono/pull/119) 與 fork main `a246ffb6` 整合，保留兩邊的歷史。[11 月 11 日整合紀錄](./fork-integration-20261111/README.md) 記錄較早的 PR #101 基準、F01–F23 功能處置、程式碼歸屬與離線遷移支援；其他有日期的報告保留各自的歷史基準。
 
 > [!IMPORTANT]
 > 這是維護文件，不是永久相容性承諾。Upstream sync 後，已被上游接收或不再存在的差異必須從本表移除或重新分類。
 
 [2026-10-22 維護審查](./fork-review-2026-10-22.md) 記錄仍需保留的擴充、對照此基準修正的整合缺陷，
 以及已移除的 watchdog 補丁。本次變更只在 fork 維護，不向 upstream 提交。
+
+## 繼承的原生 Runner 與預覽更新
+
+PR #119 採用上游的 Rust SSH runner，移除 JavaScript runners 與原本發布的 runner package。
+受支援的遠端主機不再需要 JavaScript runtime 或 registry 存取。SSH 透過關閉 stdin 取消工作，
+保留 fork PR #118 的有限輸出收尾，stdin 等待與程序清理也有時限。
+建置及清理行為見 [DEVELOPMENT.md](../DEVELOPMENT.md#remote-runner)，升級與回滾見 [MIGRATIONS.md](../MIGRATIONS.md#native-ssh-remote-runner)。
+
+HTML 預覽以寫入該回覆的 run 權限讀取指定的單一檔案；本機資產須先內嵌，內建 visualize helper
+可協助處理。詳見 [native 預覽](./native-surface.md#rich-content-and-previews)。Discord 唯讀 thread control、
+subagent 對話上下文、網頁連線恢復與更新的 Result 規則，也都是繼承的上游能力，不列為 fork-only 功能。
+
+本次同步保留 Telegram、OpenAI 搜尋、origin-session authority、S3 檢查與 fork 的 container variants。
+涉及既有政策、或不影響同步相容性的小型 review 建議仍延後處理；這次不新增禁止目標 symlink 的 metadata 政策。
 
 ## 繼承的 Native 聊天與 Heartbeat 更新
 
