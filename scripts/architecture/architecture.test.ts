@@ -2945,6 +2945,7 @@ describe("real declaration integration", () => {
       ["architecture/no-nested-result-continuation", 74],
       ["architecture/no-nested-result-continuation", 88],
       ["architecture/no-nested-result-continuation", 100],
+      ["architecture/no-repeated-result-match", 127],
     ]);
   });
 

@@ -948,9 +948,25 @@ export class FileSystem {
         }
       }
 
-      const read = resultOutcome(await this.host.readBytes(canonicalPath));
+      const read = resultOutcome(
+        maxBytes === undefined
+          ? await this.host.readBytes(canonicalPath)
+          : (await this.host.readBytePrefix(canonicalPath, maxBytes + 1)).map(
+              (value) => value.bytes,
+            ),
+      );
       if (!read.ok) return Result.err(read.error);
       const bytes = read.value;
+      if (maxBytes !== undefined && bytes.byteLength > maxBytes) {
+        return Result.ok<ReadFileBytesResult>({
+          success: false,
+          resolvedPath,
+          error: {
+            code: "MEDIA_TOO_LARGE",
+            message: `File is too large to inline (${bytes.byteLength} bytes; maximum ${maxBytes} bytes): ${resolvedPath}`,
+          },
+        });
+      }
       const fileHash = this.hash(bytes);
 
       this.fileAccessRecord.set(resolvedPath, {
@@ -1847,6 +1863,7 @@ export class FileSystem {
       denyPaths: this.denyPaths,
       dangerouslyAllow,
       cacheDir: this.fffCacheDir,
+      withStats: mode !== "default",
     });
     if (!backendResult && this.fsBackend === "fff") {
       backendResult = await this.host.searchBackend("node-rg").glob({
@@ -1855,6 +1872,7 @@ export class FileSystem {
         maxEntries,
         denyPaths: this.denyPaths,
         dangerouslyAllow,
+        withStats: mode !== "default",
       });
     }
 

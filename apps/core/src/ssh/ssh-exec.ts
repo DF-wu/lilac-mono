@@ -464,21 +464,21 @@ async function readReadableStreamTextCapped(
   const stopReading = () => cancelStreamReader(reader);
   if (options?.stopSignal?.aborted) stopReading();
   options?.stopSignal?.addEventListener("abort", stopReading, { once: true });
+  const overflowCapture: OverflowCapture | undefined = options?.overflowFilePath
+    ? {
+        target: options.overflowFilePath,
+        bufferedRawChunks: [],
+        fileCreated: false,
+        disabled: false,
+      }
+    : undefined;
 
-  const outcome = await (async () => {
+  const capture = (async () => {
     const decoder = new TextDecoder();
     let text = "";
     let totalChars = 0;
     let capped = false;
     let overflowFilePath: string | undefined;
-    const overflowCapture: OverflowCapture | undefined = options?.overflowFilePath
-      ? {
-          target: options.overflowFilePath,
-          bufferedRawChunks: [],
-          fileCreated: false,
-          disabled: false,
-        }
-      : undefined;
 
     const consumeChunkText = async (
       chunkText: string,
@@ -565,18 +565,35 @@ async function readReadableStreamTextCapped(
       status: "return",
       value: combineStreamReadAndCleanup(primary, releaseStreamReader(reader)),
     } as const;
-  })().finally(() => {
-    options?.stopSignal?.removeEventListener("abort", stopReading);
-    if (!releaseAttempted) {
-      const released = releaseStreamReader(reader);
-      released.match({
-        ok: () => undefined,
-        err: (error) =>
-          logger.debug("SSH stream reader cleanup failed", formatTaggedErrorForLog(error)),
-      });
-    }
+  })();
+  const outcome = await Result.tryPromise({ try: () => capture, catch: captureRuntimeError });
+  const cleanup = await Result.tryPromise({
+    try: async () => {
+      // Only an unfinished sink belongs to this exceptional-exit cleanup.
+      if (overflowCapture?.sink) await cleanupOverflowCaptureOutcome(overflowCapture);
+      options?.stopSignal?.removeEventListener("abort", stopReading);
+      if (!releaseAttempted) {
+        const released = releaseStreamReader(reader);
+        released.match({
+          ok: () => undefined,
+          err: (error) =>
+            logger.debug("SSH stream reader cleanup failed", formatTaggedErrorForLog(error)),
+        });
+      }
+    },
+    catch: captureRuntimeError,
   });
-  return outcome.value;
+  if (outcome.isErr()) {
+    return adaptToolResultToHost(
+      Result.err(projectCapturedRuntimeError(outcome.error, "SSH output capture failed")),
+    );
+  }
+  if (cleanup.isErr()) {
+    return adaptToolResultToHost(
+      Result.err(projectCapturedRuntimeError(cleanup.error, "SSH output cleanup failed")),
+    );
+  }
+  return outcome.value.value;
 }
 
 async function readBodyTextCapped(
@@ -781,10 +798,10 @@ function deployFailureResult(
 }
 
 export async function sshExecBash(params: SshExecBashParams): Promise<SshExecBashResult> {
+  const startedAt = Date.now();
   if (params.cwd !== undefined) normalizeRemoteCwd(params.cwd);
   await requireConfiguredSshHost(params.host);
 
-  const startedAt = Date.now();
   if (params.signal?.aborted) return emptyExecResult(startedAt, { aborted: true });
   const outcome = await runWithRunner(params, startedAt, (deployment) =>
     remoteJobInvocation(params, deployment),
@@ -808,10 +825,10 @@ export async function sshCallRunner(params: {
   readonly signal?: AbortSignal;
   readonly maxOutputChars: number;
 }): Promise<SshRunnerCallOutcome> {
+  const startedAt = Date.now();
   const configured = await requireConfiguredSshHostResult(params.host);
   const hostError = configured.match({ ok: () => null, err: (error) => error });
   if (hostError) return { kind: "rejected", message: hostError.message };
-  const startedAt = Date.now();
   if (params.signal?.aborted) {
     return { kind: "completed", result: emptyExecResult(startedAt, { aborted: true }) };
   }
@@ -844,6 +861,9 @@ async function runWithRunner(
       ? startedAt + UNBOUNDED_CALL_DEPLOY_WAIT_MS
       : startedAt + params.timeoutMs;
   for (let attempt = 0; ; attempt++) {
+    if (Date.now() >= deadline) {
+      return { kind: "completed", result: emptyExecResult(startedAt, { timedOut: true }) };
+    }
     const resolved = await resolveRemoteRunner({
       host: params.host,
       deadline,
@@ -860,15 +880,22 @@ async function runWithRunner(
         reason: deployment.kind === "unsupported" ? deployment.reason : "unsupported host",
       };
     }
-    const remainingMs =
-      params.timeoutMs === undefined ? undefined : Math.max(1, deadline - Date.now());
     const token = crypto.randomUUID();
     const launch =
       deployment.kind === "runner"
         ? { ...invocation, remoteArgs: [...invocation.remoteArgs, token] }
         : invocation;
-    const result = await runRemoteJob(params, launch, startedAt, remainingMs);
-    if (attempt === 0 && deployment.kind === "runner" && runnerWentMissing(result, token)) {
+    const { result, wrapperExitCode } = await runRemoteJob(
+      params,
+      launch,
+      startedAt,
+      params.timeoutMs === undefined ? undefined : deadline,
+    );
+    if (
+      attempt === 0 &&
+      deployment.kind === "runner" &&
+      runnerWentMissing(result, token, wrapperExitCode)
+    ) {
       // The cached binary was removed after deployment, so the command never ran; redeploy once.
       invalidateRemoteRunner(params.host);
       continue;
@@ -877,8 +904,12 @@ async function runWithRunner(
   }
 }
 
-function runnerWentMissing(result: SshExecBashResult, token: string): boolean {
-  if (result.timedOut || result.aborted || result.exitCode !== 127) return false;
+function runnerWentMissing(
+  result: SshExecBashResult,
+  token: string,
+  wrapperExitCode: number | undefined,
+): boolean {
+  if (result.timedOut || result.aborted || wrapperExitCode !== 127) return false;
   return result.stderr.trim() === `${REMOTE_RUNNER_MISSING_MARKER}:${token}`;
 }
 
@@ -948,12 +979,13 @@ async function runRemoteJob(
   params: SshExecBashParams,
   invocation: { readonly remoteArgs: readonly string[]; readonly stdin: string },
   startedAt: number,
-  timeoutMs: number | undefined,
-): Promise<SshExecBashResult> {
+  deadline: number | undefined,
+): Promise<{ readonly result: SshExecBashResult; readonly wrapperExitCode?: number }> {
   let termination: "timeout" | "aborted" | "failed" | undefined;
   let child: ReturnType<typeof Bun.spawn> | null = null;
   let stdinFailure: SshStreamCleanupError | undefined;
   let stdinClose: ReturnType<typeof startStdinClose> | undefined;
+  let wrapperExitCode: number | undefined;
 
   function startStdinClose() {
     return Result.tryPromise({ try: () => closeJobStdin(child), catch: captureRuntimeError });
@@ -1026,7 +1058,11 @@ async function runRemoteJob(
       abortListener = () => params.signal?.removeEventListener("abort", onAbort);
     }
   }
-  if (timeoutMs !== undefined) schedule(timeoutMs, () => terminate("timeout"));
+  const checkDeadline = () => {
+    if (deadline !== undefined && Date.now() >= deadline) terminate("timeout");
+  };
+  if (deadline !== undefined)
+    schedule(Math.max(0, deadline - Date.now()), () => terminate("timeout"));
   const stopWatchingExecution = () => {
     abortListener?.();
     abortListener = null;
@@ -1036,6 +1072,7 @@ async function runRemoteJob(
 
   const outcome = await Result.tryPromise({
     try: async () => {
+      checkDeadline();
       if (termination) {
         return {
           status: "return",
@@ -1046,6 +1083,7 @@ async function runRemoteJob(
         } as const;
       }
       const sshArgs = await buildSshArgs(params.host, invocation.remoteArgs);
+      checkDeadline();
       if (termination) {
         return {
           status: "return",
@@ -1063,6 +1101,7 @@ async function runRemoteJob(
         detached: true,
         env: buildSshChildEnv(),
       });
+      checkDeadline();
       if (termination) closeStdin();
       const requestWrite = termination
         ? Promise.resolve()
@@ -1118,6 +1157,7 @@ async function runRemoteJob(
         },
       });
       const exitCode = stdinFailure ? -1 : exit.code;
+      wrapperExitCode = exit.code;
 
       const transportError = exitCode === 255 ? inferTransportError(stderr) : undefined;
 
@@ -1188,5 +1228,5 @@ async function runRemoteJob(
   }
   stopWatchingExecution();
   for (const timer of timers) clearTimeout(timer);
-  return outcome.value.value;
+  return { result: outcome.value.value, wrapperExitCode };
 }

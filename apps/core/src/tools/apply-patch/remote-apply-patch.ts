@@ -34,6 +34,11 @@ export async function remoteApplyPatch(params: {
 
   const canonical = await host.realpath(expandTilde(params.cwd, host.homeDir));
   if (canonical.isErr()) return { ok: false, error: canonical.error.message };
+  const cwdStats = await host.stat(canonical.value);
+  if (cwdStats.isErr()) return { ok: false, error: cwdStats.error.message };
+  if (cwdStats.value.type !== "directory") {
+    return { ok: false, error: `ENOTDIR: not a directory, chdir '${params.cwd}'` };
+  }
   const applied = await applyHunksResult(canonical.value, parsed, {
     denyPaths,
     signal: params.signal,

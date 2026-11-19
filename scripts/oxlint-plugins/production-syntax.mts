@@ -2566,7 +2566,10 @@ function writtenRootNames(statement: ts.Statement): Set<string> {
 /** Whether `name` resolves to a `const` binding in a scope enclosing `node`. */
 function isConstBinding(name: string, node: ts.Node): boolean {
   for (let scope: ts.Node | undefined = node.parent; scope; scope = scope.parent) {
-    if (ts.isFunctionLike(scope) && scope.parameters.some((p) => p.name.getText() === name)) {
+    if (
+      ts.isFunctionLike(scope) &&
+      scope.parameters.some((parameter) => bindingNames(parameter.name).includes(name))
+    ) {
       return false;
     }
     const statements =
@@ -2575,8 +2578,8 @@ function isConstBinding(name: string, node: ts.Node): boolean {
         : undefined;
     for (const statement of statements ?? []) {
       if (!ts.isVariableStatement(statement)) continue;
-      const declared = statement.declarationList.declarations.some(
-        (declaration) => ts.isIdentifier(declaration.name) && declaration.name.text === name,
+      const declared = statement.declarationList.declarations.some((declaration) =>
+        bindingNames(declaration.name).includes(name),
       );
       if (declared) return (statement.declarationList.flags & ts.NodeFlags.Const) !== 0;
     }
@@ -2597,7 +2600,13 @@ function repeatsUnchangedCondition(previous: ts.IfStatement, next: ts.IfStatemen
   ) {
     return false;
   }
-  if (hasEffect(previous.expression) || readsMember(previous.expression)) return false;
+  if (
+    hasEffect(previous.expression) ||
+    readsMember(previous.expression) ||
+    hasImplicitCoercion(previous.expression)
+  ) {
+    return false;
+  }
   const read = referencedRootNames(previous.expression);
   if ([...writtenRootNames(previous.thenStatement)].some((name) => read.has(name))) return false;
   if (!hasEffect(previous.thenStatement)) return true;
@@ -2607,6 +2616,27 @@ function repeatsUnchangedCondition(previous: ts.IfStatement, next: ts.IfStatemen
 function readsMember(node: ts.Node): boolean {
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) return true;
   return ts.forEachChild(node, readsMember) ?? false;
+}
+
+function hasImplicitCoercion(node: ts.Node): boolean {
+  if (ts.isTemplateExpression(node)) return true;
+  if (ts.isPrefixUnaryExpression(node) && node.operator !== ts.SyntaxKind.ExclamationToken) {
+    return true;
+  }
+  if (
+    ts.isBinaryExpression(node) &&
+    ![
+      ts.SyntaxKind.EqualsEqualsEqualsToken,
+      ts.SyntaxKind.ExclamationEqualsEqualsToken,
+      ts.SyntaxKind.AmpersandAmpersandToken,
+      ts.SyntaxKind.BarBarToken,
+      ts.SyntaxKind.QuestionQuestionToken,
+      ts.SyntaxKind.CommaToken,
+    ].includes(node.operatorToken.kind)
+  ) {
+    return true;
+  }
+  return ts.forEachChild(node, hasImplicitCoercion) ?? false;
 }
 
 function adjacentStatementLists(node: ts.Node): ts.NodeArray<ts.Statement> | undefined {

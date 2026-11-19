@@ -1,6 +1,12 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 
 import {
@@ -65,16 +71,23 @@ function cargoEnvKey(target: Target, name: string): string {
 // `-mmacosx-version-min` and applies its own default (macOS 15) unless the target names a version.
 const MACOS_MIN_VERSION = "11.0";
 
+function writeLinkerInput(file: string, content: string): void {
+  if (existsSync(file) && readFileSync(file, "utf8") === content) return;
+  writeFileSync(file, content);
+}
+
 // Linking macOS binaries off a Mac uses zig as the linker. Rust's standard library links libiconv,
 // which zig does not ship, so a text stub stands in for the system library at link time.
 function zigMacosLinkerEnv(target: Target): Record<string, string> {
   if (!hasCommand("zig", ["version"])) {
     throw new Error(`Building ${target} on this machine needs zig on PATH`);
   }
-  const workDir = mkdtempSync(path.join(tmpdir(), "lilac-remote-zig-"));
+  // Cargo fingerprints linker paths and flags; keep them inside its persistent target cache.
+  const workDir = path.join(TARGET_DIR, "zig-linker", target);
+  mkdirSync(workDir, { recursive: true });
   const zigArch = target.startsWith("aarch64") ? "aarch64" : "x86_64";
   const linker = path.join(workDir, "cc");
-  writeFileSync(
+  writeLinkerInput(
     linker,
     [
       "#!/bin/sh",
@@ -88,7 +101,7 @@ function zigMacosLinkerEnv(target: Target): Record<string, string> {
     ].join("\n"),
   );
   chmodSync(linker, 0o755);
-  writeFileSync(
+  writeLinkerInput(
     path.join(workDir, "libiconv.tbd"),
     [
       "--- !tapi-tbd",

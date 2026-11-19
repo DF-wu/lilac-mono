@@ -33,9 +33,15 @@ function handledRejection(error: Error) {
   return promise;
 }
 
-function fakeChild(options?: { running?: boolean; output?: string; pid?: number }) {
+function fakeChild(options?: {
+  running?: boolean;
+  output?: string;
+  stderr?: string;
+  exitCode?: number;
+  pid?: number;
+}) {
   const exit = Promise.withResolvers<number>();
-  if (!options?.running) exit.resolve(0);
+  if (!options?.running) exit.resolve(options?.exitCode ?? 0);
   const stdin = {
     write: mock((): number | Promise<number> => 1),
     flush: mock((): number | Promise<number> => 1),
@@ -48,7 +54,7 @@ function fakeChild(options?: { running?: boolean; output?: string; pid?: number 
     pid: options?.pid ?? 0,
     stdin,
     stdout: closedOutput(options?.output),
-    stderr: closedOutput(),
+    stderr: closedOutput(options?.stderr),
     exited: exit.promise,
   } as unknown as ReturnType<typeof Bun.spawn>;
   spyOn(Bun, "spawn").mockImplementation(() => child);
@@ -56,6 +62,109 @@ function fakeChild(options?: { running?: boolean; output?: string; pid?: number 
 }
 
 describe("SSH job lifecycle", () => {
+  for (const boundary of ["host validation", "deployment", "argument setup", "spawn"] as const) {
+    it(`does not dispatch after the deadline expires during ${boundary}`, async () => {
+      const args = configureRunner();
+      let now = 1000;
+      spyOn(Date, "now").mockImplementation(() => now);
+      const advance = () => {
+        now = 2000;
+      };
+      const { child, stdin } = fakeChild();
+      if (boundary === "host validation") {
+        spyOn(config, "requireConfiguredSshHostResult").mockImplementation(async () => {
+          advance();
+          return Result.ok(undefined);
+        });
+      }
+      if (boundary === "deployment") {
+        spyOn(deployment, "resolveRemoteRunner").mockImplementation(async () => {
+          advance();
+          return Result.ok({
+            kind: "runner",
+            target: "x86_64-unknown-linux-musl",
+            command: ["runner"],
+          });
+        });
+      }
+      if (boundary === "argument setup")
+        args.mockImplementation(async () => {
+          advance();
+          return ["host", "runner"];
+        });
+      if (boundary === "spawn")
+        spyOn(Bun, "spawn").mockImplementation(() => {
+          advance();
+          return child;
+        });
+      const result = await sshCallRunner({
+        host: "host",
+        request: { op: "write_file", path: "/target", content: "mutation" },
+        timeoutMs: 500,
+        maxOutputChars: 100,
+      });
+      expect(result.kind).toBe("completed");
+      if (result.kind === "completed") {
+        expect(result.result.timedOut).toBeTrue();
+        if (boundary !== "spawn") expect(result.result.exitCode).toBe(-1);
+      }
+      expect(stdin.write).not.toHaveBeenCalled();
+      if (boundary !== "spawn") expect(Bun.spawn).not.toHaveBeenCalled();
+    });
+  }
+
+  it("counts bash host validation against the original deadline", async () => {
+    configureRunner();
+    let now = 1000;
+    spyOn(Date, "now").mockImplementation(() => now);
+    spyOn(config, "requireConfiguredSshHost").mockImplementation(async () => {
+      now = 2000;
+    });
+    fakeChild();
+    const result = await sshExecBash({
+      host: "host",
+      cmd: "true",
+      timeoutMs: 500,
+      maxOutputChars: 100,
+    });
+    expect(result.timedOut).toBeTrue();
+    expect(Bun.spawn).not.toHaveBeenCalled();
+  });
+
+  for (const operation of ["write", "flush", "end"] as const) {
+    for (const marked of [true, false]) {
+      it(`${marked ? "retries" : "does not retry"} exit 127 ${marked ? "with" : "without"} the per-call marker when stdin ${operation} fails`, async () => {
+        configureRunner();
+        const token = "11111111-1111-4111-8111-111111111111";
+        spyOn(crypto, "randomUUID").mockReturnValue(token);
+        const invalidated = spyOn(deployment, "invalidateRemoteRunner").mockImplementation(
+          () => {},
+        );
+        const { child, stdin } = fakeChild({
+          exitCode: 127,
+          stderr: marked
+            ? `${deployment.REMOTE_RUNNER_MISSING_MARKER}:${token}\n`
+            : "ordinary command failure",
+        });
+        stdin[operation].mockImplementation(() => handledRejection(new Error("broken pipe")));
+        const nextStdin = { write: mock(() => 1), flush: mock(() => 1), end: mock(() => 0) };
+        const nextChild = {
+          ...child,
+          stdin: nextStdin,
+          stderr: closedOutput(),
+          exited: Promise.resolve(0),
+        } as unknown as ReturnType<typeof Bun.spawn>;
+        spyOn(Bun, "spawn")
+          .mockImplementationOnce(() => child)
+          .mockImplementation(() => nextChild);
+        const result = await sshExecBash({ host: "host", cmd: "true", maxOutputChars: 100 });
+        expect(result.exitCode).toBe(marked ? 0 : -1);
+        expect(invalidated).toHaveBeenCalledTimes(marked ? 1 : 0);
+        expect(Bun.spawn).toHaveBeenCalledTimes(marked ? 2 : 1);
+      });
+    }
+  }
+
   it("does not start SSH argument setup after deployment resolves a cancelled call", async () => {
     const args = configureRunner();
     const controller = new AbortController();

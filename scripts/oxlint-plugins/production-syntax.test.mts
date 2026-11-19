@@ -425,6 +425,64 @@ describe("flat control flow syntax", () => {
     expect(violations).toEqual([]);
   });
 
+  it("keeps repeated conditions whose destructured parameters shadow outer constants", () => {
+    const violations = findRedundantBranchViolations(
+      `
+        const ready = true;
+        function objectParameter({ ready }: { ready: boolean }) {
+          const reset = () => { ready = false; };
+          if (ready) reset();
+          if (ready) second();
+        }
+        function arrayParameter([ready]: boolean[]) {
+          const reset = () => { ready = false; };
+          if (ready) reset();
+          if (ready) second();
+        }
+        function localBinding() {
+          let { ready } = { ready: true };
+          const reset = () => { ready = false; };
+          if (ready) reset();
+          if (ready) second();
+        }
+        function constant() {
+          if (ready) first();
+          if (ready) second();
+        }
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind, line }) => [kind, line])).toEqual([["repeated-condition", 21]]);
+  });
+
+  it("keeps repeated conditions whose implicit coercion can change their value", () => {
+    const violations = findRedundantBranchViolations(
+      `
+        let reads = 0;
+        const value = { toString: () => String(++reads), valueOf: () => ++reads };
+        if (\`\${value}\` === "1") {}
+        if (\`\${value}\` === "1") second();
+        if (value + 0 === 1) {}
+        if (value + 0 === 1) second();
+        if (value < 2) {}
+        if (value < 2) second();
+        if (+value === 1) {}
+        if (+value === 1) second();
+        if (value == 1) {}
+        if (value == 1) second();
+        const ready = true;
+        if (ready === true) first();
+        if (ready === true) second();
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind, line }) => [kind, line])).toEqual([["repeated-condition", 16]]);
+  });
+
   it("removes else branches after direct terminal statements", () => {
     const violations = findElseAfterTerminalViolations(
       `

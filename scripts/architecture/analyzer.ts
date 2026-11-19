@@ -2754,6 +2754,14 @@ function analyzeRepeatedResultMatches(
     }
     if (canonical) matched.add(canonical);
     ts.forEachChild(node, visit);
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(unwrapExpression(node.left))
+    ) {
+      const assigned = checker.getSymbolAtLocation(unwrapExpression(node.left));
+      if (assigned) matched.delete(canonicalSymbol(assigned, checker));
+    }
   };
   visit(sourceFile);
 }

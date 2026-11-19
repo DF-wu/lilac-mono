@@ -153,7 +153,7 @@ pub fn read_prefix(path: &str, limit: u64) -> Result<BytesRead, FsError> {
         .map_err(|error| FsError::from_io(&error, "fstat", path))?
         .len();
     let mut bytes = Vec::new();
-    file.take(limit.min(total_bytes))
+    file.take(limit)
         .read_to_end(&mut bytes)
         .map_err(|error| FsError::from_read(&error))?;
     Ok(BytesRead {

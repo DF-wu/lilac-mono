@@ -203,10 +203,16 @@ packages/utils/builtin-skills/visualize/SKILL.md  # PR119: documents run-scoped 
 packages/utils/builtin-skills/visualize/scripts/build.ts  # PR119: decodes HTML asset URLs and rejects unsupported document bases
 scripts/architecture/analyzer.ts  # PR119: recognizes wrapped named Result continuation handlers
 scripts/architecture/fixtures/real-libraries/result-continuation.ts  # PR119: fixtures for parenthesized and satisfies-wrapped handlers
-scripts/build-remote-runner.ts  # PR119: aligns Cargo target directory and copied artifacts under environment overrides
+scripts/build-remote-runner.ts  # PR119: aligns Cargo output and copy paths and keeps macOS linker inputs stable in the target cache
 scripts/oxlint-plugins/production-syntax.mts  # PR119: avoids redundant-condition false positives for initialized var and getter reads
 scripts/oxlint-plugins/production-syntax.test.mts  # PR119: covers var writes and unstable member conditions
 apps/core/tests/surface/bridge/bus-agent-runner-core-primary.test.ts  # PR119: isolates the compaction fixture system prompt from operator-owned global skills while retaining real compaction
 apps/core/tests/tool-server-skills.test.ts  # PR119: asserts invocation-cwd skill results independently of unrelated global discovery warnings
 apps/core/tests/tool-server/ssh.test.ts  # PR119: gives the SSH child fixture its real stdin pipe contract when testing stream and exit failures
 apps/core/tests/ssh/remote-runner-transport.test.ts  # PR119: synchronizes fallback PID readiness and observes bounded asynchronous process cleanup without fixed waits
+apps/core/tests/ssh/ssh-exec.test.ts  # PR119: covers overflow cleanup and exact supported SSH error paths
+packages/fs/src/fs-impl.ts  # PR119: carries glob detail mode to backends and enforces whole-file limits during bounded reads
+packages/fs/src/search-backend.ts  # PR119: carries requested metadata mode to the private remote glob backend
+packages/fs/tests/read-byte-prefix.test.ts  # PR119: rejects growth between whole-file size preflight and bounded read
+packages/fs/src/node-host.ts  # PR119: reads a bounded prefix from the opened handle without capping at stale metadata size
+apps/remote-runner/src/fsops.rs  # PR119: bounded prefix reads observe growth after opened-handle metadata

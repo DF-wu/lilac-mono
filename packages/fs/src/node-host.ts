@@ -105,14 +105,16 @@ export const nodeFileSystemHost: FileSystemHost = {
     return captureFilesystemOperation("read byte prefix", async () => {
       await using handle = await fs.open(canonicalPath, "r");
       const stats = await handle.stat();
-      const buffer = Buffer.alloc(Math.min(limit, stats.size));
+      const chunks: Buffer[] = [];
       let size = 0;
-      while (size < buffer.length) {
-        const read = await handle.read(buffer, size, buffer.length - size, size);
+      while (size < limit) {
+        const buffer = Buffer.alloc(Math.min(65_536, limit - size));
+        const read = await handle.read(buffer, 0, buffer.length, size);
         if (read.bytesRead === 0) break;
+        chunks.push(buffer.subarray(0, read.bytesRead));
         size += read.bytesRead;
       }
-      return { bytes: buffer.subarray(0, size), totalBytes: stats.size };
+      return { bytes: Buffer.concat(chunks, size), totalBytes: stats.size };
     });
   },
 

@@ -1,4 +1,14 @@
-import { chmod, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -63,13 +73,14 @@ async function writeTree(root: string) {
 }
 
 beforeAll(async () => {
-  tempDir = await mkdtemp(path.join(tmpdir(), "lilac-remote-fs-parity-"));
+  tempDir = await realpath(await mkdtemp(path.join(tmpdir(), "lilac-remote-fs-parity-")));
   tree = path.join(tempDir, "tree");
   const remoteHome = path.join(tempDir, "home");
   const binDir = path.join(tempDir, "bin");
   await mkdir(remoteHome, { recursive: true });
   await mkdir(binDir, { recursive: true });
   await writeTree(tree);
+  await symlink("plain.txt", path.join(tree, "plain-alias.txt"));
   denyPaths = [path.join(tree, "secret")];
   const ssh = path.join(binDir, "ssh");
   await writeFile(
@@ -233,6 +244,10 @@ describe("remote filesystem parity", () => {
         { patterns: [".config/*"] },
         { patterns: ["**/node_modules/**"] },
         { patterns: ["linked/*"] },
+        { patterns: ["./linked/*"] },
+        { patterns: ["././linked/*"] },
+        { patterns: ["linked/*"], mode: "detailed" },
+        { patterns: ["./linked/*"], mode: "detailed" },
         { patterns: ["**/*.{ts,md}"] },
         { patterns: ["src/lib/"] },
         { patterns: ["+(src|docs)/**"] },
@@ -266,6 +281,30 @@ describe("remote filesystem parity", () => {
   );
 
   it(
+    "caps explicit directory-symlink roots like the local walker in both modes",
+    async () => {
+      const root = path.join(tempDir, "capped-linked-glob");
+      await mkdir(path.join(root, "target"), { recursive: true });
+      await writeFile(path.join(root, "target/child.txt"), "child\n");
+      await symlink("target", path.join(root, "linked"));
+      const denyPaths = [path.join(root, "denied")];
+      for (const pattern of ["linked/*", "./linked/*", "././linked/*"]) {
+        for (const mode of ["default", "detailed"] as const) {
+          for (const maxEntries of [1, 2]) {
+            const input = { patterns: [pattern], mode, maxEntries };
+            const expected = withoutBackend(await new FileSystem(root, { denyPaths }).glob(input));
+            const actual = withoutBackend(
+              unwrap(await remoteGlob({ host: HOST, cwd: root, denyPaths, ...input })),
+            );
+            expect({ input, result: actual }).toEqual({ input, result: expected });
+          }
+        }
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
     "greps the same matches",
     async () => {
       const cases: {
@@ -285,6 +324,8 @@ describe("remote filesystem parity", () => {
         { pattern: "util", fileExtensions: ["ts"] },
         { pattern: "beta", mode: "hashline" },
         { pattern: "gamma", cwd: path.join(tree, "plain.txt"), mode: "hashline" },
+        { pattern: "gamma", cwd: path.join(tree, "plain-alias.txt"), mode: "detailed" },
+        { pattern: "gamma", cwd: path.join(tree, "plain-alias.txt"), mode: "hashline" },
         { pattern: "emoji", cwd: path.join(tree, "unicode.txt"), mode: "detailed" },
         { pattern: "x", cwd: path.join(tree, "long.txt"), mode: "hashline" },
         { pattern: "nothing-matches-this" },
@@ -433,15 +474,50 @@ describe("remote filesystem parity", () => {
     "keeps dangling symlinks in default glob paths without inventing metadata",
     async () => {
       const root = path.join(tempDir, "dangling-glob");
-      await mkdir(root);
-      await symlink("missing.txt", path.join(root, "dangling.txt"));
-      await writeFile(path.join(root, "present.txt"), "present\n");
+      await mkdir(path.join(root, "first"), { recursive: true });
+      await mkdir(path.join(root, "other"));
+      await symlink("missing.txt", path.join(root, "first/dangling.txt"));
+      await writeFile(path.join(root, "other/present.txt"), "present\n");
+      const patterns = ["first/*.txt", "other/*.txt"];
+      const denyPaths = [path.join(root, "denied")];
       for (const mode of ["default", "detailed"] as const) {
-        const expected = withoutBackend(await local(root).glob({ patterns: ["*.txt"], mode }));
-        const actual = withoutBackend(
-          unwrap(await remoteGlob({ host: HOST, cwd: root, patterns: ["*.txt"], mode, denyPaths })),
-        );
-        expect(actual).toEqual(expected);
+        for (const maxEntries of [1, 10]) {
+          const expected = withoutBackend(
+            await new FileSystem(root, { denyPaths }).glob({ patterns, mode, maxEntries }),
+          );
+          const actual = withoutBackend(
+            unwrap(
+              await remoteGlob({ host: HOST, cwd: root, patterns, mode, maxEntries, denyPaths }),
+            ),
+          );
+          expect(actual).toEqual(expected);
+        }
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "keeps fallback default paths independent from matched metadata errors",
+    async () => {
+      const root = path.join(tempDir, "loop-glob");
+      await mkdir(root);
+      await symlink("loop.txt", path.join(root, "loop.txt"));
+      await writeFile(path.join(root, "present.txt"), "present\n");
+      for (const patterns of [["*.txt"], ["+(loop|present).txt"], ["+(present).txt"]]) {
+        for (const mode of ["default", "detailed"] as const) {
+          const expected = withoutBackend(await local(root).glob({ patterns, mode }));
+          const actual = withoutBackend(
+            unwrap(await remoteGlob({ host: HOST, cwd: root, patterns, mode, denyPaths })),
+          );
+          const sorted = (value: typeof expected) =>
+            value.mode === "default" ? { ...value, paths: [...value.paths].sort() } : value;
+          expect({ patterns, mode, result: sorted(actual) }).toEqual({
+            patterns,
+            mode,
+            result: sorted(expected),
+          });
+        }
       }
     },
     TEST_TIMEOUT_MS,
@@ -505,6 +581,28 @@ describe("remote filesystem parity", () => {
       await expect(readFile(path.join(cwd, "target.txt"), "utf8")).rejects.toMatchObject({
         code: "ENOENT",
       });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "rejects a regular file cwd before a patch can write outside it",
+    async () => {
+      const root = path.join(tempDir, "patch-file-cwd");
+      await mkdir(root);
+      const cwd = path.join(root, "file.txt");
+      await writeFile(cwd, "original");
+      const applied = await remoteApplyPatch({
+        host: HOST,
+        cwd,
+        patchText: "*** Begin Patch\n*** Add File: ../escaped.txt\n+blocked\n*** End Patch",
+      });
+      expect(applied.ok).toBeFalse();
+      if (!applied.ok) expect(applied.error).toContain("ENOTDIR");
+      await expect(readFile(path.join(root, "escaped.txt"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      expect(await readFile(cwd, "utf8")).toBe("original");
     },
     TEST_TIMEOUT_MS,
   );

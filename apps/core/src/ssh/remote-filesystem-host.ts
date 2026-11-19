@@ -77,6 +77,7 @@ const walkSchema = z.object({
       isDirectory: z.boolean(),
       type: fileTypeSchema.optional(),
       size: z.number().optional(),
+      metadataError: fsErrorSchema.optional(),
     }),
   ),
   truncated: z.boolean(),
@@ -230,7 +231,7 @@ function remoteSearchBackend(context: CallContext): SearchBackend {
           maxEntries: options.maxEntries,
           denyPaths: [...options.denyPaths],
           dangerouslyAllow: options.dangerouslyAllow,
-          withStats: true,
+          withStats: options.withStats ?? false,
         },
         globSchema,
       );
@@ -309,43 +310,47 @@ async function remoteGlobWalk(
     },
     walkSchema,
   );
-  return listed.map((listing) => {
-    const paths: string[] = [];
-    const entries: HostGlobEntry[] = [];
-    const pruned = new Set<string>();
-    let truncated = false;
-    const underPruned = (entryPath: string) => {
-      let parent = entryPath;
-      while (parent.includes("/")) {
-        parent = parent.slice(0, parent.lastIndexOf("/"));
-        if (pruned.has(parent)) return true;
-      }
-      return false;
-    };
-    for (const entry of listing.entries) {
-      if (truncated) break;
-      if (underPruned(entry.path)) {
-        if (entry.isDirectory) pruned.add(entry.path);
-        continue;
-      }
-      if (matchesAnyGlob(entry.path, params.excludes)) {
-        if (entry.isDirectory) pruned.add(entry.path);
-        continue;
-      }
-      if (!matchesAnyGlob(entry.path, params.includes)) continue;
-      const count = params.withStats ? entries.length : paths.length;
-      if (count >= params.maxEntries) {
-        truncated = true;
-        break;
-      }
-      if (!params.withStats) {
-        paths.push(entry.path);
-      } else if (entry.type !== undefined && entry.size !== undefined) {
-        entries.push({ path: entry.path, type: entry.type, size: entry.size });
-      }
+  if (listed.isErr()) return Result.err(listed.error);
+  const listing = listed.value;
+  const paths: string[] = [];
+  const entries: HostGlobEntry[] = [];
+  const pruned = new Set<string>();
+  let truncated = false;
+  const underPruned = (entryPath: string) => {
+    let parent = entryPath;
+    while (parent.includes("/")) {
+      parent = parent.slice(0, parent.lastIndexOf("/"));
+      if (pruned.has(parent)) return true;
     }
-    return { paths, entries, truncated: truncated || listing.truncated };
-  });
+    return false;
+  };
+  for (const entry of listing.entries) {
+    if (truncated) break;
+    if (underPruned(entry.path)) {
+      if (entry.isDirectory) pruned.add(entry.path);
+      continue;
+    }
+    if (matchesAnyGlob(entry.path, params.excludes)) {
+      if (entry.isDirectory) pruned.add(entry.path);
+      continue;
+    }
+    if (!matchesAnyGlob(entry.path, params.includes)) continue;
+    const count = params.withStats ? entries.length : paths.length;
+    if (count >= params.maxEntries) {
+      truncated = true;
+      break;
+    }
+    if (!params.withStats) {
+      paths.push(entry.path);
+      continue;
+    }
+    if (entry.metadataError) {
+      return Result.err(failure("stat", entry.metadataError.code, entry.metadataError.message));
+    }
+    if (entry.type === undefined || entry.size === undefined) continue;
+    entries.push({ path: entry.path, type: entry.type, size: entry.size });
+  }
+  return Result.ok({ paths, entries, truncated: truncated || listing.truncated });
 }
 
 /**

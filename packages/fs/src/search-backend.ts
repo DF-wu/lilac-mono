@@ -63,6 +63,7 @@ export type SearchBackend = {
     denyPaths: readonly string[];
     dangerouslyAllow: boolean;
     cacheDir?: string;
+    withStats?: boolean;
   }): Promise<GlobSearchResult | null>;
 };
 

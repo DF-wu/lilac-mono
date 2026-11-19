@@ -1,8 +1,10 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import fsPromises from "node:fs/promises";
 import { mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { FileSystem } from "../src";
+import { nodeFileSystemHost } from "../src/node-host";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -57,4 +59,50 @@ test("prefix limits are strict and whole-file results retain their existing shap
   const complete = await fs.readFileBytes({ path: "small.txt" });
   expect(complete).toMatchObject({ success: true, bytesLength: 5 });
   expect(complete).not.toHaveProperty("totalBytes");
+});
+
+test("whole-file limits reject growth between preflight stat and opening the read handle", async () => {
+  const root = await fixture();
+  const file = path.join(root, "growing.txt");
+  await writeFile(file, Buffer.alloc(900, 97));
+  const fs = new FileSystem(root, {
+    host: {
+      ...nodeFileSystemHost,
+      async stat(target) {
+        const stats = await nodeFileSystemHost.stat(target);
+        await writeFile(file, Buffer.alloc(2000, 97));
+        return stats;
+      },
+    },
+  });
+  const result = await fs.readFileBytes({ path: file, maxBytes: 1000 });
+  expect(result).toMatchObject({ success: false, error: { code: "MEDIA_TOO_LARGE" } });
+});
+
+test("whole-file reads detect growth after the opened handle reports its initial size", async () => {
+  const root = await fixture();
+  const file = path.join(root, "growing-after-open.txt");
+  await writeFile(file, Buffer.alloc(900, 97));
+  const originalOpen = fsPromises.open;
+  const opened = spyOn(fsPromises, "open").mockImplementation(async (...args) => {
+    const handle = await originalOpen(...args);
+    const originalStat = handle.stat.bind(handle);
+    spyOn(handle, "stat").mockImplementationOnce(
+      new Proxy(originalStat, {
+        async apply(target, receiver, args) {
+          const stats: unknown = await Reflect.apply(target, receiver, args);
+          await writeFile(file, Buffer.alloc(2000, 97));
+          return stats;
+        },
+      }),
+    );
+    return handle;
+  });
+  try {
+    const result = await new FileSystem(root).readFileBytes({ path: file, maxBytes: 1000 });
+    expect(result.success).toBeFalse();
+    if (!result.success) expect(result.error.code).toBe("MEDIA_TOO_LARGE");
+  } finally {
+    opened.mockRestore();
+  }
 });

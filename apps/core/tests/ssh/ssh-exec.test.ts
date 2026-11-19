@@ -4,6 +4,8 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { z } from "zod";
+import { Panic } from "better-result";
+import { BufferedFileSink } from "@stanley2058/lilac-coding-tools/buffered-file-sink";
 import type { Tool } from "ai";
 
 import { invalidateRemoteRunner } from "../../src/ssh/remote-runner-deploy";
@@ -329,6 +331,107 @@ exit 0
     expect((await stat(stderrPath)).mode & 0o777).toBe(0o600);
   });
 
+  for (const cleanupPanics of [false, true]) {
+    it(`closes and removes an open overflow file when later activity panics${cleanupPanics ? " and cleanup panics" : ""}`, async () => {
+      const overflowPath = path.join(tempDir, "panic-overflow.part");
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(Buffer.from("overflow"));
+          controller.enqueue(Buffer.from("next"));
+          controller.close();
+        },
+      });
+      const panic = new Panic({ message: "activity invariant" });
+      const originalAbort = BufferedFileSink.prototype.abort;
+      const abort = spyOn(BufferedFileSink.prototype, "abort").mockImplementation(
+        async function (this: BufferedFileSink) {
+          await originalAbort.call(this);
+          if (cleanupPanics) throw new Panic({ message: "cleanup invariant" });
+        },
+      );
+      let activities = 0;
+      try {
+        await expect(
+          readStreamTextCapped(stream, 1, {
+            overflowFilePath: overflowPath,
+            onActivity: () => {
+              activities++;
+              if (activities === 2) throw panic;
+            },
+          }),
+        ).rejects.toBe(panic);
+        expect(abort).toHaveBeenCalledTimes(1);
+        await expect(stat(overflowPath)).rejects.toThrow();
+        expect(stream.locked).toBeFalse();
+      } finally {
+        abort.mockRestore();
+      }
+    });
+  }
+
+  it("preserves the activity Panic when releasing the reader also panics", async () => {
+    const overflowPath = path.join(tempDir, "dual-panic-overflow.part");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(Buffer.from("overflow"));
+        controller.enqueue(Buffer.from("next"));
+        controller.close();
+      },
+    });
+    const reader = stream.getReader();
+    const release = reader.releaseLock.bind(reader);
+    const panic = new Panic({ message: "activity invariant" });
+    const acquire = spyOn(stream, "getReader").mockReturnValue(reader);
+    const releaseSpy = spyOn(reader, "releaseLock").mockImplementation(() => {
+      release();
+      throw new Panic({ message: "reader release invariant" });
+    });
+    let activities = 0;
+    try {
+      await expect(
+        readStreamTextCapped(stream, 1, {
+          overflowFilePath: overflowPath,
+          onActivity: () => {
+            activities++;
+            if (activities === 2) throw panic;
+          },
+        }),
+      ).rejects.toBe(panic);
+      await expect(stat(overflowPath)).rejects.toThrow();
+      expect(stream.locked).toBeFalse();
+    } finally {
+      acquire.mockRestore();
+      releaseSpy.mockRestore();
+    }
+  });
+
+  it("keeps a completed overflow file when releasing the reader panics", async () => {
+    const overflowPath = path.join(tempDir, "completed-overflow.part");
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(Buffer.from("complete"));
+        controller.close();
+      },
+    });
+    const reader = stream.getReader();
+    const release = reader.releaseLock.bind(reader);
+    const panic = new Panic({ message: "reader release invariant" });
+    const acquire = spyOn(stream, "getReader").mockReturnValue(reader);
+    const releaseSpy = spyOn(reader, "releaseLock").mockImplementation(() => {
+      release();
+      throw panic;
+    });
+    try {
+      await expect(
+        readStreamTextCapped(stream, 1, { overflowFilePath: overflowPath }),
+      ).rejects.toBe(panic);
+      expect(await readFile(overflowPath, "utf8")).toBe("complete");
+    } finally {
+      acquire.mockRestore();
+      releaseSpy.mockRestore();
+    }
+  });
+
   it("retains exact non-ASCII, BOM, and malformed UTF-8 bytes in streaming overflow", async () => {
     const overflowPath = path.join(tempDir, "stream-bytes.part");
     const bytes = Uint8Array.from([
@@ -446,7 +549,9 @@ exit 0
     });
 
     // Depending on what is cached for the host, the failure surfaces before or after path resolution.
-    expect(readOutput.resolvedPath).toMatch(/^ssh:\/\/fakehost\/(.*\/)?missing\.ts$/);
+    expect(["ssh://fakehost/missing.ts", `ssh://fakehost${tempDir}/missing.ts`]).toContain(
+      readOutput.resolvedPath,
+    );
     expect(readOutput.error.message).toContain("code 23");
     expect(patchOutput.ok).toBeFalse();
     if (!patchOutput.ok) expect(patchOutput.error).toContain("code 23");

@@ -104,3 +104,25 @@ export function rejectNestedContinuationThroughSatisfiesHandlers(text: string): 
   } satisfies { err: (error: Error) => () => number; ok: (value: number) => () => number };
   return readCount(text).match<() => number>(handlers)();
 }
+
+export function permitReassignedResultMatch(): number {
+  let parsed = readCount("a");
+  const first = parsed.match({ ok: (value) => value, err: () => 0 });
+  parsed = readCount("bb");
+  return first + parsed.match({ ok: (value) => value, err: () => 0 });
+}
+
+export function permitReassignedStaticResultMatch(): number {
+  let parsed = readCount("a");
+  const handlers = { ok: (value: number) => value, err: () => 0 };
+  const first = Result.match(parsed, handlers);
+  parsed = readCount("bb");
+  return first + Result.match(parsed, handlers);
+}
+
+export function rejectRepeatedMutableResultMatch(): number {
+  let parsed = readCount("a");
+  parsed = readCount("bb");
+  const first = parsed.match({ ok: (value) => value, err: () => 0 });
+  return first + parsed.match({ ok: (value) => value, err: () => 0 });
+}

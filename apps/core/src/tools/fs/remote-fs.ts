@@ -213,6 +213,7 @@ export async function remoteGrep(params: {
 }): Promise<ResultType<RemoteGrepOutput, RemoteFsExecutionError>> {
   return await withRemoteFileSystem(params, (fileSystem) =>
     fileSystem.grep({
+      reportedFilePath: params.cwd,
       pattern: params.input.pattern,
       regex: params.input.regex,
       maxResults: params.input.maxResults,

@@ -50,7 +50,7 @@ Language: [`English (primary / canonical)`](../README.md) · [`Traditional Chine
 | Document | Contents |
 | --- | --- |
 | [`../AGENTS.md`](../AGENTS.md) | Repository commands, test rules, and TypeScript conventions |
-| [`../packages/remote-fs-runner/README.md`](../packages/remote-fs-runner/README.md) | Remote filesystem helper used by Core SSH tools |
+| [`../DEVELOPMENT.md#remote-runner`](../DEVELOPMENT.md#remote-runner) | Native Rust runner used by Core SSH tools: builds, toolchain, and parity tests |
 | [`agents/issue-tracker.md`](./agents/issue-tracker.md) | How open and deferred work is tracked in local Markdown files and when issue documents are removed |
 
 > [!NOTE]
