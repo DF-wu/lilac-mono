@@ -87,6 +87,50 @@ describe("native search authority", () => {
     db.query("DELETE FROM native_records WHERE kind='turn' AND thread_id=?").run(origin.id);
     expect(search.query("alice", { query: "needle" }).unwrap().items).toEqual([]);
   });
+  test("reading thread context only decodes turns in the requested thread", () => {
+    const origin = thread("alice", "origin", "needle");
+    const unrelated = thread("alice", "unrelated", "other text");
+    store
+      .appendMessage(origin.id, 0, origin.turnId, {
+        id: "context",
+        role: "assistant",
+        parts: [{ type: "text", text: "context without the search term" }],
+      })
+      .unwrap();
+    db.run("UPDATE native_records SET data_json='invalid JSON' WHERE kind='turn' AND id=?", [
+      unrelated.turnId,
+    ]);
+
+    const first = messages.readThread("alice", origin.id, { limit: 1 }).unwrap();
+    const second = messages.readThread("alice", origin.id, { offset: 1, limit: 1 }).unwrap();
+    expect(first.messages.map(({ text, ordinal }) => ({ text, ordinal }))).toEqual([
+      { text: "needle", ordinal: 0 },
+    ]);
+    expect(second.messages.map(({ messageId, ordinal }) => ({ messageId, ordinal }))).toEqual([
+      { messageId: "context", ordinal: 1 },
+    ]);
+    expect(second.total).toBe(2);
+    expect(second.startMessageId).toBe(first.messages[0]!.messageId);
+    expect(second.endMessageId).toBe("context");
+  });
+  test("thread-scoped search keeps ordinals from the full thread before filtering", () => {
+    const origin = thread("alice", "origin", "context");
+    thread("alice", "unrelated", "needle");
+    store
+      .appendMessage(origin.id, 0, origin.turnId, {
+        id: "match",
+        role: "assistant",
+        parts: [{ type: "text", text: "needle" }],
+      })
+      .unwrap();
+
+    const hits = messages
+      .searchMessages("alice", { threadId: origin.id, query: "needle", limit: 10 })
+      .unwrap();
+    expect(
+      hits.map(({ threadId, messageId, ordinal }) => ({ threadId, messageId, ordinal })),
+    ).toEqual([{ threadId: origin.id, messageId: "match", ordinal: 1 }]);
+  });
   test("native discovery surrounds only visible matches and validates time windows", () => {
     thread("owner", "secret", "needle private");
     const origin = thread("alice", "origin", "needle visible");
