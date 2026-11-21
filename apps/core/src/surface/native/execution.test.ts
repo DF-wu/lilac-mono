@@ -1,4 +1,5 @@
 import { projectAssistantTextHistory } from "../bridge/request-composition/normalization";
+import { JobStoreFailed } from "../../jobs/job-store";
 import { NativeQuestions } from "./questions";
 import { describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
@@ -161,6 +162,7 @@ function fixture(
     };
   };
   return {
+    database,
     store,
     surface,
     transcripts,
@@ -1682,6 +1684,24 @@ describe("native turn transcripts", () => {
     }
   });
 
+  test("trims a full predecessor before joining turn rows at a later canonical start", async () => {
+    const { f, finish, send } = harness("mixed");
+    try {
+      await send(1_000);
+      await finish();
+      await send(2_000);
+      await finish();
+      f.setMaxAge(1_500);
+      expect((await send(3_000)).history).toEqual(["m2", "a2", "m3"]);
+      await finish();
+      expect((await send(3_600)).history).toEqual(["m3", "a3", "m4"]);
+      await finish(undefined, "replaced");
+      expect((await send(4_700)).history).toEqual(["m4", "a4", "m5"]);
+    } finally {
+      f.close();
+    }
+  });
+
   test("retains repaired history across successive canonical starts", async () => {
     const { f, finish, send } = harness("turn");
     try {
@@ -1981,7 +2001,7 @@ function rewindFixture() {
     historyGeneration: 0,
     revision: value(f.store.getThreadRecord(f.thread.id)).revision,
   };
-  return { ...f, rewindRequest: request };
+  return { ...f, rewindRequest: request, rewindInput: value(f.store.getInput(input.inputId)) };
 }
 
 test("retrying a completed DM rewind leaves a newer run alone", async () => {
@@ -2190,9 +2210,10 @@ test("restart recovery suppresses discarded jobs using the persisted rewind rece
     },
     runner: () => ({ cancelNativeSession: async () => Result.ok(undefined) }),
     jobs: {
-      stopSessionJobsSince: async (...args: [string, number, "thread_rewound"]) => {
+      stopSessionRequests: async (...args: [string, readonly string[], "thread_rewound"]) => {
         expect(value(f.store.getThreadRecord(f.thread.id)).mutationPending).toBe(true);
         stopped.push(args);
+        return Result.ok(undefined);
       },
     } as unknown as NonNullable<Parameters<typeof createNativeExecution>[0]["jobs"]>,
   });
@@ -2200,8 +2221,147 @@ test("restart recovery suppresses discarded jobs using the persisted rewind rece
     value(f.store.beginRewind("owner", f.rewindRequest));
     value(await execution.recoverMutations());
     value(await execution.recoverMutations());
-    expect(stopped).toEqual([[`native:${f.thread.id}`, 1000, "thread_rewound"]]);
+    expect(stopped).toEqual([
+      [`native:${f.thread.id}`, [f.rewindInput.requestId], "thread_rewound"],
+    ]);
     expect(value(f.store.getThreadRecord(f.thread.id)).mutationPending).toBe(false);
+  } finally {
+    f.close();
+  }
+});
+
+test.each([false, true])(
+  "rewind suppression failure stays pending and retries (recovery: %s)",
+  async (recovery) => {
+    const f = rewindFixture();
+    let attempts = 0;
+    const execution = createNativeExecution({
+      store: f.store,
+      transcriptStore: f.transcripts,
+      bus: {
+        publish: async () => {
+          throw new Error("unexpected publication");
+        },
+      },
+      runner: () => ({ cancelNativeSession: async () => Result.ok(undefined) }),
+      jobs: {
+        stopSession: async () => undefined,
+        stopSessionRequests: async (_session, requests) => {
+          expect(requests).toEqual([f.rewindInput.requestId]);
+          attempts++;
+          return attempts === 1
+            ? Result.err(
+                new JobStoreFailed({
+                  operation: "suppress",
+                  code: "SQLITE_BUSY",
+                  message: "suppression unavailable",
+                }),
+              )
+            : Result.ok(undefined);
+        },
+      },
+    });
+    try {
+      if (recovery) value(f.store.beginRewind("owner", f.rewindRequest));
+      const run = async () =>
+        recovery
+          ? execution.recoverMutations()
+          : (await execution.rewind("owner", f.rewindRequest)).map(() => undefined);
+      expect((await run()).isErr()).toBe(true);
+      expect(value(f.store.getThreadRecord(f.thread.id)).mutationPending).toBe(true);
+      value(await run());
+      value(await run());
+      expect(attempts).toBe(2);
+      expect(value(f.store.getThreadRecord(f.thread.id)).mutationPending).toBe(false);
+    } finally {
+      f.close();
+    }
+  },
+);
+
+test("superseded rewind receipts cannot return an old draft", async () => {
+  const f = rewindFixture();
+  try {
+    value(await f.execution.rewind("owner", f.rewindRequest));
+    const next = f.submit("second draft");
+    value(f.store.settleInput(next.inputId, "admitted"));
+    value(
+      f.store.projectTurn(f.thread.id, 1, "settle_second", next.turnId!, (slot) =>
+        Result.ok({ slot: { ...slot, state: "complete", settledAt: 1000 }, changes: [] }),
+      ),
+    );
+    value(f.store.markInputCompleted(next.inputId));
+    value(
+      await f.execution.rewind("owner", {
+        ...f.rewindRequest,
+        commandId: "second-rewind",
+        turnId: next.turnId!,
+        historyGeneration: 1,
+        revision: value(f.store.getThreadRecord(f.thread.id)).revision,
+      }),
+    );
+    expect(
+      (await f.execution.rewind("owner", f.rewindRequest)).match({
+        ok: () => "unexpected draft",
+        err: (error) => error.message,
+      }),
+    ).toBe("Rewind receipt belongs to superseded history");
+  } finally {
+    f.close();
+  }
+});
+
+test("legacy rewind without the target ownership record remains pending", async () => {
+  const f = rewindFixture();
+  try {
+    value(f.store.beginRewind("owner", f.rewindRequest));
+    f.database
+      .query("DELETE FROM native_records WHERE kind='input' AND id=?")
+      .run(f.rewindInput.id);
+    expect(
+      (await f.execution.recoverMutations()).match({
+        ok: () => "unexpected completion",
+        err: (error) => error.message,
+      }),
+    ).toBe("Rewind job ownership is unavailable");
+    expect(value(f.store.getThreadRecord(f.thread.id)).mutationPending).toBe(true);
+  } finally {
+    f.close();
+  }
+});
+
+test("rewind receipt ownership excludes retained turns and their steering inputs", async () => {
+  const f = fixture();
+  try {
+    const a = f.submit("retain A");
+    value(await f.execution.kick(f.thread.id));
+    const b = f.submit("discard B", "followup");
+    f.submit("steer A after B queued", "steer");
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...f.request(),
+        requestClient: "native",
+        messages: [
+          { role: "user", content: "retain A" },
+          { role: "assistant", content: "retained answer" },
+        ],
+      }),
+    );
+    value(f.store.markInputCompleted(a.inputId));
+    value(f.store.setActiveRun(f.thread.id, 0, undefined));
+    value(await f.execution.kick(f.thread.id));
+    const bInput = value(f.store.getInput(b.inputId));
+    value(
+      f.store.beginRewind("owner", {
+        threadId: f.thread.id,
+        commandId: "owned-rewind",
+        turnId: bInput.turnId!,
+        historyGeneration: 0,
+        revision: value(f.store.getThreadRecord(f.thread.id)).revision,
+      }),
+    );
+    expect(value(f.store.getRewindRequestIds(f.thread.id, 1))).toEqual([bInput.requestId]);
+    expect(value(f.store.getTurnPosition(a.turnId!))).toBeGreaterThanOrEqual(0);
   } finally {
     f.close();
   }

@@ -32,7 +32,7 @@ apps/core/src/runtime/create-core-runtime.ts  # constructs and registers the Tel
 apps/core/src/runtime/main.ts  # settles Core creation/start Results through the fork-owned startCoreRuntime helper
 apps/core/src/ssh/ssh-exec.ts  # PR119: preserves bounded output drain and handles cancelled dispatch, async stdin failures, Panic cleanup, and surviving process-group helpers
 apps/core/src/surface/adapter.ts  # adds the optional attachment-resolver capability and resolve-attachment operation
-apps/core/src/surface/bridge/bus-agent-runner.ts  # retains Telegram authority and fork delivery fixes; PR120 adds a user continuation after thinking repair removes a terminal tool result
+apps/core/src/surface/bridge/bus-agent-runner.ts  # retains Telegram authority and fork delivery fixes; PR120 adds thinking continuation, drains after failed settlement publication, safely drains active cancellation, and refreshes native heartbeat overlays while preserving Discord lineage
 apps/core/src/surface/bridge/bus-agent-runner/auto-inject-thread-search.ts  # F01–F08/F14/F15: Surface registration/origin/resource seams on current upstream shared owners
 apps/core/src/surface/bridge/request-composition/attachments.ts  # resolves Telegram attachment refs during composition
 apps/core/src/surface/bridge/request-composition/normalization.ts  # preserves Telegram metadata and removes adjacent Discord attribution headers idempotently during thinking repair
@@ -41,7 +41,7 @@ apps/core/src/surface/bridge/subscribe-from-bus.ts  # platform-generic relay ref
 apps/core/src/surface/builtin-surface-protocols.ts  # registers telegramSurfaceProtocol in the closed catalog
 apps/core/src/surface/native/runtime.ts  # composes the opt-in fork-owned Discord recorder at native ingress and shutdown
 apps/core/src/surface/native/store-search.ts  # scope the message projection before decoding turns for single-thread search and context reads
-apps/core/src/surface/native/store.ts  # preserves fork native search and mirror contracts; derives pending rewind job cutoff from existing command receipts without changing stored data
+apps/core/src/surface/native/store.ts  # preserves fork native search and mirror contracts; derives discarded request ownership from retained cancelled inputs and existing receipts, failing closed on missing ownership without changing stored data
 apps/core/src/surface/native/push.test.ts  # updates the native schema upgrade regression for durable Discord child routing
 
 # --- OpenAI web.search provider (staged for an upstream contribution; remove once accepted)
@@ -221,7 +221,7 @@ packages/fs/src/node-host.ts  # PR119: reads a bounded prefix from the opened ha
 apps/remote-runner/src/fsops.rs  # PR119: bounded prefix reads observe growth after opened-handle metadata
 
 # PR #120 verified integration fixes
-apps/core/src/surface/native/execution.ts  # drains queued input after a final failed cancellation and replays rewind job suppression before clearing mutation state
+apps/core/src/surface/native/execution.ts  # drains input only after runner cancellation settles, trims canonical predecessor windows, rejects superseded rewind receipts, and keeps suppression failures pending
 apps/core/tests/agent/anthropic-thinking-recovery.test.ts  # adjacent attribution normalization is complete and idempotent
 apps/web/src/components/Chat.tsx  # keeps the composer disabled during a running rewind across navigation and preserves the originating draft key when retaining files
 apps/web/src/components/Composer.tsx  # aborts pending message-paste downloads when rewind replaces the draft
@@ -229,3 +229,7 @@ apps/web/src/uploads.ts  # retained files without a reference get cancellable re
 apps/web/src/use-dm-rewind.ts  # retries one unchanged history page after a transient failure so rewind availability can recover online
 apps/web/tests/uploads.test.ts  # retained-file retry reaches reservation/upload and exact expiry uses a fixed clock
 apps/core/tests/tool-server-health-state.test.ts  # isolates dependency fatal-streak assertions from real main-isolate memory accumulated during full-suite workers
+apps/core/src/jobs/job-service.ts  # PR120: selects discarded service jobs by request ownership, propagates suppression errors and reselects pending events on retry
+apps/core/tests/jobs/job-service.test.ts  # PR120: retained jobs survive overlapping timestamps and partial suppression retries are idempotent
+apps/core/tests/surface/bridge/bus-agent-runner-recovery.test.ts  # PR120: repaired recovery uses only a readable marked predecessor and preserves the consumed retry marker
+apps/core/tests/surface/native/job-lifecycle.test.ts  # PR120: real native rewind integration assigns actual retained/discarded request owners and overlaps job creation times

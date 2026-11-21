@@ -2043,9 +2043,14 @@ describe("durable accepted runner recovery", () => {
     }
   });
 
-  it.each([false, true])(
-    "keeps repair consumed on unavailable checkpoint (%s)",
-    async (repaired) => {
+  it.each([
+    [false, false, false],
+    [true, false, false],
+    [true, true, false],
+    [true, true, true],
+  ])(
+    "keeps repair consumed on unavailable checkpoint (head repaired: %s, predecessor repaired: %s, missing: %s)",
+    async (repaired, previousRepaired, previousMissing) => {
       const bus = createLilacBus(createInMemoryRawBus());
       let level1RequestContext:
         | Parameters<CoreToolPluginManager["buildLevel1ToolsetResult"]>[0]["requestContext"]
@@ -2058,6 +2063,7 @@ describe("durable accepted runner recovery", () => {
       let observedTools: string[] = [];
       let resets = 0;
       let promotions = 0;
+      let savedRepair: boolean | undefined;
       const journal = {
         openRun: (owner: {
           readonly requestDeliveryId: string;
@@ -2070,12 +2076,18 @@ describe("durable accepted runner recovery", () => {
             sessionId: owner.sessionId,
             sequence: 1,
           }),
-        writeCheckpoint: (handle: {
-          readonly runId: string;
-          readonly requestId: string;
-          readonly sessionId: string;
-          readonly sequence: number;
-        }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+        writeCheckpoint: (
+          handle: {
+            readonly runId: string;
+            readonly requestId: string;
+            readonly sessionId: string;
+            readonly sequence: number;
+          },
+          checkpoint: { anthropicThinkingRepaired?: boolean },
+        ) => {
+          savedRepair = checkpoint.anthropicThinkingRepaired;
+          return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+        },
         promotePreviousCheckpoint: (handle: {
           readonly runId: string;
           readonly requestId: string;
@@ -2181,7 +2193,26 @@ describe("durable accepted runner recovery", () => {
         },
         previousCheckpoint: {
           version: 1,
-          messages: [{ role: "user", content: "previous safe checkpoint" }],
+          anthropicThinkingRepaired: previousRepaired,
+          messages: previousMissing
+            ? [
+                {
+                  role: "assistant",
+                  content: [
+                    {
+                      type: "blob",
+                      blob: {
+                        version: 1,
+                        objectId: `b1_${"55".repeat(16)}`,
+                        sha256: "66".repeat(32),
+                        byteLength: 1,
+                      },
+                      mediaType: "image/png",
+                    },
+                  ],
+                },
+              ]
+            : [{ role: "user", content: "previous safe checkpoint" }],
           loadedCatalogIds: ["catalog-id"],
           currentTurnUserId: "checkpoint-user",
           retainedRequestDeliveries: [],
@@ -2193,7 +2224,7 @@ describe("durable accepted runner recovery", () => {
       try {
         transcriptResultValue(await runner.resumeAcceptedDelivery(accepted, head));
         runner.activate();
-        if (repaired) {
+        if (repaired && (!previousRepaired || previousMissing)) {
           expect(await lifecycle.terminal).toBe("failed");
           expect(observedPrompt).toBe("");
           expect(promotions).toBe(0);
@@ -2201,6 +2232,8 @@ describe("durable accepted runner recovery", () => {
         }
         await modelCalled.promise;
         expect(promotions).toBe(1);
+        await lifecycle.terminal;
+        expect(savedRepair === true).toBe(previousRepaired);
         expect(resets).toBe(0);
         expect(observedPrompt).toContain("previous safe checkpoint");
         expect(observedPrompt).not.toContain("accepted floor");

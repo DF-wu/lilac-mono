@@ -6,7 +6,7 @@ import { Result } from "better-result";
 
 import { JOB_LIMITS, type JobOwner, type JobRecord } from "../../src/jobs/job-domain";
 import { JobService, type JobWakeDelivery } from "../../src/jobs/job-service";
-import { SqliteJobStore } from "../../src/jobs/job-store";
+import { JobStoreFailed, SqliteJobStore } from "../../src/jobs/job-store";
 
 const owner: JobOwner = {
   requestId: "request-1",
@@ -298,15 +298,58 @@ describe("JobService", () => {
     expect(service.hasPendingEvents(owner.sessionId)).toBe(false);
   });
 
-  it("stops only jobs from the rewound turns", async () => {
-    const earlier = ok<JobRecord>(await start(service, "sleep 60", { mode: "service" }));
-    const later = ok<JobRecord>(await start(service, "sleep 60", { mode: "service" }));
-    const cutoff = later.createdAt + 1;
-    await service.stopSessionJobsSince(owner.sessionId, cutoff, "thread_rewound");
-    expect(ok<JobRecord | null>(store.get(earlier.jobId))?.status).toBe("running");
-
-    await service.stopSessionJobsSince(owner.sessionId, later.createdAt, "thread_rewound");
-    expect(ok<JobRecord | null>(store.get(later.jobId))?.stopReason).toBe("thread_rewound");
+  it("rewind selects request owners despite overlapping timestamps and retries pending suppression", async () => {
+    const discardedOwner = { ...owner, requestId: "discarded" };
+    // Both retained jobs start after the discarded input could have been queued.
+    const retained = ok<JobRecord>(await start(service, "sleep 60", { mode: "service" }));
+    const retainedEvent = ok<JobRecord>(await start(service, "true", { mode: "service" }));
+    const discarded = ok<JobRecord>(
+      await start(service, "sleep 60", { mode: "service", owner: discardedOwner }),
+    );
+    const discardedEvent = ok<JobRecord>(
+      await start(service, "true", { mode: "service", owner: discardedOwner }),
+    );
+    await untilEnded(service, retainedEvent.jobId);
+    await untilEnded(service, discardedEvent.jobId);
+    const suppress = spyOn(store, "suppress").mockReturnValueOnce(
+      Result.err(
+        new JobStoreFailed({ operation: "suppress", code: "SQLITE_BUSY", message: "busy" }),
+      ),
+    );
+    try {
+      expect(
+        (
+          await service.stopSessionRequests(
+            owner.sessionId,
+            [discardedOwner.requestId],
+            "thread_rewound",
+          )
+        ).isErr(),
+      ).toBe(true);
+      expect(ok<JobRecord | null>(store.get(discarded.jobId))?.stopReason).toBe("thread_rewound");
+      expect(ok<JobRecord | null>(store.get(discardedEvent.jobId))?.delivery).toBe("pending");
+      ok(
+        await service.stopSessionRequests(
+          owner.sessionId,
+          [discardedOwner.requestId],
+          "thread_rewound",
+        ),
+      );
+      ok(
+        await service.stopSessionRequests(
+          owner.sessionId,
+          [discardedOwner.requestId],
+          "thread_rewound",
+        ),
+      );
+      expect(ok<JobRecord | null>(store.get(discardedEvent.jobId))?.delivery).toBe("suppressed");
+      expect(ok<JobRecord | null>(store.get(retained.jobId))?.status).toBe("running");
+      expect(ok<JobRecord | null>(store.get(retainedEvent.jobId))?.delivery).toBe("pending");
+      expect(suppress.mock.calls[1]?.[0]).toEqual([discardedEvent.jobId]);
+      expect(suppress.mock.calls[2]?.[0]).toEqual([]);
+    } finally {
+      suppress.mockRestore();
+    }
   });
 
   describe("after a restart", () => {

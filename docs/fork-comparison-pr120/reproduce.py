@@ -11,6 +11,7 @@ from pathlib import Path
 
 FORK = "4d8c0a8d799fcacd8aa51ca7613f48d7bb3f2327"
 UPSTREAM = "7613d519643005ee4574c085a534c74af9508f88"
+FIRST_PUBLISHED = "3292b12b99992aa648b28aa2b00252098aeb4663"
 BASE = "90d71dbe9a2a86d8b0a39513e9eb67d65eb93683"
 OUT = Path(__file__).resolve().parent
 ROOT = OUT.parent.parent
@@ -73,6 +74,8 @@ def category(path):
         return "F12 and U02 provider execution, search and history"
     if "store-search" in p or p.endswith("/surface/native/search.test.ts"):
         return "N01 scoped native conversation search (PR121)"
+    if p in ("apps/core/src/jobs/job-service.ts", "apps/core/tests/jobs/job-service.test.ts", "apps/core/tests/surface/native/job-lifecycle.test.ts"):
+        return "U01 native rewind job ownership and suppression"
     if "rewind" in p or p.endswith("/client-protocol/src/domain.ts") or p.endswith("/client-protocol/src/index.ts"):
         return "U01 incoming native DM rewind and protocol"
     if "cache" in p and p.startswith("apps/web/"):
@@ -157,10 +160,31 @@ def footprint(ref, snapshots, base_ref):
                       for p, reason in sorted(entries.items())])
 
 
+def validate_worktree_base(head):
+    if head == FORK:
+        assert git("rev-parse", "MERGE_HEAD") == UPSTREAM, "Unexpected MERGE_HEAD"
+        return
+    for pin in (FORK, UPSTREAM):
+        subprocess.run(["git", "merge-base", "--is-ancestor", pin, head], cwd=ROOT, check=True)
+    merging = subprocess.run(["git", "rev-parse", "--verify", "MERGE_HEAD"], cwd=ROOT,
+                             capture_output=True, text=True)
+    assert merging.returncode != 0, "Finish the active merge before capturing a follow-up candidate"
+
+
 def candidate_ref(args):
     if args.candidate_worktree:
-        assert git("rev-parse", "HEAD") == FORK, "Unexpected integration HEAD"
-        assert git("rev-parse", "MERGE_HEAD") == UPSTREAM, "Unexpected MERGE_HEAD"
+        head = git("rev-parse", "HEAD")
+        validate_worktree_base(head)
+        indexed_links = {}
+        for entry in git("ls-files", "--stage", "-z").split("\0"):
+            if not entry:
+                continue
+            metadata, path = entry.split("\t", 1)
+            mode, oid, stage = metadata.split()
+            if mode == "160000":
+                indexed_links[path] = dict(mode=mode, kind="commit", oid=oid)
+        expected_links = {p: obj for p, obj in tree(head).items() if obj["mode"] == "160000"}
+        assert indexed_links == expected_links, "Staged gitlink changes cannot be excluded from the candidate snapshot"
         assert not git("ls-files", "-u"), "Resolve the real index conflicts first"
         # A disposable index leaves the actual merge index and all worktree bytes untouched.
         with tempfile.TemporaryDirectory(prefix="lilac-pr120-index-") as directory:
@@ -168,7 +192,7 @@ def candidate_ref(args):
             def staged(*argv):
                 return subprocess.check_output(["git", "-c", "submodule.recurse=false", *argv],
                                                cwd=ROOT, env=env).decode().strip()
-            staged("read-tree", FORK)
+            staged("read-tree", head)
             staged("add", "--all", "--", ".", ":(exclude)ref")
             return staged("write-tree")
     if not args.candidate:
@@ -180,8 +204,7 @@ def candidate_ref(args):
         for pin in (FORK, UPSTREAM):
             subprocess.run(["git", "merge-base", "--is-ancestor", pin, ref], cwd=ROOT, check=True)
         return ref
-    assert git("rev-parse", "HEAD") == FORK and git("rev-parse", "MERGE_HEAD") == UPSTREAM, \
-        "A tree-only candidate requires the exact uncommitted merge parents"
+    validate_worktree_base(git("rev-parse", "HEAD"))
     return git("rev-parse", "--verify", f"{args.candidate}^{{tree}}")
 
 
@@ -198,12 +221,12 @@ def counts(values):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group()
-    source.add_argument("--candidate", help="Resolved descendant commit, or tree with exact merge parents")
-    source.add_argument("--candidate-worktree", action="store_true", help="Snapshot the exact uncommitted merge with a temporary index")
+    source.add_argument("--candidate", help="Resolved descendant commit or tree based on a verified integration HEAD")
+    source.add_argument("--candidate-worktree", action="store_true", help="Snapshot the merge or post-merge worktree with a temporary index")
     parser.add_argument("--check", action="store_true", help="Check generated files byte for byte without writing")
     args = parser.parse_args()
     assert git("merge-base", FORK, UPSTREAM) == BASE
-    refs = dict(base=BASE, fork=FORK, upstream=UPSTREAM)
+    refs = dict(base=BASE, fork=FORK, upstream=UPSTREAM, firstPublished=FIRST_PUBLISHED)
     snapshots = {key: tree(ref) for key, ref in refs.items()}
     candidate = candidate_ref(args)
     if candidate:
@@ -214,8 +237,8 @@ def main():
     pairs = [("baseToFork", BASE, FORK), ("baseToUpstream", BASE, UPSTREAM), ("upstreamToFork", UPSTREAM, FORK)]
     if candidate:
         c = snapshots["candidate"]
-        comparisons.update(forkToCandidate=delta(f, c), upstreamToCandidate=delta(u, c))
-        pairs += [("forkToCandidate", FORK, candidate), ("upstreamToCandidate", UPSTREAM, candidate)]
+        comparisons.update(forkToCandidate=delta(f, c), upstreamToCandidate=delta(u, c), firstPublishedToCandidate=delta(snapshots["firstPublished"], c))
+        pairs += [("forkToCandidate", FORK, candidate), ("upstreamToCandidate", UPSTREAM, candidate), ("firstPublishedToCandidate", FIRST_PUBLISHED, candidate)]
     # Independent Git comparisons include execute modes and gitlinks, without rename heuristics.
     for key, left, right in pairs:
         expected_paths = set(filter(None, git("diff", "--name-only", "--no-renames", "-z", left, right).split("\0")))
@@ -274,7 +297,7 @@ def main():
             omittedEvidenceContentPaths=sorted(EVIDENCE),
             identity="Complete candidate tree except evidence-output content; presence and modes remain inventoried")
     lines = ["# Pinned PR #120 path inventory", "", "Generated by [reproduce.py](reproduce.py). Read the [capability comparison](../fork-differences.md) and [verification record](VERIFICATION.md) for behavior and test evidence.", "",
-             "B/F/U columns are immutable committed baselines. Candidate columns describe the explicitly supplied resolved commit/tree or temporary-index snapshot. A blob/mode delta establishes source differences, not feature ownership or a passed test. `A/M/D/T` describes the right tree relative to the left; `=` means equal. Rename detection is disabled.", "", "## Pins and scope", "", "| Role | Full SHA |", "| --- | --- |"]
+             "B/F/U and firstPublished (C1) columns are immutable committed baselines. Candidate (C) columns describe the final resolved commit/tree or temporary-index snapshot. C1 is the first published integration, not a deployment claim. A blob/mode delta establishes source differences, not feature ownership or a passed test. `A/M/D/T` describes the right tree relative to the left; `=` means equal. Rename detection is disabled.", "", "## Pins and scope", "", "| Role | Full SHA |", "| --- | --- |"]
     for key, ref in refs.items():
         repo = "stanley2058" if key in ("base", "upstream") else "DF-wu"
         lines.append(f"| {key} | [`{ref}`](https://github.com/{repo}/lilac-mono/commit/{ref}) |")
@@ -288,15 +311,15 @@ def main():
     for key, d in payload["comparisons"].items():
         lines.append(f"| {key} | {d['paths']} | {d['statuses']} |")
     lines += ["", f"Union: **{len(rows)} changed paths**. Baseline trial merge has **{len(conflict_paths)} textual conflict** ({', '.join('`'+p+'`' for p in conflict_paths) or 'none'}). Its diagnostic tree is never the candidate.", "", "## Reproduce and refresh", "", "From the repository root:", "", "```sh",
-              "# Before committing: requires HEAD=F and MERGE_HEAD=U; snapshots without changing the real index.",
+              "# Before a follow-up commit: HEAD must contain F and U; snapshots without changing the real index.",
               "python3 docs/fork-comparison-pr120/reproduce.py --candidate-worktree",
               "python3 docs/fork-comparison-pr120/reproduce.py --candidate-worktree --check",
-              "# A precomputed write-tree object also works while those exact merge parents are present:",
+              "# A precomputed write-tree object also works on the validated integration checkout:",
               "python3 docs/fork-comparison-pr120/reproduce.py --candidate <tree-object> --check",
               "# After committing/publishing: verifies both pinned parents are ancestors.",
               "python3 docs/fork-comparison-pr120/reproduce.py --candidate HEAD --check",
               "```", "",
-              "The helper writes only PATH-INVENTORY.md and inventory.json. `--check` compares both byte for byte; it never writes them. With no candidate option it produces only the historical B/F/U ledger and therefore does not match this combined report. Temporary-index mode includes tracked changes and nonignored additions, preserves ref gitlinks without opening submodules, and creates only Git tree/blob objects, never commits. Reproduction also uses the repository's already-installed oxfmt to match the JSON formatting gate; install the existing frozen dev dependencies first. The helper never downloads tooling. No network is needed during reproduction. Prefix commands with the repository's required wrapper where applicable.", "",
+              "The helper writes only PATH-INVENTORY.md and inventory.json. `--check` compares both byte for byte; it never writes them. With no candidate option it produces only the historical B/F/U/C1 ledger and therefore does not match this combined report. Temporary-index mode includes tracked changes and nonignored additions, preserves HEAD gitlinks without opening submodules and rejects differing staged gitlinks, and creates only Git tree/blob objects, never commits. Reproduction also uses the repository's already-installed oxfmt to match the JSON formatting gate; install the existing frozen dev dependencies first. The helper never downloads tooling. No network is needed during reproduction. Prefix commands with the repository's required wrapper where applicable.", "",
               "Every path/status set is checked independently with `git diff --name-only` and `--name-status --no-renames -z`. The JSON includes complete-tree mode/kind counts, all gitlinks and exact policy reasons. Candidate-only files must have a named category; duplicate/empty policy rows fail. Historical [PR101 evidence](../fork-integration-20261111/PATH-INVENTORY.md) remains unchanged.", "", "## Complete tree mode and kind counts", "", "| Snapshot | Paths | Modes | Object kinds |", "| --- | ---: | --- | --- |"]
     for key, values in payload["treeCounts"].items():
         lines.append(f"| {key} | {values['paths']} | {values['modes']} | {values['kinds']} |")
@@ -309,7 +332,7 @@ def main():
         path = row["path"]
         link = f"[{path}](../../{path})" if path in snapshots.get("candidate", f) else f"`{path}`"
         lines.append("| " + link + " | " + " | ".join(row["changes"][key] for key in keys) + f" | {row['state']} | {row.get('candidateDisposition', 'not supplied')} | {row['category']} |")
-    lines += ["", "## Every exact footprint row", "", "The unchanged production gate compares the merge base of its fetched upstream ref and HEAD with tracked worktree MDT changes; strict mode also rejects stale policy rows. This deliberately excludes newer upstream work that the fork has not incorporated. Direct-tip comparison is **only** the pinned candidate check here: after a merge commit containing U, its merge base with U is U, so the same policy check is equivalent. During the uncommitted merge HEAD is still F; running the production CLI then uses B and is not an exact U-to-candidate check. Advancing upstream may change the merge base after publication, so rerun the normal CI gate on its fetched refs as well.", ""]
+    lines += ["", "## Every exact footprint row", "", "The unchanged production gate compares the merge base of its fetched upstream ref and HEAD with tracked worktree MDT changes; strict mode also rejects stale policy rows. This deliberately excludes newer upstream work that the fork has not incorporated. Direct-tip comparison is **only** the pinned candidate check here: after a merge commit containing U, its merge base with U is U, so the same policy check is equivalent. During the original uncommitted merge HEAD was F and the CLI used B. C1 and its follow-ups contain U, so the normal pinned-U CLI now checks the exact candidate. Advancing upstream may change the merge base after publication, so rerun the normal CI gate on its fetched refs as well.", ""]
     for name, fp in footprints.items():
         lines += [f"### {name}", "", f"Comparison base `{fp['comparisonBase']}`: **{len(fp['rows'])} policy rows; {len(fp['covered'])} covered, {len(fp['unlisted'])} unlisted, {len(fp['stale'])} stale**.", "", "| Path | Gate state | Category | Exact policy reason |", "| --- | --- | --- | --- |"]
         for row in fp["rows"]:

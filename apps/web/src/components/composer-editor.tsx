@@ -727,6 +727,12 @@ const ComposerEditorInstance = memo(function ComposerEditorInstance(
       if (!seenAttachments.current.has(attachment.key) && !references.has(attachment.key))
         insertEditorAttachment(editor, attachment);
     }
+    // Silent post-send clearing retains undo atoms; keep their reference-only records too.
+    editor.state.doc.descendants((node) => {
+      if (node.type.name !== "composer_attachment") return;
+      const attachment = attachments.find((item) => item.key === node.attrs.attachmentKey);
+      if (attachment) historyAttachments.current.set(node, attachment);
+    });
     seenAttachments.current = keys;
     referencedAttachments.current = editorAttachmentKeys(editor.state.doc);
   }, [editor, attachments, props.loadingDraft]);

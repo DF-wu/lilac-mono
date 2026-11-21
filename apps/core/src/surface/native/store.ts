@@ -2979,30 +2979,41 @@ export class NativeStore {
     );
   }
 
-  /** Rewind cancels the target's input but keeps its record, so this still answers afterwards. */
-  getTurnInputCreatedAt(threadId: string, turnId: string): NativeStoreResult<number | null> {
-    return nativeStoreTransaction(this.db, () =>
-      this.readRows(
-        "SELECT * FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.turnId')=? AND json_extract(data_json,'$.value.mode')!='steer' LIMIT 1",
-        [threadId, turnId],
-      ).map((rows) => {
-        const input = rows[0];
-        return input?.kind === "input" ? input.value.createdAt : null;
-      }),
-    );
-  }
-
-  /** The existing command receipt survives a crash after the target turn is removed. */
-  getRewindCutoff(threadId: string, historyGeneration: number): NativeStoreResult<number | null> {
+  /** Recover ownership from the unchanged receipt and retained cancelled full-input records. */
+  getRewindRequestIds(threadId: string, historyGeneration: number): NativeStoreResult<string[]> {
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
         const commands = yield* this.readRows(
-          "SELECT * FROM native_records WHERE kind='command' AND thread_id=? AND json_extract(data_json,'$.value.result.historyGeneration')=? AND json_extract(data_json,'$.value.result.turnId') IS NOT NULL LIMIT 1",
+          "SELECT * FROM native_records WHERE kind='command' AND thread_id=? AND json_extract(data_json,'$.value.result.historyGeneration')=? AND json_extract(data_json,'$.value.result.turnId') IS NOT NULL",
           [threadId, historyGeneration],
         );
         const command = commands[0];
-        if (command?.kind !== "command" || !command.value.result.turnId) return Result.ok(null);
-        return this.getTurnInputCreatedAt(threadId, command.value.result.turnId);
+        if (commands.length !== 1 || command?.kind !== "command" || !command.value.result.turnId)
+          return Result.err(nativeFailure("conflict", "Rewind job ownership is unavailable"));
+        const targets = yield* this.readRows(
+          "SELECT * FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.turnId')=? AND json_extract(data_json,'$.value.mode')!='steer'",
+          [threadId, command.value.result.turnId],
+        );
+        const target = targets[0];
+        if (
+          targets.length !== 1 ||
+          target?.kind !== "input" ||
+          target.value.state !== "canceled" ||
+          target.value.historyGeneration >= historyGeneration
+        )
+          return Result.err(nativeFailure("conflict", "Rewind job ownership is unavailable"));
+        // Input positions are monotonic. A retained turn is never selected, even across old generations.
+        // Legacy receipts without their target input fail closed; timestamps cannot prove ownership.
+        const inputs = yield* this.readRows(
+          "SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND i.position>=? AND json_extract(i.data_json,'$.value.historyGeneration')<? AND json_extract(i.data_json,'$.value.state')='canceled' AND json_extract(i.data_json,'$.value.mode')!='steer' AND NOT EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.thread_id=i.thread_id AND t.id=json_extract(i.data_json,'$.value.turnId')) ORDER BY i.position",
+          [threadId, target.value.position, historyGeneration],
+        );
+        const ids = inputs.flatMap((record) =>
+          record.kind === "input" ? [record.value.requestId] : [],
+        );
+        if (!ids.includes(target.value.requestId))
+          return Result.err(nativeFailure("conflict", "Rewind job ownership is unavailable"));
+        return Result.ok(ids);
       }, this),
     );
   }

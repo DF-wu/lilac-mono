@@ -24,6 +24,7 @@ import {
   EventPublishTransportFailed,
   lilacEventTypes,
   outReqTopic,
+  storedMessagesV1Schema,
   type CoreLineageManifestV2,
   type Message,
 } from "@stanley2058/lilac-event-bus";
@@ -5859,3 +5860,78 @@ it("keeps the custom command result in response-only transcripts with heartbeat 
     await rm(dataDir, { recursive: true, force: true });
   }
 });
+
+it.each([false, true])(
+  "native prompts remove prior heartbeat overlays (enabled: %s)",
+  async (enabled) => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    const config = parseCoreConfigV2ToUniversal({});
+    config.surface.heartbeat.enabled = enabled;
+    const requestId = "native:heartbeat-history:current";
+    let prompt = "";
+    const runner = await startBusAgentRunner({
+      bus,
+      config,
+      pluginManager,
+      subscriptionId: "native-heartbeat-history",
+      startPaused: true,
+      reportFatalPanic: (panic) => {
+        throw panic;
+      },
+      nativeExecution: {
+        validate: () => Result.ok({ safetyMode: "restricted" }),
+        settled: async () => Result.ok(undefined),
+      },
+      issueHeartbeatCapability: () => "heartbeat-fixture",
+      issueControlCapability: () => ({ capability: "native-fixture", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "native-heartbeat-history",
+            doStream: async (call) => {
+              prompt = JSON.stringify(call.prompt);
+              return level1TextStep("done");
+            },
+          }),
+        }),
+    });
+    const historical = buildGeneratedMessage({
+      kind: "heartbeat_context",
+      id: "previous:heartbeat-context",
+      content: "stale-heartbeat-source",
+    });
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    try {
+      transcriptResultValue(
+        await runner.resumeAcceptedDelivery(
+          acceptedRunnerDelivery({
+            requestDeliveryId: crypto.randomUUID(),
+            requestId,
+            sessionId: "native:heartbeat-history",
+            requestClient: "native",
+            queue: "prompt",
+            messages: [
+              { role: "user", content: "previous turn" },
+              storedMessagesV1Schema.parse([historical])[0]!,
+              { role: "assistant", content: "previous answer" },
+              { role: "user", content: "current turn" },
+            ],
+          }),
+        ),
+      );
+      runner.activate();
+      expect(await lifecycle.terminal).toBe("resolved");
+      expect(prompt).toContain("previous answer");
+      expect(prompt).not.toContain("stale-heartbeat-source");
+      expect(prompt.includes(`sourceRequestId='${requestId}'`)).toBe(enabled);
+      expect(generatedMessageMetadata(historical)?.id).toBe("previous:heartbeat-context");
+    } finally {
+      await lifecycle.stop();
+      await runner.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  },
+);

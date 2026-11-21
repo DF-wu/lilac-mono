@@ -1,135 +1,164 @@
-# Integrated PR #120 verification
+# PR #120 integration and follow-up verification
 
-This record describes the resolved integration candidate C in the [canonical comparison](../fork-differences.md). F remains the shipped Git baseline; C is locally verified and unpublished. It is not evidence of a deployment, hosted CI run or live-provider compatibility. Documentation preparation results from a separate baseline-only tree are not included in candidate pass/fail counts.
+This record distinguishes the fork baseline F, upstream input U, first published integration C1,
+and current integration tree C. It describes source and fixture checks, not deployment or live-provider traffic.
+The [English guide](../fork-differences.md), [Traditional Chinese guide](../fork-differences.zh-TW.md),
+[complete path ledger](PATH-INVENTORY.md) and [JSON inventory](inventory.json) describe the same C.
 
-## Inputs and deliverables
+## Immutable inputs and current tree
 
-| Input | Exact identity |
+| Role | Identity |
 | --- | --- |
 | Fork main F, including PR #121 | `4d8c0a8d799fcacd8aa51ca7613f48d7bb3f2327` |
 | Upstream / PR #120 U | `7613d519643005ee4574c085a534c74af9508f88` |
 | Common ancestor B | `90d71dbe9a2a86d8b0a39513e9eb67d65eb93683` |
-| Candidate C | Content fingerprint and complete mode/path records in [PATH-INVENTORY.md](PATH-INVENTORY.md) and [inventory.json](inventory.json); no invented commit SHA |
+| First published merge C1 | [`3292b12b99992aa648b28aa2b00252098aeb4663`](https://github.com/DF-wu/lilac-mono/commit/3292b12b99992aa648b28aa2b00252098aeb4663), with parents F and U |
+| Current integration C | Content fingerprint and complete path/mode records in the generated ledger; on a clean committed checkout, `--candidate HEAD --check` verifies that commit's tree |
 
-The original merge had one textual conflict in `apps/core/tests/tools/web.test.ts`. Both parent test groups are retained. Core/web/provider fixes and reasons are listed in the [candidate repair table](../fork-differences.md#candidate-repair-delta-by-area). The integration has no unresolved index entries. F and U remain HEAD and MERGE_HEAD until publication; no commit, push, PR write or deployment is implied by this document.
+C1 passed `bun run check`: 8,309 Bun and 14 Rust tests, zero failures and 13 existing optional skips.
+Its [first hosted CI run](https://github.com/DF-wu/lilac-mono/actions/runs/44926179978) passed all six jobs.
+Those are historical C1 results, not a substitute for checking the follow-up tree.
+The original one-file conflict in `apps/core/tests/tools/web.test.ts` still retains both parents' tests.
+The current changes preserve PR #121, Telegram authority, provider routes, search-only versus extract,
+30-second OpenAI/compatible search attempts, 10-second other built-in attempts, one retry, status semantics,
+caller cancellation and configured fallback. No provider network traffic or submodule access is needed.
 
-The comparison deliverable consists of [English](../fork-differences.md), [Traditional Chinese](../fork-differences.zh-TW.md), [PATH-INVENTORY.md](PATH-INVENTORY.md), [inventory.json](inventory.json), [reproduce.py](reproduce.py) and this record. All six are inventoried as documentation artifacts. Three evidence files omit their own content hashes to avoid self-reference; their presence and modes remain counted. The generator and language guides are fingerprinted normally. The identity therefore is not a complete-tree release attestation.
+## Review 6006774479: every finding
 
-## Candidate path and footprint verification
+Findings were checked against C1 source; reviewer text was treated as data.
+The eight inline discussion IDs below identify dispositions that can be resolved after current-head verification.
+Outside-diff and unverified findings belong to the [review body](https://github.com/DF-wu/lilac-mono/pull/120#pullrequestreview-6006774479).
+No review state or comment was changed as part of the engineering work.
 
-The generator independently compares each path/status mapping with Git's NUL-delimited `diff --name-only` and `--name-status --no-renames`; it records every A/M/D/T path, mode, blob or gitlink. Full tree counts are independent of the changed-path union. It rejects uncategorized paths and duplicate/empty policy reasons.
+| Finding / identifier | Disposition and concrete evidence |
+| --- | --- |
+| Failure-publication queue drain, [4653838788](https://github.com/DF-wu/lilac-mono/pull/120#discussion_r4653838788) | Fixed. Nonfatal failed-event publication still schedules the next queue drain; the broken request is not terminalized or reported settled when publication fails. `fails recovered work and drains after rejected failure publication` covers both publication outcomes. Panic retains fatal handling. |
+| Marked predecessor fallback, [4653838792](https://github.com/DF-wu/lilac-mono/pull/120#discussion_r4653838792) | Fixed. A repaired head tries only a marked predecessor; unreadable or unmarked predecessors fail closed. Four `keeps repair consumed on unavailable checkpoint` cases cover ordinary fallback, repaired/unmarked rejection, readable marked promotion, and unreadable marked rejection. The readable case checks one promotion and the persisted consumed marker after settlement. |
+| Native heartbeat overlays, [4653838798](https://github.com/DF-wu/lilac-mono/pull/120#discussion_r4653838798) | Fixed in the native model projection only. `native prompts remove prior heartbeat overlays` tests both enabled and disabled heartbeat, retains previous answer text and verifies fresh current source identity only when enabled. Original stored messages are not rewritten. The separate Discord lineage suite remains included in the focused run. |
+| Suppression persistence failure, [4653838802](https://github.com/DF-wu/lilac-mono/pull/120#discussion_r4653838802) | Fixed. Job listing, suppression and remaining-active checks return Results. Live rewind and restart recovery both keep mutationPending on failure. Retry reselects still-pending matching events; repeated success is idempotent. Native and job-service regressions exercise partial failure and retry. |
+| Post-send attachment Undo, [4653838803](https://github.com/DF-wu/lilac-mono/pull/120#discussion_r4653838803) | Fixed. Existing attachment synchronization associates outgoing reference records with undo atoms before silent clear. The real ComposerEditor browser fixture reproduces failure before the fix and passes post-send Undo, rewind Undo and attachment sendability afterwards. No editor-history reset or new state store. |
+| Omitted staged gitlinks, [4653838809](https://github.com/DF-wu/lilac-mono/pull/120#discussion_r4653838809) | Fixed by rejection. Snapshot capture compares real-index gitlink paths/modes/OIDs against the verified HEAD before excluding ref. A disposable-index changed-gitlink case is rejected; unchanged post-merge capture passes without opening submodules or changing the real index. |
+| Stale candidate status / commands, [4653838811](https://github.com/DF-wu/lilac-mono/pull/120#discussion_r4653838811) | Fixed in both guides and ledger. C1 is a committed/published two-parent merge. C is the current content snapshot, with a separate C1-to-C comparison. Clean committed checkouts use `--candidate HEAD --check`; edited follow-ups use the supported temporary-index worktree mode. |
+| Rewind blockers documentation, [4653838812](https://github.com/DF-wu/lilac-mono/pull/120#discussion_r4653838812) | Fixed in [native operations](../native-surface.md#permanent-direct-conversation). Existing blockers are retained; cancellation in progress and undelivered external sends are listed even when no external message is visible or the originating request settled. Store policy is unchanged. |
+| Outside diff: request ownership, `execution.ts:806-811`, review marker `02bd5697379752bbaafcffd3` | Fixed without a new stored contract. The existing receipt identifies the target; retained cancelled full-input records identify discarded request owners. Service jobs belonging to retained turns survive even when created after a queued discarded input. Job-service tests cover retained active jobs and pending events with overlapping timestamps. Native ownership tests exclude retained steering and exercise restart recovery. |
+| Outside diff: canonical predecessor trim, `execution.ts:194-195`, marker `f218666d4a7b616670c9fd1e` | Fixed. Prove and trim predecessor history to the canonical start before appending it. The new mixed full/turn-row regression originally lost the entire non-DM prefix; it now retains the expected fourth-turn pair. Existing full/turn/mixed, compaction, repaired-prefix and DM tests remain included. Missing boundary proof retains the empty fallback. |
+| Outside diff: superseded receipt, `execution.ts:838-839`, marker `90cb15b42d0fce4ebc53650b` | Fixed. Receipt generation must equal the current thread generation before returning its draft. The two-rewind regression rejects the old receipt; same-generation lost-response replay and later active-run preservation still pass. |
+| Explicitly unverified cancellation note, `execution.ts:776`, marker `061a78af57cc66efcf77b73e` | Confirmed by the actual runner: C1 returned from queued rejection before calling activeRun.cancel or awaiting sessionDrainOperations. Fixed at the runner owner: accumulate the rejection failure, cancel the active run, await its drain, then return the original error. `drains the active native run even when queued rejection fails` uses a real runner, observes its abort before return and checks the rejection cause. The existing overlapping-cancellation execution case remains covered; the execution kick is safe because runner errors now follow the drain. |
 
-| Comparison | Paths and statuses |
+## Receipt compatibility and safe failure
+
+Rewind receipts, input records and database schemas are unchanged. Recovery requires exactly one matching
+receipt and one retained cancelled full-input target from an older generation. Monotonic input positions,
+request IDs, cancelled state and absence of a retained turn identify the discarded full requests;
+steering records never become owners of a retained run's jobs. Job selection is by session and request
+ownership and is limited to service jobs. It never uses input or job creation timestamps.
+
+A legacy receipt with a missing/ambiguous target record cannot prove ownership. Recovery returns
+`Rewind job ownership is unavailable` and leaves mutationPending set. It does not stop retained jobs or
+clear the mutation by guessing. The regression deletes the target record from a local fixture and proves
+this behavior. Transient job-store errors likewise leave the existing mutation eligible for retry.
+No new queue, journal, recovery worker, persisted field or migration was added. Deletion retains its existing
+whole-session cleanup path. These are operational failure results, not an automatic repair of corrupt state.
+
+## Exact comparison and reproduction
+
+| Comparison | Paths / statuses |
 | --- | --- |
 | B → F | 371: 160 A / 207 M / 4 D |
 | B → U | 147: 26 A / 121 M |
 | U → F | 494: 160 A / 304 M / 30 D |
-| F → C | 157: 31 A / 126 M |
-| U → C | 384: 165 A / 215 M / 4 D |
-| Combined union | 500 paths, including the six current comparison artifacts |
-| Candidate complete tree | 2,263 paths: 2,248 regular 100644 files, seven 100755 executables, one 120000 symlink, seven 160000 gitlinks |
-| Candidate exact footprint against U | 219 policy rows, 219 covered, zero unlisted, zero stale |
+| F → C | 161: 31 A / 130 M |
+| U → C | 388: 165 A / 219 M / 4 D |
+| Combined union | 503 paths; C1 → C is independently recorded in the ledger |
+| Complete candidate tree | 2,263 paths: 2,248 mode 100644, seven 100755, one 120000, seven 160000 |
+| Exact pinned footprint | 223 covered, zero unlisted, zero stale |
 
-All seven gitlinks and `.gitmodules` match B/F/U/C. No submodule was fetched, initialized or read. The four U → C deletions are historical previous-release fixtures, not removal of current workflow APIs. The inventory names generated/schema/bundle artifacts separately.
-
-The production checker and original fixture tests remain exactly as at F. Their merge-base semantics intentionally exclude upstream changes not yet incorporated by the fork, including newer upstream commits fetched by CI. Direct comparison with latest upstream would incorrectly attribute incoming changes to the fork.
-
-During this uncommitted merge, the production CLI still uses B because HEAD=F. It is not the exact U → C check. Executing it now exits 1 with **217 allowed, 92 unlisted, 2 stale**: that is the expected comparison-stage mismatch, not a failure of the exact pinned candidate policy. No checker or allowlist relaxation was used to disguise it. The candidate check instead compares the candidate policy with exactly:
-
-```sh
-git diff --name-only --diff-filter=MDT --no-renames 7613d519643005ee4574c085a534c74af9508f88
-```
-
-Once a merge commit contains U, the normal gate against U has merge base U and is equivalent. Hosted CI must still run the unchanged gate against its actual fetched upstream ref; the pinned local comparison cannot predict a later ref or merge base. Fork additions are outside the footprint gate and remain fully accounted for by this inventory.
-
-## Reproduction before and after publication
+All seven gitlinks and `.gitmodules` remain unchanged at B/F/U/C1/C. No submodule was fetched,
+initialized or opened. The four U-to-C deletions remain historical previous-release fixtures.
+The production footprint checker and original fixture remain unchanged from F. Its merge-base semantics
+exclude incoming upstream work the fork has not taken. Since C1 and its follow-ups contain U, the normal
+strict gate against pinned U now compares exactly U to C. CI must also run against its actual fetched refs.
 
 ```sh
-# Before commit: exact HEAD=F and MERGE_HEAD=U, all source/docs present.
+# Edited follow-up checkout: HEAD must contain both F and U.
 python3 -B docs/fork-comparison-pr120/reproduce.py --candidate-worktree
 python3 -B docs/fork-comparison-pr120/reproduce.py --candidate-worktree --check
-# An explicitly computed temporary-index write-tree object is also accepted:
-python3 -B docs/fork-comparison-pr120/reproduce.py --candidate <tree-object> --check
-# After committing/publishing the same content, without changing the report:
+# Clean committed checkout: verifies the actual commit tree, before or after push.
 python3 -B docs/fork-comparison-pr120/reproduce.py --candidate HEAD --check
-bun run fork:footprint -- --upstream=<fetched-upstream-ref> --strict
+bun run fork:footprint -- --upstream=7613d519643005ee4574c085a534c74af9508f88 --strict
+git diff --check
+git diff --cached --check
 ```
 
-Reproduction uses Python/Git and the repository's already-declared, locally installed oxfmt to produce JSON accepted by the format gate. Install the existing frozen dev dependencies first; the helper never downloads tools. Temporary-index mode starts at F, stages candidate content through a temporary `GIT_INDEX_FILE`, preserves ref gitlinks without entering them, and writes only ordinary Git tree/blob objects. It neither changes the real index nor creates a commit. It includes nonignored new files, so inspect Git status before capturing a candidate. Commit mode requires both F and U as ancestors. Its positive post-commit invocation cannot be exercised until such a candidate commit exists; no synthetic commit was made to claim that result. The existing ancestry checks are exercised by rejecting unintegrated HEAD. `--candidate HEAD` must reject the uncommitted F baseline; it is only a post-merge command. With no candidate argument the helper produces the immutable baseline ledger only, which does not match these combined outputs.
+Worktree mode validates F/U ancestry, starts a temporary GIT_INDEX_FILE at verified HEAD, rejects
+unmerged entries and differing staged gitlinks, and snapshots nonignored source/docs without entering ref.
+The original HEAD=F / MERGE_HEAD=U mode remains supported. Explicit temporary-index tree input is also
+accepted on a validated integration checkout. No synthetic commit is created. Commit input verifies both
+pins as ancestors. The helper uses Python/Git and the existing local oxfmt, never downloaded tooling.
+`--check` compares generated Markdown and JSON byte for byte.
 
-`--check` verifies both generated outputs byte for byte. They contain no transient tree OID, host name, checkout path or timestamp. The content fingerprint is stable across committing the same files because commit identity is not an input. Changing verification prose does not change that fingerprint, but still requires review; changing code, policy, generator or language guides requires regeneration.
+All six comparison artifacts are included. PATH-INVENTORY.md, inventory.json and this record omit their
+own candidate content hashes to avoid self-reference; presence/mode remain counted. The generator,
+both guides and production/test code are fingerprinted normally. This is not a complete-tree release
+attestation: verification prose still needs review. Generated output contains no transient tree OID,
+checkout path, host name, timestamp or invented commit link.
 
-## Integrated engineering evidence
+## Follow-up local verification
 
-These runs used the actual resolved integration, local/injected provider fixtures and fake clocks. No live provider inference was required.
+The focused command covered native execution, job service, runner recovery, session queue, thinking/heartbeat
+and Discord core-primary lineage:
 
-| Command / check | Result |
-| --- | --- |
-| `bun run test:root -- ./apps/core/tests/tools/web.test.ts ./apps/core/tests/tools/web-search-openai.test.ts ./apps/core/tests/tools/web-search-openai-model.test.ts ./apps/core/tests/tools/web-search-firecrawl.test.ts ./apps/core/tests/tools/web-search-exa.test.ts` | 88 pass, zero fail, 279 assertions. Slow OpenAI route tests first failed at the old 10-second deadline. Final tests prove 20-second success, independent 30-second OpenAI attempts, 10-second other-provider attempts, one retry, exact timeout messages and early cancellation. |
-| `bun run test:root -- ./apps/core/tests/agent/anthropic-thinking-recovery.test.ts ./apps/core/tests/surface/bridge/bus-agent-runner.test.ts -t 'repairs Anthropic\|attribution headers'` | 15 pass, zero fail, 151 assertions. Adjacent attribution and tool-ended repair cases failed before their fixes. Checkpoint assertions execute after settlement; newly generated signature is isolated. |
-| `bun run test:root -- ./apps/core/src/surface/native/execution.test.ts` | 71 pass, zero fail, 277 assertions. Failed-overlap draining and recovery job-suppression tests first failed with no publication/suppression. |
-| `bun run test:web -- tests/uploads.test.ts tests/cache.test.ts` | 56 pass, zero fail, 167 assertions after the final originating-draft-key assertion. Attachment-only listing, retained reservation retry and question-draft readiness failed before their fixes. |
-| `bun run test:web` | 820 pass, zero fail, 3,915 assertions across 85 files in the engineering gate. |
-| `bun run test:root -- ./apps/core/tests/tool-server-health-state.test.ts` | 18 pass, zero fail, 60 assertions. The dependency-streak fixture now disables its unrelated ambient main-isolate threshold; production and dedicated memory-limit behavior remain intact. |
-| `bun run typecheck:workspaces` | All workspace typechecks passed on the resolved source. |
-| `bun run lint:architecture` | Semantic gate passed; production syntax gate: zero errors. |
-| `bun run test:all` | Full engineering run passed: 8,284 Bun tests plus 14 Rust tests at that point. The root set then had 39 tests before a subsequently removed checker fixture; this is an earlier run, not the combined-tree total below. |
-| `bun run build:web` | Passed. Existing large Monaco/runtime chunk warnings; no build error. |
-| `bun run check` before the comparison import | Passed: 8,310 Bun tests and 14 Rust tests, zero failures, 13 declared optional skips. That run included one checker fixture subsequently removed to restore CI semantics. The final combined-tree check is recorded below. |
-
-The available Bun is 1.4.5; `packageManager` requests 1.4.4. The installed `1.94` rustup alias lacked Cargo despite listing the musl target, while system PATH selected Rust 1.100. Selecting the already installed patch release through `PATH="$HOME/.cargo/bin:$PATH" RUSTUP_TOOLCHAIN=1.94.1` allowed normal repository musl builds and Rust tests. No host/toolchain configuration was changed and no target or tool installation was needed. This difference is disclosed rather than hidden by a check bypass.
-
-The first combined documentation run had all tests pass but exited 1 because plain Python JSON formatting differed from the repository formatter. The generator now formats through the existing local oxfmt, and byte-for-byte reproduction plus standalone `bun run fmt:check` pass. No formatting rule was disabled.
-
-A full-worker health test once failed because real accumulated main-isolate memory crossed its default limit; its snapshot identified the memory alarm, not a dependency-streak defect. The fixture was isolated with the existing option and rerun. An intermediate browser-fixture format failure was also corrected. Those failures are not counted as passes; the final gate below supersedes them. The separate documentation-only preparation clone's missing dependencies or tooling were never candidate failures.
-
-## Running-web checks
-
-A fresh repository `bun run dev:web` fixture served synthetic data. Desktop and mobile checks verified:
-
-- Real DM send, settle and rewind restore the original editable prompt.
-- Reference-only attachment undo restores the attachment record and remains sendable.
-- Rewind aborts a held message-paste download; completing it later does not change the restored draft.
-- A held rewind keeps the composer disabled after navigating away and back, then restores editability on completion.
-- One unchanged failed history-page request retries exactly once and restores availability.
-- File viewer app.ts selection reveals the parent folder and highlights the file; download completed with the expected file name and 8,351 bytes.
-- The standalone gallery DM demo disables busy rewind and restores the prompt in its available state; desktop and mobile layout/composer/sidebar interactions were inspected.
-
-The reusable browser check [rewind-regressions.js](../../apps/web/tests/support/rewind-regressions.js) mounts the real component/hook, waits on DOM conditions, cleans up its roots and returns two passing results. Run it from the repository development browser:
-
-```js
-await (await import('/tests/support/rewind-regressions.js')).verifyRewindRegressions()
+```sh
+bun run test:root -- ./apps/core/src/surface/native/execution.test.ts ./apps/core/tests/jobs/job-service.test.ts ./apps/core/tests/surface/bridge/bus-agent-runner-recovery.test.ts ./apps/core/tests/surface/bridge/bus-agent-runner-session-queue.test.ts ./apps/core/tests/surface/bridge/bus-agent-runner.test.ts ./apps/core/tests/surface/bridge/bus-agent-runner-core-primary.test.ts --only-failures
 ```
 
-Screenshots were inspected during integration. Final app snapshots showed meaningful content, no framework error overlay and no relevant console errors. No numeric production performance baseline or provider-network claim is inferred from these checks. This documentation refresh does not change rendered UI behavior.
+Result: **315 pass, zero fail, 1,389 assertions**, six files. `bun run typecheck:workspaces` passed.
+A deliberately restored pre-fix runner branch stranded the next request during the red experiment and
+required terminating that test process; this was not counted as a passing run. Stale-receipt and mixed
+canonical-prefix regressions failed their expected assertions before the fixes. Browser post-send Undo
+failed with a missing reference record before capture was added. Initial test-fixture type errors and a
+flat-control-flow lint error were corrected; final gate results below supersede intermediate failures.
 
-## Final combined-tree verification
+A fresh `bun run dev:web` fixture exercised real components with synthetic data. The reusable
+[rewind browser fixture](../../apps/web/tests/support/rewind-regressions.js) returned three passes:
+reference-only rewind Undo, reference-only post-send Undo and bounded failed-history-page retry.
+Run `await (await import('/tests/support/rewind-regressions.js')).verifyRewindRegressions()` in the
+fixture development browser. Browser checks require no live providers. Screenshots remain local verification artifacts rather than committed host paths. The real DM flow
+uploaded a synthetic file, reloaded to obtain a reference-only draft, sent it, then used Undo; its chip
+returned with Send enabled on desktop and mobile. No overflow or framework overlay appeared. Repeated
+dev mounting/resizing emitted ResizeObserver-loop notifications and one Tiptap flushSync warning; these
+did not block Undo and were not hidden. No numeric production performance claim is made.
 
-The complete source plus these six refreshed artifacts is checked together. Repository checks use `PATH="$HOME/.cargo/bin:$PATH" RUSTUP_TOOLCHAIN=1.94.1 bun run check`; the final result is **exit 0**. This is the candidate tree, not the earlier documentation-only clone.
+The full gate first exposed the old native job-lifecycle fixture's placeholder job owner. It was
+corrected to bind jobs to their actual retained/discarded requests while making their timestamps overlap.
+`bun run test:root -- ./apps/core/tests/surface/native/job-lifecycle.test.ts --only-failures` then passed
+**9 tests / 23 assertions**. This corrects the fixture's ownership model; production selection was not relaxed.
+The initial combined command ended with exit 143 after that failure; it is not counted as a successful run.
 
-| Evidence check | Actual integrated result |
-| --- | --- |
-| Restored checker and original fixture | Both byte-identical to F; focused fixture suite: **4 pass, zero fail, 10 assertions**. |
-| Exact pinned footprint using the existing policy parser/comparator | **219 covered, zero unlisted, zero stale**, against the exact worktree MDT set relative to U. |
-| Raw Git working-tree status sets vs inventory | F → C: 157 paths (31 A / 126 M); U → C: 384 paths (165 A / 215 M / 4 D). Every path and status agrees independently of the generator. |
-| Independent temporary-index tree | 2,263 paths, all mode/kind counts agree; seven unchanged gitlinks; real merge-index digest unchanged by snapshot generation. |
-| Baseline preservation | All 494 original B/F/U object/status rows, fixed pins, baseline comparison counts, generated-artifact set and conflict ledger match the imported baseline evidence. |
-| Worktree and explicit tree-input reproduction | Regeneration produced identical Markdown/JSON bytes; both `--candidate-worktree --check` and `--candidate <tree-object> --check` passed. |
-| Generator helper cases | A/M/D/type/executable-mode classification, duplicate/empty policy rejection, evidence-content hash omission and unintegrated `--candidate HEAD` rejection passed without synthetic commits. |
-| Documentation links and public object references | 681 relative links/anchors, three pinned GitHub SHA URL targets and 64 plain public commit references resolve locally. Seven gitlink OIDs are verified as tree entries only, without fetching their commits. |
-| Private-artifact scan | Six artifacts contain no host checkout paths, loopback/private host names, fixture passwords, token-shaped credentials, private keys or internal thread links. |
-| Whitespace | `git diff --check` and `git diff --cached --check` pass. |
+## Final combined-tree checks
 
-Final combined `bun run check`: **8,309 Bun tests and 14 Rust tests passed, zero failures; 13 declared optional skips**. Core: 4,757 tests / 25,925 assertions. Web: 820 tests / 3,915 assertions. Root: 39 tests after restoring the original checker fixture. Architecture: 114 tests / 1,174 assertions. Generated-code checks, lint/semantic architecture/production syntax, custom-media source/bundle tests, all typechecks and formatting passed. The skips are the existing optional container, installer and real-S3 cases; no new skip was added.
+`PATH="$HOME/.cargo/bin:$PATH" RUSTUP_TOOLCHAIN=1.94.1 bun run check` completed with **exit 0**:
+**8,321 Bun tests plus 14 Rust tests passed, zero failures, 13 existing optional skips**.
+This includes all generated-code checks, lint/architecture/production syntax, custom-media source/bundle
+checks, workspace and extra typechecks, formatting, 820 web tests and 114 architecture tests.
+`bun run build:web` also passed; the existing large-chunk warning remains.
+Bun was 1.4.5 (manifest 1.4.4); the explicitly selected already-installed Cargo/Rust was 1.94.1.
+No toolchain installation, host configuration change, or check bypass was required.
 
-Candidate content fingerprint: `a1f880156e222701be3fb687229c20bf56bd81325ea4c22be1f7a6ef92b8bd44`. The six comparison artifacts were present in the tested tree; the final verification-result prose was filled from actual output afterwards and is deliberately outside the fingerprint. Reproduction and whitespace were rechecked after filling it. Earlier engineering totals include the removed checker fixture and must not be substituted for this combined total.
+The complete source and six comparison artifacts were present for this check; final verification-result
+prose was filled from actual output afterwards and is one of the deliberate evidence-hash exclusions.
+Byte-for-byte regeneration, raw Git status/mode comparison, strict pinned footprint, baseline preservation,
+relative links/anchors, privacy scan and whitespace were rerun after filling it. The generator snapshot
+checks include unchanged real-index bytes and a changed gitlink rejected through a disposable index.
+All 500 C1 ledger rows retain their exact B/F/U objects and statuses; current extra rows are explicit.
+C1's historical pass is not substituted for the new result. Hosted CI must run on the actual new PR head;
+no later result is inferred here.
 
-The first exploratory link scan tried to resolve gitlink OIDs as locally present commits; the corrected check recognizes their Git-tree semantics and validates the entries without submodule access. No missing documentation link was found.
+## Remaining limits
 
-## Limits and remaining publication work
-
-The candidate is uncommitted and unpublished. Hosted exact-commit CI, image/Docker smoke, dedicated e2e, real-S3 and deployment checks remain separate; optional suite skips are reported, not fabricated. Live provider traffic was not exercised.
-
-The only deferred review finding is Exa transport cancellation: `exa-js@2.11.0` has no supported signal argument on its search/request APIs. The existing abort wrapper bounds tool waiting and caller cancellation; the underlying SDK request can remain in flight. Replacing or patching the dependency is a separate scoped decision, unnecessary for the verified caller-visible policy. A second consecutive history-page failure remains bounded at two automatic requests; existing Load more/reconnect/navigation can retry later.
-
-No essential fix requires a new product or persistent-contract decision. Publication still requires its own approval and exact-commit verification. Preserve both pins, the complete ledger and the shipped-versus-candidate distinction when refreshing after publication.
+Exa SDK transport cancellation remains the separately accepted open finding and is unchanged in this
+follow-up. The existing wrapper cancels tool waiting; exa-js 2.11.0 has no supported request-signal API,
+so its HTTP request can remain in flight. No provider inference, deployment or new release was exercised.
+Optional container/installer/real-S3 cases remain subject to their normal repository mechanisms.
+No essential repair requires a new product or stored-data decision; missing legacy ownership deliberately
+fails closed rather than broadening cleanup to retained jobs.

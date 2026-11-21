@@ -33,7 +33,7 @@ function waitForDom(host, condition) {
   });
 }
 
-async function verifyReferenceUndo() {
+async function verifyReferenceUndo(sent = false) {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
@@ -51,7 +51,14 @@ async function verifyReferenceUndo() {
     const [text, setText] = useState("[A.txt](attachment:reference-a)");
     const [attachments, setAttachments] = useState([record]);
     const [replacement, setReplacement] = useState();
-    replace = () => setReplacement({ id: Symbol(), documentKey: "draft", text: "Restored prompt" });
+    replace = () => {
+      if (sent) {
+        setText("");
+        setAttachments([]);
+        return;
+      }
+      setReplacement({ id: Symbol(), documentKey: "draft", text: "Restored prompt" });
+    };
     return React.createElement(ComposerEditor, {
       ref,
       text,
@@ -86,7 +93,9 @@ async function verifyReferenceUndo() {
     await waitForDom(host, () => ref.current && host.querySelector('[data-ui="composer-input"]'));
     assert(!ref.current.hasMissingAttachments(), "Initial reference is unavailable");
     replace();
-    await waitForDom(host, () => host.textContent.includes("Restored prompt"));
+    await waitForDom(host, () =>
+      sent ? !host.textContent.includes("A.txt") : host.textContent.includes("Restored prompt"),
+    );
     host.querySelector('[data-ui="composer-input"]').dispatchEvent(
       new KeyboardEvent("keydown", {
         key: "z",
@@ -97,12 +106,17 @@ async function verifyReferenceUndo() {
       }),
     );
     await waitForDom(host, () => host.textContent.includes("A.txt"));
-    assert(!ref.current.hasMissingAttachments(), "Rewind undo lost the reference-only attachment");
+    assert(
+      !ref.current.hasMissingAttachments(),
+      sent
+        ? "Post-send undo lost the reference-only attachment"
+        : "Rewind undo lost the reference-only attachment",
+    );
     assert(
       restored[0]?.reference?.resourceId === "resource-a",
       "Undo did not restore the attachment record",
     );
-    return "reference-only rewind undo: pass";
+    return sent ? "reference-only post-send undo: pass" : "reference-only rewind undo: pass";
   } finally {
     root.unmount();
     host.remove();
@@ -182,5 +196,5 @@ async function verifyHistoryRetry() {
 }
 
 export async function verifyRewindRegressions() {
-  return [await verifyReferenceUndo(), await verifyHistoryRetry()];
+  return [await verifyReferenceUndo(), await verifyReferenceUndo(true), await verifyHistoryRetry()];
 }

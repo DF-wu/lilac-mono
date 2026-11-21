@@ -254,8 +254,10 @@ while a reply runs.
 Bootstrap creates it on first use. Its history stays available indefinitely. Sharing, renaming,
 archiving, deletion, and storage-retention cleanup do not apply to this conversation.
 The latest full user turn can be rewound after completion, failure, or cancellation, until its
-settlement time plus "DM timestamp gap (ms)". Active runs and pending inputs block rewind, as do
-messages from outside the exchange anywhere in the removed history. Each rewind restores the prompt
+settlement time plus "DM timestamp gap (ms)". Active runs, pending inputs, and cancellation still in
+progress block rewind, as do messages from outside the exchange anywhere in the removed history.
+Undelivered external sends also block rewind, even when their originating request has settled and
+no external message is visible in history. Each rewind restores the prompt
 and available attachments to the composer. An unfinished canceled attachment whose local file is
 unavailable becomes a reattachment marker; keep the original file if it may need to be attached again.
 Earlier turns can then be rewound while their original settlement times remain within the window. Rewind does not undo tool effects.

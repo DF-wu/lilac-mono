@@ -20,7 +20,7 @@ import {
   type JobStatus,
   type JobStopReason,
 } from "./job-domain";
-import type { JobStoreError, SqliteJobStore } from "./job-store";
+import { JobStoreFailed, type JobStoreError, type SqliteJobStore } from "./job-store";
 
 const logger = createLogger({ module: "background-jobs" });
 
@@ -410,19 +410,36 @@ export class JobService {
   }
 
   /** Stops the jobs a rewind discarded. Jobs from turns before the target keep running. */
-  async stopSessionJobsSince(
+  async stopSessionRequests(
     sessionId: string,
-    createdAtOrAfter: number,
+    requestIds: readonly string[],
     stopReason: JobStopReason,
-  ): Promise<void> {
-    await this.#stopSessionJobs(sessionId, stopReason, (job) => job.createdAt >= createdAtOrAfter);
-    const pending = this.#listPending(sessionId, "list-pending");
-    this.#store
-      .suppress(pending.filter((job) => job.createdAt >= createdAtOrAfter).map((job) => job.jobId))
-      .match({
-        ok: () => undefined,
-        err: (error) => logStoreFailure("suppress-rewind", error),
-      });
+  ): Promise<ResultType<void, JobStoreError>> {
+    const owners = new Set(requestIds);
+    const selected = (job: JobRecord) => job.mode === "service" && owners.has(job.requestId);
+    return Result.gen(async function* (this: JobService) {
+      const active = yield* this.#store.listActiveForSession(sessionId);
+      await Promise.all(
+        active
+          .filter(selected)
+          .map((job) =>
+            this.#stopRunning(job.jobId, { status: "stopped", stopReason, delivery: "suppressed" }),
+          ),
+      );
+      // Re-read pending events on every attempt, including jobs stopped by an earlier attempt.
+      const pending = yield* this.#store.listPending(sessionId);
+      yield* this.#store.suppress(pending.filter(selected).map((job) => job.jobId));
+      const remaining = yield* this.#store.listActiveForSession(sessionId);
+      if (remaining.some(selected))
+        return Result.err(
+          new JobStoreFailed({
+            operation: "stop-rewind",
+            code: "ACTIVE_JOBS",
+            message: "Discarded jobs have not settled",
+          }),
+        );
+      return Result.ok(undefined);
+    }, this);
   }
 
   /**

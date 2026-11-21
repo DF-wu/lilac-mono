@@ -60,10 +60,10 @@ async function harness() {
     originMessageId: null,
     runProfile: "primary",
   };
-  const startService = async () =>
+  const startService = async (requestId = owner.requestId) =>
     (
       await jobs.start({
-        owner,
+        owner: { ...owner, requestId },
         toolCallId: crypto.randomUUID(),
         mode: "service",
         label: "dev server",
@@ -182,7 +182,6 @@ describe("rewinding", () => {
   test("stops jobs from the discarded turns and keeps earlier ones", async () => {
     const h = await harness();
     try {
-      const kept = await h.startService();
       const submit = async (text: string) => {
         const receipt = await h.client.inputs.submit({
           threadId: h.thread.id,
@@ -200,9 +199,15 @@ describe("rewinding", () => {
         );
         return receipt;
       };
-      await submit("first");
+      const first = await submit("first");
       const target = await submit("second");
-      const discarded = await h.startService();
+      // Both jobs start after the discarded input; only their request ownership distinguishes them.
+      const kept = await h.startService(
+        integrationValue(h.fixture.store.getInput(first.inputId)).requestId,
+      );
+      const discarded = await h.startService(
+        integrationValue(h.fixture.store.getInput(target.inputId)).requestId,
+      );
       if (!target.turnId) throw new Error("Full turn missing stable identity");
       const before = await h.client.threads.sync({ threadId: h.thread.id });
 

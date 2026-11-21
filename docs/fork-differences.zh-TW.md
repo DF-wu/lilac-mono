@@ -11,9 +11,10 @@
 | 已合入的 fork 基準 F | [`4d8c0a8d799fcacd8aa51ca7613f48d7bb3f2327`](https://github.com/DF-wu/lilac-mono/commit/4d8c0a8d799fcacd8aa51ca7613f48d7bb3f2327) | Fork main，包含 PR #121；本文「現行 fork」的依據 |
 | 待整合的 upstream／PR #120 目標 U | [`7613d519643005ee4574c085a534c74af9508f88`](https://github.com/stanley2058/lilac-mono/commit/7613d519643005ee4574c085a534c74af9508f88) | 上游輸入，**不是**已解決衝突的 fork candidate |
 | 共同祖先 B | [`90d71dbe9a2a86d8b0a39513e9eb67d65eb93683`](https://github.com/stanley2058/lilac-mono/commit/90d71dbe9a2a86d8b0a39513e9eb67d65eb93683) | Fork PR #119 已納入的 upstream |
-| PR #120 已解衝突 candidate C | [清冊中的內容指紋](./fork-comparison-pr120/PATH-INVENTORY.md#pins-and-scope) | F 與 U 的未提交整合，加上下列修正；已完成本機驗證，尚未發布 |
+| 首次發布整合 C1 | [`3292b12b99992aa648b28aa2b00252098aeb4663`](https://github.com/DF-wu/lilac-mono/commit/3292b12b99992aa648b28aa2b00252098aeb4663) | 已提交且發布的 F／U 雙親 merge；首輪 hosted CI 六項全部通過 |
+| PR #120 目前整合 candidate C | [清冊中的內容指紋](./fork-comparison-pr120/PATH-INVENTORY.md#pins-and-scope) | 本清冊所描述的目前整合樹，含下列 review 修正；提交前後皆可重建，不捏造 commit SHA |
 
-「已合入」只指 F 的 Git 狀態，不代表任何實際環境已部署。[PR #120](https://github.com/DF-wu/lilac-mono/pull/120) 已有本機解衝突 candidate；發布及 hosted integration CI 仍待完成。C 不等於把 U 改名成 fork main，本文不連結不存在的未發布 commit。
+「已合入」只指 F 的 Git 狀態，不代表實際部署。[PR #120](https://github.com/DF-wu/lilac-mono/pull/120) 已發布 C1，確實以 F 與 U 為雙親；[首輪 hosted CI](https://github.com/DF-wu/lilac-mono/actions/runs/44926179978) 六項全部通過。C 表示本文件與清冊描述的目前整合樹，包含 C1 之後的 review 修正。C1 的 CI 結果不能代表後續變更；須查核目前 PR head 的 hosted CI。C1 與 C 都不等於 fork main，也不表示已部署。
 
 [完整路徑清冊](./fork-comparison-pr120/PATH-INVENTORY.md) 與 [JSON 證據](./fork-comparison-pr120/inventory.json) 逐一列出所有差異路徑、blob／mode、分類與 footprint 原因。清冊及重建程式使用英文，與英文規範文件共用同一份證據。
 
@@ -24,10 +25,10 @@
 | U → F | 494：新增 160、修改 304、刪除 30 | 兩端 tip 比較；**不等於** 494 項 fork 獨有功能，也不等於 fork 主動刪除 30 個檔案 |
 | 聯集 | 494 | 347 個僅 fork 側變更、123 個僅上游輸入、24 個雙方皆修改的路徑 |
 | F 的精確 footprint | 211 列，211 covered、0 unlisted、0 stale | 只包含共同祖先已存在、之後修改／刪除／變更類型的路徑；不涵蓋 fork 新增檔 |
-| F → C | 157：新增 31、修改 126 | 採用上游、保留 fork 行為、必要修正及比較文件 |
-| U → C | 384：新增 165、修改 215、刪除 4 | 相對固定上游輸入的實際 resolved fork 差異 |
-| 全部聯集 | 500 | 包含所有基準與 candidate 差異，以及六份比較文件 |
-| C 相對 U 的精確 footprint | 219 列，219 covered、0 unlisted、0 stale | 等同包含 U 的 merge commit 之正常 gate；checker 本身未改 |
+| F → C | 161：新增 31、修改 130 | 採用上游、保留 fork 行為、必要修正及比較文件 |
+| U → C | 388：新增 165、修改 219、刪除 4 | 相對固定上游輸入的實際 resolved fork 差異 |
+| 全部聯集 | 503 | 包含所有基準與 candidate 差異，以及六份比較文件 |
+| C 相對 U 的精確 footprint | 223 列，223 covered、0 unlisted、0 stale | 等同包含 U 的 merge commit 之正常 gate；checker 本身未改 |
 
 U → F 的 30 個刪除中，**26 個其實是 F 尚未納入的上游新增檔**。B → F 真正刪除的只有 `packages/client-protocol/compat/previous-release/` 下四個歷史 fixture：`actionsPartSchema.schema.json`、`workflowRunSummarySchema.schema.json`、`workflows.get.schema.json`、`workflows.list.schema.json`。這是修正已驗證舊版 release 的實際 contract，並非移除現行 workflow API。
 
@@ -38,7 +39,7 @@ U → F 的 30 個刪除中，**26 個其實是 F 尚未納入的上游新增檔
 ## 狀態用語與證據
 
 - **現行 fork 新增／修改／刪除**：由 B → F 及 F 的原始碼證明；同一檔案可以同時包含上游基礎與 fork 擴充。
-- **Candidate 修正**：已在 C 實作並完成本機驗證，尚未進入 F，也未發布。
+- **Candidate 修正**：已在目前整合 C 實作，尚未進入 F；revision 狀態以清冊及目前 head 的檢查為準。
 - **採用的上游功能**：存在於 U，已納入 C；F 尚無或行為不同，不應歸功為 fork 原創。
 - **共用／已上游化**：已納入共同基準；即使最初由 fork 貢獻，也不再列為現行差異。
 - **歷史／已退役**：只保留特定日期的證據，或已不在現行 production；不能只憑 commit 標題認定仍有該行為。
@@ -174,7 +175,7 @@ PR #119 已採用上游 **Rust** SSH runner，支援的遠端主機不再需要 
 
 F 的 root package manager 是 **Bun 1.4.4**。B 之後未修改的 dependency／patch declaration 屬 inherited；清冊涵蓋有差異的 root／Core／example manifest／lock，不把上游 AI SDK／storage／runner dependency 歸功於 fork。生成證據包含 editor schema、web activity、previous-release JSON、custom-media bundle；須依 owner generator／contract 檢查，不手改生成檔掩蓋失敗。
 
-Footprint tool 比較 `git merge-base <upstream> HEAD` 與 **tracked working tree** 的 `--diff-filter=MDT --no-renames`，不管 untracked 與 fork 新增檔；`--strict` 另拒絕 stale row。因此通過不代表完整差異已盤點、合併乾淨或 runtime 已測試。清冊保留 B／F／U，並新增 C 的全部 path／status／mode 及 219 policy rows。既有 checker 及原始測試未改。未提交 merge 時 HEAD 仍為 F，與 U 的 merge base 是 B，因此此時正常 CLI 不是精確 C 對 U 檢查；candidate helper 另將 `git diff --name-only --diff-filter=MDT --no-renames U` 集合對照 C 的 policy。Merge commit 包含 U 後，對 U 的正常 CLI 才以 U 為 merge base。之後 upstream 前進時，merge-base 政策刻意排除 fork 尚未納入的上游變更，直接比較 tip 反而會誤判。Hosted CI 仍須依實際 fetched refs 重跑。
+Footprint tool 比較 `git merge-base <upstream> HEAD` 與 **tracked working tree** 的 `--diff-filter=MDT --no-renames`，不管 untracked 與 fork 新增檔；`--strict` 另拒絕 stale row。因此通過不代表完整差異已盤點、合併乾淨或 runtime 已測試。清冊保留 B／F／U，並新增 C 的全部 path／status／mode 及 精確 policy rows。既有 checker 及原始測試未改。原始未提交 merge 的 HEAD 為 F，merge base 為 B；已提交的 C1 與其後續 revision 都包含 U，正常 CLI 現在可精確比較固定 U；candidate helper 另將 `git diff --name-only --diff-filter=MDT --no-renames U` 集合對照 C 的 policy。Merge commit 包含 U 後，對 U 的正常 CLI 才以 U 為 merge base。之後 upstream 前進時，merge-base 政策刻意排除 fork 尚未納入的上游變更，直接比較 tip 反而會誤判。Hosted CI 仍須依實際 fetched refs 重跑。
 
 **操作：**Host mount 必須允許所選 image 的 numeric identity；不要依 source default 猜 production 帳號或權限。[Docker 文件](./docker-deployment.md)、[installer](./installation.md)、[sync 政策](./upstream-sync.md) 負責命令。`main` 為唯一長期分支，一般 feature／fix／docs 使用短期 PR；乾淨 sync candidate 為 `chore/sync-upstream-*`，conflict review 為 `automation/sync-upstream`。以 merge 保留 upstream history；先確認相等 contract，再移除重複 fork patch。
 
@@ -202,12 +203,12 @@ B 已含上游 Core execution／recovery、Discord／GitHub／native、resource�
 | 區域 | 保留／採用行為及精確修正 | 原始碼與回歸證據 |
 | --- | --- | --- |
 | Search 政策與衝突 | 保留 OpenAI model route、status-based retry、search-only；採用 U 的一次 retry／deadline／cancel wrapper。OpenAI 每次 30 秒，其餘內建 provider 10 秒，雙方測試群組皆保留。 | [web.ts](../apps/core/src/tool-server/tools/web.ts)、[web.test.ts](../apps/core/tests/tools/web.test.ts)、四組 provider suite；[搜尋文件](./web-search-openai.md)。 |
-| Rewind 附件 undo／retry | Silent replacement 前記住 reference-only attachment record，使 undo 後仍可送出。無 reference 的 retained file 建立 controller／reservation command，並保留來源 question-draft key 到 ready callback。 | [composer-editor](../apps/web/src/components/composer-editor.tsx)、[uploads](../apps/web/src/uploads.ts)、[Chat](../apps/web/src/components/Chat.tsx)、[upload tests](../apps/web/tests/uploads.test.ts)、[真實 component fixture](../apps/web/tests/support/rewind-regressions.js)。 |
+| Rewind 附件 undo／retry | Silent replacement 與送出清空前記住 reference-only attachment record，使 rewind Undo 與送出後 Undo 都仍可送出。無 reference 的 retained file 建立 controller／reservation command，並保留來源 question-draft key 到 ready callback。 | [composer-editor](../apps/web/src/components/composer-editor.tsx)、[uploads](../apps/web/src/uploads.ts)、[Chat](../apps/web/src/components/Chat.tsx)、[upload tests](../apps/web/tests/uploads.test.ts)、[真實 component fixture](../apps/web/tests/support/rewind-regressions.js)。 |
 | Draft 持久化與順序 | Local／reply 清單保留純附件 draft；儲存 reference 依 composer key 排序，而非 upload 完成順序。兩個既有 hydration path 均可還原順序；不改 stored schema。保留 F 的 monotonic cache recency。 | [cache](../apps/web/src/cache.ts)、[cache tests](../apps/web/tests/cache.test.ts)、既有 App／queries reload。 |
 | Pending paste／navigation | Rewind 換 draft 時取消尚未完成的 message-paste download；離開再返回時，running rewind 仍鎖住 composer。停止且等待 retry 的 attempt 可編輯。 | [Composer](../apps/web/src/components/Composer.tsx)、[Chat](../apps/web/src/components/Chat.tsx)；真實 DM paste／navigation 驗證。 |
 | History availability／缺檔 | History page 失敗且 cursor 未變時重試一次；effect cleanup 後不重試。兩次都失敗後仍有界，使用既有 Load more／reconnect／navigation。未完成且 local file 不在的附件還原為 reattachment marker，文件同步澄清。 | [use-dm-rewind](../apps/web/src/use-dm-rewind.ts)、[browser fixture](../apps/web/tests/support/rewind-regressions.js)、[native 操作](./native-surface.md#permanent-direct-conversation)。 |
-| Crash recovery／jobs | 從既有 command receipt 與保留的 input timestamp 找 rewind cutoff；完成 recovered mutation 前，停止並抑制 cutoff 之後（含當下）的 jobs。無新 persisted field、journal 或 recovery subsystem。 | [store](../apps/core/src/surface/native/store.ts)、[execution](../apps/core/src/surface/native/execution.ts)、[execution tests](../apps/core/src/surface/native/execution.test.ts)、既有 job-service cutoff／suppression tests。 |
-| 重疊取消失敗 | 最後一個 cancel 清除 marker 時，即使失敗也執行既有 input drain；保留原 cancellation error 優先順序。 | 上列 native execution／tests；兩個重疊 cancel 與 queued input 回歸。 |
+| Crash recovery／jobs | 從既有 command receipt 與保留的 canceled full-input 記錄還原被丟棄的 request ID，只停止／抑制這些 request 擁有的 service jobs；時間重疊也不影響保留 turn 的 jobs。List／suppression 失敗會保留 mutationPending，重試時重選仍 pending 的事件。舊資料缺少或無法明確證明 ownership 時保留 pending，不退回時間推測；無新 persisted field、journal 或 recovery subsystem。 | [store](../apps/core/src/surface/native/store.ts)、[execution](../apps/core/src/surface/native/execution.ts)、[execution tests](../apps/core/src/surface/native/execution.test.ts)、[job ownership／suppression tests](../apps/core/tests/jobs/job-service.test.ts)。 |
+| 重疊取消失敗 | Queued delivery 終結失敗時仍取消並等待 active runner drain；最後一個重疊 cancellation 完成 drain 後才釋放 input，回傳原錯誤，失敗的 durable delivery 仍可 recovery。 | [Native execution](../apps/core/src/surface/native/execution.ts)、[runner queue tests](../apps/core/tests/surface/bridge/bus-agent-runner-session-queue.test.ts)。 |
 | Thinking repair／replay | 刪除尾端 tool result 後若只剩 assistant text，補入既有 user continuation。相鄰 Discord attribution line 一次移除且重跑不變。保留 Telegram metadata、fork compaction boundary，以及 U 的 provider-history／tool-search projection。 | [runner](../apps/core/src/surface/bridge/bus-agent-runner.ts)、[normalization](../apps/core/src/surface/bridge/request-composition/normalization.ts)、[thinking tests](../apps/core/tests/agent/anthropic-thinking-recovery.test.ts)、[runner tests](../apps/core/tests/surface/bridge/bus-agent-runner.test.ts)。 |
 | 回歸測試品質 | Lifecycle 結束後才 assert repaired checkpoint，避免預期 provider failure 吞掉 assertion；新 signature 與舊 thinking 隔離。Upload expiry 使用固定時鐘。僅 dependency-streak fixture 停用 ambient main-isolate alarm，專門 memory-limit tests 保留。 | 上列 runner／upload tests；[health fixture](../apps/core/tests/tool-server-health-state.test.ts)。 |
 | Contract／生成檔組合 | 保留 Telegram／OpenAI v2/v3 config、compatible image／tool middleware、非標準 finish-reason 執行、#121 scope、Activity caret、native recorder、歷史 protocol fixture。採用 U 的 caching／Codex／heartbeat／history；schema 與 architecture registration 通過既有 check。 | [PROJECT](../PROJECT.md)、[MIGRATIONS](../MIGRATIONS.md)、[config migration](./core-config-migrations.md)、清冊逐路徑證據。 |
@@ -220,11 +221,11 @@ Allowlist 保留每項差異原因，C 不含 gate implementation 變更。文�
 
 Bash／filesystem 檢查、trusted plugin／MCP stdio、programmatic workflow、container 同 UID 存取是 guardrail／trusted execution，不是惡意程式 sandbox。本文不授權部署，也不證明 gateway 相容或 live data 狀態；未讀寫 operator model／alias／preset／permission／credential／private runtime data。
 
-整合後 focused 回歸已通過：search／providers **88 tests**、native execution **71 tests**、thinking repair／normalization **15 tests**、upload／cache **56 tests**。Web suite **820 tests** 通過，所有 workspace typecheck 與 architecture check 也通過。這些 source-level 結果與最終 combined root gate 分別記錄。
+C1 當時的 focused 回歸已通過：search／providers **88 tests**、native execution **71 tests**、thinking repair／normalization **15 tests**、upload／cache **56 tests**。Web suite **820 tests** 通過，所有 workspace typecheck 與 architecture check 也通過。這些 source-level 結果與最終 combined root gate 分別記錄。
 
-整合檢查使用 Bun 1.4.5（manifest 指定 1.4.4）及已安裝的 Rust 1.94.1。合併後 tree 的實際結果與精確數量見 [VERIFICATION.md](./fork-comparison-pr120/VERIFICATION.md)。本機通過不代表 hosted CI、image build、live-provider 或部署通過。
+C1 整合檢查使用 Bun 1.4.5（manifest 指定 1.4.4）及已安裝的 Rust 1.94.1。合併後 tree 的實際結果與精確數量見 [VERIFICATION.md](./fork-comparison-pr120/VERIFICATION.md)。本機通過不代表 hosted CI、image build、live-provider 或部署通過。
 
-提交前可重建 C，不建立 commit，也不改實際 index：
+編輯 follow-up 時可重建目前 worktree，不建立 commit，也不改實際 index：
 
 ```sh
 python3 docs/fork-comparison-pr120/reproduce.py --candidate-worktree
@@ -234,6 +235,8 @@ git diff --check
 git diff --cached --check
 ```
 
-Helper 驗證精確 HEAD／MERGE_HEAD，以 temporary `GIT_INDEX_FILE` snapshot，獨立核對每個 path／status、219 列精確 policy，逐 byte 重建 Markdown／JSON。不初始化 submodule、不建立 commit。三份 evidence file 的 path／mode 仍列入，但省略自身內容 hash 以避免自我參照；其餘內容（含 helper 與兩語 guide）均納入指紋。這是供審查的內容識別，不是完整 Git tree 的 release attestation。
+Helper 驗證 F／U ancestry（原始 merge 則驗證 HEAD／MERGE_HEAD），以 temporary `GIT_INDEX_FILE` snapshot，獨立核對每個 path／status、223 列精確 policy，逐 byte 重建 Markdown／JSON。不初始化 submodule、不建立 commit。三份 evidence file 的 path／mode 仍列入，但省略自身內容 hash 以避免自我參照；其餘內容（含 helper 與兩語 guide）均納入指紋。這是供審查的內容識別，不是完整 Git tree 的 release attestation。
 
-相同內容提交／發布後執行 `python3 docs/fork-comparison-pr120/reproduce.py --candidate HEAD --check`；它要求 F、U 同為祖先，不需捏造未發布 commit 連結。之後對 fetched upstream ref 執行未改的 `bun run fork:footprint -- --upstream=<fetched-upstream-ref> --strict`，並對同一 commit 完成 hosted CI／image checks。Source、policy 或非 evidence 文件改動都需刷新清冊；verification prose 雖排除 hash，仍須審查。
+乾淨且已提交的 checkout 請執行 `python3 docs/fork-comparison-pr120/reproduce.py --candidate HEAD --check`；它要求 F、U 同為祖先，不需捏造未發布 commit 連結。之後對 fetched upstream ref 執行未改的 `bun run fork:footprint -- --upstream=<fetched-upstream-ref> --strict`，並對同一 commit 完成 hosted CI／image checks。Source、policy 或非 evidence 文件改動都需刷新清冊；verification prose 雖排除 hash，仍須審查。
+
+本次 follow-up 已通過六個 Core suite 共 **315 tests／1,389 assertions** 與 workspace typechecks。完整最終 gate、八則 inline／三則 outside-diff／一則 unverified finding 的處置及限制，見 [verification](./fork-comparison-pr120/VERIFICATION.md)。C1 的 hosted CI 結果不代表後續 revision。

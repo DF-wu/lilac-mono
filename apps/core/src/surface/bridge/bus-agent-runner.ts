@@ -3209,8 +3209,15 @@ export async function startBusAgentRunner(params: {
     };
     const failDequeuedEntry = async (cause: Error): Promise<void> => {
       releaseDequeuedSession();
-      await failUnmaterializableEntry(next, cause);
+      const settled = await Result.tryPromise({
+        try: () => failUnmaterializableEntry(next, cause),
+        catch: captureError,
+      });
+      const failure = settled.match({ ok: () => null, err: (error) => error.cause });
+      if (Panic.is(failure)) return signalBusAgentRunnerHostFailure(failure);
+      // Failed publication leaves this delivery recoverable, but must not strand its successor.
       startSessionQueueDrain(sessionId, state);
+      if (failure) return signalBusAgentRunnerHostFailure(failure);
     };
     if (next.requestClient === "native") {
       const validated = validateNativeRequest({
@@ -3244,7 +3251,9 @@ export async function startBusAgentRunner(params: {
         identityProjection: storedMessageIdentity,
       });
       if (materialized.isErr()) {
-        if (next.recovery.anthropicThinkingRepaired) return failDequeuedEntry(materialized.error);
+        const repairedHead = next.recovery.anthropicThinkingRepaired === true;
+        if (repairedHead && next.previousRecoveryCheckpoint?.anthropicThinkingRepaired !== true)
+          return failDequeuedEntry(materialized.error);
         const previous = await materializePreviousRunCheckpoint({
           imageRegistry: mcpImages,
           entry: next,
@@ -3259,6 +3268,7 @@ export async function startBusAgentRunner(params: {
             handle: previous.handle,
           });
         } else {
+          if (repairedHead) return failDequeuedEntry(materialized.error);
           fallBackRunCheckpointToAcceptedWork({ entry: next, error: materialized.error });
         }
       } else {
@@ -3268,6 +3278,14 @@ export async function startBusAgentRunner(params: {
     if (next.recovery?.anthropicThinkingRepaired) {
       next.storedMessages = projectAssistantTextHistory(next.storedMessages);
       next.messages = projectAssistantTextHistory(next.messages);
+    }
+    if (next.requestClient === "native") {
+      next.storedMessages = next.storedMessages.filter(
+        (message) => generatedMessageMetadata(message)?.kind !== "heartbeat_context",
+      );
+      next.messages = next.messages.filter(
+        (message) => generatedMessageMetadata(message)?.kind !== "heartbeat_context",
+      );
     }
     if (next.messages.length === 0 && next.storedMessages.length > 0) {
       const materialized = await materializeStoredMessagesV1({
@@ -4798,6 +4816,17 @@ export async function startBusAgentRunner(params: {
               seededStoredMessages,
               activeBinding,
             );
+          }
+          if (next.requestClient === "native") {
+            // Native rows retain generated overlays; only this run's fresh heartbeat may reach the model.
+            const withoutHeartbeat = (messages: readonly ModelMessage[]) =>
+              messages.filter(
+                (message) => generatedMessageMetadata(message)?.kind !== "heartbeat_context",
+              );
+            next.messages = withoutHeartbeat(next.messages);
+            seededSessionMessages = withoutHeartbeat(seededSessionMessages);
+            if (next.recovery)
+              next.recovery.checkpointMessages = withoutHeartbeat(next.recovery.checkpointMessages);
           }
           if (state.activeRun) {
             state.activeRun.messages = next.messages;
@@ -7861,16 +7890,14 @@ export async function startBusAgentRunner(params: {
       return Result.ok(undefined);
     }
     const queued = state.queue.splice(0);
+    let rejectionFailure: Error | null = null;
     for (const entry of queued) {
       const rejected = await rejectNativeDelivery(
         entry.requestDeliveryId ?? "",
         new Error("Native session canceled"),
       );
       const failure = rejected.match({ ok: () => null, err: (error) => error });
-      if (failure) {
-        nativeBlockedSessions.delete(sessionId);
-        return Result.err(failure);
-      }
+      if (failure) rejectionFailure ??= failure;
       if (entry.identityOwner) requestMessageCache.releaseOwner(entry.identityOwner);
       reservedQueueEntries.delete(entry);
     }
@@ -7880,6 +7907,7 @@ export async function startBusAgentRunner(params: {
     }
     await Promise.allSettled(sessionDrainOperations.get(sessionId) ?? []);
     nativeBlockedSessions.delete(sessionId);
+    if (rejectionFailure) return Result.err(rejectionFailure);
     return Result.ok(undefined);
   }
 

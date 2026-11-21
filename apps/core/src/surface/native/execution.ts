@@ -58,7 +58,7 @@ export function createNativeExecution(options: {
   deliveryState?: (
     deliveryId: string,
   ) => ResultType<"missing" | "owned" | "completed" | "failed" | "cancelled" | "abandoned", Error>;
-  jobs?: Pick<JobService, "stopSession" | "stopSessionJobsSince">;
+  jobs?: Pick<JobService, "stopSession" | "stopSessionRequests">;
 }) {
   const { store } = options;
   const publications = new Map<string, Promise<ResultType<void, Error>>>();
@@ -173,7 +173,7 @@ export function createNativeExecution(options: {
   }
 
   function canonicalTurnMessages(
-    threadId: string,
+    thread: NativeThreadRecord,
     source: NativeInputRecord,
     latest: NativeInputRecord,
     messages: readonly StoredMessageV1[],
@@ -183,7 +183,7 @@ export function createNativeExecution(options: {
       let turn = latest;
       let row = messages;
       while (turn.position > source.position && opensNativeTurn(row[0], turn.requestId)) {
-        const previous = yield* store.selectCanonicalInput(threadId, { before: turn.position });
+        const previous = yield* store.selectCanonicalInput(thread.id, { before: turn.position });
         if (!previous || previous.position < source.position) return Result.ok(null);
         const snapshot = yield* (
           options.transcriptStore.getRequestTranscript?.({ requestId: previous.requestId }) ??
@@ -191,7 +191,11 @@ export function createNativeExecution(options: {
         );
         if (!snapshot) return Result.ok(null);
         turn = previous;
-        row = snapshot.messages;
+        // A predecessor can contain a full, older window. Prove and trim its canonical start
+        // before joining it; recursion always moves to an earlier input position.
+        const prefix = yield* fullRowHistory(thread, source, previous, snapshot.messages);
+        if (prefix.messages.length === 0) return Result.ok(null);
+        row = prefix.messages;
         rows.push(row);
       }
       return Result.ok(rows.toReversed().flatMap((row) => [...row]));
@@ -230,7 +234,7 @@ export function createNativeExecution(options: {
         }
         const source = yield* canonicalSource(thread.id, turn);
         if (!source || source.position > turn.position) return Result.ok(empty);
-        const reconstructed = yield* canonicalTurnMessages(thread.id, source, turn, messages);
+        const reconstructed = yield* canonicalTurnMessages(thread, source, turn, messages);
         if (!reconstructed) return Result.ok(empty);
         if (selectedTurn.position <= source.position) {
           selected = { messages: reconstructed, firstRequestId: source.requestId };
@@ -803,12 +807,10 @@ export function createNativeExecution(options: {
       const runner = options.runner();
       if (!runner) return Result.err(nativeFailure("conflict", "Native runner is unavailable"));
       yield* Result.await(runner.cancelNativeSession(nativeSessionId(threadId)));
-      const rewindCutoff = yield* store.getTurnInputCreatedAt(threadId, turnId);
-      if (rewindCutoff !== null)
-        await options.jobs?.stopSessionJobsSince(
-          nativeSessionId(threadId),
-          rewindCutoff,
-          "thread_rewound",
+      const requestIds = yield* store.getRewindRequestIds(threadId, historyGeneration);
+      if (options.jobs)
+        yield* Result.await(
+          options.jobs.stopSessionRequests(nativeSessionId(threadId), requestIds, "thread_rewound"),
         );
       yield* reconcileCanonical(threadId);
       yield* store.finishMutation(threadId, historyGeneration);
@@ -835,7 +837,9 @@ export function createNativeExecution(options: {
       if (rewound.historyGeneration === undefined || rewound.text === undefined)
         return Result.err(nativeFailure("invalid", "Rewind receipt is incomplete"));
       const thread = yield* store.getThreadRecord(request.threadId);
-      if (!thread.mutationPending || thread.historyGeneration !== rewound.historyGeneration)
+      if (thread.historyGeneration !== rewound.historyGeneration)
+        return Result.err(nativeFailure("stale", "Rewind receipt belongs to superseded history"));
+      if (!thread.mutationPending)
         return Result.ok({ text: rewound.text, historyGeneration: rewound.historyGeneration });
       const key = `${request.threadId}:${rewound.historyGeneration}`;
       const pending = rewinds.get(key);
@@ -879,12 +883,20 @@ export function createNativeExecution(options: {
         return Result.err(nativeFailure("conflict", "Native runner is unavailable"));
       for (const thread of pending) {
         if (runner) yield* Result.await(runner.cancelNativeSession(nativeSessionId(thread.id)));
-        const cutoff = yield* store.getRewindCutoff(thread.id, thread.historyGeneration);
-        if (cutoff !== null)
-          await options.jobs?.stopSessionJobsSince(
-            nativeSessionId(thread.id),
-            cutoff,
-            "thread_rewound",
+        if (thread.deleted) {
+          await options.jobs?.stopSession(nativeSessionId(thread.id), "thread_deleted");
+          yield* reconcileCanonical(thread.id);
+          yield* store.finishMutation(thread.id, thread.historyGeneration);
+          continue;
+        }
+        const requestIds = yield* store.getRewindRequestIds(thread.id, thread.historyGeneration);
+        if (options.jobs)
+          yield* Result.await(
+            options.jobs.stopSessionRequests(
+              nativeSessionId(thread.id),
+              requestIds,
+              "thread_rewound",
+            ),
           );
         yield* reconcileCanonical(thread.id);
         yield* store.finishMutation(thread.id, thread.historyGeneration);
