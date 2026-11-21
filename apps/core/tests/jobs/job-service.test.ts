@@ -6,7 +6,7 @@ import { Result } from "better-result";
 
 import { JOB_LIMITS, type JobOwner, type JobRecord } from "../../src/jobs/job-domain";
 import { JobService, type JobWakeDelivery } from "../../src/jobs/job-service";
-import { JobStoreFailed, SqliteJobStore } from "../../src/jobs/job-store";
+import { JobStoreFailed, SqliteJobStore, type FinishJobInput } from "../../src/jobs/job-store";
 
 const owner: JobOwner = {
   requestId: "request-1",
@@ -351,6 +351,107 @@ describe("JobService", () => {
       suppress.mockRestore();
     }
   });
+
+  it("rewind suppresses pending await output only for discarded request owners", async () => {
+    const retained = ok<JobRecord>(await start(service, "printf retained-output"));
+    const discarded = ok<JobRecord>(
+      await start(service, "printf discarded-output", {
+        owner: { ...owner, requestId: "discarded-await" },
+      }),
+    );
+    await untilEnded(service, retained.jobId);
+    await untilEnded(service, discarded.jobId);
+    ok(await service.stopSessionRequests(owner.sessionId, ["discarded-await"], "thread_rewound"));
+    expect(ok<JobRecord | null>(store.get(discarded.jobId))?.delivery).toBe("suppressed");
+    expect(ok<JobRecord | null>(store.get(retained.jobId))?.delivery).toBe("pending");
+    const events = await service.pendingEvents(owner.sessionId);
+    expect(events.map((event) => event.job.jobId)).toEqual([retained.jobId]);
+    expect(events[0]?.outputTail).toBe("retained-output");
+  });
+
+  it.each([false, true])(
+    "rewind retries the observed completion after process exit (terminal row won: %s)",
+    async (terminalRowWon) => {
+      const retained = ok<JobRecord>(await start(service, "sleep 60", { mode: "service" }));
+      const discarded = ok<JobRecord>(
+        await start(service, "printf 'ready\\n'; exec sleep 60", {
+          mode: "service",
+          owner: { ...owner, requestId: "discarded-finish" },
+        }),
+      );
+      await untilLogContains(discarded.jobId, "ready");
+      const persist = store.finish.bind(store);
+      const failure = new JobStoreFailed({
+        operation: "finish",
+        code: "SQLITE_BUSY",
+        message: "transient finish failure",
+      });
+      let failing = true;
+      const endings: FinishJobInput[] = [];
+      const finish = spyOn(store, "finish").mockImplementation((id, ending) => {
+        if (id !== discarded.jobId) return persist(id, ending);
+        expect(existsSync(`/proc/${discarded.pid}/stat`)).toBe(false);
+        endings.push(ending);
+        if (failing) return Result.err(failure);
+        if (terminalRowWon) persist(id, { ...ending, status: "lost", stopReason: "core_restart" });
+        return persist(id, ending);
+      });
+      try {
+        process.kill(discarded.pid!, "SIGSTOP");
+        const cleanup = service.stopSessionRequests(
+          owner.sessionId,
+          ["discarded-finish"],
+          "thread_rewound",
+        );
+        expect(
+          await Promise.race([
+            cleanup.then(() => "released"),
+            new Promise<string>((resolve) => setImmediate(() => resolve("waiting"))),
+          ]),
+        ).toBe("waiting");
+        expect(finish).not.toHaveBeenCalled();
+        expect(ok<JobRecord | null>(store.get(discarded.jobId))?.status).toBe("running");
+        process.kill(discarded.pid!, "SIGCONT");
+        expect((await cleanup).match({ ok: () => null, err: (error) => error })).toBe(failure);
+        expect(ok<JobRecord | null>(store.get(discarded.jobId))?.status).toBe("running");
+        expect(endings[0]).toEqual({
+          status: "stopped",
+          exitCode: null,
+          stopReason: "thread_rewound",
+          delivery: "suppressed",
+          outputBytes: 6,
+          outputTruncated: false,
+        });
+        failing = false;
+        ok(
+          await service.stopSessionRequests(
+            owner.sessionId,
+            ["discarded-finish"],
+            "thread_rewound",
+          ),
+        );
+        expect(endings.at(-1)).toEqual(endings[0]);
+        expect(ok<JobRecord | null>(store.get(discarded.jobId))).toMatchObject({
+          status: terminalRowWon ? "lost" : "stopped",
+          stopReason: terminalRowWon ? "core_restart" : "thread_rewound",
+          delivery: "suppressed",
+          outputBytes: 6,
+        });
+        expect(ok<JobRecord | null>(store.get(retained.jobId))?.status).toBe("running");
+        const calls = finish.mock.calls.length;
+        ok(
+          await service.stopSessionRequests(
+            owner.sessionId,
+            ["discarded-finish"],
+            "thread_rewound",
+          ),
+        );
+        expect(finish.mock.calls).toHaveLength(calls);
+      } finally {
+        finish.mockRestore();
+      }
+    },
+  );
 
   describe("after a restart", () => {
     it("kills what it can identify and reports the job lost", async () => {

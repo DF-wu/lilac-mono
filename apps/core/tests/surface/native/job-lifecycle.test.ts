@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -6,7 +6,8 @@ import { MockLanguageModelV4 } from "ai/test";
 
 import type { JobOwner, JobRecord } from "../../../src/jobs/job-domain";
 import { JobService } from "../../../src/jobs/job-service";
-import { SqliteJobStore } from "../../../src/jobs/job-store";
+import { Result } from "better-result";
+import { JobStoreFailed, SqliteJobStore } from "../../../src/jobs/job-store";
 import { nativeSessionId } from "../../../src/surface/native/native-protocol";
 import type { NativeStore } from "../../../src/surface/native/store";
 import {
@@ -60,15 +61,15 @@ async function harness() {
     originMessageId: null,
     runProfile: "primary",
   };
-  const startService = async (requestId = owner.requestId) =>
+  const startService = async (requestId = owner.requestId, mode: "service" | "await" = "service") =>
     (
       await jobs.start({
         owner: { ...owner, requestId },
         toolCallId: crypto.randomUUID(),
-        mode: "service",
+        mode,
         label: "dev server",
         launch: {
-          args: ["bash", "-c", "sleep 60"],
+          args: ["bash", "-c", mode === "await" ? "printf await-output" : "sleep 60"],
           cwd: tmpdir(),
           env: process.env,
           literalSecrets: [],
@@ -100,6 +101,7 @@ async function harness() {
     client,
     thread,
     jobs,
+    jobStore,
     prompts,
     startService,
     read,
@@ -179,52 +181,101 @@ describe("native thread actions stop jobs without telling the agent", () => {
 });
 
 describe("rewinding", () => {
-  test("stops jobs from the discarded turns and keeps earlier ones", async () => {
-    const h = await harness();
-    try {
-      const submit = async (text: string) => {
-        const receipt = await h.client.inputs.submit({
+  test.each([false, true])(
+    "rewind suppresses discarded job output and retries completion persistence (%s)",
+    async (failFinish) => {
+      const h = await harness();
+      try {
+        const submit = async (text: string) => {
+          const receipt = await h.client.inputs.submit({
+            threadId: h.thread.id,
+            commandId: crypto.randomUUID(),
+            historyGeneration: 0,
+            text,
+            mode: "prompt",
+            attachmentIds: [],
+            skillIds: [],
+          });
+          await waitForStore(
+            h.fixture.store,
+            () =>
+              integrationValue(h.fixture.store.getInput(receipt.inputId)).completedAt !== undefined,
+          );
+          return receipt;
+        };
+        const first = await submit("first");
+        const target = await submit("second");
+        // Both jobs start after the discarded input; only their request ownership distinguishes them.
+        const kept = await h.startService(
+          integrationValue(h.fixture.store.getInput(first.inputId)).requestId,
+        );
+        const discarded = await h.startService(
+          integrationValue(h.fixture.store.getInput(target.inputId)).requestId,
+        );
+        const keptAwait = await h.startService(
+          integrationValue(h.fixture.store.getInput(first.inputId)).requestId,
+          "await",
+        );
+        const discardedAwait = await h.startService(
+          integrationValue(h.fixture.store.getInput(target.inputId)).requestId,
+          "await",
+        );
+        await h.untilStopped(keptAwait.jobId);
+        await h.untilStopped(discardedAwait.jobId);
+        if (!target.turnId) throw new Error("Full turn missing stable identity");
+        const before = await h.client.threads.sync({ threadId: h.thread.id });
+
+        const request = {
           threadId: h.thread.id,
           commandId: crypto.randomUUID(),
           historyGeneration: 0,
-          text,
-          mode: "prompt",
-          attachmentIds: [],
-          skillIds: [],
-        });
-        await waitForStore(
-          h.fixture.store,
-          () =>
-            integrationValue(h.fixture.store.getInput(receipt.inputId)).completedAt !== undefined,
+          expectedRevision: before.checkpoint.projectionRevision,
+          turnId: target.turnId,
+        };
+        let failing = failFinish;
+        const persist = h.jobStore.finish.bind(h.jobStore);
+        const finish = spyOn(h.jobStore, "finish").mockImplementation((id, ending) =>
+          id === discarded.jobId && failing
+            ? Result.err(
+                new JobStoreFailed({
+                  operation: "finish",
+                  code: "SQLITE_BUSY",
+                  message: "transient finish failure",
+                }),
+              )
+            : persist(id, ending),
         );
-        return receipt;
-      };
-      const first = await submit("first");
-      const target = await submit("second");
-      // Both jobs start after the discarded input; only their request ownership distinguishes them.
-      const kept = await h.startService(
-        integrationValue(h.fixture.store.getInput(first.inputId)).requestId,
-      );
-      const discarded = await h.startService(
-        integrationValue(h.fixture.store.getInput(target.inputId)).requestId,
-      );
-      if (!target.turnId) throw new Error("Full turn missing stable identity");
-      const before = await h.client.threads.sync({ threadId: h.thread.id });
+        try {
+          if (failFinish) {
+            await expect(h.client.threads.rewind(request)).rejects.toThrow();
+            expect(
+              integrationValue(h.fixture.store.getThreadRecord(h.thread.id)).mutationPending,
+            ).toBe(true);
+            expect(h.read(discarded.jobId)?.status).toBe("running");
+            failing = false;
+          }
+          await h.client.threads.rewind(request);
+          expect(
+            integrationValue(h.fixture.store.getThreadRecord(h.thread.id)).mutationPending,
+          ).toBe(false);
+          expect(h.read(discardedAwait.jobId)?.delivery).toBe("suppressed");
+          expect(h.read(keptAwait.jobId)?.delivery).toBe("pending");
+          expect(
+            (await h.jobs.pendingEvents(nativeSessionId(h.thread.id))).map(
+              (event) => event.job.jobId,
+            ),
+          ).toEqual([keptAwait.jobId]);
+        } finally {
+          finish.mockRestore();
+        }
 
-      await h.client.threads.rewind({
-        threadId: h.thread.id,
-        commandId: crypto.randomUUID(),
-        historyGeneration: 0,
-        expectedRevision: before.checkpoint.projectionRevision,
-        turnId: target.turnId,
-      });
-
-      expect(h.read(discarded.jobId)?.stopReason).toBe("thread_rewound");
-      expect(h.read(kept.jobId)?.status).toBe("running");
-    } finally {
-      await h.close();
-    }
-  });
+        expect(h.read(discarded.jobId)?.stopReason).toBe("thread_rewound");
+        expect(h.read(kept.jobId)?.status).toBe("running");
+      } finally {
+        await h.close();
+      }
+    },
+  );
 });
 
 describe("native job wakes", () => {

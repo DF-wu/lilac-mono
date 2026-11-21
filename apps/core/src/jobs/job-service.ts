@@ -20,7 +20,12 @@ import {
   type JobStatus,
   type JobStopReason,
 } from "./job-domain";
-import { JobStoreFailed, type JobStoreError, type SqliteJobStore } from "./job-store";
+import {
+  JobStoreFailed,
+  type FinishJobInput,
+  type JobStoreError,
+  type SqliteJobStore,
+} from "./job-store";
 
 const logger = createLogger({ module: "background-jobs" });
 
@@ -95,6 +100,7 @@ type RunningJob = {
   readonly pid: number;
   readonly child: Bun.Subprocess<"ignore", "pipe", "pipe">;
   readonly done: Promise<void>;
+  ending: FinishJobInput | null;
   requestedStop: RequestedStop | null;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   hardKillTimer: ReturnType<typeof setTimeout> | null;
@@ -419,16 +425,22 @@ export class JobService {
     const selected = (job: JobRecord) => job.mode === "service" && owners.has(job.requestId);
     return Result.gen(async function* (this: JobService) {
       const active = yield* this.#store.listActiveForSession(sessionId);
-      await Promise.all(
-        active
-          .filter(selected)
-          .map((job) =>
-            this.#stopRunning(job.jobId, { status: "stopped", stopReason, delivery: "suppressed" }),
-          ),
+      const stopped = await Promise.all(
+        active.filter(selected).map(async (job) => {
+          await this.#stopRunning(job.jobId, {
+            status: "stopped",
+            stopReason,
+            delivery: "suppressed",
+          });
+          return this.#persistSettledJob(job.jobId);
+        }),
       );
+      yield* Result.all(stopped);
       // Re-read pending events on every attempt, including jobs stopped by an earlier attempt.
       const pending = yield* this.#store.listPending(sessionId);
-      yield* this.#store.suppress(pending.filter(selected).map((job) => job.jobId));
+      yield* this.#store.suppress(
+        pending.filter((job) => owners.has(job.requestId)).map((job) => job.jobId),
+      );
       const remaining = yield* this.#store.listActiveForSession(sessionId);
       if (remaining.some(selected))
         return Result.err(
@@ -452,7 +464,7 @@ export class JobService {
     this.#retentionTimer = null;
     for (const timer of this.#wakeTimers.values()) clearTimeout(timer);
     this.#wakeTimers.clear();
-    const running = [...this.#running.values()];
+    const running = [...this.#running.values()].filter((job) => !job.ending);
     for (const job of running) {
       signalProcessGroup(job.pid, "SIGTERM");
       this.#scheduleHardKill(job);
@@ -494,11 +506,22 @@ export class JobService {
 
   async #stopRunning(jobId: string, stop: RequestedStop): Promise<void> {
     const running = this.#running.get(jobId);
-    if (!running) return;
+    if (!running || running.ending) return;
     running.requestedStop ??= stop;
     signalProcessGroup(running.pid, "SIGTERM");
     this.#scheduleHardKill(running);
     await running.done;
+  }
+
+  #persistSettledJob(jobId: string): ResultType<void, JobStoreError> {
+    const running = this.#running.get(jobId);
+    // Only the supervisor can establish an observed outcome after process and stream cleanup.
+    // Unowned active rows remain blocked by stopSessionRequests' remaining-active check.
+    if (!running?.ending) return Result.ok(undefined);
+    const finished = this.#store.finish(jobId, running.ending);
+    if (finished.isErr()) return Result.err(finished.error);
+    this.#running.delete(jobId);
+    return Result.ok(undefined);
   }
 
   #scheduleHardKill(job: RunningJob): void {
@@ -565,6 +588,7 @@ export class JobService {
       pid: child.pid,
       child,
       done,
+      ending: null,
       requestedStop: null,
       deadlineTimer: null,
       hardKillTimer: null,
@@ -635,8 +659,10 @@ export class JobService {
     if (running.hardKillTimer) clearTimeout(running.hardKillTimer);
     signalProcessGroup(running.pid, "SIGKILL");
     await Result.tryPromise({ try: () => logHandle.close(), catch: captureRuntimeError });
-    this.#running.delete(job.jobId);
-    if (this.#closing) return;
+    if (this.#closing) {
+      this.#running.delete(job.jobId);
+      return;
+    }
 
     const stop = running.requestedStop;
     const ending = {
@@ -647,7 +673,9 @@ export class JobService {
       outputBytes: capture.bytes,
       outputTruncated: capture.truncated,
     } as const;
-    const finished = this.#store.finish(job.jobId, ending);
+    // Retain the exact terminal outcome until the compare-and-transition write succeeds.
+    running.ending = ending;
+    const finished = this.#persistSettledJob(job.jobId);
     finished.match({
       ok: () => undefined,
       err: (error) => logStoreFailure("finish", error),

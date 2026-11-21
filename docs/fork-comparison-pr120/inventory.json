@@ -1988,7 +1988,7 @@
         {
           "path": "apps/core/src/jobs/job-service.ts",
           "category": "U01 native rewind job ownership and suppression",
-          "reason": "PR120: selects discarded service jobs by request ownership, propagates suppression errors and reselects pending events on retry",
+          "reason": "PR120: stops discarded service jobs by ownership, suppresses pending await/service events, and retries observed completion writes without resending signals",
           "state": "covered"
         },
         {
@@ -2396,7 +2396,7 @@
         {
           "path": "apps/core/tests/jobs/job-service.test.ts",
           "category": "U01 native rewind job ownership and suppression",
-          "reason": "PR120: retained jobs survive overlapping timestamps and partial suppression retries are idempotent",
+          "reason": "PR120: retained jobs/events survive rewind; partial suppression and observed completion retries are idempotent and cannot release live processes",
           "state": "covered"
         },
         {
@@ -2498,7 +2498,7 @@
         {
           "path": "apps/core/tests/surface/native/job-lifecycle.test.ts",
           "category": "U01 native rewind job ownership and suppression",
-          "reason": "PR120: real native rewind integration assigns actual retained/discarded request owners and overlaps job creation times",
+          "reason": "PR120: real rewind RPC preserves owner isolation, suppresses discarded await events and resumes the same pending command after finish persistence failure",
           "state": "covered"
         },
         {
@@ -5262,7 +5262,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "e7498e86d39a6c0fae2c7e9bfc394c8b2479570c"
+          "oid": "a6d60070f49d54360808b31d413973533b005dbe"
         }
       },
       "candidateDisposition": "resolved combination or integration repair; see capability guide"
@@ -9870,7 +9870,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "9b7787ef3e77c2810dea3e8a453194064cb6958f"
+          "oid": "97a28df28865347b3c320b6402acd30a07c3df1e"
         }
       },
       "candidateDisposition": "resolved combination or integration repair; see capability guide"
@@ -10921,7 +10921,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "4d277249d4bb75f1aec90ad0ca7d79e7be38e1af"
+          "oid": "1469be9851ee009764e4d14bd4eafd3deb61bd98"
         }
       },
       "candidateDisposition": "resolved combination or integration repair; see capability guide"
@@ -16422,7 +16422,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "236f1fce0e10ba98e0d274c6f1b3f71595917e56"
+          "oid": "2b789e5c5b8943f113463f5d18d7f2076db55968"
         }
       },
       "candidateDisposition": "comparison documentation included in candidate"
@@ -16455,7 +16455,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "c059c6c40d32525f87252567e1dd01824b6684a5"
+          "oid": "5d54a414805139734b92aac265befc26e18d7153"
         }
       },
       "candidateDisposition": "comparison documentation included in candidate"
@@ -22277,7 +22277,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "5b19eb96da40cd1644cebb49fb9d4864bef9ebb3"
+          "oid": "29fa014d7400c20a7a840baff11fd7863a506d6b"
         }
       },
       "candidateDisposition": "resolved combination or integration repair; see capability guide"
@@ -22473,7 +22473,7 @@
     }
   ],
   "candidate": {
-    "contentSha256": "27869db76cf7a0457099503af515013636a6d0433b61e7550f648cfb24b6e349",
+    "contentSha256": "bf405188e1b962aec797d3bfec988559f956a34f192fd5708f7efda4864574a8",
     "requiredParents": [
       "4d8c0a8d799fcacd8aa51ca7613f48d7bb3f2327",
       "7613d519643005ee4574c085a534c74af9508f88"

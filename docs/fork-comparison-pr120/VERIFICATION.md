@@ -13,6 +13,7 @@ The [English guide](../fork-differences.md), [Traditional Chinese guide](../fork
 | Upstream / PR #120 U | `7613d519643005ee4574c085a534c74af9508f88` |
 | Common ancestor B | `90d71dbe9a2a86d8b0a39513e9eb67d65eb93683` |
 | First published merge C1 | [`3292b12b99992aa648b28aa2b00252098aeb4663`](https://github.com/DF-wu/lilac-mono/commit/3292b12b99992aa648b28aa2b00252098aeb4663), with parents F and U |
+| Previous published follow-up E | [`e2750297a144344ab67c490ef5bf9a417decba39`](https://github.com/DF-wu/lilac-mono/commit/e2750297a144344ab67c490ef5bf9a417decba39); [all six hosted jobs passed](https://github.com/DF-wu/lilac-mono/actions/runs/44930917729) |
 | Current integration C | Content fingerprint and complete path/mode records in the generated ledger; on a clean committed checkout, `--candidate HEAD --check` verifies that commit's tree |
 
 C1 passed `bun run check`: 8,309 Bun and 14 Rust tests, zero failures and 13 existing optional skips.
@@ -51,7 +52,8 @@ Rewind receipts, input records and database schemas are unchanged. Recovery requ
 receipt and one retained cancelled full-input target from an older generation. Monotonic input positions,
 request IDs, cancelled state and absence of a retained turn identify the discarded full requests;
 steering records never become owners of a retained run's jobs. Job selection is by session and request
-ownership and is limited to service jobs. It never uses input or job creation timestamps.
+ownership: active stopping is limited to service jobs, while pending-event suppression covers both await
+and service output. It never uses input or job creation timestamps.
 
 A legacy receipt with a missing/ambiguous target record cannot prove ownership. Recovery returns
 `Rewind job ownership is unavailable` and leaves mutationPending set. It does not stop retained jobs or
@@ -103,7 +105,7 @@ both guides and production/test code are fingerprinted normally. This is not a c
 attestation: verification prose still needs review. Generated output contains no transient tree OID,
 checkout path, host name, timestamp or invented commit link.
 
-## Follow-up local verification
+## Earlier follow-up local verification (E)
 
 The focused command covered native execution, job service, runner recovery, session queue, thinking/heartbeat
 and Discord core-primary lineage:
@@ -135,7 +137,7 @@ corrected to bind jobs to their actual retained/discarded requests while making 
 **9 tests / 23 assertions**. This corrects the fixture's ownership model; production selection was not relaxed.
 The initial combined command ended with exit 143 after that failure; it is not counted as a successful run.
 
-## Final combined-tree checks
+## Previous published combined-tree checks (E)
 
 `PATH="$HOME/.cargo/bin:$PATH" RUSTUP_TOOLCHAIN=1.94.1 bun run check` completed with **exit 0**:
 **8,321 Bun tests plus 14 Rust tests passed, zero failures, 13 existing optional skips**.
@@ -151,8 +153,58 @@ Byte-for-byte regeneration, raw Git status/mode comparison, strict pinned footpr
 relative links/anchors, privacy scan and whitespace were rerun after filling it. The generator snapshot
 checks include unchanged real-index bytes and a changed gitlink rejected through a disposable index.
 All 500 C1 ledger rows retain their exact B/F/U objects and statuses; current extra rows are explicit.
-C1's historical pass is not substituted for the new result. Hosted CI must run on the actual new PR head;
-no later result is inferred here.
+These are E's historical results. The current narrow job-cleanup result follows below; hosted CI must
+run on its actual PR head.
+
+## Review 6007059282: narrow job-cleanup follow-up
+
+Both findings were confirmed against E's actual spawn/supervise/finish/stop flow.
+
+| Finding | Disposition and regression evidence |
+| --- | --- |
+| [Inline 4654109469](https://github.com/DF-wu/lilac-mono/pull/120#discussion_r4654109469): discarded pending await output | Fixed. `stopSessionRequests` stops active service jobs as before, but selects pending events by request ownership independently of mode. The focused regression proves discarded completed await output is suppressed, retained output stays pending, and `pendingEvents` exposes only the retained owner's output. The real native rewind RPC exercises the same behavior. |
+| [Outside-diff major](https://github.com/DF-wu/lilac-mono/pull/120#pullrequestreview-6007059282), marker `5ceea67609e6c28bd9cc675f`: completion-write failure | Fixed. The existing in-memory running record retains its exact observed terminal result after process exit and bounded stream cleanup until `finish` succeeds. Rewind retries that existing compare-and-transition, propagates write errors, and cannot release an active process. Tests stop a real process with SIGSTOP, prove cleanup still waits with no finish write, resume it, inject SQLITE_BUSY, and verify the same observed status/reason/output is persisted on retry. A competing terminal transition wins without overwrite; repeated cleanup is idempotent and retained jobs stay active. The real rewind RPC keeps mutationPending after failure and completes the same command after retry. |
+
+No storage schema, journal, startup reconciliation, timeout setting or provider policy changed.
+The supervisor alone establishes the terminal outcome. Retry does not infer process death from an absent
+map entry, signal a settled PID, or synthesize an exit result. Unowned active rows keep the existing
+ACTIVE_JOBS guard. Close still leaves interrupted live jobs for existing restart reconciliation, and skips
+signalling already-settled records. The store retains its existing successful-write-time `ended_at` semantics.
+
+Focused red command before the production fix:
+
+```sh
+bun run test:root -- ./apps/core/tests/jobs/job-service.test.ts -t 'pending await output|observed completion' --only-failures
+```
+
+Result: **0 pass, 3 fail**, with the discarded await event still pending and the two completion cases
+returning ACTIVE_JOBS instead of the transient finish error. After the fix: **3 pass, zero fail,
+30 assertions**. An initial fixture used a non-newline output marker that the sanitizer buffered and
+hit the test deadline; using a newline made readiness observable. That fixture failure is not counted as
+regression proof or as a successful check.
+
+```sh
+bun run test:root -- ./apps/core/tests/jobs/job-service.test.ts ./apps/core/tests/surface/native/job-lifecycle.test.ts ./apps/core/src/surface/native/execution.test.ts --only-failures
+```
+
+Current focused result: **117 pass, zero fail, 450 assertions** across three files, including the existing
+native execution/recovery cases. No web code or rendered interaction changed in this narrow follow-up;
+the earlier browser evidence remains historical E evidence.
+
+The current complete tree passed `PATH="$HOME/.cargo/bin:$PATH" RUSTUP_TOOLCHAIN=1.94.1 bun run check`
+with **exit 0: 8,325 Bun tests and 14 Rust tests passed, zero failures, 13 existing optional skips**.
+This includes Core/web/provider suites, all workspace and extra typechecks, architecture and production
+syntax, generated-code checks, formatting and the normal external plugin checks. No check was bypassed.
+Bun 1.4.5 and the already-installed Rust/Cargo 1.94.1 were used, as for E; no host configuration changed.
+
+The exact pinned strict footprint remains **223 covered, zero unlisted, zero stale**. All 503 ledger paths
+and complete-tree mode counts match independent Git comparisons; the nine changed files from E are
+limited to JobService, its focused/native tests, the affected comparison evidence and footprint reasons.
+Byte-for-byte worktree/tree-input reproduction, 694 relative links/anchors, private-artifact scans and
+whitespace passed. Verification-result prose was filled from actual output after the gate and is one of
+the existing evidence-content hash exclusions. Reproduction is checked again before and after commit.
+All B/F/U/C1 object/status evidence is preserved. New hosted CI must validate the actual follow-up head;
+E's six successful jobs are historical evidence, not a result for changed code.
 
 ## Remaining limits
 
