@@ -278,6 +278,100 @@ describe("rewinding", () => {
   );
 });
 
+test("rewind keeps failed await completion pending until its observed outcome persists", async () => {
+  const h = await harness();
+  let finish: ReturnType<typeof spyOn> | undefined;
+  try {
+    const target = await h.client.inputs.submit({
+      threadId: h.thread.id,
+      commandId: crypto.randomUUID(),
+      historyGeneration: 0,
+      text: "await-write target",
+      mode: "prompt",
+      attachmentIds: [],
+      skillIds: [],
+    });
+    await waitForStore(
+      h.fixture.store,
+      () => integrationValue(h.fixture.store.getInput(target.inputId)).completedAt !== undefined,
+    );
+    const requestId = integrationValue(h.fixture.store.getInput(target.inputId)).requestId;
+    const attempted = Promise.withResolvers<void>();
+    let failing = true;
+    const persist = h.jobStore.finish.bind(h.jobStore);
+    finish = spyOn(h.jobStore, "finish").mockImplementation((id, ending) => {
+      if (h.read(id)?.requestId === requestId && failing) {
+        attempted.resolve();
+        return Result.err(
+          new JobStoreFailed({
+            operation: "finish",
+            code: "SQLITE_BUSY",
+            message: "await completion unavailable",
+          }),
+        );
+      }
+      return persist(id, ending);
+    });
+    const job = await h.startService(requestId, "await");
+    await attempted.promise;
+    const before = await h.client.threads.sync({ threadId: h.thread.id });
+    const request = {
+      threadId: h.thread.id,
+      commandId: crypto.randomUUID(),
+      historyGeneration: 0,
+      expectedRevision: before.checkpoint.projectionRevision,
+      turnId: target.turnId!,
+    };
+    await expect(h.client.threads.rewind(request)).rejects.toThrow();
+    expect(integrationValue(h.fixture.store.getThreadRecord(h.thread.id)).mutationPending).toBe(
+      true,
+    );
+    expect(h.read(job.jobId)?.status).toBe("running");
+    const promptsBeforeWake = h.prompts.length;
+    expect(
+      integrationValue(
+        h.fixture.runtime.deliverJobWake({
+          wakeId: crypto.randomUUID(),
+          threadId: h.thread.id,
+          userId: h.thread.starterId,
+          text: "discarded wake",
+        }),
+      ),
+    ).toBe("unavailable");
+    expect(h.prompts).toHaveLength(promptsBeforeWake);
+    failing = false;
+    await h.client.threads.rewind(request);
+    expect(integrationValue(h.fixture.store.getThreadRecord(h.thread.id)).mutationPending).toBe(
+      false,
+    );
+    expect(h.read(job.jobId)).toMatchObject({
+      status: "exited",
+      exitCode: 0,
+      stopReason: null,
+      delivery: "suppressed",
+    });
+    expect(await h.jobs.pendingEvents(nativeSessionId(h.thread.id))).toEqual([]);
+    const next = await h.client.inputs.submit({
+      threadId: h.thread.id,
+      commandId: crypto.randomUUID(),
+      historyGeneration: 1,
+      text: "after successful rewind",
+      mode: "prompt",
+      attachmentIds: [],
+      skillIds: [],
+    });
+    await waitForStore(
+      h.fixture.store,
+      () => integrationValue(h.fixture.store.getInput(next.inputId)).completedAt !== undefined,
+    );
+    expect(h.prompts.at(-1)?.includes("await-output")).toBe(false);
+    expect(h.prompts.at(-1)?.includes("discarded wake")).toBe(false);
+  } finally {
+    finish?.mockRestore();
+    await h.close();
+  }
+});
+
 describe("native job wakes", () => {
   const wake = (h: Awaited<ReturnType<typeof harness>>, wakeId = crypto.randomUUID()) =>
     integrationValue(

@@ -1988,7 +1988,7 @@
         {
           "path": "apps/core/src/jobs/job-service.ts",
           "category": "U01 native rewind job ownership and suppression",
-          "reason": "PR120: stops discarded service jobs by ownership, suppresses pending await/service events, and retries observed completion writes without resending signals",
+          "reason": "PR120: settles discarded await/service jobs; retries observed completions and startup-fenced lost classification without claiming new reservations or retained owners",
           "state": "covered"
         },
         {
@@ -2396,7 +2396,7 @@
         {
           "path": "apps/core/tests/jobs/job-service.test.ts",
           "category": "U01 native rewind job ownership and suppression",
-          "reason": "PR120: retained jobs/events survive rewind; partial suppression and observed completion retries are idempotent and cannot release live processes",
+          "reason": "PR120: await/service owner matrix, completion and startup failures, spawn/register races, unknown ownership and idempotent cleanup retain live processes and events",
           "state": "covered"
         },
         {
@@ -2498,7 +2498,7 @@
         {
           "path": "apps/core/tests/surface/native/job-lifecycle.test.ts",
           "category": "U01 native rewind job ownership and suppression",
-          "reason": "PR120: real rewind RPC preserves owner isolation, suppresses discarded await events and resumes the same pending command after finish persistence failure",
+          "reason": "PR120: real rewind RPC preserves owner isolation and observed await outcomes, blocks wakes while pending, and excludes discarded output after retry",
           "state": "covered"
         },
         {
@@ -5262,7 +5262,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "a6d60070f49d54360808b31d413973533b005dbe"
+          "oid": "e8135466d83d59577c6b75d28140cdce3bc944ec"
         }
       },
       "candidateDisposition": "resolved combination or integration repair; see capability guide"
@@ -9870,7 +9870,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "97a28df28865347b3c320b6402acd30a07c3df1e"
+          "oid": "0431ccc5ee8a8fa01708e7904ee68aa96d9b9d4f"
         }
       },
       "candidateDisposition": "resolved combination or integration repair; see capability guide"
@@ -10921,7 +10921,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "1469be9851ee009764e4d14bd4eafd3deb61bd98"
+          "oid": "8f0d247e72a03862f4551378e827d5ee3ecbe25d"
         }
       },
       "candidateDisposition": "resolved combination or integration repair; see capability guide"
@@ -16422,7 +16422,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "2b789e5c5b8943f113463f5d18d7f2076db55968"
+          "oid": "6ca583b2ea8084879db3787b030fad68d9d91ce8"
         }
       },
       "candidateDisposition": "comparison documentation included in candidate"
@@ -16455,7 +16455,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "5d54a414805139734b92aac265befc26e18d7153"
+          "oid": "96b7cd377fd5fb1d34cf7668d2e14a710f3d8624"
         }
       },
       "candidateDisposition": "comparison documentation included in candidate"
@@ -22277,7 +22277,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "29fa014d7400c20a7a840baff11fd7863a506d6b"
+          "oid": "991f9c25c832c3194b7ff2ed11276c54ef81ab9f"
         }
       },
       "candidateDisposition": "resolved combination or integration repair; see capability guide"
@@ -22473,7 +22473,7 @@
     }
   ],
   "candidate": {
-    "contentSha256": "bf405188e1b962aec797d3bfec988559f956a34f192fd5708f7efda4864574a8",
+    "contentSha256": "130f1a1d6237af376abf85efe2e39fd7fa6fe5341e5fe648cf4889077cc8b75d",
     "requiredParents": [
       "4d8c0a8d799fcacd8aa51ca7613f48d7bb3f2327",
       "7613d519643005ee4574c085a534c74af9508f88"

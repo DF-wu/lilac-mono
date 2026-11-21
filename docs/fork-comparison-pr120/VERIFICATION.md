@@ -14,6 +14,7 @@ The [English guide](../fork-differences.md), [Traditional Chinese guide](../fork
 | Common ancestor B | `90d71dbe9a2a86d8b0a39513e9eb67d65eb93683` |
 | First published merge C1 | [`3292b12b99992aa648b28aa2b00252098aeb4663`](https://github.com/DF-wu/lilac-mono/commit/3292b12b99992aa648b28aa2b00252098aeb4663), with parents F and U |
 | Previous published follow-up E | [`e2750297a144344ab67c490ef5bf9a417decba39`](https://github.com/DF-wu/lilac-mono/commit/e2750297a144344ab67c490ef5bf9a417decba39); [all six hosted jobs passed](https://github.com/DF-wu/lilac-mono/actions/runs/44930917729) |
+| Published job-cleanup follow-up J | [`677e56956fc6e7cec8927e28f3a4a5d6c55ca381`](https://github.com/DF-wu/lilac-mono/commit/677e56956fc6e7cec8927e28f3a4a5d6c55ca381); [all six hosted jobs passed](https://github.com/DF-wu/lilac-mono/actions/runs/44933469954) |
 | Current integration C | Content fingerprint and complete path/mode records in the generated ledger; on a clean committed checkout, `--candidate HEAD --check` verifies that commit's tree |
 
 C1 passed `bun run check`: 8,309 Bun and 14 Rust tests, zero failures and 13 existing optional skips.
@@ -52,8 +53,8 @@ Rewind receipts, input records and database schemas are unchanged. Recovery requ
 receipt and one retained cancelled full-input target from an older generation. Monotonic input positions,
 request IDs, cancelled state and absence of a retained turn identify the discarded full requests;
 steering records never become owners of a retained run's jobs. Job selection is by session and request
-ownership: active stopping is limited to service jobs, while pending-event suppression covers both await
-and service output. It never uses input or job creation timestamps.
+ownership for both await and service jobs, including active stopping, terminal persistence and pending
+event suppression. It never uses input or job creation timestamps.
 
 A legacy receipt with a missing/ambiguous target record cannot prove ownership. Recovery returns
 `Rewind job ownership is unavailable` and leaves mutationPending set. It does not stop retained jobs or
@@ -156,7 +157,7 @@ All 500 C1 ledger rows retain their exact B/F/U objects and statuses; current ex
 These are E's historical results. The current narrow job-cleanup result follows below; hosted CI must
 run on its actual PR head.
 
-## Review 6007059282: narrow job-cleanup follow-up
+## Review 6007059282: published job-cleanup follow-up J
 
 Both findings were confirmed against E's actual spawn/supervise/finish/stop flow.
 
@@ -187,11 +188,11 @@ regression proof or as a successful check.
 bun run test:root -- ./apps/core/tests/jobs/job-service.test.ts ./apps/core/tests/surface/native/job-lifecycle.test.ts ./apps/core/src/surface/native/execution.test.ts --only-failures
 ```
 
-Current focused result: **117 pass, zero fail, 450 assertions** across three files, including the existing
+J focused result: **117 pass, zero fail, 450 assertions** across three files, including the existing
 native execution/recovery cases. No web code or rendered interaction changed in this narrow follow-up;
 the earlier browser evidence remains historical E evidence.
 
-The current complete tree passed `PATH="$HOME/.cargo/bin:$PATH" RUSTUP_TOOLCHAIN=1.94.1 bun run check`
+J passed `PATH="$HOME/.cargo/bin:$PATH" RUSTUP_TOOLCHAIN=1.94.1 bun run check`
 with **exit 0: 8,325 Bun tests and 14 Rust tests passed, zero failures, 13 existing optional skips**.
 This includes Core/web/provider suites, all workspace and extra typechecks, architecture and production
 syntax, generated-code checks, formatting and the normal external plugin checks. No check was bypassed.
@@ -205,6 +206,75 @@ whitespace passed. Verification-result prose was filled from actual output after
 the existing evidence-content hash exclusions. Reproduction is checked again before and after commit.
 All B/F/U/C1 object/status evidence is preserved. New hosted CI must validate the actual follow-up head;
 E's six successful jobs are historical evidence, not a result for changed code.
+
+## Review 6007211581: await and restart contract audit
+
+Both findings were reproduced against J and fixed in the JobService owner.
+
+| Finding | Disposition |
+| --- | --- |
+| [4654241440](https://github.com/DF-wu/lilac-mono/pull/120#discussion_r4654241440): await rows bypass active cleanup | Fixed. Active selection and the remaining-active guard now cover every discarded request's await and service rows. Observed await outcomes receive the same persistence retry as service outcomes; a current process must finish supervision before success. The real rewind RPC test injects an await completion-write failure, checks mutationPending, retries the same command, verifies the actual exited/zero outcome, and proves no discarded output reaches the next model call. |
+| [4654241445](https://github.com/DF-wu/lilac-mono/pull/120#discussion_r4654241445): restart finish failure blocks rewind | Fixed for proven pre-startup records. A synchronous active-ID snapshot at service construction fences all restart-lost classification. Both the normal sweep and targeted cleanup use the existing PID/start-tick check and active-only finish transition. Failed writes retain eligibility for retry. Cleanup touches only the requested owners/session; it never runs a global sweep. New reservations and spawn/register gaps are excluded from the startup set, regardless of running-map registration. |
+
+The snapshot is process-local ownership evidence, not a new stored journal, schema, worker or knob.
+A successful finish removes its ID from the retry set. A competing terminal transition is never overwritten.
+The old lost/core_restart/pending classification, process identity check, existing output metadata and
+successful-write-time ended_at semantics remain. Current observed outcomes take priority over restart
+classification. There is no time cutoff and no inference of death from a missing map entry.
+
+If the **initial constructor snapshot itself fails**, no pre-startup ID can be proved. Unclassified active
+rows remain ACTIVE_JOBS and rewind stays pending until a successful new service startup can capture them.
+A later sweep cannot adopt arbitrary rows, because they may be new reservations. This is the deliberate
+fail-closed limitation required by ownership safety; confirmed current jobs still stop and persist normally.
+A later sweep-enumeration failure after a successful initial snapshot is retryable through targeted cleanup.
+No new product or persistent-data decision is required for these rules.
+
+The contract audit checked the combinations together:
+
+| Combination | Required result and evidence |
+| --- | --- |
+| Retained await/service, active or pending | Unchanged by discarded-owner cleanup. Mode matrix and pending-output tests preserve rows/events; startup retry compares the retained row byte for byte before/after the targeted operation. |
+| Discarded await/service, current process active | Stop and await supervision; never finish early. SIGSTOP/SIGCONT tests prove no finish write while the process remains active. |
+| Observed terminal result, transient write failure | Return the store failure, retain mutationPending, retry the same status/reason/output and preserve a competing terminal winner. Four mode/terminal-winner cases exercise this path. |
+| Confirmed pre-startup row, failed later enumeration or finish | Retain startup-ID eligibility; retry only the selected predecessor job as lost, suppress its event, and leave retained/new current jobs unchanged. Four mode/failure-phase cases exercise this path. |
+| Failed initial snapshot / unconfirmed record | Keep the row active and mutation pending, create no lost event, and continue to handle confirmed current jobs normally. Both modes are tested. |
+| Reservation created after startup / spawn before map registration | Never classify it as lost. A direct reservation and a real markRunning registration seam retain the starting/running row and live process with no pending event. |
+| Wake during pending rewind / next run after retry | Native deliverJobWake returns unavailable without model publication while mutationPending. After successful retry, pendingEvents is empty and the next real RPC prompt contains neither discarded await output nor the held wake. |
+| Missing native receipt ownership | Existing native execution tests still fail closed before job cleanup; this change does not widen receipt/request authorization. |
+
+Focused red/green command:
+
+```sh
+bun run test:root -- ./apps/core/tests/jobs/job-service.test.ts -t 'observed.*completion|startup' --only-failures
+```
+
+Before the fix: **2 pass, 9 fail**. After the fix: **11 pass, zero fail, 91 assertions** at that point.
+The final expanded owner/snapshot assertions are included in the complete focused run below.
+
+```sh
+bun run test:root -- ./apps/core/tests/jobs/job-service.test.ts ./apps/core/tests/surface/native/job-lifecycle.test.ts ./apps/core/src/surface/native/execution.test.ts --only-failures
+```
+
+Result on the final source: **127 pass, zero fail, 529 assertions** across three files. No live provider
+traffic was used. The first full check found two TS2339 errors in new test assertions that read `code`
+from the broader JobStoreError union. Those assertions now match the expected error shape without
+accessing an unproved property. That failed check is not counted as a successful gate.
+
+The final tree passed `PATH="$HOME/.cargo/bin:$PATH" RUSTUP_TOOLCHAIN=1.94.1 bun run check`
+with **exit 0: 8,335 Bun tests and 14 Rust tests passed, zero failures, 13 existing optional skips**,
+using Bun 1.4.5 and Rust 1.94.1. This includes all workspace and extra typechecks, architecture and
+production syntax, generated-code checks, formatting, provider/web suites and normal external plugin
+checks. No check was bypassed. J's six successful hosted jobs remain historical evidence; hosted CI must
+run on the new commit. No web code changed, so previous browser evidence is not counted as a new browser
+run for this source-only repair.
+
+The regenerated full ledger reproduces byte for byte using `--candidate-worktree --check`; publication
+verification repeats it using `--candidate HEAD --check`. The independent pinned-U MDT set exactly matches
+all **223** policy rows; the unchanged strict gate reports **zero unlisted and zero stale**. All 503
+historical baseline objects/statuses and seven gitlinks remain unchanged. The 2,263-path candidate tree,
+694 relative link targets, six comparison artifacts' private-pattern scan and whitespace checks pass.
+The content fingerprint in the ledger excludes only the three documented evidence outputs' contents;
+their presence and modes remain included. Verification prose is reviewed separately from that fingerprint.
 
 ## Remaining limits
 

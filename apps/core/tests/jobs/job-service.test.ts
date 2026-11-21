@@ -369,13 +369,18 @@ describe("JobService", () => {
     expect(events[0]?.outputTail).toBe("retained-output");
   });
 
-  it.each([false, true])(
-    "rewind retries the observed completion after process exit (terminal row won: %s)",
-    async (terminalRowWon) => {
-      const retained = ok<JobRecord>(await start(service, "sleep 60", { mode: "service" }));
+  it.each([
+    ["service", false],
+    ["service", true],
+    ["await", false],
+    ["await", true],
+  ] as const)(
+    "rewind retries the observed %s completion after process exit (terminal row won: %s)",
+    async (mode, terminalRowWon) => {
+      const retained = ok<JobRecord>(await start(service, "sleep 60", { mode }));
       const discarded = ok<JobRecord>(
         await start(service, "printf 'ready\\n'; exec sleep 60", {
-          mode: "service",
+          mode,
           owner: { ...owner, requestId: "discarded-finish" },
         }),
       );
@@ -449,6 +454,183 @@ describe("JobService", () => {
         expect(finish.mock.calls).toHaveLength(calls);
       } finally {
         finish.mockRestore();
+      }
+    },
+  );
+
+  it.each([
+    ["await", "enumeration"],
+    ["service", "enumeration"],
+    ["await", "finish"],
+    ["service", "finish"],
+  ] as const)(
+    "rewind retries startup %s classification after failed %s without touching retained owners",
+    async (mode, phase) => {
+      const retained = ok<JobRecord>(await start(service, "sleep 60", { mode }));
+      const discardedOwner = { ...owner, requestId: "discarded-startup" };
+      const discarded = ok<JobRecord>(
+        await start(service, "sleep 60", { mode, owner: discardedOwner }),
+      );
+      await service.close();
+      const restarted = createService();
+      const failure = new JobStoreFailed({
+        operation: "finish",
+        code: "SQLITE_BUSY",
+        message: "startup write unavailable",
+      });
+      let failing = true;
+      const persist = store.finish.bind(store);
+      const finish = spyOn(store, "finish").mockImplementation((id, ending) =>
+        id === discarded.jobId && failing ? Result.err(failure) : persist(id, ending),
+      );
+      const enumeration = spyOn(store, "listActive");
+      if (phase === "enumeration") enumeration.mockReturnValueOnce(Result.err(failure));
+      try {
+        restarted.reconcileAfterRestart();
+        const retainedBefore = ok<JobRecord | null>(store.get(retained.jobId));
+        const current = ok<JobRecord>(
+          await start(restarted, "sleep 60", {
+            mode,
+            owner: { ...owner, requestId: "post-startup" },
+          }),
+        );
+        expect(
+          (
+            await restarted.stopSessionRequests(
+              owner.sessionId,
+              [discardedOwner.requestId],
+              "thread_rewound",
+            )
+          ).match({ ok: () => null, err: (error) => error }),
+        ).toBe(failure);
+        expect(ok<JobRecord | null>(store.get(discarded.jobId))?.status).toBe("running");
+        failing = false;
+        ok(
+          await restarted.stopSessionRequests(
+            owner.sessionId,
+            [discardedOwner.requestId],
+            "thread_rewound",
+          ),
+        );
+        expect(ok<JobRecord | null>(store.get(discarded.jobId))).toMatchObject({
+          status: "lost",
+          stopReason: "core_restart",
+          delivery: "suppressed",
+        });
+        expect(ok<JobRecord | null>(store.get(retained.jobId))).toEqual(retainedBefore);
+        expect(ok<JobRecord | null>(store.get(current.jobId))).toMatchObject({
+          status: "running",
+          delivery: "none",
+        });
+        expect(
+          (await restarted.pendingEvents(owner.sessionId)).some(
+            (event) => event.job.jobId === discarded.jobId,
+          ),
+        ).toBe(false);
+        restarted.reconcileAfterRestart();
+        expect(ok<JobRecord | null>(store.get(current.jobId))?.status).toBe("running");
+        ok(
+          await restarted.stopSessionRequests(
+            owner.sessionId,
+            [discardedOwner.requestId],
+            "thread_rewound",
+          ),
+        );
+      } finally {
+        finish.mockRestore();
+        enumeration.mockRestore();
+      }
+    },
+  );
+
+  it("startup classification cannot claim a new reservation or a spawn/register race", async () => {
+    ok(
+      store.reserve({
+        jobId: "job_unregistered",
+        launchKey: "unregistered",
+        owner: { ...owner, requestId: "unconfirmed" },
+        toolCallId: "unregistered",
+        mode: "await",
+        label: "not registered",
+        command: "unused",
+        cwd: tmpdir(),
+        deadlineAt: Date.now() + 1000,
+      }),
+    );
+    service.reconcileAfterRestart();
+    expect(ok<JobRecord | null>(store.get("job_unregistered"))?.status).toBe("starting");
+    expect(
+      (await service.stopSessionRequests(owner.sessionId, ["unconfirmed"], "thread_rewound")).match(
+        { ok: () => null, err: (error) => error },
+      ),
+    ).toMatchObject({ code: "ACTIVE_JOBS" });
+    const mark = store.markRunning.bind(store);
+    const registration = spyOn(store, "markRunning").mockImplementation((id, input) => {
+      service.reconcileAfterRestart();
+      return mark(id, input);
+    });
+    try {
+      const job = ok<JobRecord>(await start(service, "sleep 60", { mode: "await" }));
+      expect(ok<JobRecord | null>(store.get(job.jobId))).toMatchObject({
+        status: "running",
+        delivery: "none",
+      });
+      expect(existsSync(`/proc/${job.pid}/stat`)).toBe(true);
+      expect(await service.pendingEvents(owner.sessionId)).toEqual([]);
+    } finally {
+      registration.mockRestore();
+    }
+  });
+
+  it.each(["await", "service"] as const)(
+    "failed startup snapshot keeps an unclassified %s row pending",
+    async (mode) => {
+      const job = ok<JobRecord>(await start(service, "sleep 60", { mode }));
+      await service.close();
+      const enumeration = spyOn(store, "listActive").mockReturnValueOnce(
+        Result.err(
+          new JobStoreFailed({
+            operation: "listActive",
+            code: "SQLITE_BUSY",
+            message: "startup snapshot unavailable",
+          }),
+        ),
+      );
+      try {
+        const restarted = createService();
+        const current = ok<JobRecord>(
+          await start(restarted, "sleep 60", {
+            mode,
+            owner: { ...owner, requestId: "confirmed-current" },
+          }),
+        );
+        restarted.reconcileAfterRestart();
+        expect(
+          (
+            await restarted.stopSessionRequests(
+              owner.sessionId,
+              [owner.requestId],
+              "thread_rewound",
+            )
+          ).match({ ok: () => null, err: (error) => error }),
+        ).toMatchObject({ code: "ACTIVE_JOBS" });
+        restarted.reconcileAfterRestart();
+        expect(ok<JobRecord | null>(store.get(job.jobId))?.status).toBe("running");
+        expect(ok<JobRecord | null>(store.get(current.jobId))?.status).toBe("running");
+        ok(
+          await restarted.stopSessionRequests(
+            owner.sessionId,
+            ["confirmed-current"],
+            "thread_rewound",
+          ),
+        );
+        expect(ok<JobRecord | null>(store.get(current.jobId))).toMatchObject({
+          status: "stopped",
+          delivery: "suppressed",
+        });
+        expect(await restarted.pendingEvents(owner.sessionId)).toEqual([]);
+      } finally {
+        enumeration.mockRestore();
       }
     },
   );

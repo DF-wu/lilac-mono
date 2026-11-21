@@ -152,6 +152,7 @@ export class JobService {
   readonly #logDir: string;
   readonly #now: () => number;
   readonly #running = new Map<string, RunningJob>();
+  readonly #restartJobIds: Set<string>;
   readonly #listeners = new Set<() => void>();
   readonly #wakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #wakeRetries = new Map<string, number>();
@@ -172,6 +173,14 @@ export class JobService {
     this.#wakeRetryDelaysMs = input.wakeRetryDelaysMs ?? JOB_LIMITS.wakeRetryDelaysMs;
     this.#maxOutputBytes = input.maxOutputBytes ?? JOB_LIMITS.maxOutputBytes;
     this.#store = input.store;
+    // Only these pre-startup rows may be classified as lost; absence from #running proves nothing.
+    this.#restartJobIds = this.#store.listActive().match({
+      ok: (jobs) => new Set(jobs.map((job) => job.jobId)),
+      err: (error) => {
+        logStoreFailure("reconcile-snapshot", error);
+        return new Set<string>();
+      },
+    });
     this.#logDir = input.logDir;
     this.#now = input.now ?? Date.now;
     mkdirSync(this.#logDir, { recursive: true, mode: 0o700 });
@@ -191,25 +200,10 @@ export class JobService {
       .listActive()
       .match({ ok: (jobs) => jobs, err: (error) => (logStoreFailure("reconcile", error), []) });
     for (const job of active) {
-      const identified =
-        job.pid !== null &&
-        job.processStartTicks !== null &&
-        readProcessStartTicks(job.pid) === job.processStartTicks;
-      if (identified && job.pid !== null) signalProcessGroup(job.pid, "SIGKILL");
-      logger.warn("job lost after restart", { ...jobLogFields(job), killed: identified });
-      this.#store
-        .finish(job.jobId, {
-          status: "lost",
-          exitCode: null,
-          stopReason: "core_restart",
-          delivery: "pending",
-          outputBytes: job.outputBytes,
-          outputTruncated: job.outputTruncated,
-        })
-        .match({
-          ok: () => undefined,
-          err: (error) => logStoreFailure("reconcile-finish", error),
-        });
+      this.#finishRestartJob(job).match({
+        ok: () => undefined,
+        err: (error) => logStoreFailure("reconcile-finish", error),
+      });
     }
     this.#deleteExpired();
   }
@@ -422,7 +416,7 @@ export class JobService {
     stopReason: JobStopReason,
   ): Promise<ResultType<void, JobStoreError>> {
     const owners = new Set(requestIds);
-    const selected = (job: JobRecord) => job.mode === "service" && owners.has(job.requestId);
+    const selected = (job: JobRecord) => owners.has(job.requestId);
     return Result.gen(async function* (this: JobService) {
       const active = yield* this.#store.listActiveForSession(sessionId);
       const stopped = await Promise.all(
@@ -513,11 +507,36 @@ export class JobService {
     await running.done;
   }
 
+  #finishRestartJob(job: JobRecord): ResultType<void, JobStoreError> {
+    if (!this.#restartJobIds.has(job.jobId) || !isJobActive(job.status))
+      return Result.ok(undefined);
+    const identified =
+      job.pid !== null &&
+      job.processStartTicks !== null &&
+      readProcessStartTicks(job.pid) === job.processStartTicks;
+    if (identified && job.pid !== null) signalProcessGroup(job.pid, "SIGKILL");
+    logger.warn("job lost after restart", { ...jobLogFields(job), killed: identified });
+    const finished = this.#store.finish(job.jobId, {
+      status: "lost",
+      exitCode: null,
+      stopReason: "core_restart",
+      delivery: "pending",
+      outputBytes: job.outputBytes,
+      outputTruncated: job.outputTruncated,
+    });
+    if (finished.isErr()) return Result.err(finished.error);
+    this.#restartJobIds.delete(job.jobId);
+    return Result.ok(undefined);
+  }
+
   #persistSettledJob(jobId: string): ResultType<void, JobStoreError> {
     const running = this.#running.get(jobId);
-    // Only the supervisor can establish an observed outcome after process and stream cleanup.
-    // Unowned active rows remain blocked by stopSessionRequests' remaining-active check.
-    if (!running?.ending) return Result.ok(undefined);
+    if (!running)
+      return this.#store
+        .get(jobId)
+        .andThen((job) => (job ? this.#finishRestartJob(job) : Result.ok(undefined)));
+    // A current process must finish supervision; startup classification cannot claim it.
+    if (!running.ending) return Result.ok(undefined);
     const finished = this.#store.finish(jobId, running.ending);
     if (finished.isErr()) return Result.err(finished.error);
     this.#running.delete(jobId);
