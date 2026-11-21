@@ -6,7 +6,7 @@ import { Result } from "better-result";
 
 import { JOB_LIMITS, type JobOwner, type JobRecord } from "../../src/jobs/job-domain";
 import { JobService, type JobWakeDelivery } from "../../src/jobs/job-service";
-import { JobStoreFailed, SqliteJobStore, type FinishJobInput } from "../../src/jobs/job-store";
+import { JobStoreFailed, SqliteJobStore } from "../../src/jobs/job-store";
 
 const owner: JobOwner = {
   requestId: "request-1",
@@ -369,43 +369,23 @@ describe("JobService", () => {
     expect(events[0]?.outputTail).toBe("retained-output");
   });
 
-  it.each([
-    ["service", false],
-    ["service", true],
-    ["await", false],
-    ["await", true],
-  ] as const)(
-    "rewind retries the observed %s completion after process exit (terminal row won: %s)",
-    async (mode, terminalRowWon) => {
+  it.each(["await", "service"] as const)(
+    "rewind waits for live discarded %s supervision and preserves retained owners",
+    async (mode) => {
       const retained = ok<JobRecord>(await start(service, "sleep 60", { mode }));
       const discarded = ok<JobRecord>(
         await start(service, "printf 'ready\\n'; exec sleep 60", {
           mode,
-          owner: { ...owner, requestId: "discarded-finish" },
+          owner: { ...owner, requestId: "discarded-live" },
         }),
       );
       await untilLogContains(discarded.jobId, "ready");
-      const persist = store.finish.bind(store);
-      const failure = new JobStoreFailed({
-        operation: "finish",
-        code: "SQLITE_BUSY",
-        message: "transient finish failure",
-      });
-      let failing = true;
-      const endings: FinishJobInput[] = [];
-      const finish = spyOn(store, "finish").mockImplementation((id, ending) => {
-        if (id !== discarded.jobId) return persist(id, ending);
-        expect(existsSync(`/proc/${discarded.pid}/stat`)).toBe(false);
-        endings.push(ending);
-        if (failing) return Result.err(failure);
-        if (terminalRowWon) persist(id, { ...ending, status: "lost", stopReason: "core_restart" });
-        return persist(id, ending);
-      });
+      const finish = spyOn(store, "finish");
       try {
         process.kill(discarded.pid!, "SIGSTOP");
         const cleanup = service.stopSessionRequests(
           owner.sessionId,
-          ["discarded-finish"],
+          ["discarded-live"],
           "thread_rewound",
         );
         expect(
@@ -415,43 +395,16 @@ describe("JobService", () => {
           ]),
         ).toBe("waiting");
         expect(finish).not.toHaveBeenCalled();
-        expect(ok<JobRecord | null>(store.get(discarded.jobId))?.status).toBe("running");
         process.kill(discarded.pid!, "SIGCONT");
-        expect((await cleanup).match({ ok: () => null, err: (error) => error })).toBe(failure);
-        expect(ok<JobRecord | null>(store.get(discarded.jobId))?.status).toBe("running");
-        expect(endings[0]).toEqual({
-          status: "stopped",
-          exitCode: null,
-          stopReason: "thread_rewound",
-          delivery: "suppressed",
-          outputBytes: 6,
-          outputTruncated: false,
-        });
-        failing = false;
-        ok(
-          await service.stopSessionRequests(
-            owner.sessionId,
-            ["discarded-finish"],
-            "thread_rewound",
-          ),
-        );
-        expect(endings.at(-1)).toEqual(endings[0]);
+        ok(await cleanup);
+        expect(existsSync(`/proc/${discarded.pid}/stat`)).toBe(false);
         expect(ok<JobRecord | null>(store.get(discarded.jobId))).toMatchObject({
-          status: terminalRowWon ? "lost" : "stopped",
-          stopReason: terminalRowWon ? "core_restart" : "thread_rewound",
+          status: "stopped",
+          stopReason: "thread_rewound",
           delivery: "suppressed",
           outputBytes: 6,
         });
         expect(ok<JobRecord | null>(store.get(retained.jobId))?.status).toBe("running");
-        const calls = finish.mock.calls.length;
-        ok(
-          await service.stopSessionRequests(
-            owner.sessionId,
-            ["discarded-finish"],
-            "thread_rewound",
-          ),
-        );
-        expect(finish.mock.calls).toHaveLength(calls);
       } finally {
         finish.mockRestore();
       }
@@ -463,174 +416,104 @@ describe("JobService", () => {
     ["service", "enumeration"],
     ["await", "finish"],
     ["service", "finish"],
+    ["await", "markRunning"],
+    ["service", "markRunning"],
   ] as const)(
-    "rewind retries startup %s classification after failed %s without touching retained owners",
+    "rewind tolerates stale %s rows after failed startup/launch %s once storage recovers",
     async (mode, phase) => {
-      const retained = ok<JobRecord>(await start(service, "sleep 60", { mode }));
-      const discardedOwner = { ...owner, requestId: "discarded-startup" };
-      const discarded = ok<JobRecord>(
-        await start(service, "sleep 60", { mode, owner: discardedOwner }),
-      );
-      await service.close();
-      const restarted = createService();
       const failure = new JobStoreFailed({
-        operation: "finish",
+        operation: phase,
         code: "SQLITE_BUSY",
-        message: "startup write unavailable",
+        message: "transient storage failure",
       });
-      let failing = true;
-      const persist = store.finish.bind(store);
-      const finish = spyOn(store, "finish").mockImplementation((id, ending) =>
-        id === discarded.jobId && failing ? Result.err(failure) : persist(id, ending),
-      );
-      const enumeration = spyOn(store, "listActive");
-      if (phase === "enumeration") enumeration.mockReturnValueOnce(Result.err(failure));
-      try {
-        restarted.reconcileAfterRestart();
-        const retainedBefore = ok<JobRecord | null>(store.get(retained.jobId));
-        const current = ok<JobRecord>(
-          await start(restarted, "sleep 60", {
+      const discardedOwner = { ...owner, requestId: "discarded-stale" };
+      if (phase === "markRunning") {
+        const registration = spyOn(store, "markRunning").mockReturnValueOnce(Result.err(failure));
+        try {
+          expect(
+            (await start(service, "sleep 60", { mode, owner: discardedOwner })).match({
+              ok: () => null,
+              err: (error) => error,
+            }),
+          ).toBe(failure);
+          await untilProcessExits(registration.mock.calls[0]![1].pid);
+        } finally {
+          registration.mockRestore();
+        }
+      } else {
+        ok(
+          store.reserve({
+            jobId: "job_stale",
+            launchKey: "stale",
+            owner: discardedOwner,
+            toolCallId: "stale",
             mode,
-            owner: { ...owner, requestId: "post-startup" },
+            label: "stale startup row",
+            command: "unused",
+            cwd: tmpdir(),
+            deadlineAt: Date.now() + 1000,
           }),
         );
-        expect(
-          (
-            await restarted.stopSessionRequests(
-              owner.sessionId,
-              [discardedOwner.requestId],
-              "thread_rewound",
-            )
-          ).match({ ok: () => null, err: (error) => error }),
-        ).toBe(failure);
-        expect(ok<JobRecord | null>(store.get(discarded.jobId))?.status).toBe("running");
-        failing = false;
+        const unavailable = spyOn(
+          store,
+          phase === "enumeration" ? "listActive" : "finish",
+        ).mockReturnValue(Result.err(failure));
+        try {
+          createService().reconcileAfterRestart();
+        } finally {
+          unavailable.mockRestore();
+        }
+      }
+      const stale = ok<JobRecord[]>(store.listActiveForSession(owner.sessionId))[0]!;
+      expect(stale.status).toBe("starting");
+      const retained = ok<JobRecord>(await start(service, "sleep 60", { mode }));
+      const retainedBefore = ok<JobRecord | null>(store.get(retained.jobId));
+      const retainedEvent = ok<JobRecord>(await start(service, "printf retained", { mode }));
+      const discardedEvent = ok<JobRecord>(
+        await start(service, "printf discarded", {
+          mode,
+          owner: discardedOwner,
+        }),
+      );
+      await untilEnded(service, retainedEvent.jobId);
+      await untilEnded(service, discardedEvent.jobId);
+      for (let attempt = 0; attempt < 2; attempt += 1) {
         ok(
-          await restarted.stopSessionRequests(
+          await service.stopSessionRequests(
             owner.sessionId,
             [discardedOwner.requestId],
             "thread_rewound",
           ),
         );
-        expect(ok<JobRecord | null>(store.get(discarded.jobId))).toMatchObject({
-          status: "lost",
-          stopReason: "core_restart",
-          delivery: "suppressed",
-        });
+        expect(ok<JobRecord | null>(store.get(stale.jobId))).toEqual(stale);
         expect(ok<JobRecord | null>(store.get(retained.jobId))).toEqual(retainedBefore);
-        expect(ok<JobRecord | null>(store.get(current.jobId))).toMatchObject({
-          status: "running",
-          delivery: "none",
-        });
+        expect(existsSync(`/proc/${retained.pid}/stat`)).toBe(true);
+        expect(ok<JobRecord | null>(store.get(discardedEvent.jobId))?.delivery).toBe("suppressed");
         expect(
-          (await restarted.pendingEvents(owner.sessionId)).some(
-            (event) => event.job.jobId === discarded.jobId,
-          ),
-        ).toBe(false);
-        restarted.reconcileAfterRestart();
-        expect(ok<JobRecord | null>(store.get(current.jobId))?.status).toBe("running");
-        ok(
-          await restarted.stopSessionRequests(
-            owner.sessionId,
-            [discardedOwner.requestId],
-            "thread_rewound",
-          ),
-        );
-      } finally {
-        finish.mockRestore();
-        enumeration.mockRestore();
+          (await service.pendingEvents(owner.sessionId)).map((event) => event.job.jobId),
+        ).toEqual([retainedEvent.jobId]);
       }
     },
   );
 
-  it("startup classification cannot claim a new reservation or a spawn/register race", async () => {
-    ok(
-      store.reserve({
-        jobId: "job_unregistered",
-        launchKey: "unregistered",
-        owner: { ...owner, requestId: "unconfirmed" },
-        toolCallId: "unregistered",
-        mode: "await",
-        label: "not registered",
-        command: "unused",
-        cwd: tmpdir(),
-        deadlineAt: Date.now() + 1000,
-      }),
-    );
-    service.reconcileAfterRestart();
-    expect(ok<JobRecord | null>(store.get("job_unregistered"))?.status).toBe("starting");
-    expect(
-      (await service.stopSessionRequests(owner.sessionId, ["unconfirmed"], "thread_rewound")).match(
-        { ok: () => null, err: (error) => error },
-      ),
-    ).toMatchObject({ code: "ACTIVE_JOBS" });
-    const mark = store.markRunning.bind(store);
-    const registration = spyOn(store, "markRunning").mockImplementation((id, input) => {
-      service.reconcileAfterRestart();
-      return mark(id, input);
-    });
-    try {
-      const job = ok<JobRecord>(await start(service, "sleep 60", { mode: "await" }));
-      expect(ok<JobRecord | null>(store.get(job.jobId))).toMatchObject({
-        status: "running",
-        delivery: "none",
-      });
-      expect(existsSync(`/proc/${job.pid}/stat`)).toBe(true);
-      expect(await service.pendingEvents(owner.sessionId)).toEqual([]);
-    } finally {
-      registration.mockRestore();
-    }
-  });
-
-  it.each(["await", "service"] as const)(
-    "failed startup snapshot keeps an unclassified %s row pending",
-    async (mode) => {
-      const job = ok<JobRecord>(await start(service, "sleep 60", { mode }));
-      await service.close();
-      const enumeration = spyOn(store, "listActive").mockReturnValueOnce(
-        Result.err(
-          new JobStoreFailed({
-            operation: "listActive",
-            code: "SQLITE_BUSY",
-            message: "startup snapshot unavailable",
-          }),
-        ),
-      );
+  it.each(["listActiveForSession", "listPending"] as const)(
+    "rewind propagates %s failures and retries cleanup",
+    async (operation) => {
+      const job = ok<JobRecord>(await start(service, "printf discarded"));
+      await untilEnded(service, job.jobId);
+      const failure = new JobStoreFailed({ operation, code: "SQLITE_BUSY", message: "busy" });
+      const read = spyOn(store, operation).mockReturnValueOnce(Result.err(failure));
       try {
-        const restarted = createService();
-        const current = ok<JobRecord>(
-          await start(restarted, "sleep 60", {
-            mode,
-            owner: { ...owner, requestId: "confirmed-current" },
-          }),
-        );
-        restarted.reconcileAfterRestart();
         expect(
           (
-            await restarted.stopSessionRequests(
-              owner.sessionId,
-              [owner.requestId],
-              "thread_rewound",
-            )
+            await service.stopSessionRequests(owner.sessionId, [owner.requestId], "thread_rewound")
           ).match({ ok: () => null, err: (error) => error }),
-        ).toMatchObject({ code: "ACTIVE_JOBS" });
-        restarted.reconcileAfterRestart();
-        expect(ok<JobRecord | null>(store.get(job.jobId))?.status).toBe("running");
-        expect(ok<JobRecord | null>(store.get(current.jobId))?.status).toBe("running");
-        ok(
-          await restarted.stopSessionRequests(
-            owner.sessionId,
-            ["confirmed-current"],
-            "thread_rewound",
-          ),
-        );
-        expect(ok<JobRecord | null>(store.get(current.jobId))).toMatchObject({
-          status: "stopped",
-          delivery: "suppressed",
-        });
-        expect(await restarted.pendingEvents(owner.sessionId)).toEqual([]);
+        ).toBe(failure);
+        expect(ok<JobRecord | null>(store.get(job.jobId))?.delivery).toBe("pending");
+        ok(await service.stopSessionRequests(owner.sessionId, [owner.requestId], "thread_rewound"));
+        expect(await service.pendingEvents(owner.sessionId)).toEqual([]);
       } finally {
-        enumeration.mockRestore();
+        read.mockRestore();
       }
     },
   );

@@ -229,7 +229,7 @@ apps/web/src/uploads.ts  # retained files without a reference get cancellable re
 apps/web/src/use-dm-rewind.ts  # retries one unchanged history page after a transient failure so rewind availability can recover online
 apps/web/tests/uploads.test.ts  # retained-file retry reaches reservation/upload and exact expiry uses a fixed clock
 apps/core/tests/tool-server-health-state.test.ts  # isolates dependency fatal-streak assertions from real main-isolate memory accumulated during full-suite workers
-apps/core/src/jobs/job-service.ts  # PR120: settles discarded await/service jobs; retries observed completions and startup-fenced lost classification without claiming new reservations or retained owners
-apps/core/tests/jobs/job-service.test.ts  # PR120: await/service owner matrix, completion and startup failures, spawn/register races, unknown ownership and idempotent cleanup retain live processes and events
+apps/core/src/jobs/job-service.ts  # PR120: selects discarded request owners and propagates cleanup reads/suppression errors; upstream lifecycle leaves stale rows nonblocking for rewind
+apps/core/tests/jobs/job-service.test.ts  # PR120: verifies await/service owner isolation, live supervision, retryable cleanup errors and nonblocking stale rows after startup/launch failures
 apps/core/tests/surface/bridge/bus-agent-runner-recovery.test.ts  # PR120: repaired recovery uses only a readable marked predecessor and preserves the consumed retry marker
-apps/core/tests/surface/native/job-lifecycle.test.ts  # PR120: real rewind RPC preserves owner isolation and observed await outcomes, blocks wakes while pending, and excludes discarded output after retry
+apps/core/tests/surface/native/job-lifecycle.test.ts  # PR120: real rewind RPC retries pending suppression, preserves retained jobs/events and completes despite recovered startup/launch/completion failures

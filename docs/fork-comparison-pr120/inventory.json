@@ -1988,7 +1988,7 @@
         {
           "path": "apps/core/src/jobs/job-service.ts",
           "category": "U01 native rewind job ownership and suppression",
-          "reason": "PR120: settles discarded await/service jobs; retries observed completions and startup-fenced lost classification without claiming new reservations or retained owners",
+          "reason": "PR120: selects discarded request owners and propagates cleanup reads/suppression errors; upstream lifecycle leaves stale rows nonblocking for rewind",
           "state": "covered"
         },
         {
@@ -2396,7 +2396,7 @@
         {
           "path": "apps/core/tests/jobs/job-service.test.ts",
           "category": "U01 native rewind job ownership and suppression",
-          "reason": "PR120: await/service owner matrix, completion and startup failures, spawn/register races, unknown ownership and idempotent cleanup retain live processes and events",
+          "reason": "PR120: verifies await/service owner isolation, live supervision, retryable cleanup errors and nonblocking stale rows after startup/launch failures",
           "state": "covered"
         },
         {
@@ -2498,7 +2498,7 @@
         {
           "path": "apps/core/tests/surface/native/job-lifecycle.test.ts",
           "category": "U01 native rewind job ownership and suppression",
-          "reason": "PR120: real rewind RPC preserves owner isolation and observed await outcomes, blocks wakes while pending, and excludes discarded output after retry",
+          "reason": "PR120: real rewind RPC retries pending suppression, preserves retained jobs/events and completes despite recovered startup/launch/completion failures",
           "state": "covered"
         },
         {
@@ -5262,7 +5262,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "e8135466d83d59577c6b75d28140cdce3bc944ec"
+          "oid": "82cec20340bf3a4d4d5f6cc1007cab6f19864b9d"
         }
       },
       "candidateDisposition": "resolved combination or integration repair; see capability guide"
@@ -9870,7 +9870,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "0431ccc5ee8a8fa01708e7904ee68aa96d9b9d4f"
+          "oid": "d1dca7a6eaf213bf435a58308438c4415316ef6b"
         }
       },
       "candidateDisposition": "resolved combination or integration repair; see capability guide"
@@ -10921,7 +10921,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "8f0d247e72a03862f4551378e827d5ee3ecbe25d"
+          "oid": "6433126bfe8a02c23586b92655c1a53c47b65090"
         }
       },
       "candidateDisposition": "resolved combination or integration repair; see capability guide"
@@ -16422,7 +16422,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "6ca583b2ea8084879db3787b030fad68d9d91ce8"
+          "oid": "0a15dd339329553fbc5ca5930af2558fef48cc8a"
         }
       },
       "candidateDisposition": "comparison documentation included in candidate"
@@ -16455,7 +16455,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "96b7cd377fd5fb1d34cf7668d2e14a710f3d8624"
+          "oid": "8083f291ea83450e7b7894a8cd40e6bef51cb609"
         }
       },
       "candidateDisposition": "comparison documentation included in candidate"
@@ -22277,7 +22277,7 @@
         "candidate": {
           "mode": "100644",
           "kind": "blob",
-          "oid": "991f9c25c832c3194b7ff2ed11276c54ef81ab9f"
+          "oid": "f09f0c2ab8c7cbb4ee0156b06fe320a774e365e7"
         }
       },
       "candidateDisposition": "resolved combination or integration repair; see capability guide"
@@ -22473,7 +22473,7 @@
     }
   ],
   "candidate": {
-    "contentSha256": "130f1a1d6237af376abf85efe2e39fd7fa6fe5341e5fe648cf4889077cc8b75d",
+    "contentSha256": "5bb6be7fb4ba7ec328298d86ad811fb599fb18fbc599b0c4d5791d225eb4af27",
     "requiredParents": [
       "4d8c0a8d799fcacd8aa51ca7613f48d7bb3f2327",
       "7613d519643005ee4574c085a534c74af9508f88"

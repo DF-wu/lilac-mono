@@ -182,8 +182,8 @@ describe("native thread actions stop jobs without telling the agent", () => {
 
 describe("rewinding", () => {
   test.each([false, true])(
-    "rewind suppresses discarded job output and retries completion persistence (%s)",
-    async (failFinish) => {
+    "rewind suppresses discarded job output and retries pending suppression (%s)",
+    async (failSuppress) => {
       const h = await harness();
       try {
         const submit = async (text: string) => {
@@ -232,26 +232,27 @@ describe("rewinding", () => {
           expectedRevision: before.checkpoint.projectionRevision,
           turnId: target.turnId,
         };
-        let failing = failFinish;
-        const persist = h.jobStore.finish.bind(h.jobStore);
-        const finish = spyOn(h.jobStore, "finish").mockImplementation((id, ending) =>
-          id === discarded.jobId && failing
+        let failing = failSuppress;
+        const persist = h.jobStore.suppress.bind(h.jobStore);
+        const suppress = spyOn(h.jobStore, "suppress").mockImplementation((ids) =>
+          failing
             ? Result.err(
                 new JobStoreFailed({
-                  operation: "finish",
+                  operation: "suppress",
                   code: "SQLITE_BUSY",
-                  message: "transient finish failure",
+                  message: "transient suppression failure",
                 }),
               )
-            : persist(id, ending),
+            : persist(ids),
         );
         try {
-          if (failFinish) {
+          if (failSuppress) {
             await expect(h.client.threads.rewind(request)).rejects.toThrow();
             expect(
               integrationValue(h.fixture.store.getThreadRecord(h.thread.id)).mutationPending,
             ).toBe(true);
-            expect(h.read(discarded.jobId)?.status).toBe("running");
+            expect(h.read(discarded.jobId)?.status).toBe("stopped");
+            expect(h.read(discardedAwait.jobId)?.delivery).toBe("pending");
             failing = false;
           }
           await h.client.threads.rewind(request);
@@ -266,7 +267,7 @@ describe("rewinding", () => {
             ),
           ).toEqual([keptAwait.jobId]);
         } finally {
-          finish.mockRestore();
+          suppress.mockRestore();
         }
 
         expect(h.read(discarded.jobId)?.stopReason).toBe("thread_rewound");
@@ -278,99 +279,120 @@ describe("rewinding", () => {
   );
 });
 
-test("rewind keeps failed await completion pending until its observed outcome persists", async () => {
-  const h = await harness();
-  let finish: ReturnType<typeof spyOn> | undefined;
-  try {
-    const target = await h.client.inputs.submit({
-      threadId: h.thread.id,
-      commandId: crypto.randomUUID(),
-      historyGeneration: 0,
-      text: "await-write target",
-      mode: "prompt",
-      attachmentIds: [],
-      skillIds: [],
-    });
-    await waitForStore(
-      h.fixture.store,
-      () => integrationValue(h.fixture.store.getInput(target.inputId)).completedAt !== undefined,
-    );
-    const requestId = integrationValue(h.fixture.store.getInput(target.inputId)).requestId;
-    const attempted = Promise.withResolvers<void>();
-    let failing = true;
-    const persist = h.jobStore.finish.bind(h.jobStore);
-    finish = spyOn(h.jobStore, "finish").mockImplementation((id, ending) => {
-      if (h.read(id)?.requestId === requestId && failing) {
-        attempted.resolve();
-        return Result.err(
-          new JobStoreFailed({
-            operation: "finish",
-            code: "SQLITE_BUSY",
-            message: "await completion unavailable",
+test.each(["enumeration", "markRunning", "finish"] as const)(
+  "rewind completes after storage recovers from %s despite a stale active row",
+  async (phase) => {
+    const h = await harness();
+    try {
+      const target = await h.client.inputs.submit({
+        threadId: h.thread.id,
+        commandId: crypto.randomUUID(),
+        historyGeneration: 0,
+        text: "stale-job target",
+        mode: "prompt",
+        attachmentIds: [],
+        skillIds: [],
+      });
+      await waitForStore(
+        h.fixture.store,
+        () => integrationValue(h.fixture.store.getInput(target.inputId)).completedAt !== undefined,
+      );
+      const requestId = integrationValue(h.fixture.store.getInput(target.inputId)).requestId;
+      const failure = new JobStoreFailed({
+        operation: phase,
+        code: "SQLITE_BUSY",
+        message: "busy",
+      });
+      if (phase === "enumeration") {
+        integrationValue(
+          h.jobStore.reserve({
+            jobId: "job_stale",
+            launchKey: "stale",
+            owner: {
+              requestId,
+              requestDeliveryId: null,
+              sessionId: nativeSessionId(h.thread.id),
+              platform: "native",
+              userId: h.thread.starterId,
+              originMessageId: null,
+              runProfile: "primary",
+            },
+            toolCallId: "stale",
+            mode: "await",
+            label: "stale",
+            command: "unused",
+            cwd: tmpdir(),
+            deadlineAt: Date.now() + 1000,
           }),
         );
+        const enumeration = spyOn(h.jobStore, "listActive").mockReturnValue(Result.err(failure));
+        try {
+          h.jobs.reconcileAfterRestart();
+        } finally {
+          enumeration.mockRestore();
+        }
+      } else if (phase === "markRunning") {
+        const registration = spyOn(h.jobStore, "markRunning").mockReturnValueOnce(
+          Result.err(failure),
+        );
+        try {
+          await expect(h.startService(requestId, "await")).rejects.toMatchObject({
+            cause: failure,
+          });
+        } finally {
+          registration.mockRestore();
+        }
+      } else {
+        const attempted = Promise.withResolvers<void>();
+        const finish = spyOn(h.jobStore, "finish").mockImplementation(() => {
+          attempted.resolve();
+          return Result.err(failure);
+        });
+        try {
+          await h.startService(requestId, "await");
+          await attempted.promise;
+        } finally {
+          finish.mockRestore();
+        }
       }
-      return persist(id, ending);
-    });
-    const job = await h.startService(requestId, "await");
-    await attempted.promise;
-    const before = await h.client.threads.sync({ threadId: h.thread.id });
-    const request = {
-      threadId: h.thread.id,
-      commandId: crypto.randomUUID(),
-      historyGeneration: 0,
-      expectedRevision: before.checkpoint.projectionRevision,
-      turnId: target.turnId!,
-    };
-    await expect(h.client.threads.rewind(request)).rejects.toThrow();
-    expect(integrationValue(h.fixture.store.getThreadRecord(h.thread.id)).mutationPending).toBe(
-      true,
-    );
-    expect(h.read(job.jobId)?.status).toBe("running");
-    const promptsBeforeWake = h.prompts.length;
-    expect(
-      integrationValue(
-        h.fixture.runtime.deliverJobWake({
-          wakeId: crypto.randomUUID(),
-          threadId: h.thread.id,
-          userId: h.thread.starterId,
-          text: "discarded wake",
-        }),
-      ),
-    ).toBe("unavailable");
-    expect(h.prompts).toHaveLength(promptsBeforeWake);
-    failing = false;
-    await h.client.threads.rewind(request);
-    expect(integrationValue(h.fixture.store.getThreadRecord(h.thread.id)).mutationPending).toBe(
-      false,
-    );
-    expect(h.read(job.jobId)).toMatchObject({
-      status: "exited",
-      exitCode: 0,
-      stopReason: null,
-      delivery: "suppressed",
-    });
-    expect(await h.jobs.pendingEvents(nativeSessionId(h.thread.id))).toEqual([]);
-    const next = await h.client.inputs.submit({
-      threadId: h.thread.id,
-      commandId: crypto.randomUUID(),
-      historyGeneration: 1,
-      text: "after successful rewind",
-      mode: "prompt",
-      attachmentIds: [],
-      skillIds: [],
-    });
-    await waitForStore(
-      h.fixture.store,
-      () => integrationValue(h.fixture.store.getInput(next.inputId)).completedAt !== undefined,
-    );
-    expect(h.prompts.at(-1)?.includes("await-output")).toBe(false);
-    expect(h.prompts.at(-1)?.includes("discarded wake")).toBe(false);
-  } finally {
-    finish?.mockRestore();
-    await h.close();
-  }
-});
+      const stale = integrationValue(
+        h.jobStore.listActiveForSession(nativeSessionId(h.thread.id)),
+      )[0]!;
+      expect(stale.status).toBe(phase === "finish" ? "running" : "starting");
+      const before = await h.client.threads.sync({ threadId: h.thread.id });
+      const request = {
+        threadId: h.thread.id,
+        commandId: crypto.randomUUID(),
+        historyGeneration: 0,
+        expectedRevision: before.checkpoint.projectionRevision,
+        turnId: target.turnId!,
+      };
+      await h.client.threads.rewind(request);
+      await h.client.threads.rewind(request);
+      expect(integrationValue(h.fixture.store.getThreadRecord(h.thread.id)).mutationPending).toBe(
+        false,
+      );
+      expect(h.read(stale.jobId)).toEqual(stale);
+      expect(await h.jobs.pendingEvents(nativeSessionId(h.thread.id))).toEqual([]);
+      const next = await h.client.inputs.submit({
+        threadId: h.thread.id,
+        commandId: crypto.randomUUID(),
+        historyGeneration: 1,
+        text: "after successful rewind",
+        mode: "prompt",
+        attachmentIds: [],
+        skillIds: [],
+      });
+      await waitForStore(
+        h.fixture.store,
+        () => integrationValue(h.fixture.store.getInput(next.inputId)).completedAt !== undefined,
+      );
+      expect(h.prompts.at(-1)?.includes("await-output")).toBe(false);
+    } finally {
+      await h.close();
+    }
+  },
+);
 
 describe("native job wakes", () => {
   const wake = (h: Awaited<ReturnType<typeof harness>>, wakeId = crypto.randomUUID()) =>

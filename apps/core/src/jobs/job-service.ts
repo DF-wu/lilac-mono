@@ -20,12 +20,7 @@ import {
   type JobStatus,
   type JobStopReason,
 } from "./job-domain";
-import {
-  JobStoreFailed,
-  type FinishJobInput,
-  type JobStoreError,
-  type SqliteJobStore,
-} from "./job-store";
+import type { JobStoreError, SqliteJobStore } from "./job-store";
 
 const logger = createLogger({ module: "background-jobs" });
 
@@ -100,7 +95,6 @@ type RunningJob = {
   readonly pid: number;
   readonly child: Bun.Subprocess<"ignore", "pipe", "pipe">;
   readonly done: Promise<void>;
-  ending: FinishJobInput | null;
   requestedStop: RequestedStop | null;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   hardKillTimer: ReturnType<typeof setTimeout> | null;
@@ -152,7 +146,6 @@ export class JobService {
   readonly #logDir: string;
   readonly #now: () => number;
   readonly #running = new Map<string, RunningJob>();
-  readonly #restartJobIds: Set<string>;
   readonly #listeners = new Set<() => void>();
   readonly #wakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #wakeRetries = new Map<string, number>();
@@ -173,14 +166,6 @@ export class JobService {
     this.#wakeRetryDelaysMs = input.wakeRetryDelaysMs ?? JOB_LIMITS.wakeRetryDelaysMs;
     this.#maxOutputBytes = input.maxOutputBytes ?? JOB_LIMITS.maxOutputBytes;
     this.#store = input.store;
-    // Only these pre-startup rows may be classified as lost; absence from #running proves nothing.
-    this.#restartJobIds = this.#store.listActive().match({
-      ok: (jobs) => new Set(jobs.map((job) => job.jobId)),
-      err: (error) => {
-        logStoreFailure("reconcile-snapshot", error);
-        return new Set<string>();
-      },
-    });
     this.#logDir = input.logDir;
     this.#now = input.now ?? Date.now;
     mkdirSync(this.#logDir, { recursive: true, mode: 0o700 });
@@ -200,10 +185,25 @@ export class JobService {
       .listActive()
       .match({ ok: (jobs) => jobs, err: (error) => (logStoreFailure("reconcile", error), []) });
     for (const job of active) {
-      this.#finishRestartJob(job).match({
-        ok: () => undefined,
-        err: (error) => logStoreFailure("reconcile-finish", error),
-      });
+      const identified =
+        job.pid !== null &&
+        job.processStartTicks !== null &&
+        readProcessStartTicks(job.pid) === job.processStartTicks;
+      if (identified && job.pid !== null) signalProcessGroup(job.pid, "SIGKILL");
+      logger.warn("job lost after restart", { ...jobLogFields(job), killed: identified });
+      this.#store
+        .finish(job.jobId, {
+          status: "lost",
+          exitCode: null,
+          stopReason: "core_restart",
+          delivery: "pending",
+          outputBytes: job.outputBytes,
+          outputTruncated: job.outputTruncated,
+        })
+        .match({
+          ok: () => undefined,
+          err: (error) => logStoreFailure("reconcile-finish", error),
+        });
     }
     this.#deleteExpired();
   }
@@ -416,34 +416,24 @@ export class JobService {
     stopReason: JobStopReason,
   ): Promise<ResultType<void, JobStoreError>> {
     const owners = new Set(requestIds);
-    const selected = (job: JobRecord) => owners.has(job.requestId);
     return Result.gen(async function* (this: JobService) {
       const active = yield* this.#store.listActiveForSession(sessionId);
-      const stopped = await Promise.all(
-        active.filter(selected).map(async (job) => {
-          await this.#stopRunning(job.jobId, {
-            status: "stopped",
-            stopReason,
-            delivery: "suppressed",
-          });
-          return this.#persistSettledJob(job.jobId);
-        }),
+      await Promise.all(
+        active
+          .filter((job) => owners.has(job.requestId))
+          .map((job) =>
+            this.#stopRunning(job.jobId, {
+              status: "stopped",
+              stopReason,
+              delivery: "suppressed",
+            }),
+          ),
       );
-      yield* Result.all(stopped);
       // Re-read pending events on every attempt, including jobs stopped by an earlier attempt.
       const pending = yield* this.#store.listPending(sessionId);
       yield* this.#store.suppress(
         pending.filter((job) => owners.has(job.requestId)).map((job) => job.jobId),
       );
-      const remaining = yield* this.#store.listActiveForSession(sessionId);
-      if (remaining.some(selected))
-        return Result.err(
-          new JobStoreFailed({
-            operation: "stop-rewind",
-            code: "ACTIVE_JOBS",
-            message: "Discarded jobs have not settled",
-          }),
-        );
       return Result.ok(undefined);
     }, this);
   }
@@ -458,7 +448,7 @@ export class JobService {
     this.#retentionTimer = null;
     for (const timer of this.#wakeTimers.values()) clearTimeout(timer);
     this.#wakeTimers.clear();
-    const running = [...this.#running.values()].filter((job) => !job.ending);
+    const running = [...this.#running.values()];
     for (const job of running) {
       signalProcessGroup(job.pid, "SIGTERM");
       this.#scheduleHardKill(job);
@@ -500,47 +490,11 @@ export class JobService {
 
   async #stopRunning(jobId: string, stop: RequestedStop): Promise<void> {
     const running = this.#running.get(jobId);
-    if (!running || running.ending) return;
+    if (!running) return;
     running.requestedStop ??= stop;
     signalProcessGroup(running.pid, "SIGTERM");
     this.#scheduleHardKill(running);
     await running.done;
-  }
-
-  #finishRestartJob(job: JobRecord): ResultType<void, JobStoreError> {
-    if (!this.#restartJobIds.has(job.jobId) || !isJobActive(job.status))
-      return Result.ok(undefined);
-    const identified =
-      job.pid !== null &&
-      job.processStartTicks !== null &&
-      readProcessStartTicks(job.pid) === job.processStartTicks;
-    if (identified && job.pid !== null) signalProcessGroup(job.pid, "SIGKILL");
-    logger.warn("job lost after restart", { ...jobLogFields(job), killed: identified });
-    const finished = this.#store.finish(job.jobId, {
-      status: "lost",
-      exitCode: null,
-      stopReason: "core_restart",
-      delivery: "pending",
-      outputBytes: job.outputBytes,
-      outputTruncated: job.outputTruncated,
-    });
-    if (finished.isErr()) return Result.err(finished.error);
-    this.#restartJobIds.delete(job.jobId);
-    return Result.ok(undefined);
-  }
-
-  #persistSettledJob(jobId: string): ResultType<void, JobStoreError> {
-    const running = this.#running.get(jobId);
-    if (!running)
-      return this.#store
-        .get(jobId)
-        .andThen((job) => (job ? this.#finishRestartJob(job) : Result.ok(undefined)));
-    // A current process must finish supervision; startup classification cannot claim it.
-    if (!running.ending) return Result.ok(undefined);
-    const finished = this.#store.finish(jobId, running.ending);
-    if (finished.isErr()) return Result.err(finished.error);
-    this.#running.delete(jobId);
-    return Result.ok(undefined);
   }
 
   #scheduleHardKill(job: RunningJob): void {
@@ -607,7 +561,6 @@ export class JobService {
       pid: child.pid,
       child,
       done,
-      ending: null,
       requestedStop: null,
       deadlineTimer: null,
       hardKillTimer: null,
@@ -678,10 +631,8 @@ export class JobService {
     if (running.hardKillTimer) clearTimeout(running.hardKillTimer);
     signalProcessGroup(running.pid, "SIGKILL");
     await Result.tryPromise({ try: () => logHandle.close(), catch: captureRuntimeError });
-    if (this.#closing) {
-      this.#running.delete(job.jobId);
-      return;
-    }
+    this.#running.delete(job.jobId);
+    if (this.#closing) return;
 
     const stop = running.requestedStop;
     const ending = {
@@ -692,9 +643,7 @@ export class JobService {
       outputBytes: capture.bytes,
       outputTruncated: capture.truncated,
     } as const;
-    // Retain the exact terminal outcome until the compare-and-transition write succeeds.
-    running.ending = ending;
-    const finished = this.#persistSettledJob(job.jobId);
+    const finished = this.#store.finish(job.jobId, ending);
     finished.match({
       ok: () => undefined,
       err: (error) => logStoreFailure("finish", error),

@@ -13,7 +13,7 @@ B/F/U and firstPublished (C1) columns are immutable committed baselines. Candida
 | upstream | [`7613d519643005ee4574c085a534c74af9508f88`](https://github.com/stanley2058/lilac-mono/commit/7613d519643005ee4574c085a534c74af9508f88) |
 | firstPublished | [`3292b12b99992aa648b28aa2b00252098aeb4663`](https://github.com/DF-wu/lilac-mono/commit/3292b12b99992aa648b28aa2b00252098aeb4663) |
 
-Candidate content fingerprint (SHA-256): `130f1a1d6237af376abf85efe2e39fd7fa6fe5341e5fe648cf4889077cc8b75d`.
+Candidate content fingerprint (SHA-256): `5bb6be7fb4ba7ec328298d86ad811fb599fb18fbc599b0c4d5791d225eb4af27`.
 
 This is a content identity, **not a commit SHA or published release**. It covers every candidate path/mode/object except the content of the three evidence files below. Those files describe this tree, so their own hashes would be self-referential; their paths, presence and modes are still counted. The generator, both language guides and all code are hashed normally. The same candidate content reproduces before and after a commit without inventing a commit or linking an unpublished SHA.
 
@@ -882,7 +882,7 @@ Comparison base `7613d519643005ee4574c085a534c74af9508f88`: **223 policy rows; 2
 | `apps/core/src/generated/config-schemas/core-config.schema.json` | covered | F23 versioned configuration and generated editor schema | generated from fork input schemas including Telegram and OpenAI search |
 | `apps/core/src/github/github-state.ts` | covered | F19 and N04 GitHub publication and delivery identity | preserves unfinished interrupt retry after durable prompt publication |
 | `apps/core/src/github/webhook/github-webhook-server.ts` | covered | F19 and N04 GitHub publication and delivery identity | final publication policy, UUID delivery identity repair and redacted contract error logging (#107) |
-| `apps/core/src/jobs/job-service.ts` | covered | U01 native rewind job ownership and suppression | PR120: settles discarded await/service jobs; retries observed completions and startup-fenced lost classification without claiming new reservations or retained owners |
+| `apps/core/src/jobs/job-service.ts` | covered | U01 native rewind job ownership and suppression | PR120: selects discarded request owners and propagates cleanup reads/suppression errors; upstream lifecycle leaves stale rows nonblocking for rewind |
 | `apps/core/src/runtime/compose-builtin-surface-runtimes.ts` | covered | F01-F08/F14/F15 shared runtime and surface seams | includes the Telegram runtime descriptor entry |
 | `apps/core/src/runtime/create-core-runtime.ts` | covered | F01-F08/F14/F15 shared runtime and surface seams | constructs and registers the Telegram surface module |
 | `apps/core/src/runtime/main.ts` | covered | F17 typed Core startup | settles Core creation/start Results through the fork-owned startCoreRuntime helper |
@@ -950,7 +950,7 @@ Comparison base `7613d519643005ee4574c085a534c74af9508f88`: **223 policy rows; 2
 | `apps/core/tests/heartbeat/heartbeat-real-bus.test.ts` | covered | U03 shared heartbeat with Telegram destination limitation | retains body and cleanup failures with lexical disposal |
 | `apps/core/tests/heartbeat/heartbeat-service.test.ts` | covered | U03 shared heartbeat with Telegram destination limitation | machine-independent quiet-hours timezone test |
 | `apps/core/tests/helpers/client-compat.ts` | covered | N06 verified historical protocol fixtures | historical integrity list excludes workflow endpoints absent from that release |
-| `apps/core/tests/jobs/job-service.test.ts` | covered | U01 native rewind job ownership and suppression | PR120: await/service owner matrix, completion and startup failures, spawn/register races, unknown ownership and idempotent cleanup retain live processes and events |
+| `apps/core/tests/jobs/job-service.test.ts` | covered | U01 native rewind job ownership and suppression | PR120: verifies await/service owner isolation, live supervision, retryable cleanup errors and nonblocking stale rows after startup/launch failures |
 | `apps/core/tests/runtime/compose-builtin-surface-runtimes.test.ts` | covered | F01-F08/F14/F15 shared runtime and surface seams | covers the Telegram runtime entry |
 | `apps/core/tests/runtime/config-schemas.test.ts` | covered | F23 versioned configuration and generated editor schema | verifies fork editor schema acceptance and removed image config diagnostics |
 | `apps/core/tests/ssh/remote-filesystem-parity.test.ts` | covered | N07 SSH, filesystem and Rust runner corrections | PR119: covers dangling links, normalized globs, and physical remote cwd parity |
@@ -967,7 +967,7 @@ Comparison base `7613d519643005ee4574c085a534c74af9508f88`: **223 policy rows; 2
 | `apps/core/tests/surface/bridge/subagent-profile-parity.test.ts` | covered | F01-F08/F14/F15 shared runtime and surface seams | PR119: verifies conversation identifiers reach Claude Code and OpenAI provider prompts |
 | `apps/core/tests/surface/bridge/subscribe-from-bus.test.ts` | covered | F01-F08/F14/F15 shared runtime and surface seams | platform-generic relay refs |
 | `apps/core/tests/surface/discord/discord-thread-control.test.ts` | covered | N11 Discord read-control failures and inherited context | PR119: covers configuration failure and exact Panic identity on Discord reads |
-| `apps/core/tests/surface/native/job-lifecycle.test.ts` | covered | U01 native rewind job ownership and suppression | PR120: real rewind RPC preserves owner isolation and observed await outcomes, blocks wakes while pending, and excludes discarded output after retry |
+| `apps/core/tests/surface/native/job-lifecycle.test.ts` | covered | U01 native rewind job ownership and suppression | PR120: real rewind RPC retries pending suppression, preserves retained jobs/events and completes despite recovered startup/launch/completion failures |
 | `apps/core/tests/surface/native/operator-integration.test.ts` | covered | F08 and N10 native observer, routing, admission and upstream integration | Inherited verification: Real operator gateway fixture uses an ephemeral listener, preserving production port |
 | `apps/core/tests/surface/native/resources-live.test.ts` | covered | N09 run-scoped previews and opened-handle containment | verifies exclusive concurrent saves without assuming asynchronous authorization order |
 | `apps/core/tests/surface/native/search.test.ts` | covered | N01 scoped native conversation search (PR121) | verifies single-thread context isolation, message ordinals and pagination |

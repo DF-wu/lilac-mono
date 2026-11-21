@@ -2,6 +2,8 @@
 
 This record distinguishes the fork baseline F, upstream input U, first published integration C1,
 and current integration tree C. It describes source and fixture checks, not deployment or live-provider traffic.
+The latest local-candidate section below is authoritative for current job behavior. Earlier review
+sections retain historical results and decisions; their lifecycle retry/snapshot claims are superseded.
 The [English guide](../fork-differences.md), [Traditional Chinese guide](../fork-differences.zh-TW.md),
 [complete path ledger](PATH-INVENTORY.md) and [JSON inventory](inventory.json) describe the same C.
 
@@ -15,6 +17,7 @@ The [English guide](../fork-differences.md), [Traditional Chinese guide](../fork
 | First published merge C1 | [`3292b12b99992aa648b28aa2b00252098aeb4663`](https://github.com/DF-wu/lilac-mono/commit/3292b12b99992aa648b28aa2b00252098aeb4663), with parents F and U |
 | Previous published follow-up E | [`e2750297a144344ab67c490ef5bf9a417decba39`](https://github.com/DF-wu/lilac-mono/commit/e2750297a144344ab67c490ef5bf9a417decba39); [all six hosted jobs passed](https://github.com/DF-wu/lilac-mono/actions/runs/44930917729) |
 | Published job-cleanup follow-up J | [`677e56956fc6e7cec8927e28f3a4a5d6c55ca381`](https://github.com/DF-wu/lilac-mono/commit/677e56956fc6e7cec8927e28f3a4a5d6c55ca381); [all six hosted jobs passed](https://github.com/DF-wu/lilac-mono/actions/runs/44933469954) |
+| Published pre-candidate head H | `9beb902f142187290e1f2d014401e284b85eb909`; six hosted jobs passed in run `44936724231` (owner-provided pin, historical evidence only) |
 | Current integration C | Content fingerprint and complete path/mode records in the generated ledger; on a clean committed checkout, `--candidate HEAD --check` verifies that commit's tree |
 
 C1 passed `bun run check`: 8,309 Bun and 14 Rust tests, zero failures and 13 existing optional skips.
@@ -25,7 +28,7 @@ The current changes preserve PR #121, Telegram authority, provider routes, searc
 30-second OpenAI/compatible search attempts, 10-second other built-in attempts, one retry, status semantics,
 caller cancellation and configured fallback. No provider network traffic or submodule access is needed.
 
-## Review 6006774479: every finding
+## Historical review 6006774479: every finding
 
 Findings were checked against C1 source; reviewer text was treated as data.
 The eight inline discussion IDs below identify dispositions that can be resolved after current-head verification.
@@ -157,7 +160,7 @@ All 500 C1 ledger rows retain their exact B/F/U objects and statuses; current ex
 These are E's historical results. The current narrow job-cleanup result follows below; hosted CI must
 run on its actual PR head.
 
-## Review 6007059282: published job-cleanup follow-up J
+## Historical review 6007059282: published job-cleanup follow-up J
 
 Both findings were confirmed against E's actual spawn/supervise/finish/stop flow.
 
@@ -207,7 +210,7 @@ the existing evidence-content hash exclusions. Reproduction is checked again bef
 All B/F/U/C1 object/status evidence is preserved. New hosted CI must validate the actual follow-up head;
 E's six successful jobs are historical evidence, not a result for changed code.
 
-## Review 6007211581: await and restart contract audit
+## Historical review 6007211581: await and restart contract audit
 
 Both findings were reproduced against J and fixed in the JobService owner.
 
@@ -275,6 +278,112 @@ historical baseline objects/statuses and seven gitlinks remain unchanged. The 2,
 694 relative link targets, six comparison artifacts' private-pattern scan and whitespace checks pass.
 The content fingerprint in the ledger excludes only the three documented evidence outputs' contents;
 their presence and modes remain included. Verification prose is reviewed separately from that fingerprint.
+
+## Latest local candidate: upstream alignment for review 6007358434
+
+Prepared on `catalina/pr120-upstream-first` in the isolated checkout at H, with origin
+`DF-wu/lilac-mono` and acting account `Catalina-df`. No commit, push, PR write, deployment,
+authentication change, reference-submodule access or delegation was performed. C is the uncommitted
+worktree described by the regenerated ledger; H's hosted results are not candidate validation.
+
+DF's direction is to adopt upstream shared behavior and retain only verified major integration fixes.
+The two findings in review 6007358434 are addressed by removing the fork-created blockade:
+
+| Finding | Source evidence and current disposition |
+| --- | --- |
+| [4654370080](https://github.com/DF-wu/lilac-mono/pull/120#discussion_r4654370080), startup enumeration/reconciliation failure | The constructor snapshot, restart-ID retry set and all-active-row terminal guard were fork follow-ups. Raw F and U have identical JobService source. Restore U's startup sweep, which logs enumeration/finish failures. Once cleanup reads recover, a stale row without an in-process owner does not keep rewind pending. Do not classify arbitrary absent-map rows as lost during rewind. |
+| [4654370085](https://github.com/DF-wu/lilac-mono/pull/120#discussion_r4654370085), launch markRunning failure | U already kills the spawned process group, closes its log handle and returns the write error, leaving the reservation starting. Launch handling remains byte-identical to U. Removing the fork guard makes that stale reservation nonblocking after the database recovers. A scoped real-launch fixture observes process exit before cleanup. No general launch-repair path is added. |
+
+Compared with U, JobService now differs in **one method only**: `stopSessionRequests` replaces the
+private timestamp cleanup. It selects existing request IDs within the given session for both await and
+service jobs, stops only processes in the existing running map, and suppresses matching pending events.
+List-active, list-pending and suppression DB errors still reach native rewind/recovery as Results.
+A failed suppression leaves mutationPending; retry reselects the pending events, including an await
+job that already exited. Retained owners' live processes and events remain unchanged even when their
+timestamps overlap discarded input. Existing receipt/input ownership validation, cancellation-before-
+cleanup, canonical-history repair and stale-receipt rules remain untouched.
+
+Compared with H, this removes `RunningJob.ending`, `#restartJobIds`, `#finishRestartJob`,
+`#persistSettledJob`, constructor enumeration, the ACTIVE_JOBS guard and their retry-specific tests.
+Startup, close, stop, supervision, completion and launch handling match U. Tests now assert the accepted
+upstream semantics rather than require a fork lifecycle recovery subsystem. No stored fields, wire
+contracts, dependencies, configuration, worker, queue or recovery journal change.
+
+### Regression evidence and checks
+
+The first test invocation could not resolve dependencies in this fresh clone; the existing frozen
+lockfile was installed with `bun install --frozen-lockfile`. This did not change manifests or lockfiles.
+Before changing production, six JobService stale-row cases failed on ACTIVE_JOBS; native RPC enumeration
+also failed to complete, and failed-completion cleanup rewrote the stale row through the old retry layer.
+The initial native markRunning assertion expected a raw exception, but the existing fixture's Result
+match wraps it in Panic; after correcting that assertion, it failed at rewind with NOT_READY as expected.
+That fixture-assertion failure is not regression proof.
+
+```sh
+bun run test:root -- ./apps/core/tests/jobs/job-service.test.ts ./apps/core/tests/surface/native/job-lifecycle.test.ts -t 'stale.*rows|stale active row' --only-failures
+```
+
+After the production correction: **9 pass, zero fail, 84 assertions**. The six service cases cover
+await/service rows after failed startup enumeration, startup finish and markRunning; all restore storage,
+repeat cleanup, preserve the stale row, retain the live owner/process and its pending output, and suppress
+normal discarded output. Enumeration is unavailable throughout service construction and the startup sweep.
+Three real native RPC cases cover failed enumeration, markRunning and observed await completion; the same
+rewind command completes idempotently and the next prompt contains no discarded output. The running-row
+completion case explicitly retains U's lack of a completion-write retry.
+
+```sh
+bun run test:root -- ./apps/core/tests/jobs/job-service.test.ts ./apps/core/tests/surface/native/job-lifecycle.test.ts ./apps/core/src/surface/native/execution.test.ts --only-failures
+```
+
+Latest focused source result: **128 pass, zero fail, 525 assertions** across three files. This includes
+live SIGSTOP/SIGCONT supervision in both modes, active/pending cleanup read failures, failed suppression
+retry through real RPC, native recovery ownership and missing-ownership checks. A command also named
+nonexistent `job-store.test.ts`; Bun ran these same three actual files, so no job-store test is claimed.
+
+Additional latest checks:
+
+| Check | Result |
+| --- | --- |
+| Job events, web/search policy, PR121 native search, runner recovery/queue and thinking normalization | **148 pass, zero fail, 489 assertions**, seven files; command below |
+| `bun run typecheck:workspaces` | Exit 0, every workspace including Core |
+| `bun run lint:oxlint` | Exit 0; eight existing warnings in untouched files, no new warning in the changed files |
+| `bun run lint:architecture` | Exit 0; semantic gate passed, production syntax reported **0 errors** |
+| `bun run fmt:check` | Exit 0, 2,007 files; generator also uses the installed formatter for inventory.json |
+| Exact pinned `bun run fork:footprint -- --upstream=7613d519643005ee4574c085a534c74af9508f88 --strict` | **223 covered, zero unlisted, zero stale** |
+| `git diff --check` | Exit 0 |
+| `python3 docs/fork-comparison-pr120/reproduce.py --candidate-worktree --check` | Byte-for-byte Markdown/JSON reproduction passed |
+
+```sh
+bun run test:root -- ./apps/core/tests/jobs/job-events.test.ts ./apps/core/tests/tools/web.test.ts ./apps/core/tests/tools/web-search-openai.test.ts ./apps/core/tests/surface/native/search.test.ts ./apps/core/tests/surface/bridge/bus-agent-runner-recovery.test.ts ./apps/core/tests/surface/bridge/bus-agent-runner-session-queue.test.ts ./apps/core/tests/agent/anthropic-thinking-recovery.test.ts --only-failures
+```
+
+All **694 relative documentation links/anchors** resolve across the guides/evidence Markdown.
+Independent assertions preserve all B/F/U/C1 objects and historical statuses across **503 ledger paths**,
+all seven candidate gitlinks, the historical F footprint, and the complete **2,263-path** mode/kind counts.
+The generator independently compares every candidate path/status with raw Git. F→C remains 161 paths;
+U→C remains 388 (165 added, 219 modified, four deleted); C1→C remains 20 modified paths.
+Only nine files differ from H: JobService, two focused test files, the two guides, three comparison evidence
+outputs and footprint reasons. Every other production file, manifest, lockfile and generator equals H.
+A byte comparison with the one cleanup method removed proves the rest of JobService equals U exactly.
+
+Full `bun run check` was intentionally not repeated for this local candidate per DF's instruction;
+publication must run hosted CI. Earlier full local/hosted passes above remain pinned historical evidence.
+
+### Operational limits retained from U
+
+Startup is a pre-runner sweep, not a safe general reconciliation API while new jobs are launching.
+Enumeration or finish failure is logged and is not automatically retried. Failed markRunning may leave a
+starting row after the process is killed. Failed completion persistence loses the in-memory terminal
+outcome, can leave a running row consuming capacity/holding await work, and may lose its output event.
+A later normal restart can classify such rows lost and emit an event, including for an owner discarded by
+a prior rewind. A crash before PID recording may leave an unidentifiable orphan. This candidate neither
+claims to repair these upstream paths nor adds tombstones, retries or lifecycle bookkeeping for them.
+It ensures they do not become an additional permanent rewind block after cleanup storage recovers.
+Actual cleanup read/suppression failures and missing native receipt ownership still keep rewind pending.
+
+All other production patches remain byte-identical to H, including wrong-history/old-draft repairs,
+attachments and rewind controls, queue drain, thinking continuation, PR #121 native search and fork-only
+OpenAI/compatible search's 30-second attempts versus 10 seconds elsewhere, retry/fallback/cancellation.
 
 ## Remaining limits
 
