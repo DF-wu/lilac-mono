@@ -40,6 +40,7 @@ apps/core/src/surface/bridge/request-ids.ts  # telegram:<session>:<message> requ
 apps/core/src/surface/bridge/subscribe-from-bus.ts  # platform-generic relay refs
 apps/core/src/surface/builtin-surface-protocols.ts  # registers telegramSurfaceProtocol in the closed catalog
 apps/core/src/surface/native/runtime.ts  # composes the opt-in fork-owned Discord recorder at native ingress and shutdown
+apps/core/src/surface/native/store-search.ts  # scope the message projection before decoding turns for single-thread search and context reads
 apps/core/src/surface/native/store.ts  # committed display notifications, durable Discord child routing, and PR113 revoked-steer admission and assistant attribution
 apps/core/src/surface/native/push.test.ts  # updates the native schema upgrade regression for durable Discord child routing
 
@@ -78,6 +79,7 @@ apps/core/tests/surface/bridge/bus-agent-runner.test.ts  # Telegram authority
 apps/core/tests/surface/bridge/subscribe-from-bus.test.ts  # platform-generic relay refs
 apps/core/tests/surface/native/operator-integration.test.ts  # Inherited verification: Real operator gateway fixture uses an ephemeral listener, preserving production port
 apps/core/tests/surface/native/resources-live.test.ts  # verifies exclusive concurrent saves without assuming asynchronous authorization order
+apps/core/tests/surface/native/search.test.ts  # verifies single-thread context isolation, message ordinals and pagination
 apps/core/tests/surface/operation-contract.test.ts  # resolve-attachment operation
 apps/core/tests/surface/runtime-descriptor.test.ts  # Telegram descriptor
 apps/core/tests/tool-server-create-tool-server.test.ts  # origin-session authority

@@ -28,7 +28,9 @@ export type NativeSearchInput = {
   direction?: "asc" | "desc";
 };
 
-const messageProjection = `WITH messages AS (
+function projectMessages(scopedToThread: boolean): string {
+  // A thread filter preserves the full partition used to assign message ordinals.
+  return `WITH messages AS (
   SELECT t.id AS threadId, json_extract(t.data_json,'$.value.title') AS title,
     json_extract(r.data_json,'$.value.turnId') AS turnId,
     json_extract(m.value,'$.id') AS messageId,
@@ -40,7 +42,12 @@ const messageProjection = `WITH messages AS (
   JOIN json_each(r.data_json,'$.value.messages') m
   WHERE t.kind='thread' AND json_extract(t.data_json,'$.value.deleted')=0 AND json_extract(t.data_json,'$.value.ephemeral') IS NULL
     AND ((?='owner' AND json_extract(t.data_json,'$.value.kind') IS NULL) OR json_extract(t.data_json,'$.value.starterId')=? OR (json_extract(t.data_json,'$.value.kind') IS NULL AND EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=t.id AND g.user_id=?)))
+    ${scopedToThread ? "AND t.id=?" : ""}
 )`;
+}
+
+const messageProjection = projectMessages(false);
+const threadMessageProjection = projectMessages(true);
 
 function decodeSearchRows(rows: unknown[]): NativeStoreResult<NativeSearchMessage[]> {
   const parsed = z.array(searchRowSchema).safeParse(rows);
@@ -95,13 +102,11 @@ export class NativeSearchStore {
           return Result.err(nativeFailure("invalid", "Search query is required"));
         const filters: string[] = [];
         const values: (string | number)[] = [user.role, user.id, user.id];
+        const projection = input.threadId ? threadMessageProjection : messageProjection;
+        if (input.threadId) values.push(input.threadId);
         for (const term of terms) {
           filters.push("(instr(lower(text),lower(?))>0 OR instr(lower(title),lower(?))>0)");
           values.push(term, term);
-        }
-        if (input.threadId) {
-          filters.push("threadId=?");
-          values.push(input.threadId);
         }
         if (input.authorId) {
           filters.push("authorId=?");
@@ -119,7 +124,7 @@ export class NativeSearchStore {
         return decodeSearchRows(
           this.params.db
             .query(
-              `${messageProjection} SELECT * FROM messages WHERE ${filters.join(" AND ")} ORDER BY createdAt ${input.direction === "asc" ? "ASC" : "DESC"}, threadId, ordinal DESC LIMIT ? OFFSET ?`,
+              `${projection} SELECT * FROM messages WHERE ${filters.join(" AND ")} ORDER BY createdAt ${input.direction === "asc" ? "ASC" : "DESC"}, threadId, ordinal DESC LIMIT ? OFFSET ?`,
             )
             .all(...values),
         );
@@ -146,7 +151,7 @@ export class NativeSearchStore {
         const messages = yield* decodeSearchRows(
           this.params.db
             .query(
-              `${messageProjection} SELECT * FROM messages WHERE threadId=? ORDER BY ordinal LIMIT ? OFFSET ?`,
+              `${threadMessageProjection} SELECT * FROM messages ORDER BY ordinal LIMIT ? OFFSET ?`,
             )
             .all(
               ...args,
@@ -157,9 +162,9 @@ export class NativeSearchStore {
         const bounds = yield* decodeSearchCount(
           this.params.db
             .query(
-              `${messageProjection} SELECT count(*) AS total, (SELECT messageId FROM messages WHERE threadId=? ORDER BY ordinal LIMIT 1) AS startMessageId, (SELECT messageId FROM messages WHERE threadId=? ORDER BY ordinal DESC LIMIT 1) AS endMessageId FROM messages WHERE threadId=?`,
+              `${threadMessageProjection} SELECT count(*) AS total, (SELECT messageId FROM messages ORDER BY ordinal LIMIT 1) AS startMessageId, (SELECT messageId FROM messages ORDER BY ordinal DESC LIMIT 1) AS endMessageId FROM messages`,
             )
-            .get(...args.slice(0, 3), threadId, threadId, threadId),
+            .get(...args),
         );
         return Result.ok({ thread, messages, ...bounds });
       }, this),
