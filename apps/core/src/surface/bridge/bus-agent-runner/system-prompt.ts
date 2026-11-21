@@ -1,5 +1,5 @@
 import {
-  applyBasePromptForProvider,
+  applyBasePrompt,
   resolveCoreConfigPath,
   resolveSubagentPermissionProfile,
   type CoreConfig,
@@ -38,7 +38,6 @@ export function buildAgentRunSystemPrompt(params: {
   messages: readonly SurfaceMetadataMessage[];
   safetyMode: SessionSafetyMode;
   sessionId: string;
-  heartbeatOverlay?: string | null;
   subagentConversation?: SubagentConversation;
 }): string {
   const workspaceSystemPrompt = selectWorkspaceSystemPrompt({
@@ -46,17 +45,16 @@ export function buildAgentRunSystemPrompt(params: {
     primarySystemPrompt: params.cfg.agent.systemPrompt,
     workerSystemPrompt: params.cfg.agent.workerSystemPrompt,
   });
-  const providerSystemPrompt = applyBasePromptForProvider({
+  const systemPrompt = applyBasePrompt({
     systemPrompt: workspaceSystemPrompt,
     basePrompt: params.cfg.basePrompt,
-    provider: params.resolved.provider,
   });
   const profileConfig =
     params.runProfile === "primary"
       ? null
       : resolveSubagentPermissionProfile(params.cfg, params.runProfile);
   const profilePrompt = {
-    baseSystemPrompt: providerSystemPrompt,
+    baseSystemPrompt: systemPrompt,
     activeEditingTool: profileConfig?.workspaceWrites === false ? null : params.editingToolMode,
     skillsSection: params.skillsSection,
   };
@@ -82,7 +80,6 @@ export function buildAgentRunSystemPrompt(params: {
       ? buildRestrictedSessionOverlay({ sessionId: params.sessionId })
       : null;
   for (const overlay of [
-    params.heartbeatOverlay,
     buildGeneratedMessageOverlay(),
     surfaceMetadataOverlay,
     params.requestClient === "discord" ? buildDiscordOutputOverlay() : null,

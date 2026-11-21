@@ -74,6 +74,8 @@ describe("tool server health state", () => {
     const health = createToolServerHealthState({
       logger: createLogger({ module: "health-state-test" }),
       watchdogFailureThreshold: 2,
+      // This test isolates named dependency streaks from the full worker's accumulated heap.
+      maxMainIsolateBytes: Number.MAX_SAFE_INTEGER,
       maxRssBytes: Number.MAX_SAFE_INTEGER,
       externalHealthProvider: () => ({
         checks: [{ name: failedCheck, ok: false, impact: "live" }],

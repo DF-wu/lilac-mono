@@ -971,7 +971,7 @@ export const coreConfigInputSchemaV1 = z.object({
             options: jsonObjectSchema
               .optional()
               .describe(
-                "Provider-specific options merged onto inherited model settings. Accepts shorthand such as `{temperature: 0.2}` or nested provider namespaces such as `{openai: {parallelToolCalls: false}}. OpenAI-compatible options use `openaiCompatible`.\n\nLilac options include `response_commentary` for direct OpenAI/Codex channel guidance, `openai_server_compaction` to opt into server compaction, and `anthropic_prompt_cache` to opt into system/latest-user cache control. Cache writes can increase cost and interact poorly with tool-result pruning.",
+                "Provider-specific options merged onto inherited model settings. Accepts shorthand such as `{temperature: 0.2}` or nested provider namespaces such as `{openai: {parallelToolCalls: false}}. OpenAI-compatible options use `openaiCompatible`.\n\nLilac options include `response_commentary` for direct OpenAI/Codex channel guidance, `openai_server_compaction` to opt into server compaction, and `anthropic_prompt_cache` to control Claude prompt caching. Core agent calls to the first-party Anthropic API default to automatic 5-minute caching. Set `anthropic_prompt_cache` to `auto` or `true` to select the route default, `false` to opt out of Lilac's cache injection, or `legacy` to use explicit system/latest-user breakpoints. If you previously set `true` for explicit breakpoints, change it to `legacy`. An explicit `anthropic.cacheControl` provider option configures request-level caching directly. Cache writes can increase cost and interact poorly with tool-result pruning.",
               ),
           }),
         )
@@ -1004,7 +1004,7 @@ export const coreConfigInputSchemaV1 = z.object({
           options: jsonObjectSchema
             .optional()
             .describe(
-              "Provider-specific options merged onto inherited model settings. Accepts shorthand such as `{temperature: 0.2}` or nested provider namespaces such as `{openai: {parallelToolCalls: false}}. OpenAI-compatible options use `openaiCompatible`.\n\nLilac options include `response_commentary` for direct OpenAI/Codex channel guidance, `openai_server_compaction` to opt into server compaction, and `anthropic_prompt_cache` to opt into system/latest-user cache control. Cache writes can increase cost and interact poorly with tool-result pruning.",
+              "Provider-specific options merged onto inherited model settings. Accepts shorthand such as `{temperature: 0.2}` or nested provider namespaces such as `{openai: {parallelToolCalls: false}}. OpenAI-compatible options use `openaiCompatible`.\n\nLilac options include `response_commentary` for direct OpenAI/Codex channel guidance, `openai_server_compaction` to opt into server compaction, and `anthropic_prompt_cache` to control Claude prompt caching. Core agent calls to the first-party Anthropic API default to automatic 5-minute caching. Set `anthropic_prompt_cache` to `auto` or `true` to select the route default, `false` to opt out of Lilac's cache injection, or `legacy` to use explicit system/latest-user breakpoints. If you previously set `true` for explicit breakpoints, change it to `legacy`. An explicit `anthropic.cacheControl` provider option configures request-level caching directly. Cache writes can increase cost and interact poorly with tool-result pruning.",
             ),
         })
         .default({
@@ -1031,7 +1031,7 @@ export const coreConfigInputSchemaV1 = z.object({
           options: jsonObjectSchema
             .optional()
             .describe(
-              "Provider-specific options merged onto inherited model settings. Accepts shorthand such as `{temperature: 0.2}` or nested provider namespaces such as `{openai: {parallelToolCalls: false}}. OpenAI-compatible options use `openaiCompatible`.\n\nLilac options include `response_commentary` for direct OpenAI/Codex channel guidance, `openai_server_compaction` to opt into server compaction, and `anthropic_prompt_cache` to opt into system/latest-user cache control. Cache writes can increase cost and interact poorly with tool-result pruning.",
+              "Provider-specific options merged onto inherited model settings. Accepts shorthand such as `{temperature: 0.2}` or nested provider namespaces such as `{openai: {parallelToolCalls: false}}. OpenAI-compatible options use `openaiCompatible`.\n\nLilac options include `response_commentary` for direct OpenAI/Codex channel guidance, `openai_server_compaction` to opt into server compaction, and `anthropic_prompt_cache` to control Claude prompt caching. Core agent calls to the first-party Anthropic API default to automatic 5-minute caching. Set `anthropic_prompt_cache` to `auto` or `true` to select the route default, `false` to opt out of Lilac's cache injection, or `legacy` to use explicit system/latest-user breakpoints. If you previously set `true` for explicit breakpoints, change it to `legacy`. An explicit `anthropic.cacheControl` provider option configures request-level caching directly. Cache writes can increase cost and interact poorly with tool-result pruning.",
             ),
         })
         .default({
@@ -1088,9 +1088,7 @@ export const coreConfigInputSchemaV1 = z.object({
   basePrompt: z
     .string()
     .optional()
-    .describe(
-      "Base instructions. Codex uses this as Responses instructions when `codex_instructions` is absent. Other providers prepend it to the prompt files under DATA_DIR/prompts. Omit to use the provider's normal prompt assembly.",
-    ),
+    .describe("Optional base prompt prepended to the prompt files under DATA_DIR/prompts."),
 });
 
 export const coreConfigSchema = coreConfigInputSchemaV1;

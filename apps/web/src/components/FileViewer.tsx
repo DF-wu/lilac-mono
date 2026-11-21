@@ -19,7 +19,7 @@ import {
 } from "./ui/dropdown-menu";
 import { IconButton } from "./ui";
 import { useStore } from "zustand";
-import { Bot, Plus, X, Files, Maximize2, Minimize2, Pencil, Eye } from "lucide-react";
+import { Bot, Plus, X, Files, Maximize2, Minimize2, Pencil, Eye, Download } from "lucide-react";
 import { useOptionalWorkspace, useWorkspace } from "../workspace-context";
 import type { FileTarget } from "../file-target";
 import { useFileResolution, useFileViewer } from "./file-viewer-context";
@@ -30,7 +30,7 @@ import {
   useResourcePreviewText,
 } from "./ResourcePreview";
 import { FileSource } from "./FileSource";
-import { NativeSubagentPanel } from "./SubagentPanel";
+import { AgentTabIcon, NativeAgentSidebar, NativeSubagentPanel } from "./SubagentPanel";
 import { Button } from "./ui/button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "./ui/tooltip";
 import "./file-viewer.css";
@@ -108,15 +108,20 @@ export function FilePanelContent({
   )
     editablePath = target.path;
   const canEdit = !!(editablePath && workspace && viewer);
-  const modeToggle = canEdit ? (
-    <IconButton
-      label={editing ? "View file" : "Edit file"}
-      aria-pressed={editing}
-      onClick={() => setEditing(!editing)}
-    >
-      {editing ? <Eye /> : <Pencil />}
-    </IconButton>
-  ) : null;
+  const actions = (
+    <>
+      <FileDownload name={file?.name ?? target.name} href={file?.href} />
+      {canEdit ? (
+        <IconButton
+          label={editing ? "View file" : "Edit file"}
+          aria-pressed={editing}
+          onClick={() => setEditing(!editing)}
+        >
+          {editing ? <Eye /> : <Pencil />}
+        </IconButton>
+      ) : null}
+    </>
+  );
   if (kind === "text" && editing && editablePath && viewer)
     return (
       <FileDocumentEditor
@@ -125,7 +130,7 @@ export function FilePanelContent({
         target={target}
         active={active}
         heading={heading}
-        actions={modeToggle}
+        actions={actions}
       />
     );
   if (kind === "text")
@@ -138,7 +143,7 @@ export function FilePanelContent({
         endLine={target.endLine}
         navigation={target}
         heading={heading}
-        actions={modeToggle}
+        actions={actions}
       />
     );
   return (
@@ -146,6 +151,34 @@ export function FilePanelContent({
       {heading}
       {media}
     </>
+  );
+}
+
+export function FileDownload({ name, href }: { name: string; href?: string }) {
+  if (!href)
+    return (
+      <IconButton label={`Download ${name}`} tooltip="Download" disabled>
+        <Download />
+      </IconButton>
+    );
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            nativeButton={false}
+            variant="ghost"
+            size="icon"
+            className="icon-button rounded-sm text-muted-foreground"
+            aria-label={`Download ${name}`}
+            render={<a href={href} download={name} />}
+          />
+        }
+      >
+        <Download />
+      </TooltipTrigger>
+      <TooltipContent>Download</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -157,6 +190,8 @@ export function RightPanel({ threadId, foreground }: { threadId: string; foregro
   const open = useStore(panels, (state) => (state.threads.get(threadId) ?? defaultRightPanel).open);
   const visible = foreground && open;
   const actions = panels.getState();
+  const activeTab = tabs.items.find((tab) => tab.id === tabs.activeId);
+  const activePath = activeTab?.type === "file" ? activeTab.target.path : undefined;
   function draftKey(id: string) {
     const tab = tabs.items.find((item) => item.id === id);
     return tab?.type === "file" && tab.target.path
@@ -196,15 +231,29 @@ export function RightPanel({ threadId, foreground }: { threadId: string; foregro
         }}
         onAgents={() => actions.openAgents(threadId)}
         onFiles={() => actions.openFiles(threadId)}
-        expandedSidebar={
-          <Suspense fallback={<SkeletonRows label="Loading files" rows={8} />}>
-            <WorkspaceTree threadId={threadId} active={visible} />
-          </Suspense>
-        }
+        expandedSidebar={(tab) => {
+          if (tab?.type === "files") return null;
+          if (tab?.type === "agent")
+            return <NativeAgentSidebar threadId={threadId} activeId={tab.agentId} />;
+          return (
+            <Suspense fallback={<SkeletonRows label="Loading files" rows={8} />}>
+              <WorkspaceTree threadId={threadId} active={visible} activePath={activePath} />
+            </Suspense>
+          );
+        }}
         renderTab={(tab, active) => {
           if (tab.type === "agents")
             return (
               <NativeSubagentPanel threadId={threadId} foreground={foreground && active} embedded />
+            );
+          if (tab.type === "agent")
+            return (
+              <NativeSubagentPanel
+                threadId={threadId}
+                targetId={tab.agentId}
+                foreground={foreground && active}
+                embedded
+              />
             );
           if (tab.type === "thread")
             return <ThreadReferenceView target={tab.target} active={visible && active} panel />;
@@ -262,7 +311,8 @@ export function RightPanelTabs({
   renderTab: (tab: PanelTab, active: boolean) => ReactNode;
   visible?: boolean;
   dirtyIds?: ReadonlySet<string>;
-  expandedSidebar?: ReactNode;
+  /** The expanded panel's sidebar for the active tab; null hides it. */
+  expandedSidebar?: (tab: PanelTab | undefined) => ReactNode;
 }) {
   const list = useRef<HTMLDivElement>(null);
   const [expanded, setExpanded] = useState(false);
@@ -270,7 +320,8 @@ export function RightPanelTabs({
   function tabName(tab: PanelTab) {
     if (tab.type === "agents") return "Agents";
     if (tab.type === "files") return "Files";
-    return tab.type === "thread" ? tab.title : tab.target.name;
+    if (tab.type === "agent" || tab.type === "thread") return tab.title;
+    return tab.target.name;
   }
   useLayoutEffect(() => {
     const viewport = list.current;
@@ -297,8 +348,8 @@ export function RightPanelTabs({
       stopWatching();
     };
   }, [expanded]);
-  const activeType = tabs.items.find((tab) => tab.id === tabs.activeId)?.type;
-  const sidebar = expanded && expandedSidebar && activeType !== "files";
+  const activeTab = tabs.items.find((tab) => tab.id === tabs.activeId);
+  const sidebar = expanded ? expandedSidebar?.(activeTab) : null;
   return (
     <>
       {expanded ? (
@@ -344,6 +395,9 @@ export function RightPanelTabs({
                     }}
                   >
                     {tab.type === "agents" ? <Bot /> : null}
+                    {tab.type === "agent" ? (
+                      <AgentTabIcon agentId={tab.agentId} profile={tab.profile} />
+                    ) : null}
                     {tab.type === "files" ? <Files /> : null}
                     {tab.type === "thread" ? (
                       <ConversationIcon surface={tab.target.surface} />
@@ -407,8 +461,10 @@ export function RightPanelTabs({
           </div>
           <div className="flex flex-1 min-h-0 min-w-0">
             {sidebar ? (
-              <div className="file-panel-tree flex flex-none w-64 min-h-0 border-r border-border">
-                {expandedSidebar}
+              <div
+                className={`file-panel-tree flex flex-none min-h-0 border-r border-border ${activeTab?.type === "agent" ? "w-56" : "w-64"}`}
+              >
+                {sidebar}
               </div>
             ) : null}
             <div className="file-panel-tab-content">

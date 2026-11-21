@@ -319,6 +319,31 @@ test("structured composer identities survive cache reload", async () => {
   expect(await cache(factory).readDraft(scope, "thread")).toEqual(draft);
 });
 
+test("ready attachment references survive draft reload and are cleared with the draft", async () => {
+  const factory = new IDBFactory();
+  const first = cache(factory);
+  const attachmentReferences = Array.from({ length: 33 }, (_, index) => ({
+    key: `chip-${index}`,
+    resourceId: `upload-${index}`,
+    name: "notes.txt",
+    type: "text/plain",
+    size: 6,
+  }));
+  await first.saveDraft(scope, "thread", {
+    text: attachmentReferences.map((item) => `[notes.txt](attachment:${item.key})`).join(" "),
+    skillIds: [],
+    attachmentReferences,
+  });
+  first.close();
+  const reloaded = cache(factory);
+  expect((await reloaded.readDraft(scope, "thread")).attachmentReferences).toEqual(
+    attachmentReferences,
+  );
+  await reloaded.saveDraft(scope, "thread", { text: "", skillIds: [] });
+  reloaded.close();
+  expect((await cache(factory).readDraft(scope, "thread")).attachmentReferences).toBeUndefined();
+});
+
 test("legacy text-only draft rows retain text with empty selected skills", async () => {
   const factory = new IDBFactory();
   const first = cache(factory);
@@ -967,4 +992,25 @@ test("memory hits do not persist touches or scan IndexedDB metadata", async () =
   } finally {
     transactions.mockRestore();
   }
+});
+
+test("attachment-only local and reply drafts survive listing and reload in composer order", async () => {
+  const factory = new IDBFactory();
+  const first = cache(factory);
+  const a = { key: "a", resourceId: "a-resource", name: "a.txt", type: "text/plain", size: 1 };
+  const b = { ...a, key: "b", resourceId: "b-resource", name: "b.txt" };
+  for (const id of ["draft:local", "reply"]) {
+    const draft = { text: "", skillIds: [], attachments: ["a", "b"], attachmentReferences: [b, a] };
+    await first.saveDraft(scope, id, draft);
+  }
+  expect((await first.listLocalDrafts(scope)).map((row) => row.threadId)).toEqual(["draft:local"]);
+  expect(await first.listDraftedThreads(scope)).toEqual(new Set(["reply"]));
+  first.close();
+  const reopened = cache(factory);
+  expect(
+    (await reopened.listLocalDrafts(scope))[0]?.draft.attachmentReferences?.map((item) => item.key),
+  ).toEqual(["a", "b"]);
+  expect(
+    (await reopened.readDraft(scope, "reply")).attachmentReferences?.map((item) => item.key),
+  ).toEqual(["a", "b"]);
 });

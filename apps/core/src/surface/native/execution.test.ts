@@ -1,3 +1,4 @@
+import { projectAssistantTextHistory } from "../bridge/request-composition/normalization";
 import { NativeQuestions } from "./questions";
 import { describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
@@ -88,6 +89,7 @@ function fixture(
   const published: { data: CmdRequestMessageData; headers: Record<string, string> }[] = [];
   let cancellations = 0;
   let cancellationFailure: Error | undefined;
+  let cancellationWait: (() => Promise<void>) | undefined;
   let publicationFailure: EventPublishContractInvalid | EventPublishTransportFailed | undefined;
   const bus: Pick<LilacBus, "publish"> = {
     publish: async (type, data, options) => {
@@ -114,6 +116,7 @@ function fixture(
     runner: () => ({
       cancelNativeSession: async () => {
         cancellations += 1;
+        await cancellationWait?.();
         return cancellationFailure ? Result.err(cancellationFailure) : Result.ok(undefined);
       },
     }),
@@ -167,6 +170,9 @@ function fixture(
     submit,
     request,
     cancellations: () => cancellations,
+    waitForCancellation: (wait?: () => Promise<void>) => {
+      cancellationWait = wait;
+    },
     setNow: (value: number) => {
       now = value;
     },
@@ -1542,11 +1548,26 @@ describe("native turn transcripts", () => {
      * A checkpoint is a run that compacted. A recovered run inherited that compaction from its
      * checkpoint, so it has no compaction metadata.
      */
-    const finish = async (compaction?: "checkpoint" | "recovered") => {
+    const finish = async (
+      compaction?: "checkpoint" | "recovered",
+      thinking?: "signed" | "separate" | "repaired" | "replaced",
+    ) => {
       finished += 1;
       const request = f.request();
       const published = storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages);
       const answer: StoredMessageV1 = { role: "assistant", content: `a${finished}` };
+      if (thinking === "signed")
+        answer.content = [
+          { type: "reasoning", text: "", providerOptions: { anthropic: { signature: "old" } } },
+          { type: "text", text: `a${finished}` },
+        ];
+      if (thinking === "separate")
+        published.push({
+          role: "assistant",
+          content: [
+            { type: "reasoning", text: "", providerOptions: { anthropic: { signature: "old" } } },
+          ],
+        });
       const all: StoredMessageV1[] = compaction
         ? [
             { role: "user", content: "<context-compaction>summary</context-compaction>" },
@@ -1562,13 +1583,32 @@ describe("native turn transcripts", () => {
           ...(compaction === "checkpoint"
             ? { contextMeta: { type: "compaction", formatVersion: 1 } as const, messages: all }
             : {
-                messages: turnRows
-                  ? selectNativeRunMessages(all, request.requestId, published)
-                  : all,
+                messages:
+                  thinking === "replaced"
+                    ? all.map((message): StoredMessageV1 => {
+                        if (message.role !== "assistant" || typeof message.content === "string")
+                          return message;
+                        return {
+                          ...message,
+                          content: message.content.map((part) =>
+                            part.type === "reasoning"
+                              ? {
+                                  ...part,
+                                  providerOptions: { anthropic: { signature: "replacement" } },
+                                }
+                              : part,
+                          ),
+                        };
+                      })
+                    : thinking === "repaired"
+                      ? projectAssistantTextHistory(all)
+                      : turnRows
+                        ? selectNativeRunMessages(all, request.requestId, published)
+                        : all,
               }),
         }),
       );
-      if (turnRows && !compaction) {
+      if (turnRows && !compaction && !thinking) {
         const saved = value(f.transcripts.getRequestTranscript({ requestId: request.requestId }));
         expect(labels(saved!.messages)).toEqual([`m${finished}`, `a${finished}`]);
       }
@@ -1585,6 +1625,78 @@ describe("native turn transcripts", () => {
     };
     return { f, finish, send };
   };
+
+  test.each(["signed", "separate"] as const)(
+    "retains later turns across a repaired thinking cutoff (%s)",
+    async (thinking) => {
+      const { f, finish, send } = harness("turn");
+      try {
+        await send(1_000);
+        await finish(undefined, thinking);
+        await send(2_000);
+        await finish();
+        await send(3_000);
+        await finish(undefined, "repaired");
+        f.setMaxAge(1_500);
+        expect((await send(3_100)).history).toEqual(["m2", "a2", "m3", "a3", "m4"]);
+        await finish();
+        expect((await send(3_600)).history).toEqual(["m3", "a3", "m4", "a4", "m5"]);
+      } finally {
+        f.close();
+      }
+    },
+  );
+
+  test.each(["signed", "separate"] as const)(
+    "trims two old turn rows from a repaired full snapshot (%s)",
+    async (thinking) => {
+      const { f, finish, send } = harness("turn");
+      try {
+        await send(1_000);
+        await finish(undefined, thinking);
+        await send(2_000);
+        await finish();
+        await send(3_000);
+        await finish();
+        await send(4_000);
+        await finish(undefined, "repaired");
+        f.setMaxAge(2_000);
+        expect((await send(4_100)).history).toEqual(["m3", "a3", "m4", "a4", "m5"]);
+      } finally {
+        f.close();
+      }
+    },
+  );
+
+  test("does not treat replacement thinking as a repaired cutoff", async () => {
+    const { f, finish, send } = harness("turn");
+    try {
+      await send(1_000);
+      await finish(undefined, "signed");
+      await send(2_000);
+      await finish(undefined, "replaced");
+      f.setMaxAge(1_500);
+      expect((await send(3_000)).history).toEqual(["m3"]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("retains repaired history across successive canonical starts", async () => {
+    const { f, finish, send } = harness("turn");
+    try {
+      await send(1_000);
+      await finish();
+      await send(2_000);
+      await finish(undefined, "signed");
+      f.setMaxAge(1_500);
+      expect((await send(3_000)).history).toEqual(["m2", "a2", "m3"]);
+      await finish(undefined, "repaired");
+      expect((await send(3_600)).history).toEqual(["m3", "a3", "m4"]);
+    } finally {
+      f.close();
+    }
+  });
 
   test.each<Mode>(["full", "turn", "mixed"])(
     "rebuilds the same history across an advancing cutoff from %s rows",
@@ -1838,4 +1950,259 @@ describe("native turn row differential", () => {
       await publishedHistories(true, scenario),
     );
   });
+});
+
+function rewindFixture() {
+  const f = fixture(undefined, true);
+  value(
+    f.store.initializeDeployment({
+      titleModel: "fast",
+      transport: "auto",
+      outputStreaming: "paragraph",
+      dmContextGapMs: 7_200_000,
+      dmTimestampGapMs: 1_800_000,
+      oldMessageSelectionMaxAgeMs: null,
+      storageRetentionMaxAgeMs: null,
+      crossThreadSend: { triggerRun: true },
+    }),
+  );
+  const input = f.submit("rewind me");
+  value(f.store.settleInput(input.inputId, "admitted"));
+  value(
+    f.store.projectTurn(f.thread.id, 0, "settled_rewind", input.turnId!, (slot) =>
+      Result.ok({ slot: { ...slot, state: "complete", settledAt: 1000 }, changes: [] }),
+    ),
+  );
+  value(f.store.markInputCompleted(input.inputId));
+  const request = {
+    threadId: f.thread.id,
+    turnId: input.turnId!,
+    commandId: "rewind",
+    historyGeneration: 0,
+    revision: value(f.store.getThreadRecord(f.thread.id)).revision,
+  };
+  return { ...f, rewindRequest: request };
+}
+
+test("retrying a completed DM rewind leaves a newer run alone", async () => {
+  const f = rewindFixture();
+  try {
+    const first = value(await f.execution.rewind("owner", f.rewindRequest));
+    f.submit("new prompt");
+    value(await f.execution.kick(f.thread.id));
+    const active = value(f.store.getThreadRecord(f.thread.id)).activeRunId;
+    expect(active).toBeDefined();
+    expect(value(await f.execution.rewind("owner", f.rewindRequest))).toEqual(first);
+    expect(f.cancellations()).toBe(1);
+    expect(value(f.store.getThreadRecord(f.thread.id)).activeRunId).toBe(active);
+  } finally {
+    f.close();
+  }
+});
+
+test("concurrent retries share the unfinished rewind cancellation", async () => {
+  const f = rewindFixture();
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  f.waitForCancellation(async () => {
+    started.resolve();
+    await release.promise;
+  });
+  try {
+    const first = f.execution.rewind("owner", f.rewindRequest);
+    await started.promise;
+    const second = f.execution.rewind("owner", f.rewindRequest);
+    release.resolve();
+    expect(value(await first)).toEqual(value(await second));
+    expect(f.cancellations()).toBe(1);
+  } finally {
+    release.resolve();
+    f.close();
+  }
+});
+
+test("DM rewind waits until an in-progress cancellation finishes", async () => {
+  const f = rewindFixture();
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  f.waitForCancellation(async () => {
+    started.resolve();
+    await release.promise;
+  });
+  try {
+    const canceling = f.execution.cancel("owner", f.thread.id);
+    await started.promise;
+    const request = {
+      ...f.rewindRequest,
+      revision: value(f.store.getThreadRecord(f.thread.id)).revision,
+    };
+    expect(
+      (await f.execution.rewind("owner", request)).match({
+        ok: () => undefined,
+        err: (error) => error.message,
+      }),
+    ).toBe("Wait for cancellation to finish.");
+    expect(value(f.store.getThreadRecord(f.thread.id)).historyGeneration).toBe(0);
+    release.resolve();
+    value(await canceling);
+    f.waitForCancellation();
+    value(
+      await f.execution.rewind("owner", {
+        ...request,
+        revision: value(f.store.getThreadRecord(f.thread.id)).revision,
+      }),
+    );
+  } finally {
+    release.resolve();
+    f.close();
+  }
+});
+
+test("overlapping cancellations block new DM rewind until both settle", async () => {
+  const f = rewindFixture();
+  const firstStarted = Promise.withResolvers<void>();
+  const secondStarted = Promise.withResolvers<void>();
+  const releaseFirst = Promise.withResolvers<void>();
+  const releaseSecond = Promise.withResolvers<void>();
+  let calls = 0;
+  f.waitForCancellation(async () => {
+    calls++;
+    if (calls === 1) {
+      firstStarted.resolve();
+      return releaseFirst.promise;
+    }
+    secondStarted.resolve();
+    return releaseSecond.promise;
+  });
+  try {
+    const first = f.execution.cancel("owner", f.thread.id);
+    await firstStarted.promise;
+    const second = f.execution.cancel("owner", f.thread.id);
+    await secondStarted.promise;
+    releaseFirst.resolve();
+    value(await first);
+    const request = {
+      ...f.rewindRequest,
+      revision: value(f.store.getThreadRecord(f.thread.id)).revision,
+    };
+    expect((await f.execution.rewind("owner", request)).isErr()).toBe(true);
+    expect(value(f.store.getThreadRecord(f.thread.id)).historyGeneration).toBe(0);
+    releaseSecond.resolve();
+    value(await second);
+    f.waitForCancellation();
+    value(
+      await f.execution.rewind("owner", {
+        ...request,
+        revision: value(f.store.getThreadRecord(f.thread.id)).revision,
+      }),
+    );
+  } finally {
+    releaseFirst.resolve();
+    releaseSecond.resolve();
+    f.close();
+  }
+});
+
+test("completed rewind receipts remain readable during a later cancellation", async () => {
+  const f = rewindFixture();
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  try {
+    const reply = value(await f.execution.rewind("owner", f.rewindRequest));
+    f.submit("new prompt");
+    value(await f.execution.kick(f.thread.id));
+    f.waitForCancellation(async () => {
+      started.resolve();
+      await release.promise;
+    });
+    const cancel = f.execution.cancel("owner", f.thread.id);
+    await started.promise;
+    expect(value(await f.execution.rewind("owner", f.rewindRequest))).toEqual(reply);
+    expect(f.cancellations()).toBe(2);
+    release.resolve();
+    value(await cancel);
+  } finally {
+    release.resolve();
+    f.close();
+  }
+});
+
+test("the original rewind command finishes after cancellation fails post-mutation", async () => {
+  const f = rewindFixture();
+  try {
+    f.failCancellation(new Error("runner unavailable"));
+    expect((await f.execution.rewind("owner", f.rewindRequest)).isErr()).toBe(true);
+    expect(value(f.store.getThreadRecord(f.thread.id))).toMatchObject({
+      historyGeneration: 1,
+      mutationPending: true,
+    });
+    f.failCancellation();
+    expect(value(await f.execution.rewind("owner", f.rewindRequest)).text).toBe("rewind me");
+    expect(value(f.store.getThreadRecord(f.thread.id)).mutationPending).toBe(false);
+  } finally {
+    f.close();
+  }
+});
+
+test("the last overlapping cancellation drains queued input even when it fails", async () => {
+  const f = fixture();
+  const starts = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+  const releases = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+  let calls = 0;
+  f.waitForCancellation(async () => {
+    const index = calls++;
+    starts[index]!.resolve();
+    await releases[index]!.promise;
+  });
+  try {
+    const first = f.execution.cancel("owner", f.thread.id);
+    await starts[0]!.promise;
+    const second = f.execution.cancel("owner", f.thread.id);
+    await starts[1]!.promise;
+    const input = f.submit("queued during cancellation");
+    value(await f.execution.kick(f.thread.id));
+    expect(f.published).toHaveLength(0);
+    releases[0]!.resolve();
+    value(await first);
+    expect(f.published).toHaveLength(0);
+    const failure = new Error("last cancellation failed");
+    f.failCancellation(failure);
+    releases[1]!.resolve();
+    expect((await second).match({ ok: () => undefined, err: (error) => error })).toBe(failure);
+    expect(f.published).toHaveLength(1);
+    expect(value(f.store.getInput(input.inputId)).state).toBe("admitted");
+  } finally {
+    for (const release of releases) release.resolve();
+    f.close();
+  }
+});
+
+test("restart recovery suppresses discarded jobs using the persisted rewind receipt", async () => {
+  const f = rewindFixture();
+  const stopped: unknown[][] = [];
+  const execution = createNativeExecution({
+    store: f.store,
+    transcriptStore: f.transcripts,
+    bus: {
+      publish: async () => {
+        throw new Error("unexpected publication");
+      },
+    },
+    runner: () => ({ cancelNativeSession: async () => Result.ok(undefined) }),
+    jobs: {
+      stopSessionJobsSince: async (...args: [string, number, "thread_rewound"]) => {
+        expect(value(f.store.getThreadRecord(f.thread.id)).mutationPending).toBe(true);
+        stopped.push(args);
+      },
+    } as unknown as NonNullable<Parameters<typeof createNativeExecution>[0]["jobs"]>,
+  });
+  try {
+    value(f.store.beginRewind("owner", f.rewindRequest));
+    value(await execution.recoverMutations());
+    value(await execution.recoverMutations());
+    expect(stopped).toEqual([[`native:${f.thread.id}`, 1000, "thread_rewound"]]);
+    expect(value(f.store.getThreadRecord(f.thread.id)).mutationPending).toBe(false);
+  } finally {
+    f.close();
+  }
 });

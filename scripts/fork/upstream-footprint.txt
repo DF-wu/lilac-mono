@@ -32,16 +32,16 @@ apps/core/src/runtime/create-core-runtime.ts  # constructs and registers the Tel
 apps/core/src/runtime/main.ts  # settles Core creation/start Results through the fork-owned startCoreRuntime helper
 apps/core/src/ssh/ssh-exec.ts  # PR119: preserves bounded output drain and handles cancelled dispatch, async stdin failures, Panic cleanup, and surviving process-group helpers
 apps/core/src/surface/adapter.ts  # adds the optional attachment-resolver capability and resolve-attachment operation
-apps/core/src/surface/bridge/bus-agent-runner.ts  # labels telegram requests for conversation recall
+apps/core/src/surface/bridge/bus-agent-runner.ts  # retains Telegram authority and fork delivery fixes; PR120 adds a user continuation after thinking repair removes a terminal tool result
 apps/core/src/surface/bridge/bus-agent-runner/auto-inject-thread-search.ts  # F01–F08/F14/F15: Surface registration/origin/resource seams on current upstream shared owners
 apps/core/src/surface/bridge/request-composition/attachments.ts  # resolves Telegram attachment refs during composition
-apps/core/src/surface/bridge/request-composition/normalization.ts  # platform-aware routed-surface normalization
+apps/core/src/surface/bridge/request-composition/normalization.ts  # preserves Telegram metadata and removes adjacent Discord attribution headers idempotently during thinking repair
 apps/core/src/surface/bridge/request-ids.ts  # telegram:<session>:<message> request-id form
 apps/core/src/surface/bridge/subscribe-from-bus.ts  # platform-generic relay refs
 apps/core/src/surface/builtin-surface-protocols.ts  # registers telegramSurfaceProtocol in the closed catalog
 apps/core/src/surface/native/runtime.ts  # composes the opt-in fork-owned Discord recorder at native ingress and shutdown
 apps/core/src/surface/native/store-search.ts  # scope the message projection before decoding turns for single-thread search and context reads
-apps/core/src/surface/native/store.ts  # committed display notifications, durable Discord child routing, and PR113 revoked-steer admission and assistant attribution
+apps/core/src/surface/native/store.ts  # preserves fork native search and mirror contracts; derives pending rewind job cutoff from existing command receipts without changing stored data
 apps/core/src/surface/native/push.test.ts  # updates the native schema upgrade regression for durable Discord child routing
 
 # --- OpenAI web.search provider (staged for an upstream contribution; remove once accepted)
@@ -55,7 +55,7 @@ apps/core/src/tool-server/tools/web-search.ts  # exports OpenAIWebSearchProvider
 apps/core/src/tool-server/tools/web-search/default-web-search-providers.ts  # registers the openai provider
 apps/core/src/tool-server/tools/web-search/resolve-provider.ts  # OPENAI_API_KEY missing-config message
 apps/core/src/tool-server/tools/web-search/types.ts  # "openai" provider id
-apps/core/src/tool-server/tools/web.ts  # openai environment/policy plumbing; web.extract skips search-only providers
+apps/core/src/tool-server/tools/web.ts  # keeps OpenAI Responses model routing, status-based fallback, search-only scope, and the selected 30-second per-attempt deadline
 apps/core/src/tool-server/tools/web/provider-page-extraction.ts  # openai environment and supportsPageExtraction
 apps/core/src/tools/bash-impl.ts  # forwards LILAC_ORIGIN_SESSION_ID to tool processes
 apps/core/src/transcript/transcript-store.ts  # Telegram platform filters
@@ -75,7 +75,7 @@ apps/core/tests/runtime/config-schemas.test.ts  # verifies fork editor schema ac
 apps/core/tests/surface/authenticated-request.test.ts  # Telegram principals
 apps/core/tests/surface/bridge/adapter-event-projection.test.ts  # Telegram adapter events
 apps/core/tests/surface/bridge/bus-agent-runner-auto-inject.test.ts  # F01–F08/F14/F15: Surface registration/origin/resource seams on current upstream shared owners
-apps/core/tests/surface/bridge/bus-agent-runner.test.ts  # Telegram authority
+apps/core/tests/surface/bridge/bus-agent-runner.test.ts  # preserves fork lineage regressions; tests tool-ended thinking repair, isolated new thinking, and checkpoint durability after settlement
 apps/core/tests/surface/bridge/subscribe-from-bus.test.ts  # platform-generic relay refs
 apps/core/tests/surface/native/operator-integration.test.ts  # Inherited verification: Real operator gateway fixture uses an ephemeral listener, preserving production port
 apps/core/tests/surface/native/resources-live.test.ts  # verifies exclusive concurrent saves without assuming asynchronous authorization order
@@ -87,7 +87,7 @@ apps/core/tests/tool-server-image-generation.test.ts  # isolates the openaiCompa
 apps/core/tests/tool-server-surface.test.ts  # Telegram session listing
 apps/core/tests/tools/bash.test.ts  # probes stdin with readSync to distinguish EBADF from EOF across cat implementations
 apps/core/tests/tools/subagent.test.ts  # origin session context
-apps/core/tests/tools/web.test.ts  # covers search-only provider skipping
+apps/core/tests/tools/web.test.ts  # retains both parent test sets plus 30-second OpenAI/compatible deadlines, exact timeout messages, retry/fallback and early cancellation
 apps/core/tests/transcript/transcript-store.test.ts  # Telegram platform filters
 apps/core/tests/workflow/durable-workflow-store.test.ts  # Telegram authorization and real cancellation outbox/engine/durable delivery regression (#108)
 apps/core/tests/workflow/workflow-engine.test.ts  # Telegram workflow targets
@@ -97,9 +97,9 @@ apps/core/tests/workflow/workflow-wait-resolver.test.ts  # Telegram reply waits
 apps/tool-bridge/client.test.ts  # origin session header
 apps/tool-bridge/client.ts  # forwards the origin session header
 apps/tool-bridge/index.ts  # preserves lazy runtime configuration for content.inspect in the standalone bridge
-apps/web/src/cache.ts  # issue #111: transaction-derived persistent cache recency across clock ties
+apps/web/src/cache.ts  # retains fork cache behavior and keeps attachment-only drafts and composer attachment order across reloads
 apps/web/src/generated/tool-activities.ts  # generated from fork tool definitions and workflow progress content
-apps/web/tests/cache.test.ts  # issue #111: recache, cross-instance ordering, capacity and safe-integer regressions
+apps/web/tests/cache.test.ts  # covers retained fork cache behavior plus attachment-only local/reply drafts and upload-completion order independence
 bun.lock  # grammY (Telegram Bot API) dependency
 compose.yaml  # container identity variants, native surface port and optional native Discord webhook forwarding
 docker/direct-entrypoint.sh  # restores configured image identity/home and preserves the direct-launch contract
@@ -107,7 +107,7 @@ docker/verify-image.sh  # verifies the container identity variants
 docs/core-config-migrations.md  # documents fork v2 config keys
 docs/docker-deployment.md  # documents container identity variants and optional native Discord recording setup
 docs/heartbeat.md  # clarifies that the fork's Telegram surface is not a heartbeat default destination
-docs/native-surface.md  # links the fork-only recorder setup and delivery guarantees
+docs/native-surface.md  # retains fork recorder documentation and clarifies missing unfinished rewind attachments require reattachment
 package.json  # fork:footprint script and scripts/fork lint, format, and typecheck coverage
 packages/agent/adapters/ai-sdk/adapter.ts  # executes parsed local tool calls on nonstandard finish reasons
 packages/agent/auto-compaction.ts  # applies the existing current-input boundary in compaction preflight; selection policy is owned by this upstream module
@@ -139,7 +139,7 @@ scripts/run-gates.ts  # runs external custom-media source/bundle regression and 
 # --- PR113 integration regressions
 apps/installer/src/data-files.ts  # preserves the existing image runtime identity when preparing private bind-mounted data
 apps/installer/tests/integration/verify-installation.ts  # verifies private installer ownership against each image's actual account
-apps/core/src/surface/native/execution.test.ts  # guards revoked automatic-steer admission and busy-send assistant attribution
+apps/core/src/surface/native/execution.test.ts  # preserves fork admission regressions; covers failed-overlap draining and restart rewind job suppression
 apps/installer/tests/runtime-contract.test.ts  # resolves existing fork Docker ARG defaults without weakening runtime environment assertions
 apps/core/scripts/generate-client-protocol-compat.ts  # stages historical schema export before replacing frozen fixtures
 apps/core/src/github/github-state.ts  # preserves unfinished interrupt retry after durable prompt publication
@@ -164,7 +164,7 @@ apps/core/tests/surface/bridge/bus-agent-runner-controls.test.ts  # preserves de
 apps/core/tests/surface/bridge/bus-agent-runner-session-queue.test.ts  # fences late steering during failure finalization
 apps/core/tests/tools/orchestrate.test.ts  # real durable publication regression for keyed live-to-ended concurrency
 apps/core/tests/workflow/workflow-subagent-convergence.test.ts  # concurrent, reopened-store and hard-exit receipt regressions; real bus deadlines
-apps/web/src/components/composer-editor.tsx  # preserves caret and selection across Activity editor recreation
+apps/web/src/components/composer-editor.tsx  # preserves Activity caret restoration and reference-only attachment records through rewind undo
 packages/client-protocol/compat/previous-release/actionsPartSchema.schema.json  # removes generated schema absent from verified release build-3c01ce2c29a6-42575569714-1
 packages/client-protocol/compat/previous-release/bootstrap.get.schema.json  # regenerated from verified historical release schemas
 packages/client-protocol/compat/previous-release/bootstrap.schema.json  # regenerated from verified historical release schemas
@@ -219,3 +219,13 @@ packages/fs/src/search-backend.ts  # PR119: carries requested metadata mode to t
 packages/fs/tests/read-byte-prefix.test.ts  # PR119: rejects growth between whole-file size preflight and bounded read
 packages/fs/src/node-host.ts  # PR119: reads a bounded prefix from the opened handle without capping at stale metadata size
 apps/remote-runner/src/fsops.rs  # PR119: bounded prefix reads observe growth after opened-handle metadata
+
+# PR #120 verified integration fixes
+apps/core/src/surface/native/execution.ts  # drains queued input after a final failed cancellation and replays rewind job suppression before clearing mutation state
+apps/core/tests/agent/anthropic-thinking-recovery.test.ts  # adjacent attribution normalization is complete and idempotent
+apps/web/src/components/Chat.tsx  # keeps the composer disabled during a running rewind across navigation and preserves the originating draft key when retaining files
+apps/web/src/components/Composer.tsx  # aborts pending message-paste downloads when rewind replaces the draft
+apps/web/src/uploads.ts  # retained files without a reference get cancellable reservation metadata and retain their originating draft key before retry
+apps/web/src/use-dm-rewind.ts  # retries one unchanged history page after a transient failure so rewind availability can recover online
+apps/web/tests/uploads.test.ts  # retained-file retry reaches reservation/upload and exact expiry uses a fixed clock
+apps/core/tests/tool-server-health-state.test.ts  # isolates dependency fatal-streak assertions from real main-isolate memory accumulated during full-suite workers

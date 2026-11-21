@@ -29,9 +29,11 @@ sequenceDiagram
     Tool-->>Agent: the same array, identical in shape to Tavily/Exa/Firecrawl results
 ```
 
-If the provider fails with a retriable error (rate limit, 5xx, timeout, network
-error), `web.search` continues with the next provider in the list, exactly as
-for the other providers.
+OpenAI Responses search, including `openai-compatible` routes, has a 30-second deadline per
+attempt. Firecrawl, Exa, and Tavily have 10 seconds per attempt. A retryable failure (rate limit,
+retryable HTTP status, timeout, or network error) gets one retry on the same provider, then the
+configured fallback order applies. Caller cancellation stops the active attempt and prevents
+retry or fallback. These deadlines apply to search; they do not change `web.extract`.
 
 ## What the mediator model receives
 

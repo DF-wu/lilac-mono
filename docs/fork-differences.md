@@ -1,215 +1,239 @@
 # Fork Differences
 
-Language: [`English (primary / canonical)`](./fork-differences.md) · [`Traditional Chinese (translation)`](./fork-differences.zh-TW.md)
+Language: [English (primary / canonical)](./fork-differences.md) · [Traditional Chinese (translation)](./fork-differences.zh-TW.md)
 
-This document describes the current differences between [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) and [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono).
+This is the engineering and operations comparison of [DF-wu/lilac-mono](https://github.com/DF-wu/lilac-mono) with [stanley2058/lilac-mono](https://github.com/stanley2058/lilac-mono). It separates the shipped fork baseline, the upstream PR #120 input, and the resolved integration candidate documented in this working tree. Source, schemas and tests at the pins below take precedence over this explanation. A fork delta is a maintenance obligation, not a permanent compatibility promise.
 
-The current integration baseline is upstream commit [`90d71dbe`](https://github.com/stanley2058/lilac-mono/commit/90d71dbe9a2a86d8b0a39513e9eb67d65eb93683) in fork PR [#119](https://github.com/DF-wu/lilac-mono/pull/119), integrated with fork main `a246ffb6` while preserving both histories. The [November 11 integration inventory](./fork-integration-20261111/README.md) records the earlier PR #101 baseline, F01–F23 dispositions, source ownership and offline migration support. Older dated reports retain their historical baselines.
+## Baselines, direction and completeness
 
-> [!IMPORTANT]
-> This is a maintenance document, not a permanent compatibility commitment. After an upstream sync, differences that have been accepted upstream or no longer exist must be removed from this table or reclassified.
+| Role | Immutable commit | Meaning |
+| --- | --- | --- |
+| Shipped fork baseline (F) | [`4d8c0a8d799fcacd8aa51ca7613f48d7bb3f2327`](https://github.com/DF-wu/lilac-mono/commit/4d8c0a8d799fcacd8aa51ca7613f48d7bb3f2327) | Fork main including PR #121; the current behavior described here |
+| Incoming upstream / PR #120 (U) | [`7613d519643005ee4574c085a534c74af9508f88`](https://github.com/stanley2058/lilac-mono/commit/7613d519643005ee4574c085a534c74af9508f88) | Incoming target, **not** a resolved fork candidate |
+| Common ancestor (B) | [`90d71dbe9a2a86d8b0a39513e9eb67d65eb93683`](https://github.com/stanley2058/lilac-mono/commit/90d71dbe9a2a86d8b0a39513e9eb67d65eb93683) | Upstream incorporated by fork PR #119 |
+| Resolved PR #120 candidate (C) | Content fingerprint in the [inventory](./fork-comparison-pr120/PATH-INVENTORY.md#pins-and-scope) | Uncommitted integration of F and U plus the repairs below; locally verified, unpublished |
 
-The [2026-10-22 maintenance review](./fork-review-2026-10-22.md) records which extensions remain
-necessary, the integration defects corrected against its baseline, and the retired watchdog patch.
-The [PR #95 integration report](./fork-integration-pr95.md) records the later v3 migration and validation.
+“Shipped” identifies committed fork main at F; it does not assert that any installation has deployed it. [PR #120](https://github.com/DF-wu/lilac-mono/pull/120) has a resolved local candidate; publication and hosted integration CI remain pending. C is not U relabeled as fork main, and no unpublished commit URL is used. Later refs and external PR status are not inferred from these local objects.
 
-## Inherited Native Runner and Preview Updates
+The [complete path inventory](./fork-comparison-pr120/PATH-INVENTORY.md) and [machine-readable evidence](./fork-comparison-pr120/inventory.json) account for **every** changed path, blob/mode, named category and exact footprint reason:
 
-PR #119 adopts upstream's Rust SSH runner and retires the JavaScript runners and published runner
-package. Supported remote hosts no longer need a JavaScript runtime or registry access. SSH cancellation
-uses stdin EOF, with bounded output drain retained from fork PR #118 and bounded stdin/process cleanup.
-See [runner builds and cleanup](../DEVELOPMENT.md#remote-runner) and [upgrade and rollback](../MIGRATIONS.md#native-ssh-remote-runner).
+| Comparison, always left → right | Paths | Interpretation |
+| --- | ---: | --- |
+| B → F | 371: 160 added, 207 modified, 4 deleted | Actual fork-side changes since the common ancestor, including tests, docs and generated output |
+| B → U | 147: 26 added, 121 modified | Incoming upstream changes missing in whole or part from F |
+| U → F | 494: 160 added, 304 modified, 30 deleted | Tip comparison; **not** 494 fork-only features or 30 deliberate fork removals |
+| Union of the above | 494 | 347 fork-side-only paths, 123 incoming-only paths, 24 paths changed on both sides |
+| Exact footprint at F | 211 rows, 211 covered, 0 unlisted, 0 stale | Only modified/deleted/type-changed paths present at the merge base; additions are outside the gate |
+| F → C | 157: 31 added, 126 modified | Upstream adoption, retained fork behavior, scoped repairs, and comparison documentation |
+| U → C | 384: 165 added, 215 modified, 4 deleted | Actual resolved fork delta against the pinned upstream input |
+| Combined union | 500 | All baseline and candidate deltas, including six comparison artifacts |
+| Exact candidate footprint against U | 219 rows, 219 covered, 0 unlisted, 0 stale | Equivalent to the normal gate after a merge commit containing U; no gate implementation change |
 
-HTML previews capture the single named file using the writing run's file access. Local assets must be
-inlined before capture; the built-in visualize helper supports this. See [native previews](./native-surface.md#rich-content-and-previews).
-Discord read-only thread control, subagent conversation context, web connection recovery and the updated
-Result rules are also inherited upstream capabilities, rather than fork-only features.
+Of the 30 U → F deletions, **26 are incoming upstream additions not yet present in F**. The only four actual B → F deletions are historical protocol fixtures: `actionsPartSchema.schema.json`, `workflowRunSummarySchema.schema.json`, `workflows.get.schema.json`, and `workflows.list.schema.json` under `packages/client-protocol/compat/previous-release/`. Their removal corrects the verified older release's actual contract; it does not remove current workflow APIs.
 
-The sync preserves Telegram, OpenAI search, origin-session authority, S3 checks and the fork's container
-variants. Optional review suggestions that change existing policy or do not affect sync compatibility
-remain deferred; this integration does not introduce a new denied-symlink metadata policy.
+The inventory also identifies **23 generated/schema/bundle paths**. All **seven gitlinks** and `.gitmodules` match at B, F, U and C: zero submodule deltas, measured with full recursive Git trees without initializing or reading submodules. Ordinary executable modes and blob IDs are included in JSON. Renames are intentionally reported as additions/deletions so no path disappears through similarity detection.
 
-## Inherited Native Chat and Heartbeat Updates
+The original trial `git merge-tree --write-tree --name-only F U` reports one textual conflict, `apps/core/tests/tools/web.test.ts`. C resolves it by preserving both test groups and incorporates the 24 overlapping paths with the repairs and checks below. The trial conflict-marker tree is only historical merge evidence. C contains 2,263 paths: 2,248 regular files, seven executable files, one symlink and seven gitlinks; all modes are inventoried.
 
-PR #92 brings upstream native permanent DMs, background push and device-aware notifications,
-gap-based DM context, and file-based proactive heartbeat into this fork. These are inherited upstream
-capabilities. See [native operation](./native-surface.md) and [heartbeat setup and verification](./heartbeat.md).
+## Status vocabulary and evidence
 
-Heartbeat's default destination supports Discord, GitHub, and native; this configuration field does
-not accept Telegram. Existing customized workflow files and legacy inbox/archive notes are preserved,
-but unfinished work must be migrated through the heartbeat skill before relying on the new workflow.
-Native tool sends queue without starting a destination run by default; heartbeat remains
-notification-only. Deploy Core and web together and review [migration and rollback requirements](../MIGRATIONS.md).
+- **Current fork addition/modification/deletion:** demonstrated by B → F and the F source. Shared files can contain both upstream foundation and fork extensions.
+- **Candidate repair:** implemented and locally verified in C, but absent from the shipped baseline F and not yet published.
+- **Upstream adoption:** present at U and integrated in C; absent or different at F. It must not be credited as a fork invention.
+- **Shared / already upstream:** present in the incorporated upstream baseline; origin in an earlier fork contribution does not make it a current difference.
+- **Historical / retired:** retained only as dated evidence, or absent from current production. Commit subjects alone do not establish current behavior.
 
-## Current Fork-only Features
+F01–F23 retain the feature IDs from [the November 11 integration record](./fork-integration-20261111/README.md). That directory's current-at-the-time narrative and path inventory are **historical PR #101 evidence**, not the current comparison. Its generator mixes its older pins with the invoking working tree; use the new pinned generator for this report. N01–N11 name later corrections, U01–U04 identify incoming/shared upstream work, and D categories identify documentation/developer metadata. The generated inventory assigns every path a category; the sections below explain the corresponding contracts. Listed tests identify coverage; actual integrated execution and limitations are recorded in [VERIFICATION.md](./fork-comparison-pr120/VERIFICATION.md). Baseline statements remain explicitly about F; candidate changes are listed separately below.
 
-| Area | Difference | Entry point | Limitations or considerations |
+## Telegram: protocol, admission, media and workflows
+
+Upstream at U has Discord, GitHub and native products and the shared surface, request-delivery, resource, memory and workflow machinery. It has no Telegram implementation, grammY dependency or `surface.telegram` input. The fork adds Telegram while using those same upstream owners rather than a second execution engine.
+
+| Capability | Current fork behavior and boundary | Owners and regression evidence |
+| --- | --- | --- |
+| F01 lifecycle / admission | Opt-in long polling for DMs, groups, supergroups and forum topics. Initialize history and bot identity before replay consumers; start polling only after consumers and the paused runner exist. Durable ingress outbox, health supervision, shutdown and reload remain explicit. Empty chat allowlist denies all; user allowlist is additional admission. | [Telegram runtime](../apps/core/src/surface/telegram/telegram-surface-runtime.ts), [adapter](../apps/core/src/surface/telegram/telegram-adapter.ts), `apps/core/tests/surface/telegram/telegram-runtime-lifecycle.test.ts`, `telegram-polling-supervision.test.ts`, `telegram-ingress-outbox.test.ts`; composition seam `runtime/create-core-runtime.ts` |
+| F02 request routing | Mentions/active routing, debounce batching, shared LLM gate, `!model:`, `!continue`, `!interrupt`, steer/follow-up and request identity. Claims fence superseded composition/publication; only the owning request settles its state. | [Router](../apps/core/src/surface/telegram/telegram-request-router.ts), composition/publish modules, `telegram-request-router.test.ts`, `bus-agent-runner-telegram-authority.test.ts` |
+| F03 output and local history | Streamed edits, HTML/plain output, 4096-character chunking, typing, cancellation, reactions, edit/delete, topic reply IDs and outbound media. `preview` removes partial output on cancellation; `inline` retains it. History contains messages observed/sent by this bot, not arbitrary Telegram backfill. | [Output stream](../apps/core/src/surface/telegram/output/telegram-output-stream.ts), chunker/HTML/delivery modules and `store/telegram-surface-store.ts`; fidelity, shrink, recording, attachment and adapter integration suites |
+| F04 inbound media | Photos/documents become bounded managed resources during composition using stable `file_id`; no token-bearing Bot API URL is persisted in canonical content. Aggregate request/history budgets apply. Oversize/unavailable data becomes metadata; unsupported audio/voice/video is metadata only. | [Inbound media](../apps/core/src/surface/telegram/telegram-inbound-media.ts), shared attachment-resolver seam; `telegram-inbound-media.test.ts`, `telegram-attachment-resolution.test.ts`, fake Bot API end-to-end suites |
+| F05 command menu | Stable unique Telegram aliases, grammar/length handling and `@bot` validation, while ordinary upstream custom-command parsing remains available. Bot API menu limit is 100 commands. | [Alias assignment](../apps/core/src/custom-commands/menu-aliases.ts), [menu grammar](../packages/utils/custom-commands-menu.ts), command manager; menu-alias and Telegram command-menu tests |
+| F06 conversation memory | Telegram source joins the upstream per-subject summary/embedding/search pipeline. One source thread per chat/topic; entries retain subject offsets, revisions and generations. Chat allowlist/revocation is checked for reads/recall and asynchronous work. Attachment projection here is metadata only. | [Source projection](../apps/core/src/surface/telegram/telegram-conversation-source.ts), `conversation/thread-store.ts`, service, search/summarization workers and protocols; [cross-surface tests](../apps/core/tests/conversation/telegram-cross-surface.test.ts) |
+| F07 workflow targets | Telegram send/edit/progress cards/actions and exact `waitForReply` use upstream durable operations, waits, cancellation and replay. Revalidate targets on delivery, edit/recreation and scheduled firing; authorization is not frozen when scheduling. | `apps/core/src/workflow/` domain/store/engine/waits/progress/scheduler and Telegram target authorizer; durable-store, engine, waits, projector and scheduler suites |
+
+Configuration is under `surface.telegram` in **config versions 2 and 3**; v1 input remains frozen and cannot enable it. Defaults in [telegram-surface.ts](../packages/utils/core-config/telegram-surface.ts):
+
+| Keys | Defaults / operational effect |
+| --- | --- |
+| `enabled`, `token`, `botName`, `botUsername` | `false`, absent, `lilac`, discovered by `getMe`; enabled operation needs a token. The token is a secret in the protected config file; removed `tokenEnv` is rejected. |
+| `allowedChatIds`, `allowedUserIds` | `[]` denies every chat; `[]` for users imposes no extra user restriction. Chat IDs are strings, including negative group IDs. |
+| `dbPath`, `apiRoot` | `DATA_DIR/telegram-surface.db`, official Telegram Bot API root. Token, database and API-root changes require restart. |
+| `outputMode`, `parseMode`, `streamEditIntervalMs` | `preview`, `html`, 1500 ms (allowed 500–60000). This interval throttles output edits; it is not a test synchronization delay. |
+| `outputNotification`, `commandMenu`, `workingIndicators` | `true`, `true`, cloned built-in phrases. |
+| `markdownTableRender.{enabled,style,maxWidth,fallbackMode}` | `true`, `unicode`, 50, `list`; text tables only, optional `ascii`, width 40–240. |
+| `inboundMedia.{enabled,maxBytesPerAttachment,maxBytesPerRequest}` | `true`, 5 MiB, 10 MiB; positive bytes/friendly units accepted. |
+
+The added runtime dependency is `grammy` (`^1.45.1` in `apps/core/package.json` at F), reflected in `bun.lock`; the inventory captures all dependency deltas without implying every lockfile line belongs to Telegram. Tests use local fake servers; existing live-smoke scripts and disposable Docker helpers do not establish a live test result here.
+
+Telegram started in fork commits `f7d71df2` (config), `a6102605` (adapter) and `be56ab19` (runtime), followed by PRs [#45](https://github.com/DF-wu/lilac-mono/pull/45), [#75](https://github.com/DF-wu/lilac-mono/pull/75), router refactor `6bb96840` and memory commit `4d7d3057`. See [setup and full limits](./telegram-surface.md) and [Discord parity](./telegram-feature-parity.md). There is no webhook/inline-query/business support or transcription. Ask-user questions, session divider, `/model`, `/context`, reasoning output, skipped-output cleanup and several Level 2 operations remain Discord-only. Heartbeat default destinations remain Discord/GitHub/native; Telegram is not added by this sync. `/?ref=telegram:` references are unsupported; private `t.me/c/` links have explicit tool guidance, while public username links cannot be resolved from the ID-only history index.
+
+**Upgrade/rollback:** retain the Telegram database and coordinated Core state; a downgrade to upstream removes Telegram execution and cannot service its targets/config. Do not remove its allowlist/resource checks during conflict resolution. Derived memory indexes may be rebuilt; observed Telegram history is authoritative and cannot be recovered by assuming Bot API backfill.
+
+## Native recording, search and web corrections
+
+Upstream's native chat, permanent DM, device notifications, history, permissions and web UI are shared foundations. These fork extensions do not make the native product itself fork-owned.
+
+| Capability | Upstream at U → current fork at F | Owners, tests and inception |
+| --- | --- | --- |
+| F08 native-to-Discord recording | No recorder → optional post-commit observation of **visible native destination** human/assistant text and ready attachments. Excludes reasoning, tools, questions, internal/service inputs, child/external streams and history backfill. Never reads Discord/Telegram history. Delivery does not block native admission. | [Recorder](../apps/core/src/surface/native/discord-mirror.ts), webhook/attachment helpers, `store.ts` and `runtime.ts`; `discord-mirror.test.ts`; introduction `e947ef43` |
+| F08 threaded destination | No routing table → `flat` default, optional one public child thread per native conversation in an ordinary Discord text parent. Schema 8 `native_discord_threads` reserves destination-specific creation before HTTP. Unknown/uncertain creation remains blocked for manual reconciliation; no automatic replacement or flat fallback. | [Routing](../apps/core/src/surface/native/discord-mirror-threads.ts), `discord-mirror-threads.test.ts`, native push/store tests; `ab3daf03`, `e80d3db2`, `2a381f1c` |
+| N01 scoped native search (PR #121) | Expands the shared message projection before applying the requested thread filter → thread-scoped search/context constrains the indexed thread before JSON expansion/window sorting. Preserves access checks, complete-thread ordinals, pagination and bounds. Global search remains across visible conversations. | [Search store](../apps/core/src/surface/native/store-search.ts), [search tests](../apps/core/tests/surface/native/search.test.ts); `c5104fa9`, documentation `99e10428`, fork [#121](https://github.com/DF-wu/lilac-mono/pull/121) |
+| N02 persistent cache recency | Clock timestamps can tie → transaction-derived monotonic recency across instances; safe-integer exhaustion rebases order and preserves malformed rows' unrelated data/drafts. Same IndexedDB cache owner. | [Web cache](../apps/web/src/cache.ts), `apps/web/tests/cache.test.ts`; `87127e42`, `9cd8074f`, `e9040d22`. U also changes this file; preserve both deltas. |
+| N03 composer selection | Activity editor recreation loses caret/selection → restore editor selection through recreation. No new user setting. | [Composer editor](../apps/web/src/components/composer-editor.tsx), `composer-editor.test.ts`; `a97fb2f1`. U's attachment/rewind changes overlap this owner. |
+| N10 native admission/attribution | Fork carries additional revoked automatic-steer authorization and busy-send assistant attribution corrections over upstream native state handling. Preserve them while adopting U's DM rewind/store updates. | `apps/core/src/surface/native/store.ts`, [execution regressions](../apps/core/src/surface/native/execution.test.ts); `a060cb76` |
+
+Recording keys are **environment-only**: unset `LILAC_NATIVE_DISCORD_WEBHOOK_URL` disables it; `LILAC_NATIVE_DISCORD_ROUTING` is unset/`flat` by default or `threaded`. Compose forwards both; installer `secrets.env` can supply them without a new YAML field or UI. Threaded mode reuses the Discord token chosen by `surface.discord.tokenEnv`; it does not need a second token option or gateway ingress. It needs a supported webhook/parent and bot permissions. Recreate containers after changing Compose environment. No secret value belongs in a public report.
+
+The recorder has bounded in-memory queues and message correspondence. Only child routing is durable; there is no durable message outbox, restart replay or deletion guarantee. HTTP deadlines are 10 seconds, at most three attempts with a 30-second wait budget where retries are permitted. An uncertain create is not blindly retried. Attachments are read under native authority and byte/integrity limits, not forwarded as private URLs. [Native Discord operations](./native-discord-mirror.md) owns detailed caps and the manual unresolved-reservation procedure. Those limits are unrelated to the candidate **web search** timeout below.
+
+**Upgrade/rollback:** deploy Core and web together. Back up native SQLite before storage migrations, retain destination mappings, and never clear all unresolved rows to force retries. Disabling recording stops future observation; it does not erase Discord copies. Cache/composer changes have no new operator config; their source/tests must survive the sync even where an automatic textual merge succeeds.
+
+## Hosted search, image scripts and provider execution
+
+| Capability | Upstream at U | Current fork at F | Source, tests and origin |
 | --- | --- | --- | --- |
-| Telegram surface | Adds DM, group, and forum topic ingress; streamed HTML output; cancellation, reactions, command menus, inbound/outbound attachments, workflow cards/actions, same-surface tools, and participation in cross-surface conversation memory (one indexed thread per chat or topic, gated by `allowedChatIds`) | [`telegram-surface.md`](./telegram-surface.md), fork PRs [#45](https://github.com/DF-wu/lilac-mono/pull/45) and [#75](https://github.com/DF-wu/lilac-mono/pull/75) | Disabled by default; long polling only; history comes from the local SQLite index |
-| OpenAI-compatible image provider | `generate.image` follows upstream's script runner (commit [`05115838`](https://github.com/stanley2058/lilac-mono/commit/05115838)); the fork adds the operator's OpenAI-compatible endpoint to the scripts' `providers` global as `openaiCompatible` when `OPENAI_COMPATIBLE_BASE_URL` is set, plus an `openai-compatible.md` recipe (model listing, generation with `b64_json` or `url` results, multipart edits with named parts, new-api notes) in the `image-generation` skill. The earlier structured tool and its `tools.generate.image` routing are removed | [`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md) | Upstream's script contract applies: restricted callers are denied, the provider validates requests, and no provider falls back to another |
-| OpenAI `web.search` provider | `tools.web.extract.providers` accepts `openai`: `web.search` runs the OpenAI Responses `web_search` tool (forced via `tool_choice: required`) and returns the answer's URL citations followed by uncited retrieved sources; `tools.web.openai.{model,searchContextSize}` tune it, and `model` is a `provider/model` spec on the `openai` or `openai-compatible` provider. Search-only: `web.extract` skips it | [`web-search-openai.md`](./web-search-openai.md), [`core-config-migrations.md`](./core-config-migrations.md), `apps/core/src/tool-server/tools/web-search/openai-web-search-provider.ts` | Staged for an upstream contribution (not yet submitted); needs direct `api.openai.com` or a gateway that implements Responses `web_search`; no publish-date filter beyond model instructions |
-| GitHub final-publication policy | Issue and PR-review prompts tell the agent that Lilac publishes the final response itself: the agent must not repost it through `gh`, the GitHub API, or `surface.messages.send`, and returns `NO_REPLY` after publishing directly or after a successful `gh pr review` submission | `apps/core/src/github/webhook/github-webhook-server.ts`, fork PR [#56](https://github.com/DF-wu/lilac-mono/pull/56) | Prompt guidance only; a model that ignores it can still post a duplicate. |
-| Custom media plugin example | Provides an external Level 2 image/video plugin using an OpenAI-compatible image API and a QuantumNous/new-api-compatible video flow | [`custom-media/README.md`](../examples/plugins/custom-media/README.md), fork PR [#30](https://github.com/DF-wu/lilac-mono/pull/30) | Plugins are trusted in-process code; restricted callers currently cannot use external callables directly |
-| Protected current-input compaction | Core validates the active input boundary before threshold checks, skips soft compaction without older history, and preserves current input verbatim when summarizing older history. Callers without a protected boundary retain upstream active-request compaction | `packages/agent/auto-compaction.ts`, `apps/core/src/surface/bridge/bus-agent-runner.ts`, fork PR [#82](https://github.com/DF-wu/lilac-mono/pull/82) | Real overflow still follows the existing recovery/failure path; skipping the soft trigger does not guarantee the next request fits |
-| Native search within one conversation | Core uses SQLite's thread index to select the requested conversation before expanding and sorting its messages. This avoids decoding unrelated conversations when `discovery.search` reads context around a match. | [Native search store](../apps/core/src/surface/native/store-search.ts), fork PR [#121](https://github.com/DF-wu/lilac-mono/pull/121) | Applies to searches with a thread ID and context reads. Global search still scans the caller's visible conversations. |
-| Compatible-provider tool calls | When a compatible provider returns a nonstandard finish reason such as `other`, parsed local tool calls are still executed and their results preserved | Commit [`1c58e532`](https://github.com/DF-wu/lilac-mono/commit/1c58e532201ee51782c98c1d8b16086f6bf45c34) | Trusts only local tool calls that passed the parser; arbitrary provider text is not treated as a tool invocation |
-| Compatible-provider tool images | Moves image parts from tool results into a labeled user image message after the complete parallel tool-result group, so generic Chat Completions receives vision input instead of serialized image data | `packages/utils/openai-compatible-tool-images.ts`, `packages/utils/tests/openai-compatible-tool-images.test.ts` | Provider-view transformation only; canonical history stays intact. Requires an endpoint and model that accept user image inputs; official OpenAI Responses paths do not use this shim |
-| Container delivery | The build workflow publishes verified `catalina`, `claudia`, and SHA tags, with `latest` pointing to `catalina`; each variant has its own account and home directory, and the image also includes `rsync` | [`build-image.yml`](../.github/workflows/build-image.yml), [`Dockerfile`](../Dockerfile) | Both published variants use UID/GID 3000; host bind mounts must grant that numeric identity access |
-| Upstream maintenance | Every 6 hours, verify clean candidate merges with full CI before updating `main` and publishing images; Git conflicts open a PR with read-only Claude analysis and request `Catalina-df` review | [`sync-upstream.yml`](../.github/workflows/sync-upstream.yml), [configuration](./upstream-sync.md) | CI failures stop the update; humans resolve conflicts and validate integration |
+| F09 hosted OpenAI search | Tavily/Exa/Firecrawl chain; no `openai` hosted-search adapter | Adds `openai` to the ordered chain. A separate Responses mediator must call hosted `web_search`; returns URL citations first, deduplicated retrieved sources next. Citation snippets are labeled model-generated summaries, not page excerpts. | [Provider](../apps/core/src/tool-server/tools/web-search/openai-web-search-provider.ts), [endpoint resolver](../apps/core/src/tool-server/tools/web-search/openai-web-search-model.ts), `web-search-openai.test.ts`, `web-search-openai-model.test.ts`, `web.test.ts`; `74acb7a1`, `737742e8` |
+| F10 compatible image-script provider | Upstream `generate.image({code})` script runner and native provider recipes | Adds `providers.openaiCompatible` only when a compatible base URL exists; supplies model-list/generate/edit recipe, named multipart uploads and URL/base64 decoding guidance. No structured image routing is restored. | [Provider descriptor](../apps/core/src/tool-server/tools/image-script-openai-compatible.ts), upstream `image-script.ts`, [recipe](../packages/utils/builtin-skills/image-generation/references/openai-compatible.md); `image-script-openai-compatible.test.ts`, `tool-server-image-generation.test.ts`; `18204aaf` |
+| F11 external custom-media plugin | Generic trusted Level 2 plugin system; no bundled custom-media example | External image/video example with generation/edit, video submit/poll/download/cancel, typed failures and output cleanup. Separate plugin contract, not replaced by upstream image scripts. | [Example and config](../examples/plugins/custom-media/README.md), `src/`, `tests/custom-media.test.ts`, `tests/bundle-parity.test.ts`, committed `dist/index.js`; `ebddc6ec`, `8a02cddf`, fork [#30](https://github.com/DF-wu/lilac-mono/pull/30) |
+| F12 compatible tool-call execution | Existing AI SDK execution policy | Parsed local calls execute for nonstandard non-length finish reasons such as `other`, through normal validation/persistence. Length-truncated or provider-executed calls do not become arbitrary local invocations. | `packages/agent/adapters/ai-sdk/adapter.ts`, `packages/agent/tests/ai-sdk-pi-agent.test.ts`; `1c58e532`, `36fff08a` |
+| F13 compatible tool images | Generic Chat Completions input projection | Moves tool-result image parts to a labeled user image message **after all parallel tool results**. Preserves text and canonical history. Only the `openai-compatible` Chat path uses the shim; official Responses remains upstream-owned. | [Middleware](../packages/utils/openai-compatible-tool-images.ts), `model-provider.ts`, `openai-compatible-tool-images.test.ts`; `579b17d7`, `ac899a8f` |
+| F14 active-input compaction | Shared canonical compaction and recovery engine | Validates a supplied protected boundary before soft-threshold checks; compacts only eligible older history and keeps the active multipart/tool suffix verbatim. With no older prefix it skips soft compaction; callers without a boundary retain upstream behavior. | [Compaction](../packages/agent/auto-compaction.ts), runner lineage callback, `auto-compaction.test.ts`, `bus-agent-runner-lineage.test.ts`; `cf1897c9`, fork [#82](https://github.com/DF-wu/lilac-mono/pull/82) |
 
-## Current Telegram Status
+### Search configuration and candidate timeout policy
 
-Telegram is currently the largest fork-only product delta. The main implemented paths include:
+`tools.web.extract.providers` defaults to `[tavily]`. Selecting `openai` requires config v2/v3; v1's provider enum is frozen. V2 accepts legacy singular `extract.provider` / `search.provider` aliases; v3 requires plural `extract.providers`. [Fork schema](../packages/utils/core-config/openai-web-search.ts) and generated editor schema are composed from the same version's inputs, covered by `core-config.web-search-provider.test.ts`, `core-config.fork-v3.test.ts`, versioning and Core config-schema tests.
 
-- DMs, groups, supergroups, and forum topics.
-- Mention/active routing through a router that mirrors the upstream Discord router (debounce batching, the shared LLM gate, steer/interrupt/follow-up, `!model:`/`!continue`/`!interrupt` directives), streamed edits, HTML rendering, and 4096-character chunking.
-- Reply context, cancellation, typing indicators, reactions, custom commands, and menu aliases.
-- Inbound photos/documents, outbound attachments, workflow progress/actions, `waitForReply`, and allowlist-bound surface tools.
-- Conversation memory: Telegram chats are indexed, summarized, searched, and auto-recalled through the shared cross-surface thread store, gated by `allowedChatIds` (see [`telegram-surface.md`](./telegram-surface.md#conversation-memory)).
+`tools.web.openai.model` defaults to `openai/gpt-5-mini`, and `searchContextSize` to `medium` (`low`/`medium`/`high`). The model spec selects **only** `openai` or `openai-compatible`; legacy bare IDs mean `openai`. The direct route uses `OPENAI_API_KEY` / `OPENAI_BASE_URL`; compatible routing uses `OPENAI_COMPATIBLE_API_KEY` / `OPENAI_COMPATIBLE_BASE_URL`. A compatible endpoint needs a base URL and key for search and must implement Responses hosted `web_search`, not only Chat Completions. Unsupported model providers remain unavailable instead of silently changing route. The conversation model and its context are not sent to the mediator. Date/topic constraints are model instructions; `searchDepth` is ignored. `web.extract` skips `openai` because it is search-only; keep another provider for extraction.
 
-Items that remain unimplemented or are constrained by the platform:
+| State | Attempt budget / retry / cancellation |
+| --- | --- |
+| Shipped F | Has hosted search and existing ordered error fallback; does **not** contain U's new per-attempt timeout/same-provider retry wrapper. Do not describe F as already implementing the new policy. |
+| Incoming U (`2d392956e2d90472c983ec23956c1146341a7775`) | 10 seconds per supported provider attempt, one same-provider retry on retryable failure, then eligible ordered fallback; caller cancellation stops early. The built-in provider set at U has no OpenAI adapter. |
+| **Resolved candidate C** | **30 seconds per attempt for hosted `openai` search**, including `openai-compatible` model routes; Firecrawl/Exa/Tavily keep **10 seconds per attempt**. One same-provider retry on retryable failure, then configured fallback. Caller cancellation stops retries/fallback. No new YAML option. |
 
-- Only long polling is supported; there is no webhook ingress.
-- Conversation memory indexes one thread per chat or topic (no segmentation of long chats), has no run-in-progress signal, and projects attachments as metadata only; Lilac `/?ref=telegram:` references are not recognized yet.
-- There is no inline query support, business account support, or voice/video transcription.
-- Message history includes only content the bot actually observed or sent, not Telegram's complete pre-existing history.
-- The ask-user question port, session divider, `/model` and `/context` commands, reasoning text, skipped-output cleanup, and several Level 2 tool operations remain Discord-only.
+A retry is a second attempt, not a 30-second total budget: two deadline-exhausted hosted attempts can consume approximately 60 seconds before an eligible fallback, plus queue/provider overhead. Tests exercise both model routes succeeding at 20 seconds, independent 30/10-second deadlines, exact timeout text, retry/fallback and cancellation at five seconds. Both parents' HTTP-status tests remain: 409/425/429/503 and non-JSON 500 remain retryable; 400 stops without retry/fallback. `web.extract` remains separate and skips OpenAI. [Hosted search detail](./web-search-openai.md) describes the integrated policy.
 
-See [`telegram-surface.md`](./telegram-surface.md#10-what-works-and-what-does-not) for the operator-facing feature matrix, and [`telegram-feature-parity.md`](./telegram-feature-parity.md) for the capability-by-capability comparison with Discord, including why each gap exists and what closing it would take.
+**Exa transport limitation:** installed `exa-js@2.11.0` has no signal option on `search`, `request` or `rawRequest`. The existing abort wrapper bounds the tool's wait and prevents retry/fallback after caller cancellation, but cannot abort the underlying SDK request. It can remain in flight during a retry. No dependency patch, transport replacement or unsupported API field was added. This is the sole deferred, nonblocking review finding; local fixtures do not prove live-provider transport behavior.
 
-## Upstream Contributions
+### Image and model compatibility
 
-Every pull request this fork has opened against upstream, as of 2026-10-06. Merged contributions exist in both repositories and are no longer fork divergence; closed ones explain why a fork difference still exists or was dropped.
+Image scripts use `OPENAI_COMPATIBLE_BASE_URL`; the key is optional for that descriptor, unlike search. A key alone does not configure image scripts. They run trusted container code in a fresh Bun process, deny restricted callers, redact configured keys from captured output and have no automatic provider fallback. Provider/model IDs are in scripts/recipes; the old `tools.generate.image` provider/routes/models contract is retired. A leftover `tools.generate` block is ignored with an unknown-key warning and should be removed. [Image migration](./generate-image-openai-compatible.md) owns the full old/new input/result mapping.
 
-### Accepted Upstream Contributions
+The custom-media example is outside workspace discovery: its own lockfile/package/config/build and committed bundle matter. Root `test:custom-media` provides source/bundle tests and typecheck; an empty in-repo plugin install list does not establish that external deployments do not use it. The compatible tool-image shim needs a vision-capable endpoint; it cannot make a text-only model accept images. Active-input protection cannot make an oversized request fit; real overflow retains recovery/failure behavior. None of these changes creates a hostile-code sandbox.
 
-| Original contribution | Upstream status | Classification |
+**Upgrade/rollback:** preserve provider-specific credentials and validated model routes rather than copying operator settings into source. A downgrade to upstream loses hosted search and `openaiCompatible` image scripts; it may reject/ignore their config according to that version's parser. Do not assume compatibility with arbitrary gateways. Rebuild/verify plugin bundles against their source when changing the example. Preserve F12–F14 while adopting upstream provider-history projection and tool-search replay below.
+
+## Authority, delivery and lifecycle corrections
+
+| Capability | Upstream at U → current fork at F | Owners, tests and origin |
 | --- | --- | --- |
-| Configurable Exa web search provider | Upstream PR [#1](https://github.com/stanley2058/lilac-mono/pull/1) merged 2026-02-19 | Treated as an inherited upstream capability |
-| `TAVILY_API_BASE_URL` and related normalization/docs | Upstream PRs [#4](https://github.com/stanley2058/lilac-mono/pull/4) and [#5](https://github.com/stanley2058/lilac-mono/pull/5) merged 2026-02-20 and 2026-02-21 | Treated as an inherited upstream capability |
-| GitHub agent-comment marker, safe trigger parsing, and self-trigger loop prevention | Upstream PR [#13](https://github.com/stanley2058/lilac-mono/pull/13) merged 2026-06-08 | Not listed as a fork-only GitHub difference |
-| GitHub reply permalinks: `In reply to` links to the referenced issue/PR body or comment anchor on the configured GitHub host (GHES aware), in agent replies and workflow progress messages ([`github-reply-permalinks.md`](./github-reply-permalinks.md)) | Upstream PR [#35](https://github.com/stanley2058/lilac-mono/pull/35) merged 2026-10-05, from fork PRs [#49](https://github.com/DF-wu/lilac-mono/pull/49) and [#78](https://github.com/DF-wu/lilac-mono/pull/78); synced in [`ca808ccb`](https://github.com/DF-wu/lilac-mono/commit/ca808ccb) | Inherited upstream capability; the fork's six permalink seams and two tests now match upstream and left the footprint allowlist |
+| F15 authenticated origin | Shared capability/principal validation → carries optional `originSessionId` / `requestInitiator` plugin context, `LILAC_ORIGIN_SESSION_ID` in Bash and `x-lilac-origin-session-id` through the tool bridge. Surface defaults and restricted explicit-target checks use the **authenticated initiator**; synthetic workflow sessions do not replace origin. Native raw/prefixed aliases normalize to the same session; cross-client targets remain denied. A supplied header alone grants no authority. | [Tool server](../apps/core/src/tool-server/create-tool-server.ts), request-control authority, `tools/surface.ts`, Bash, `apps/tool-bridge/client.ts`, `packages/plugin-runtime/types.ts`; create-tool-server, surface, Bash, subagent and bridge-client suites; `8a02cddf` and PR #101 follow-up |
+| F17 typed startup | Existing runtime create/start Results → small `start-core-runtime.ts` adapter preserves returned failures and exact thrown/Panic causes for `main.ts` logging. No automatic blob migration. | [Startup helper](../apps/core/src/runtime/start-core-runtime.ts), `start-core-runtime.test.ts`; PR #101 integration evidence |
+| F18 Redis cleanup | Shared lease/subscription lifecycle → single-flight concurrent cleanup, memoized successful stop/group work, retry after failed cleanup. Preserves owner incarnation, maintenance and Panic precedence. | `packages/event-bus/redis-streams-bus.ts`, `redis-streams-bus.test.ts`; `d4fc77b9` |
+| F19 GitHub final publication | Shared verified webhook/admission/reply infrastructure → issue/review prompts explain that Lilac publishes the final answer. Direct final publication or successful manual review returns `NO_REPLY`; avoids a second default post when followed. Prompt policy is not transactional deduplication. | `github/webhook/github-webhook-server.ts`, `github-webhook-dispatch.test.ts`; `1f8d7679`, fork [#56](https://github.com/DF-wu/lilac-mono/pull/56) |
+| N04 GitHub / cancellation delivery | Fork derives wire-valid UUID delivery identities and normalizes legacy persisted cancellation keys. Retains unfinished review-interrupt retry even after prompt publication, and redacts contract-error logging. No new configuration. | GitHub webhook/state and workflow engine/store; `github-webhook-durable-delivery.test.ts`, durable workflow regression; `c1fc7ff2`, `3a5a2d1c`, `a97fb2f1` |
+| N05 subagent convergence | Fork reuses transactional invocation receipts/run handles, stable keyed child identities across retries, missed-steer identity from durable delivery, and serializes keyed live/ended decisions in-process. Existing receipts own durable replay; the in-memory lock is not a new durable queue. | [Orchestration](../apps/core/src/tools/orchestrate.ts), workflow dispatcher/follow-up; `orchestrate.test.ts`, `workflow-subagent-convergence.test.ts`, hard-exit fixture; `a97fb2f1`, `28725017` |
+| N06 previous-release evidence | Fork generator stages historical schema export before replacing fixtures, verifies release ancestry and excludes endpoints absent from the verified historical release. U's current protocol is separate from frozen predecessor evidence. | `generate-client-protocol-compat.ts`, historical JSONs, `helpers/client-compat.ts`, previous-release/harness/wire-compat tests; `a97fb2f1` |
 
-### Closed Without Merge
+These patches preserve upstream durable admission, resource authority, workflow persistence and canonical transcript owners. Do not infer an extra authorization system from compatibility headers. Public plugin fields remain part of the compatibility surface even where no direct consumer is demonstrated. Downgrading across persisted workflow/native/transcript transitions requires coordinated restoration, not merely removing a TypeScript field.
 
-| Pull request | Outcome | Fork status |
+## Filesystem, SSH, previews and verification infrastructure
+
+PR #119 already adopted upstream's **Rust** SSH runner; supported remote hosts no longer need a JavaScript runtime or registry access. Stdin EOF cancellation, the upstream shared filesystem/tool contracts and run-scoped native preview model are inherited. The following remaining differences are fork corrections to those owners, with no new operator option:
+
+| Capability | Difference from U and operational effect | Owners / test locations |
 | --- | --- | --- |
-| Upstream PR [#22](https://github.com/stanley2058/lilac-mono/pull/22), GitHub reply comment links | Closed by the author on 2026-07-30 to rework on the fork first (hard-coded `github.com` host) | Superseded by upstream PR [#35](https://github.com/stanley2058/lilac-mono/pull/35) |
-| Upstream PR [#15](https://github.com/stanley2058/lilac-mono/pull/15), custom image generation providers for `generate.image` | Closed on 2026-07-12 without merge; upstream later replaced `generate.image` with a script runner (commit [`05115838`](https://github.com/stanley2058/lilac-mono/commit/05115838)) | The fork now uses upstream's script runner and keeps only the OpenAI-compatible script provider above |
-| Upstream PR [#14](https://github.com/stanley2058/lilac-mono/pull/14), Discord stats-for-nerds in the plain preview final reply | Draft opened by accident; closed on 2026-06-15 after maintainer design feedback | Not carried by the fork |
-| Upstream PR [#6](https://github.com/stanley2058/lilac-mono/pull/6), README refresh | Opened by mistake and closed | Not applicable |
+| N07 bounded SSH termination | Retains bounded output drain when a ControlMaster holds pipes open, cancelled dispatch handling, async stdin failure and surviving process-group cleanup. Preserve exact Panic identity. | `apps/core/src/ssh/ssh-exec.ts`, `ssh-exec.test.ts`, `ssh-job-lifecycle.test.ts`, transport tests; `a934a89b`, `9b4761f3`, `7532e572` |
+| N07 filesystem parity | Remote glob paths survive missing optional metadata; detail mode is carried explicitly. Dotfile, negated character-class/range/brace matching and literal-root exclusions align local/remote behavior. Physical remote cwd is used before parent-relative patches and file resolution. Bounded prefix reads observe growth after metadata; whole-file caps remain enforced during reads. | `remote-filesystem-host.ts`, `tools/fs/remote-fs.ts`, `tools/apply-patch/remote-apply-patch.ts`, `packages/fs/src/`, Rust `glob.rs`/`fsops.rs`; remote parity, glob-match and read-byte-prefix tests |
+| N07 Rust build paths | Explicit Cargo target output/copy directory and persistent macOS linker inputs avoid wrong-copy paths and unstable cache keys. No committed runner binary delta is hidden in the report. | `scripts/build-remote-runner.ts`, `__tests__/build-remote-runner.test.ts`; `9b4761f3` |
+| N09 preview containment | Native preview containment and bounded byte reads use the same opened handle; visualize helper decodes asset URLs and rejects unsupported document bases. Run-scoped single-file capture/prebundled assets remain upstream behavior. | `surface/native/resources-live.ts`, `resources-live.test.ts`, `packages/utils/builtin-skills/visualize/scripts/build.ts`, `visualize-build.test.ts`; PR #119 |
+| N11 failure settlement | Discord read-control config failures are captured with exact Panic identity; Bash output spilling stops further reads after a deferred Panic. Upstream Discord read-only thread control itself is shared. | `discord-thread-control.ts` and test, `bash-output-sanitizer.ts` and test; PR #119 |
+| N08 harness / N06 fixture reliability | Fork e2e uses quoted FIFO paths (including spaces), observed crash/drain/readiness, cleanup failure preservation, immutable continuation fixtures, real image materialization, verified historical endpoint selection, and independent-client recovery observation. Other tests isolate operator skills, use ephemeral listeners, distinguish stdin EBADF/EOF and synchronize actual completion. | `apps/core/tests/e2e/`, native operator integration, tool-server skills/SSH/Bash, Redis-load and heartbeat-real-bus suites; PR #113/#119 changes in the path inventory |
 
-### Not Yet Submitted
+These checks are engineering deltas, not additional product features. [DEVELOPMENT.md](../DEVELOPMENT.md#remote-runner) describes runner builds; [MIGRATIONS.md](../MIGRATIONS.md#native-ssh-remote-runner) owns runner upgrades. The U temporary-root fix is adopted separately (see below). Candidate-specific regression repairs and integrated test results follow.
 
-- **OpenAI `web.search` provider**: staged for an upstream contribution; its seams are grouped in the footprint allowlist so they can be removed once accepted.
-- **Origin-session authority**: the first candidate for an upstream contribution, because it has no fork-owned module and lives entirely in upstream files.
+## Configuration, dependencies, CI and release operations
 
-## Items That Should Not Be Listed as Current Differences
-
-- **Core runtime, Discord, GitHub webhook foundation, event bus, workflows, tools, and plugins**: these primarily come from upstream. The README may describe them normally, but they must not be credited to this fork.
-- **Architecture Atlas**: the related workspace and functionality have been fully reverted.
-- **Fork-specific Discord working-indicator defaults**: these have been restored to the upstream defaults.
-- **Old empty-reply feature flag**: this has been reverted or superseded by later upstream behavior.
-- **`smart-search` foundational runtime**: the relevant implementation is not currently present in the tree. It is reverted/superseded behavior, not a current container capability.
-
-## Compatibility and Security Boundaries
-
-This fork retains the main upstream architecture and config migration policy, but Telegram and OpenAI search settings support `configVersion: 2` and `3`; v1 remains frozen. Greenfield changes may be breaking changes; read [`../MIGRATIONS.md`](../MIGRATIONS.md) before upgrading.
-
-The following mechanisms are guardrails or trusted execution, not hostile-code sandboxes:
-
-- Core Bash/filesystem checks.
-- Programmatic workflow policy.
-- External plugins and MCP stdio processes.
-- Tool server request capabilities.
-- Filesystem access between processes running under the same UID inside Docker.
-
-For deployment, also read [`docker-deployment.md`](./docker-deployment.md) and [`../PROJECT.md`](../PROJECT.md).
-
-## Fork Code Layout
-
-The fork keeps behavior in fork-owned modules and touches upstream files only at thin seams: imports, one-line registrations, closed-union members, and re-exports. Anything that needs more than that is either contributed upstream or isolated behind a fork-owned entry point.
-
-| Feature | Fork-owned modules | Upstream seams |
+| Area | Upstream at U → current fork at F | Configuration, owners and evidence |
 | --- | --- | --- |
-| Telegram surface | `apps/core/src/surface/telegram/` (adapter, ingress, output, store, protocol, and the router split into `telegram-request-router.ts`, `telegram-request-router-composition.ts`, and `telegram-request-router-publish.ts`; the router mirrors the upstream Discord router and imports the shared helpers under `surface/discord/discord-request-router/` unchanged, see [`telegram-feature-parity.md`](./telegram-feature-parity.md)). `telegram-surface-runtime.ts` owns startup adapter resolution, descriptor initialization/supervision, config hot-reload, and workflow target authorization; `TelegramAdapter` separates initialization from ingress startup | `runtime/create-core-runtime.ts` (startup adapter resolution, the runtime descriptor input, Telegram initialization/ingress ordering, config hot-reload, and the workflow target authorizer), `runtime/compose-builtin-surface-runtimes.ts` (one descriptor entry), the closed platform unions in `surface/types.ts`, `builtin-surface-protocols.ts`, `bridge/request-ids.ts`, the attachment-resolver capability in `surface/adapter.ts`, platform-aware composition and relay refs under `surface/bridge/`, Telegram platform filters in `transcript/transcript-store.ts` and the legacy snapshot decoders, and, under `workflow/`, the domain types, engine, waits, operation policy, progress projector and view, trigger scheduler, and durable store (Telegram targets, `waitForReply`, progress cards, and target revalidation) |
-| Telegram conversation memory | `apps/core/src/surface/telegram/telegram-conversation-source.ts` (SQL views over `telegram-surface.db`, projection decoders, attachment metadata) and the `telegramConversationMemoryInput` / `hydrateTelegramConversationAttachments` helpers in `telegram-surface-runtime.ts` | `conversation/thread-store.ts` (a third source branch, `telegram_thread` kind, allowlist clause), `thread-service.ts` (surface labels and allowlist checks), the summarization worker, its protocol, and `thread-worker.ts`, the search worker and its protocol (Telegram source paths, filters, allowlists, hit kinds, and source revision checks), `runtime/create-core-runtime.ts` (attaches the source, hydrates Telegram refs, passes the worker paths, and adds `surface.telegram.botName` to the thread store's main-agent user names), `bus-agent-runner.ts` (recall surface label), `tool-server/tools/conversation-thread.ts` (enum), `packages/utils/prompt-templates/TOOLS.md` (Telegram `t.me` links) |
-| Telegram configuration | `packages/utils/core-config/telegram-surface.ts` (type, defaults, v2 schema) and `telegram-runtime.ts` (token and database-path helpers) | `core-config/types.ts`, `v1.ts`, `v2.ts` (one field each) and `core-config.ts` re-exports |
-| OpenAI search configuration | `packages/utils/core-config/openai-web-search.ts` (v2 provider extension, tuning schema, and inferred type) | `core-config/types.ts` and `v2.ts` import the fork definitions; the editor-schema generator derives legacy singular aliases from the same provider items as the selected version |
-| OpenAI-compatible image provider | `apps/core/src/tool-server/tools/image-script-openai-compatible.ts`, `packages/utils/builtin-skills/image-generation/references/openai-compatible.md`, and `apps/core/tests/tool-server/image-script-openai-compatible.test.ts` | `tool-server/tools/image-script.ts` (adds the provider in `configuredImageProviders`), the `image-generation` `SKILL.md` catalog row, and `tests/tool-server-image-generation.test.ts` (isolates the provider from the environment) |
-| OpenAI `web.search` provider | `apps/core/src/tool-server/tools/web-search/openai-web-search-provider.ts` (Responses request, citation decoding, snippet labeling), `openai-web-search-model.ts` (endpoint resolution for `tools.web.openai.model`), and `apps/core/tests/tools/web-search-openai*.test.ts` | `tools/web-search.ts` (export), `web-search/default-web-search-providers.ts` (registration), `resolve-provider.ts` (missing-key message), `web-search/types.ts` (provider id), `tools/web.ts` and `web/provider-page-extraction.ts` (environment and search-only skip), `core-config/types.ts` and `v2.ts` (`openai` provider id and `tools.web.openai`) |
-| Command menu aliases | `packages/utils/custom-commands-menu.ts` (alias grammar, `@target`-aware token parsing) and `apps/core/src/custom-commands/menu-aliases.ts` (deterministic alias assignment) | `custom-commands/manager.ts` (alias index and parse options) and `packages/utils/index.ts` |
-| Origin-session authority | None yet; the change lives in upstream files | `tool-server/create-tool-server.ts`, `request-control-authority.ts`, `tools/surface.ts`, `tools/bash-impl.ts`, `apps/tool-bridge/client.ts`, `packages/plugin-runtime/types.ts`. This is the first candidate for an upstream contribution |
-| GitHub final-publication policy | None; the change lives in an upstream file | `github/webhook/github-webhook-server.ts` (issue and PR-review prompt publication policy). Reply permalinks now come from upstream PR #35 and no longer touch any seam |
-| Agent and event bus fixes | None; the changes live in upstream files | `packages/agent/adapters/ai-sdk/adapter.ts` (tool calls on nonstandard finish reasons), `packages/agent/auto-compaction.ts` (protected current input), `packages/event-bus/redis-streams-bus.ts` (single-flight subscription cleanup). The idle watchdog now matches upstream; its unused timer-injection patch was retired |
-| Compatible-provider tool images | `packages/utils/openai-compatible-tool-images.ts` | `packages/utils/model-provider.ts` wraps only the `openai-compatible` chat provider |
-| Legacy blob cutover | Historical upstream offline tool at `f2c90667ac5616796c992602ca5fb5be726cf40d` | Runtime hooks and automatic backups are retired. Follow the [offline support, backup and rollback procedure](./fork-integration-20261111/migration.md) before upgrading legacy data. |
-| Core startup Result boundary | `apps/core/src/runtime/start-core-runtime.ts` | `runtime/main.ts` delegates Core creation/start settlement to this helper; it is independent of the offline legacy blob cutover |
-| Architecture gate | None | `scripts/architecture/manifest.ts`, `precise-exception-identities.ts`, and `core-final-boundary-identities.ts` register the fork modules; `architecture.test.ts` expects the Telegram request router event consumer |
+| F20 image identities | Default upstream identity remains available for source builds; fork publication adds verified `catalina` and `claudia` variants, UID/GID 3000, per-user home, Catalina compatibility link, `rsync`, runtime `bunx`, and `/app` cwd. Installer data preparation respects the actual selected image account/private bind mounts rather than assuming one numeric UID. | `CONTAINER_USER` / `CONTAINER_UID` build args; [Dockerfile](../Dockerfile), Compose, direct entrypoint, verifier, `apps/installer/src/data-files.ts`; docker identity/build, installer runtime/integration tests; `d623de31`, `6e20251c`, `9b857397`, `f492e823` |
+| F21 exact-SHA delivery | Fork build workflow publishes variant/SHA tags, Catalina owns `latest`; serializes publication across invocations. Existing scheduled release retains versioned artifacts/digests and verifies the exact release SHA, while not replacing fork Core `latest` with the default-account image. | [Build workflow](../.github/workflows/build-image.yml), `release.yaml`, CI; `__tests__/fork-delivery-workflows.test.ts`, `release-gate.test.ts`; `58f2eefa`, historical [delivery evidence](./fork-integration-20261111/delivery.md) |
+| F21 upstream sync | Fork-only scheduled/manual sync every six hours. Pin baseline/upstream/candidate, run full reusable CI and strict footprint, verify main freshness, fast-forward only the verified candidate and publish that SHA. Conflicts open/reuse a human-review PR; read-only analysis never repairs conflicts. Non-conflict CI failures retain the candidate and stop promotion. | [Sync workflow](../.github/workflows/sync-upstream.yml), [operational/token policy](./upstream-sync.md); delivery tests and exact workflow shell fixtures; `ef92844f` and later fixes |
+| F21 review configuration | Fork `.coderabbit.yaml` selects engineering English, automatic review/approval decisions and path-specific correctness/security checks; excludes `ref/**`, disables chat auto-reply. This config does not prove a remote service approval or entitlement. | `.coderabbit.yaml`; `1fea251b`, `5c658138` |
+| F22 governance | Exact fork registrations for surface/codec/exception/Result boundaries and strict shared-file footprint. Root lint/fmt/typecheck includes `scripts/fork`; repository gate also checks external custom-media. PR #119 corrects wrapped named continuation analysis and syntax false positives for initialized `var`/getter reads. | [Footprint tool](../scripts/fork/check-upstream-footprint.ts), [policy](../scripts/fork/upstream-footprint.txt), `scripts/architecture/`, `scripts/oxlint-plugins/`, `scripts/run-gates.ts`, root `package.json`; architecture/syntax/footprint tests |
+| F23 schema and generated output | Frozen v1, additive fork Telegram/OpenAI composition in v2/v3, fresh independent defaults, version-correct aliases. Generated editor JSON and web tool-activity fixtures reflect those definitions. No blanket config-version compatibility is implied. | `packages/utils/core-config/`, Core schema/activity generators and generated files, `apps/web/src/generated/tool-activities.ts`; runtime/editor/versioning/V3/default tests |
+| D01–D05 docs and developer metadata | Fork English canonical README/docs, Traditional Chinese navigation/translations, detailed feature docs, dated integration/research/plans, Star History and local-tool ignore/project metadata. These are accounted for separately from runtime behavior. | `README*`, `docs/`, `.gitignore`, `.oxfmtrc.json`, `.serena/`; complete per-path inventory. Historical documents keep their own pins and test limits. |
 
-`bun run fork:footprint` lists every upstream file that differs from the merge base with `upstream/main` and fails when one is missing from [`scripts/fork/upstream-footprint.txt`](../scripts/fork/upstream-footprint.txt), where each entry records why that seam exists. It also reports entries whose file no longer differs so the list shrinks as upstream accepts changes. CI runs it on every push to `main` and every pull request.
+The root package manager is **Bun 1.4.4** at F. Dependencies/patch declarations not changed from B are inherited; the path inventory includes the whole root/Core/example manifests and locks when they differ, and does not credit the fork with upstream AI SDK, storage or runner dependencies. Generated evidence includes the Core editor schema, web activity catalog, previous-release JSON fixtures and custom-media bundle. Generated files must be checked against their owning generator and pinned contract, not hand-edited to hide a failure.
 
-## Branch Policy
+The footprint tool compares `git merge-base <upstream> HEAD` to the **tracked working tree** with `--diff-filter=MDT --no-renames`; untracked files and fork additions are not gated. `--strict` additionally fails stale entries. Thus a pass does not establish complete fork coverage, clean merges or tested runtime behavior. The inventory retains B/F/U and adds C, covering all path/status/mode changes and all 219 candidate policy rows. The existing checker and its original tests are unchanged. For this uncommitted merge, HEAD remains F, so its merge base with U is B: the normal CLI is not an exact C-versus-U check yet. The candidate helper checks the exact `git diff --name-only --diff-filter=MDT --no-renames U` set against the candidate policy. Once a merge commit contains U, the existing CLI against U uses U as merge base. If upstream advances, the merge-base policy continues to exclude upstream changes that this fork has not taken; a direct-tip implementation would incorrectly classify them as fork changes. Hosted CI must still rerun against its actual fetched refs.
 
-`main` is the only long-lived branch: upstream `main` plus the fork's features, always green. Other branches are short-lived and merge through a pull request. Clean automated upstream candidates are the exception: full CI (including the upstream-footprint job) runs before `main` fast-forwards to their existing commit. Only Git conflicts open an upstream synchronization PR.
+**Operations:** host mounts must match the selected numeric image identity. Do not change production identity or permissions based on a default-source-build assumption. [Docker deployment](./docker-deployment.md), [installation](./installation.md) and [sync policy](./upstream-sync.md) own commands. `main` is the sole long-lived branch; ordinary feature/fix/docs branches are short-lived PRs. Clean automatic candidates use `chore/sync-upstream-*`; conflict review uses `automation/sync-upstream`. Preserve upstream history with merges and remove a fork patch only after comparing equivalent contracts.
 
-| Prefix | Use | Lifetime |
+## Upstream adoption and already-shared capabilities
+
+These items remain upstream-owned. C adopts the following **19 non-merge commits** represented by B → U; the inventory maps every affected source/test/UI/schema path, including files shown as “deleted” by U → F because F has not adopted them yet.
+
+| Incoming capability | Behavior / compatibility to preserve | Primary evidence at U |
 | --- | --- | --- |
-| `chore/sync-upstream-<run-id>-<attempt>` | Clean upstream merge candidate verified before updating `main` | Deleted after successful update/publication dispatch; retained on failure |
-| `automation/sync-upstream` | Upstream conflict PR for human resolution and review | Deleted after the PR merges |
-| `feat/`, `fix/`, `refactor/`, `docs/`, `test/` | One change each, named after the change (`feat/telegram-forum-topics`) | Deleted after the PR merges |
-| `archive/<old-branch>` (tag, not branch) | Retired work whose commits are not in `main` but may be worth reading later | Permanent; never checked out for new work |
+| U01 DM rewind | Rewind recent native DM turns, with backend policy, disabled-reason UI and attachment/draft restoration. Shared protocol/Core/web changes must land together; not implemented at F. | `614a5fd6a18d2b8a1ae223c121250f89fba3cfcd`, `318dc32416eefcd8f9b5d7a225775f729930cff0`, `dd18abaa6e3d4d820865642a77a35ce6326b13ad`; U `store-dm-rewind.test.ts`, `packages/client-protocol/src/rewind.ts`, web rewind hook/dialog/tests |
+| U02 Anthropic search/replay | Native deferred tool loading on supported Anthropic routes; tool references must not mix incompatible content. Normalize stored metadata and project history through per-provider allowlists; isolate replay content when switching providers and retain valid text recovery for invalid thinking. Preserve fork local tool execution/images/compaction. | `78efb707113ff8cc15aecce362ed23b54e63d46e`, `e292e1d2d676675a406e2449655720550adb77be`, `1d0f4029e0b3f254786d5f3b7e38656375110f48`, `7f91607fc90daaa37ce175d9abfadc896079ae4a`, `e2f987d0e076ec34115fb9f4a84aa606ee469a3d`; U provider-history and tool-search contract/production-fixture suites |
+| U02 prompt caching | Automatic default only for first-party Anthropic endpoint routes when no explicit override/cache marker conflicts. `anthropic_prompt_cache` true/false overrides and durable false preservation matter; arbitrary gateways do not automatically receive this default. | `0a18f1ec86a91722156b494f17abf4b66e4bfd76`, U `agent/provider-options.ts`, model-slot/provider-options tests |
+| U02 Codex prompt policy | Retires `codex_instructions`; use `basePrompt` or prompt files. Removes hard-coded Codex base instructions and applies the shared base-prompt path to Codex too. V3 has an explicit removed-field diagnostic; do not claim all old config still works. | `29b8e6c9b5a19feb7d8d303469badfc008a3cf7d`, U `packages/utils/core-config/v3.ts`, `model-slot.ts`, agent prompt tests and config migration docs |
+| U03 heartbeat / U04 presentation | Isolates heartbeat context; nested subagent identities/panel tabs, current-file tree reveal/downloads, favicon placement, reply-start gap, DM demo fix and Markdown contrast. These are upstream UI/behavior work, not new fork products. Fork cache/composer/auth-online reload fixes remain relevant. | `9826893b65bd8d143d35e3f27c59129c70e5d779`, `2556b377c3e52dcd211bd77ec222b69010d09bbb`, `15a567fdfff7288caec289ea79edcfc32e58d914`, `ebead8bee93925e21641b88776422e1c73b2b2f2`, `109a8c0add12298de69798b1cfb6a31ec72f7150`, `a769c8de182c6e55c32d1ad1d7cdde61d3d7e5b8`, `7613d519643005ee4574c085a534c74af9508f88` |
+| Search bounds / test temp roots | Per-attempt retry/deadline behavior described above; isolated test roots stay inside POSIX Unix-socket path limits. C retains this behavior, with the hosted-search exception and regression repairs documented here. | `2d392956e2d90472c983ec23956c1146341a7775`, `e7af49eff6f61c913d2f55b866b7f6a2d0b58941` |
 
-Rules:
+Upstream-owned behavior already incorporated at B includes Core execution/recovery, Discord/GitHub/native surfaces, resources/blobs/S3, permission and Bash/filesystem guardrails, plugins/MCP, durable workflows/subagents, heartbeat, questions, native DM windows and notifications, the Rust runner and run-scoped previews. Exa configuration, `TAVILY_API_BASE_URL`, GitHub markers/self-trigger prevention and host-aware reply permalinks are accepted/shared contributions, not fork-only claims. Earlier records identify upstream PRs #1, #4/#5, #13 and #35 respectively; [permalink documentation](./github-reply-permalinks.md) retains the contract. Those historical PR dispositions are not a fresh live GitHub status audit.
 
-- No `backup/`, `dep/`, `pr/`, or `review-*` branches. A pre-rebase safety point is a tag or a stash, and a branch that was opened as a pull request against upstream is deleted once upstream accepts or declines it.
-- Delete a branch as soon as its PR merges; `git branch --merged origin/main` and `git cherry origin/main <branch>` decide whether anything unmerged remains.
-- Worktrees follow the same rule: one per active branch, removed with the branch.
-- Cleanup on 2026-09-26 archived 22 branches (one of them an uncommitted worktree) as `archive/*` tags and deleted 79 local and remote branches; only `main` remained.
+Retired items include Architecture Atlas, custom Discord working-indicator defaults, the empty-reply feature flag, the smart-search container experiment, the old idle-watchdog/timer-injection patch, and structured image generation/routes. Do not resurrect them from branch names or old plans. F16's automatic startup blob migration and backups are also retired: current Core requires the supported managed-blob schemas; old transcript 5/workflow 25 uses the historical offline tool at `f2c90667ac5616796c992602ca5fb5be726cf40d`. See [offline support and restore procedure](./fork-integration-20261111/migration.md). F16 is a historical support boundary, not a currently added migration subsystem.
 
-## Upstream Sync Policy
+## Candidate repair delta by area
 
-```mermaid
-flowchart TD
-    Check[Scheduled or manual sync] --> Fetch[Fetch upstream main]
-    Fetch --> Behind{Fork behind upstream?}
-    Behind -->|No| Stop[No change]
-    Behind -->|Yes| Merge[Merge upstream main]
-    Merge --> Clean{Git conflicts?}
-    Clean -->|No| CI[Full CI on candidate SHA]
-    CI --> Passed{All gates pass?}
-    Passed -->|No| Hold[Keep candidate; stop update]
-    Passed -->|Yes| Push[Fast-forward unchanged fork main]
-    Push --> Build[Trigger image build]
-    Clean -->|Yes| PR[Open PR; request Catalina-df review]
-    PR --> AI[Read-only Claude conflict analysis]
-    AI --> Manual[Human resolution and validation]
+These are C-only corrections or resolved combinations, not features already shipped at F. The [complete path ledger](./fork-comparison-pr120/PATH-INVENTORY.md#every-changed-path) retains the exact per-path classifications and objects.
+
+| Area | Retained/adopted behavior and precise repair | Source and regression evidence |
+| --- | --- | --- |
+| Search policy and conflict | Retain fork OpenAI model routes, status-based retry decisions and search-only scope; adopt U's one-retry/deadline/cancellation wrapper; give the OpenAI provider 30 seconds per attempt and other built-ins 10. Preserve both parents' tests. | [web.ts](../apps/core/src/tool-server/tools/web.ts), [web.test.ts](../apps/core/tests/tools/web.test.ts), four provider suites; [search documentation](./web-search-openai.md). |
+| Rewind attachment undo and retry | Capture reference-only attachment records before silent editor replacement so undo remains sendable. Retained local files without a reference receive an abort controller/reservation command and keep the originating question-draft key through readiness. | [composer-editor.tsx](../apps/web/src/components/composer-editor.tsx), [uploads.ts](../apps/web/src/uploads.ts), [Chat.tsx](../apps/web/src/components/Chat.tsx), [uploads tests](../apps/web/tests/uploads.test.ts), [real-component browser fixture](../apps/web/tests/support/rewind-regressions.js). |
+| Draft persistence and order | Keep attachment-only local/reply drafts in the lists; sort saved references by composer keys rather than upload-completion order. Both existing reload paths restore that order; no stored schema change. Retain F's monotonic cache recency. | [cache.ts](../apps/web/src/cache.ts), [cache tests](../apps/web/tests/cache.test.ts), existing App/queries hydration. |
+| Pending paste and navigation | Abort pending message-paste downloads when rewind replaces the draft. Preserve disabled composer state when a running rewind survives navigation. A stopped attempt waiting for retry remains editable. | [Composer.tsx](../apps/web/src/components/Composer.tsx), [Chat.tsx](../apps/web/src/components/Chat.tsx); real DM paste/navigation checks. |
+| History availability and missing files | Retry an unchanged failed history page once; leave after effect cleanup. Two failures remain bounded and require existing Load more/reconnect/navigation. Missing unfinished files become reattachment markers, accurately documented. | [use-dm-rewind.ts](../apps/web/src/use-dm-rewind.ts), [browser fixture](../apps/web/tests/support/rewind-regressions.js), [native operations](./native-surface.md#permanent-direct-conversation). |
+| Crash recovery and jobs | Derive the rewound turn cutoff from the existing command receipt and retained input timestamp; suppress jobs created at/after it before completing a recovered mutation. No persistent field, new journal or recovery subsystem. | [store.ts](../apps/core/src/surface/native/store.ts), [execution.ts](../apps/core/src/surface/native/execution.ts), [execution tests](../apps/core/src/surface/native/execution.test.ts), existing job-service cutoff/suppression tests. |
+| Failed overlapping cancellation | Run the existing input drain when the last cancellation clears its marker, even if cancellation fails; return the original cancellation error with unchanged precedence. | Native execution source/tests above; two overlapping cancellations plus queued input regression. |
+| Thinking repair and replay | Preserve assistant text but append the existing user continuation when repair removes a terminal tool result. Remove adjacent Discord attribution lines in one idempotent pass. Retain Telegram metadata, fork compaction boundaries and U's provider-history/tool-search projection. | [runner](../apps/core/src/surface/bridge/bus-agent-runner.ts), [normalization](../apps/core/src/surface/bridge/request-composition/normalization.ts), [thinking tests](../apps/core/tests/agent/anthropic-thinking-recovery.test.ts), [runner tests](../apps/core/tests/surface/bridge/bus-agent-runner.test.ts). |
+| Regression quality | Assert durable repaired checkpoints after lifecycle settlement, so an intentional provider failure cannot swallow a failed assertion. Isolate newly generated signatures from old thinking. Freeze exact upload expiry. Disable ambient main-isolate memory alarms only in the dependency-streak test; dedicated memory-limit tests remain intact. | Runner/upload tests above; [health fixture](../apps/core/tests/tool-server-health-state.test.ts). |
+| Contract and generated merges | Retain Telegram/OpenAI v2/v3 config composition, compatible image/tool middleware, nonstandard finish-reason tool execution, #121 search scoping, Activity caret restoration, native recorder and historical protocol fixtures. Adopt U's config/caching/Codex/heartbeat/history changes; generated schema and architecture registrations pass their existing checks. | [PROJECT.md](../PROJECT.md), [MIGRATIONS.md](../MIGRATIONS.md), [configuration migrations](./core-config-migrations.md), exact candidate rows. |
+
+The footprint allowlist records reasons for the retained behavior. Gate implementation changes are not part of C. The baseline-only generator and failed environment checks from the documentation preparation clone are not candidate test results.
+
+## Upgrade, rollback and final refresh
+
+Read [MIGRATIONS.md](../MIGRATIONS.md) and [configuration upgrades](./core-config-migrations.md) before changing binaries or config versions. Back up matching databases, managed blobs and required state consistently, drain/stop producers, rehearse any necessary historical offline cutover in a disposable copy, and ship matching Core/web. Restore the matching pre-upgrade binaries **and coordinated backup** when older binaries cannot read newer schemas. Changing a Git branch does not reverse a native/workflow/transcript migration. Native recording's durable child routing and Telegram observed history are distinct from rebuildable cache/memory indexes.
+
+Bash/filesystem checks, trusted plugins and MCP stdio, programmatic workflows and same-UID container access are guardrails/trusted execution, not hostile-code sandboxes. This report neither authorizes deployment nor establishes gateway compatibility or live-data state. No operator models, aliases, presets, permissions, credentials or private runtime data were inspected or changed.
+
+Focused integrated regressions passed: search/providers **88 tests**, native execution **71 tests**, thinking repair/normalization **15 tests**, and upload/cache **56 tests**. The web suite passed **820 tests**; all workspace typechecks and architecture checks passed. These source-level results are distinct from the final combined root-gate outcome.
+
+The final integrated source checks ran with Bun 1.4.5 (manifest: 1.4.4) and the already installed Rust 1.94.1 toolchain. The combined-tree result and exact totals are in [VERIFICATION.md](./fork-comparison-pr120/VERIFICATION.md). Local passing checks do not establish hosted CI, image builds, live-provider compatibility or deployment.
+
+Reproduce C before publication without committing or changing the real index:
+
+```sh
+python3 docs/fork-comparison-pr120/reproduce.py --candidate-worktree
+python3 docs/fork-comparison-pr120/reproduce.py --candidate-worktree --check
+git diff --name-only --diff-filter=MDT --no-renames 7613d519643005ee4574c085a534c74af9508f88
+git diff --check
+git diff --cached --check
 ```
 
-Sync principles:
+The helper verifies exact HEAD/MERGE_HEAD pins, snapshots with temporary `GIT_INDEX_FILE`, compares every candidate path/status independently, checks the 219 exact policy rows, and reproduces generated Markdown/JSON byte for byte. It never initializes submodules or creates commits. Three evidence files are included with modes but have no content hashes to avoid self-reference; all other content, including the helper and both guides, is fingerprinted. This is a reviewable content identity, not a complete-tree release attestation.
 
-1. Preserve upstream commit history by integrating with merges.
-2. Fork-only features must have independent tests and documentation so their behavior does not have to be inferred from commit messages during a sync.
-3. After upstream accepts equivalent functionality, compare the contracts before removing the duplicate patch and its fork-only claim from this document.
-4. When conflicts occur, do not obtain a green sync by ignoring tests or directly overwriting fork behavior.
-5. After every sync and every fork change, run `bun run fork:footprint`. Remove stale entries, and move new leakage into a fork-owned module before adding an entry.
-
-## Updating This Document
-
-Whenever a fork-only feature is added or a major upstream sync is completed, run at least the following checks:
-
-```bash
-git fetch origin
-git fetch upstream
-git log --no-merges upstream/main..origin/main
-gh pr list -R stanley2058/lilac-mono --author DF-wu --state all
-git diff --stat upstream/main..origin/main
-bun run fork:footprint
-```
-
-Distinguish among these classifications:
-
-- **Fork-only**: upstream does not currently provide an equivalent contract.
-- **Inherited**: comes directly from upstream.
-- **Upstream-accepted**: originally contributed by the fork, but now available in both repositories.
-- **Reverted/superseded**: no longer exists and should not appear in the README feature list.
+After committing/publishing the same resolved content, run `python3 docs/fork-comparison-pr120/reproduce.py --candidate HEAD --check`. It requires both F and U as ancestors and works without changing the report to link an unpublished commit. Then run the unchanged normal `bun run fork:footprint -- --upstream=<fetched-upstream-ref> --strict` and the required hosted CI/image checks on that exact commit. Any new source, policy or non-evidence documentation edit requires refreshing the candidate report; changes to verification prose require review even though its hash is excluded.
