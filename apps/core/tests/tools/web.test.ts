@@ -945,7 +945,7 @@ describe("web search and permits", () => {
     if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
   });
 
-  it("falls back to the next search provider only on retriable errors", async () => {
+  it("retries the same search provider before fallback on retriable errors", async () => {
     const calls: string[] = [];
     const fallback = configuredProvider("exa", async () => {
       calls.push("exa");
@@ -970,7 +970,7 @@ describe("web search and permits", () => {
     await expect(
       toolValue(retriable.call("search", { query: "fallback test" })),
     ).resolves.toHaveLength(1);
-    expect(calls).toEqual(["tavily", "exa"]);
+    expect(calls).toEqual(["tavily", "tavily", "exa"]);
 
     calls.length = 0;
     const terminal = createTool({
@@ -989,59 +989,102 @@ describe("web search and permits", () => {
     expect(calls).toEqual(["tavily"]);
   });
 
-  it("falls back after retriable OpenAI HTTP errors even without retry keywords", async () => {
-    const recovered = [
-      { url: "https://example.com", title: "Fallback", content: "Recovered", score: null },
-    ];
-    for (const status of [409, 425, 429, 503]) {
-      const server = startServer(
-        () =>
-          new Response(JSON.stringify({ error: { message: "request failed" } }), {
-            status,
-            headers: { "content-type": "application/json" },
-          }),
-      );
-      const fallback = jest.fn(async () => recovered);
-      const tool = createTool({
-        providers: [
-          new OpenAIWebSearchProvider({
-            apiKey: "sk-test",
-            baseUrl: `http://127.0.0.1:${server.port}/v1`,
-          }),
-          configuredProvider("exa", fallback),
-        ],
-      });
+  it("gives each provider two independent 10-second attempts", async () => {
+    jest.useFakeTimers({ now: 0 });
+    const providerIds = ["firecrawl", "exa", "tavily"];
+    const starts = Array.from({ length: 6 }, () => deferred<AbortSignal>());
+    const calls: string[] = [];
+    const tool = createTool({
+      providers: providerIds.map((id) =>
+        configuredProvider(id, async (_input, options) => {
+          const start = starts[calls.length]!;
+          calls.push(id);
+          start.resolve(options!.signal!);
+          return new Promise((_, reject) => {
+            if (id !== "firecrawl") {
+              options?.signal?.addEventListener(
+                "abort",
+                () => reject(new Error("401 unauthorized")),
+                { once: true },
+              );
+            }
+          });
+        }),
+      ),
+    });
 
-      await expect(toolValue(tool.call("search", { query: "fallback test" }))).resolves.toEqual(
-        recovered,
-      );
-      expect(fallback).toHaveBeenCalledTimes(1);
+    const pending = tool.call("search", { query: "stall each provider" });
+    for (const start of starts) {
+      const attemptSignal = await start.promise;
+      jest.advanceTimersByTime(9_999);
+      expect(attemptSignal.aborted).toBe(false);
+      jest.advanceTimersByTime(1);
+      expect(attemptSignal.aborted).toBe(true);
     }
+
+    expect(calls).toEqual(["firecrawl", "firecrawl", "exa", "exa", "tavily", "tavily"]);
+    await expect(pending).resolves.toMatchObject({
+      status: "error",
+      error: { kind: "timeout", code: "web_timeout" },
+    });
   });
 
-  it("falls back after a non-JSON OpenAI 500 but not after a 400", async () => {
-    for (const status of [500, 400]) {
-      const server = startServer(() => new Response("gateway error", { status }));
-      const fallback = jest.fn(async () => []);
-      const tool = createTool({
-        providers: [
-          new OpenAIWebSearchProvider({
-            apiKey: "sk-test",
-            baseUrl: `http://127.0.0.1:${server.port}/v1`,
-          }),
-          configuredProvider("exa", fallback),
-        ],
-      });
+  it("stops retry and fallback when the caller cancels an active provider", async () => {
+    const caller = new AbortController();
+    const started = deferred<AbortSignal>();
+    const calls: string[] = [];
+    const tool = createTool({
+      providers: [
+        configuredProvider("firecrawl", async (_input, options) => {
+          calls.push("firecrawl");
+          started.resolve(options!.signal!);
+          return new Promise(() => {});
+        }),
+        configuredProvider("exa", async () => {
+          calls.push("exa");
+          return [];
+        }),
+      ],
+    });
 
-      const result = await tool.call("search", { query: "fallback test" });
-      if (status === 500) {
-        expect(result.status).toBe("ok");
-        expect(fallback).toHaveBeenCalledTimes(1);
-        continue;
-      }
-      expect(result.status).toBe("error");
-      expect(fallback).not.toHaveBeenCalled();
-    }
+    const pending = tool.call("search", { query: "cancel search" }, { signal: caller.signal });
+    const attemptSignal = await started.promise;
+    caller.abort();
+
+    expect(attemptSignal.aborted).toBe(true);
+    await expect(pending).resolves.toMatchObject({
+      status: "error",
+      error: { kind: "cancelled", code: "web_cancelled" },
+    });
+    expect(calls).toEqual(["firecrawl"]);
+  });
+
+  it("returns cancellation when the caller aborts as the Firecrawl permit is released", async () => {
+    const caller = new AbortController();
+    const searchPermits = new FirecrawlPermitPool("search");
+    const acquire = searchPermits.acquire.bind(searchPermits);
+    searchPermits.acquire = async (signal) =>
+      (await acquire(signal)).map((permit) => ({
+        release() {
+          permit.release();
+          caller.abort();
+        },
+      }));
+    const search = jest.fn(async () => {
+      throw Object.assign(new Error("Service unavailable"), { status: 503 });
+    });
+    const tool = createTool({
+      searchPermits,
+      providers: [configuredProvider("firecrawl", search)],
+    });
+
+    await expect(
+      tool.call("search", { query: "cancel during permit release" }, { signal: caller.signal }),
+    ).resolves.toMatchObject({
+      status: "error",
+      error: { kind: "cancelled", code: "web_cancelled", retryable: false },
+    });
+    expect(search).toHaveBeenCalledTimes(1);
   });
 
   it("queues Firecrawl searches and falls back when queue TTL expires", async () => {

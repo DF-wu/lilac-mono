@@ -48,6 +48,13 @@ older binary to open current data.
 
 ## Configuration and caller changes
 
+### Anthropic prompt caching
+
+Before upgrading, change `anthropic_prompt_cache: true` to `anthropic_prompt_cache: legacy` wherever
+you want to keep explicit breakpoints. The new default uses five-minute automatic caching on
+first-party Anthropic agent calls. See [Core configuration upgrades](docs/core-config-migrations.md#anthropic-prompt-caching)
+for opt-out and rollback instructions.
+
 ### Native transport selection
 
 Native deployment settings add `transport`, with `auto`, `websocket`, and `http-sse` values.
@@ -950,3 +957,13 @@ The previous-release client decode and cache projection schemas are now frozen i
 no data migration. See [Client wire compatibility](DEVELOPMENT.md#client-wire-compatibility)
 for the release refresh process and the required protocol/projection bump and
 migration entry when deliberately breaking old clients or cached projections.
+
+### Anthropic thinking recovery checkpoints
+
+Agent-run snapshots and deltas accept optional `anthropicThinkingRepaired`. A true value records
+that the run consumed its signature-mismatch repair retry. It survives compaction and restart;
+older checkpoints without the field start with the retry available. Repair writes keep user messages and assistant text, discarding assistant reasoning, attachments,
+and tool exchanges.
+
+Drain active runs before downgrading. Older strict checkpoint readers may reject the new field
+and resume from accepted input instead of the repaired checkpoint.

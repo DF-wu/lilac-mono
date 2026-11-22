@@ -1,5 +1,7 @@
 import {
   OUTLINE_PAGE_TURNS,
+  dmRewindDisabledReason,
+  dmRewindReasonText,
   startsContextWindow,
   turnPreviewText,
   type ModelReasoning,
@@ -57,6 +59,7 @@ import {
 import { nativeUserDisplay } from "./identity";
 import { TURN_CREATED_AT, turnCompletedAtSql } from "./turn-timing";
 import { nativeFailure, type NativeStoreFailure } from "./errors";
+import { NATIVE_UPLOAD_STAGING_MS } from "./upload-staging";
 
 export type NativeStoreError = NativeStoreFailure | PersistedDataError;
 export type NativeStoreResult<T> = ResultType<T, NativeStoreError>;
@@ -177,8 +180,9 @@ export const NATIVE_AUTO_STEER_COMMAND_PREFIX = "agent-auto-";
 export const NATIVE_JOB_WAKE_COMMAND_PREFIX = "job-wake:";
 const TURN_VISIBLE = "json_array_length(data_json,'$.value.messages')>0";
 
-const CANONICAL_INPUT_FILTER =
-  "json_extract(i.data_json,'$.value.completedAt') IS NOT NULL AND json_extract(i.data_json,'$.value.mode')!='steer' AND json_extract(i.data_json,'$.value.state') IN ('admitted','canceled') AND EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.id=json_extract(i.data_json,'$.value.turnId'))";
+const CANONICAL_INPUT_ATTRIBUTES =
+  "json_extract(i.data_json,'$.value.completedAt') IS NOT NULL AND json_extract(i.data_json,'$.value.mode')!='steer' AND json_extract(i.data_json,'$.value.state') IN ('admitted','canceled')";
+const CANONICAL_INPUT_FILTER = `${CANONICAL_INPUT_ATTRIBUTES} AND EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.id=json_extract(i.data_json,'$.value.turnId'))`;
 
 function notificationBody(thread: NativeThread, preview: string) {
   if (thread.displayStatus === "error") return "Run failed";
@@ -359,6 +363,7 @@ export class NativeStore {
         CREATE UNIQUE INDEX IF NOT EXISTS native_dm_user ON native_records(json_extract(data_json,'$.value.starterId')) WHERE kind='thread' AND json_extract(data_json,'$.value.kind')='dm';
         CREATE INDEX IF NOT EXISTS native_input_delivery ON native_records(json_extract(data_json,'$.value.deliveryId')) WHERE kind='input';
         CREATE INDEX IF NOT EXISTS native_input_request ON native_records(json_extract(data_json,'$.value.requestId')) WHERE kind='input';
+        CREATE INDEX IF NOT EXISTS native_input_turn ON native_records(thread_id,json_extract(data_json,'$.value.turnId')) WHERE kind='input';
         CREATE INDEX IF NOT EXISTS native_pending_inputs ON native_records(thread_id,position) WHERE kind='input' AND json_extract(data_json,'$.value.completedAt') IS NULL AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted');
         CREATE INDEX IF NOT EXISTS native_input_created ON native_records(thread_id,json_extract(data_json,'$.value.createdAt'),position) WHERE kind='input';
         CREATE INDEX IF NOT EXISTS native_records_thread_position ON native_records(kind,thread_id,position);
@@ -2126,6 +2131,14 @@ export class NativeStore {
           upload.state === "canceled"
         )
           return Result.err(nativeFailure("forbidden", "Attachment is unavailable to this input"));
+        if (
+          upload.state === "ready" &&
+          this.now() - upload.createdAt >= NATIVE_UPLOAD_STAGING_MS &&
+          !(yield* this.hasDeferredUpload(upload.id))
+        )
+          return Result.err(
+            nativeFailure("conflict", "Attachment expired. Reattach the file to send it."),
+          );
       }
       if (question && uploads.some((upload) => upload.state !== "ready"))
         return Result.err(
@@ -2509,15 +2522,70 @@ export class NativeStore {
     );
   }
 
+  private readSessionWindow(
+    threadId: string,
+    options: { gapMs: number; at: number; beforePosition?: number; includePosts?: boolean },
+  ): NativeStoreResult<{
+    firstPosition: number | null;
+    firstAt: number | null;
+    postedTurns: ReadyTurnSlot[];
+    latestAt: number;
+  }> {
+    const statement = this.db.prepare<
+      {
+        id: string;
+        position: number;
+        posted: number;
+        created_at: number | null;
+        completed_at: number | null;
+      },
+      [string, number]
+    >(
+      `SELECT t.id,t.position,${TURN_POSTED} AS posted,${TURN_CREATED_AT} created_at,${TURN_COMPLETED_AT} completed_at
+      FROM native_records t INDEXED BY native_records_thread_position
+      WHERE t.kind='turn' AND t.thread_id=? AND t.position<? ORDER BY t.position DESC`,
+    );
+    const ids: string[] = [];
+    let firstPosition: number | null = null;
+    let firstAt: number | null = null;
+    let nextAt = options.at;
+    let latestAt = 0;
+    for (const row of statement.iterate(
+      threadId,
+      options.beforePosition ?? Number.MAX_SAFE_INTEGER,
+    )) {
+      if (row.created_at === null || row.completed_at === null || row.created_at > options.at)
+        continue;
+      if (startsContextWindow(row.completed_at, nextAt, options.gapMs)) break;
+      latestAt = Math.max(latestAt, row.completed_at);
+      firstPosition = row.position;
+      firstAt = row.created_at;
+      if (row.posted && options.includePosts) ids.push(row.id);
+      nextAt = row.created_at;
+    }
+    statement.finalize();
+    return Result.all(ids.toReversed().map((id) => this.readRecord("turn", id))).map((records) => ({
+      firstPosition,
+      firstAt,
+      postedTurns: records.flatMap((record) => (record?.kind === "turn" ? [record.value] : [])),
+      latestAt,
+    }));
+  }
+
   selectSessionStartInput(
     threadId: string,
     options: { gapMs: number; at: number },
   ): NativeStoreResult<NativeInputRecord | null> {
-    return this.selectSessionWindow(threadId, options).andThen((session) => {
-      const firstPosition = session.firstPosition;
+    return nativeStoreTransaction(this.db, () => {
+      const session = this.readSessionWindow(threadId, options);
+      if (session.isErr()) return Result.err(session.error);
+      const firstPosition = session.value.firstPosition;
       if (firstPosition === null) return Result.ok(null);
+      // `session.firstPosition` is a turn position; inputs have their own monotonic sequence
+      // that diverges on steers, rewinds, and canceled queued follow-ups. Unary `+` strips
+      // TEXT affinity from `t.id` so SQLite uses `native_input_turn`.
       return this.readRows(
-        `SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND i.position>=? AND ${CANONICAL_INPUT_FILTER} ORDER BY i.position LIMIT 1`,
+        `SELECT i.* FROM native_records t INDEXED BY native_records_thread_position JOIN native_records i INDEXED BY native_input_turn ON i.kind='input' AND i.thread_id=t.thread_id AND json_extract(i.data_json,'$.value.turnId')=+t.id WHERE t.kind='turn' AND t.thread_id=? AND t.position>=? AND ${CANONICAL_INPUT_ATTRIBUTES} ORDER BY i.position LIMIT 1`,
         [threadId, firstPosition],
       ).map((records) => {
         const record = records[0];
@@ -2535,49 +2603,7 @@ export class NativeStore {
     postedTurns: ReadyTurnSlot[];
     latestAt: number;
   }> {
-    return nativeStoreTransaction(this.db, () => {
-      const statement = this.db.prepare<
-        {
-          id: string;
-          position: number;
-          posted: number;
-          created_at: number | null;
-          completed_at: number | null;
-        },
-        [string, number]
-      >(
-        `SELECT t.id,t.position,${TURN_POSTED} AS posted,${TURN_CREATED_AT} created_at,${TURN_COMPLETED_AT} completed_at
-        FROM native_records t INDEXED BY native_records_thread_position
-        WHERE t.kind='turn' AND t.thread_id=? AND t.position<? ORDER BY t.position DESC`,
-      );
-      const ids: string[] = [];
-      let firstPosition: number | null = null;
-      let firstAt: number | null = null;
-      let nextAt = options.at;
-      let latestAt = 0;
-      for (const row of statement.iterate(
-        threadId,
-        options.beforePosition ?? Number.MAX_SAFE_INTEGER,
-      )) {
-        if (row.created_at === null || row.completed_at === null || row.created_at > options.at)
-          continue;
-        if (startsContextWindow(row.completed_at, nextAt, options.gapMs)) break;
-        latestAt = Math.max(latestAt, row.completed_at);
-        firstPosition = row.position;
-        firstAt = row.created_at;
-        if (row.posted && options.includePosts) ids.push(row.id);
-        nextAt = row.created_at;
-      }
-      statement.finalize();
-      return Result.all(ids.toReversed().map((id) => this.readRecord("turn", id))).map(
-        (records) => ({
-          firstPosition,
-          firstAt,
-          postedTurns: records.flatMap((record) => (record?.kind === "turn" ? [record.value] : [])),
-          latestAt,
-        }),
-      );
-    });
+    return nativeStoreTransaction(this.db, () => this.readSessionWindow(threadId, options));
   }
 
   /** A bounded page of jump targets, plus context windows for a DM. */
@@ -2677,10 +2703,17 @@ export class NativeStore {
   }
 
   getTurnPosition(turnId: string): NativeStoreResult<number> {
-    return this.readRecord("turn", turnId).andThen((record) =>
-      record?.kind === "turn"
-        ? Result.ok(record.value.position)
-        : Result.err(nativeFailure("not-found", "Turn is unavailable")),
+    return nativeStoreTransaction(this.db, () =>
+      // Omit message bodies so position lookups stay lightweight while preserving full codec validation.
+      this.readRows(
+        "SELECT id,position,format_version,CASE WHEN json_valid(data_json) AND json_type(data_json,'$.value.messages')='array' THEN json_set(data_json,'$.value.messages',json('[]')) ELSE data_json END AS data_json FROM native_records WHERE kind='turn' AND id=?",
+        [turnId],
+      ).andThen((records) => {
+        const record = records[0];
+        return record?.kind === "turn"
+          ? Result.ok(record.value.position)
+          : Result.err(nativeFailure("not-found", "Turn is unavailable"));
+      }),
     );
   }
 
@@ -2981,6 +3014,37 @@ export class NativeStore {
     );
   }
 
+  private validateDmRewind(
+    thread: NativeThreadRecord,
+    turn: ReadyTurnSlot,
+  ): NativeStoreResult<void> {
+    return Result.gen(function* () {
+      const latest = yield* this.readRows(
+        `SELECT * FROM native_records WHERE kind='turn' AND thread_id=? AND (${TURN_VISIBLE} OR json_extract(data_json,'$.value.settledAt') IS NULL OR json_extract(data_json,'$.value.state') NOT IN ('complete','failed','canceled')) ORDER BY position DESC LIMIT 1`,
+        [thread.id],
+      );
+      const pending = yield* this.listPendingInputs(thread.id);
+      const pendingSends = yield* this.readRows(
+        "SELECT * FROM native_records WHERE kind='send-group' AND thread_id=? AND json_extract(data_json,'$.value.delivered')=0 LIMIT 1",
+        [thread.id],
+      );
+      if (pendingSends.length)
+        return Result.err(nativeFailure("forbidden", dmRewindReasonText("outside")));
+      const deployment = yield* this.getDeployment();
+      const last = latest[0];
+      const reason = dmRewindDisabledReason({
+        turn,
+        latestTurnId: last?.kind === "turn" ? last.value.turnId : undefined,
+        ownerId: thread.starterId,
+        busy: !!thread.activeRunId || pending.length > 0,
+        windowMs: deployment.settings.dmTimestampGapMs,
+        now: this.now(),
+      });
+      if (reason) return Result.err(nativeFailure("forbidden", dmRewindReasonText(reason)));
+      return Result.ok(undefined);
+    }, this);
+  }
+
   private rewindCommand(
     input: {
       readonly threadId: string;
@@ -3005,6 +3069,7 @@ export class NativeStore {
         [thread.id, input.turnId],
       );
       const fullInput = targetInputs[0];
+      if (thread.kind === "dm") yield* this.validateDmRewind(thread, target.value);
       const inputs = yield* this.readRows(
         "SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND (json_extract(i.data_json,'$.value.state') IN ('queued','uploading') OR EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.thread_id=i.thread_id AND t.position>=? AND t.id=json_extract(i.data_json,'$.value.turnId'))) ORDER BY i.position",
         [thread.id, target.value.position],
@@ -3052,15 +3117,16 @@ export class NativeStore {
       historyGeneration: number;
       revision: number;
     },
+    cancellationPending = false,
   ): NativeStoreResult<NativeMutationResult> {
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
         const thread = yield* this.authorizeThread(actorId, input.threadId, true);
-        if (thread.kind === "dm")
-          return Result.err(nativeFailure("forbidden", "The DM cannot be rewound"));
-        return this.command(actorId, input.commandId, { operation: "rewind", ...input }, () =>
-          this.rewindCommand(input, thread),
-        );
+        return this.command(actorId, input.commandId, { operation: "rewind", ...input }, () => {
+          if (thread.kind === "dm" && cancellationPending)
+            return Result.err(nativeFailure("conflict", "Wait for cancellation to finish."));
+          return this.rewindCommand(input, thread);
+        });
       }, this),
     );
   }

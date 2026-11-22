@@ -1,4 +1,9 @@
-import { readToolLoadingDefinitions, portableToolLoadingMessages } from "./tool-search";
+import {
+  openAIHistoryProfile,
+  projectMessagesFor,
+  type ProviderMessages,
+} from "../provider-history";
+import { readToolLoadingDefinitions } from "./tool-search";
 import type { AgentToolDefinition } from "../../agent-adapter";
 import type { FilePart, ModelMessage, ToolResultPart } from "ai";
 import { Result, type Result as ResultType } from "better-result";
@@ -417,14 +422,19 @@ function toolSearchOutput(
   });
 }
 
-function encodeMessages(
+function projectForOpenAI(
   messages: readonly ModelMessage[],
+  nativeToolSearch: boolean | undefined,
+): ProviderMessages<"openai"> {
+  return projectMessagesFor(openAIHistoryProfile({ nativeToolSearch }), messages);
+}
+
+function encodeMessages(
+  history: ProviderMessages<"openai">,
   policy: EncodingPolicy,
 ): Encoded<OpenAIInputItem[]> {
   const items: OpenAIInputItem[] = [];
-  for (const message of policy.nativeToolSearch
-    ? messages
-    : portableToolLoadingMessages(messages)) {
+  for (const message of history.messages) {
     if (policy.nativeToolSearch) {
       const seed = captureResultOutcome(
         readToolLoadingDefinitions(message.providerOptions, "toolSearchSeed"),
@@ -613,8 +623,12 @@ function encodeRequest(
   if (systemMode !== "system" && systemMode !== "developer" && systemMode !== "remove")
     return unsupported("Invalid OpenAI system message mode");
   const systemMessages = systemPromptMessages(input.context.system);
+  const history = projectForOpenAI(
+    [...systemMessages, ...input.context.messages],
+    input.context.nativeToolSearch,
+  );
   const encodedMessages = captureResultOutcome(
-    encodeMessages([...systemMessages, ...input.context.messages], {
+    encodeMessages(history, {
       nativeToolSearch: input.context.nativeToolSearch,
       store: options.store !== false,
       hasConversation: options.conversation != null,
@@ -717,7 +731,7 @@ export const openAIRequestCodec: OpenAIRequestCodec = {
     return encodeRequest(input);
   },
   async messages(messages, options) {
-    return encodeMessages(messages, {
+    return encodeMessages(projectForOpenAI(messages, options?.nativeToolSearch), {
       ...defaultPolicy,
       nativeToolSearch: options?.nativeToolSearch,
       store: options?.store ?? defaultPolicy.store,
@@ -727,8 +741,9 @@ export const openAIRequestCodec: OpenAIRequestCodec = {
   async steer(messages) {
     if (messages.length === 0 || messages.some((message) => message.role !== "user"))
       return unsupported("OpenAI steering requires one or more user messages");
+    const steering = projectForOpenAI(messages, false).messages;
     return Result.all(
-      messages.map((message): Encoded<ResponseSteerInputItemList.Message> => {
+      steering.map((message): Encoded<ResponseSteerInputItemList.Message> => {
         if (message.role !== "user") return unsupported("OpenAI steering requires user messages");
         if (typeof message.content === "string")
           return Result.ok({

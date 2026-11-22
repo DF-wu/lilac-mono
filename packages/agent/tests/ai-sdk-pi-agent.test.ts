@@ -2782,6 +2782,7 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
       },
     });
     const replacementModel = new MockLanguageModelV4({
+      provider: "test.mock",
       doStream: async () => {
         order.push("model");
         return textStream("replacement", "replacement response");

@@ -4,7 +4,7 @@
 
 本文件描述 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) 相對於 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的現行差異。
 
-目前整合基準為 upstream commit [`90d71dbe`](https://github.com/stanley2058/lilac-mono/commit/90d71dbe9a2a86d8b0a39513e9eb67d65eb93683)，透過 fork PR [#119](https://github.com/DF-wu/lilac-mono/pull/119) 與 fork main `a246ffb6` 整合，保留兩邊的歷史。[11 月 11 日整合紀錄](./fork-integration-20261111/README.md) 記錄較早的 PR #101 基準、F01–F23 功能處置、程式碼歸屬與離線遷移支援；其他有日期的報告保留各自的歷史基準。
+目前整合基準為 upstream commit [`d16d6b3f`](https://github.com/stanley2058/lilac-mono/commit/d16d6b3f9f41a870cf43ca93534cb329d0629853)。[11 月 11 日整合紀錄](./fork-integration-20261111/README.md) 記錄較早的 PR #101 基準、F01–F23 功能處置、程式碼歸屬與離線遷移支援。其他有日期的報告保留各自的歷史基準。
 
 > [!IMPORTANT]
 > 這是維護文件，不是永久相容性承諾。Upstream sync 後，已被上游接收或不再存在的差異必須從本表移除或重新分類。
@@ -47,7 +47,6 @@ skill 遷移未完成事項。Native 工具送訊息預設排隊投遞，不啟�
 | GitHub final-publication policy | Issue 與 PR review 的 prompt 告知 agent 由 Lilac 自行發布最終回覆：agent 不得再透過 `gh`、GitHub API 或 `surface.messages.send` 重複發布；若已直接發布，或 `gh pr review` 送出成功，則回傳 `NO_REPLY` | `apps/core/src/github/webhook/github-webhook-server.ts`、fork PR [#56](https://github.com/DF-wu/lilac-mono/pull/56) | 只是 prompt 指引；模型若忽略仍可能重複發文 |
 | Custom media plugin example | 提供 external Level 2 image/video plugin，使用 OpenAI-compatible image API 與 QuantumNous/new-api-compatible video flow | [`custom-media/README.md`](../examples/plugins/custom-media/README.md)、fork PR [#30](https://github.com/DF-wu/lilac-mono/pull/30) | Plugin 是 trusted in-process code；restricted callers 目前不能直接使用 external callables |
 | 本次輸入的壓縮保護 | Core 在 threshold 檢查前驗證本次輸入邊界；沒有舊歷史時略過軟性壓縮，摘要舊歷史時保留本次輸入原文。未提供保護邊界的呼叫端維持上游的作用中請求壓縮行為 | `packages/agent/auto-compaction.ts`、`apps/core/src/surface/bridge/bus-agent-runner.ts`、fork PR [#82](https://github.com/DF-wu/lilac-mono/pull/82) | 真正 overflow 仍走既有恢復／失敗路徑；略過軟性壓縮不保證下一次請求能放入 context |
-| 單一原生會話搜尋 | Core 先透過 SQLite 的會話索引找到指定會話，再展開並排序其中的訊息。當 `discovery.search` 讀取命中的前後文時，可省去解析其他會話的工作。 | [原生會話搜尋實作](../apps/core/src/surface/native/store-search.ts)、fork PR [#121](https://github.com/DF-wu/lilac-mono/pull/121) | 適用於指定會話 ID 的搜尋及前後文讀取。全域搜尋仍會掃描呼叫者有權存取的會話。 |
 | Compatible-provider tool calls | Compatible provider 即使回傳 `other` 等非標準 finish reason，只要已解析出 local tool calls 仍會執行並保存結果 | Commit [`1c58e532`](https://github.com/DF-wu/lilac-mono/commit/1c58e532201ee51782c98c1d8b16086f6bf45c34) | 只信任已通過 parser 的 local tool calls；不會把任意 provider text 當成 tool invocation |
 | Compatible-provider tool images | 把 tool results 的圖片移至完整平行 tool-result group 後方，成為附有來源標籤的 user image message，讓通用 Chat Completions 接收視覺輸入而非序列化圖片資料 | `packages/utils/openai-compatible-tool-images.ts`、`packages/utils/tests/openai-compatible-tool-images.test.ts` | 僅轉換 provider view，canonical history 不變；endpoint 與模型仍須支援 user image inputs；官方 OpenAI Responses 路徑不使用此 shim |
 | Container delivery | Build workflow 發布經驗證的 `catalina`、`claudia` 與 SHA tags，`latest` 指向 `catalina`；每個 variant 都有各自的帳號與 home directory，image 另加入 `rsync` | [`build-image.yml`](../.github/workflows/build-image.yml)、[`Dockerfile`](../Dockerfile) | 兩個發布 variant 都使用 UID/GID 3000；host bind mounts 必須允許該數字身分存取 |
