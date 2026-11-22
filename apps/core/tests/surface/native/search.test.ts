@@ -55,6 +55,29 @@ describe("native search authority", () => {
     expect(result.nextCursor).toBeUndefined();
     expect(search.query("owner", { query: "needle" }).unwrap().items).toHaveLength(2);
   });
+  test("global search pages preserve message order when timestamps tie", () => {
+    const visible = thread("alice", "visible", "First Needle");
+    thread("bob", "private", "Private needle");
+    store
+      .appendMessage(visible.id, 0, visible.turnId, {
+        id: "reply",
+        role: "assistant",
+        parts: [
+          { type: "text", text: "Second" },
+          { type: "text", text: "Needle" },
+        ],
+      })
+      .unwrap();
+
+    const first = search.query("alice", { query: "needle", limit: 1 }).unwrap();
+    expect(first.items.map((item) => item.excerpt)).toEqual(["Second\nNeedle"]);
+    expect(first.nextCursor).toBe("1");
+    const next = search
+      .query("alice", { query: "needle", limit: 1, cursor: first.nextCursor })
+      .unwrap();
+    expect(next.items.map((item) => item.excerpt)).toEqual(["First Needle"]);
+    expect(next.nextCursor).toBeUndefined();
+  });
   test("share removal revokes content, metadata, and reads immediately", () => {
     const hidden = thread("alice", "secret", "needle");
     store.shareThread("owner", { threadId: hidden.id, userId: "bob", grant: "read" }).unwrap();
