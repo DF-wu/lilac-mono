@@ -29,20 +29,25 @@ export type NativeSearchInput = {
 };
 
 function projectMessages(scopedToThread: boolean): string {
-  // A thread filter preserves the full partition used to assign message ordinals.
-  return `WITH messages AS (
+  // Materialize the extracted fields so the window sort never carries full turn JSON.
+  return `WITH decoded_messages AS MATERIALIZED (
   SELECT t.id AS threadId, json_extract(t.data_json,'$.value.title') AS title,
     json_extract(r.data_json,'$.value.turnId') AS turnId,
     json_extract(m.value,'$.id') AS messageId,
     COALESCE((SELECT group_concat(json_extract(p.value,'$.text'), char(10)) FROM json_each(m.value,'$.parts') p WHERE json_extract(p.value,'$.type')='text'), '') AS text,
     COALESCE(json_extract(m.value,'$.metadata.authorId'), CASE json_extract(m.value,'$.role') WHEN 'assistant' THEN 'lilac' ELSE json_extract(t.data_json,'$.value.starterId') END) AS authorId,
     COALESCE(json_extract(m.value,'$.metadata.createdAt'), json_extract(t.data_json,'$.value.createdAt')) AS createdAt,
-    row_number() OVER (PARTITION BY t.id ORDER BY r.position, CAST(m.key AS INTEGER)) - 1 AS ordinal
+    r.position AS turnPosition,
+    CAST(m.key AS INTEGER) AS messagePosition
   FROM native_records t JOIN native_records r ON r.thread_id=t.id AND r.kind='turn'
   JOIN json_each(r.data_json,'$.value.messages') m
   WHERE t.kind='thread' AND json_extract(t.data_json,'$.value.deleted')=0 AND json_extract(t.data_json,'$.value.ephemeral') IS NULL
     AND ((?='owner' AND json_extract(t.data_json,'$.value.kind') IS NULL) OR json_extract(t.data_json,'$.value.starterId')=? OR (json_extract(t.data_json,'$.value.kind') IS NULL AND EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=t.id AND g.user_id=?)))
     ${scopedToThread ? "AND t.id=?" : ""}
+), messages AS (
+  SELECT threadId, title, turnId, messageId, text, authorId, createdAt,
+    row_number() OVER (PARTITION BY threadId ORDER BY turnPosition, messagePosition) - 1 AS ordinal
+  FROM decoded_messages
 )`;
 }
 
