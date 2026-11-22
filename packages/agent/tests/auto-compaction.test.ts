@@ -2351,6 +2351,7 @@ describe("auto-compaction internals", () => {
     const serverInputs: ModelMessage[][] = [];
     let mainCalls = 0;
     const mainModel = new MockLanguageModelV4({
+      provider: "openai.responses",
       doStream: async ({ prompt }) => {
         mainCalls += 1;
         prompts.push(JSON.stringify(prompt));
@@ -2442,6 +2443,7 @@ describe("auto-compaction internals", () => {
     const prompts: string[] = [];
     let mainCalls = 0;
     const mainModel = new MockLanguageModelV4({
+      provider: "openai.responses",
       doStream: async ({ prompt }) => {
         mainCalls += 1;
         prompts.push(JSON.stringify(prompt));
@@ -2555,6 +2557,7 @@ describe("auto-compaction internals", () => {
       },
     });
     const mainModel = new MockLanguageModelV4({
+      provider: "test.mock",
       doStream: async () => summaryResponse("answer"),
     });
     const latest: ModelMessage = {

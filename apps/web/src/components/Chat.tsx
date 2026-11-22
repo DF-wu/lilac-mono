@@ -3,7 +3,14 @@ import { Result } from "better-result";
 import { RecentContextProvider } from "./RecentContext";
 import { currentPushDeviceId } from "../push-device";
 import { watchReadLifecycle } from "../read-lifecycle";
-import { rewindDraft } from "../rewind-draft";
+import { useDmRewind } from "../use-dm-rewind";
+import {
+  rewindRestrictionReason,
+  rewindRejectionReason,
+  type RewindReason,
+} from "../rewind-policy";
+import { RewindDialog } from "./RewindDialog";
+import { prepareRewindDraft, type RewindAttempt } from "../rewind-draft";
 import type { OptimisticTurn } from "../optimistic-turns";
 import { useEventCallback } from "../use-event-callback";
 import { useStore } from "zustand";
@@ -64,7 +71,6 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
-import { RotateCcw } from "lucide-react";
 import type {
   NativeInput,
   NativeInputReceipt,
@@ -74,8 +80,15 @@ import type {
   NativeThread,
   ReadyTurnSlot,
 } from "@stanley2058/lilac-client-protocol";
-import type { ChatCommon, ComposerSubmission } from "../types";
+import type { Attachment, ChatCommon, ComposerSubmission, UploadReference } from "../types";
 import { resolveAttachmentIds } from "../uploads";
+import {
+  attachmentStaging,
+  canUseStagedUpload,
+  draftAttachments,
+  readyUploadReference,
+  referencedAttachment,
+} from "../attachment-reference";
 import { inputDeliveryOptions } from "../input-mode";
 import { deliverPendingInput, type PendingInput } from "../pending-input";
 import { pendingTurnSlot } from "../pending-message";
@@ -84,7 +97,7 @@ import { ConversationStatus } from "./ConversationStatus";
 import { Timeline, useLatestReadableTurn } from "./Timeline";
 import { QueuedMessage, QueuedMessages } from "./QueuedMessage";
 import type { OutlineSource } from "../timeline-outline";
-import { attempt, Modal } from "./ui";
+import { attempt } from "./ui";
 import { toast } from "./ui/toast";
 import { isConnectionFailure } from "../connection-lifecycle";
 import { UploadProgressContext } from "../upload-context";
@@ -135,6 +148,7 @@ export function Chat(props: ChatProps) {
     drafts: draftStore,
   } = useWorkspace();
   const { thread, threadId } = props;
+  const rewindAttempt = useStore(draftStore, (state) => state.rewinds.get(threadId));
   const local = threadId.startsWith("draft:");
   const localThread = useStore(
     draftStore,
@@ -199,9 +213,10 @@ export function Chat(props: ChatProps) {
   const replyStep = Math.min(progress.step, Math.max(replyPrompts.length - 1, 0));
   const replyPrompt = replyPrompts[replyStep];
   const draftKey =
-    replyMessageId && replyPrompt
+    rewindAttempt?.draftKey ??
+    (replyMessageId && replyPrompt
       ? questionDraftKey(threadId, replyMessageId, replyPrompt.ordinal)
-      : threadId;
+      : threadId);
   const draftOptions = composerDraftOptions(scope, draftKey, draftCache);
   // Draft writes wait for a pause in typing; leaving the conversation writes them now.
   useEffect(() => () => void draftCache?.flushDrafts?.(), [draftCache, threadId]);
@@ -220,6 +235,7 @@ export function Chat(props: ChatProps) {
     error?: string;
     historyError?: string;
     rewindTarget?: string;
+    rewindRejected?: RewindReason;
     rewinding?: boolean;
     latestVisible?: boolean;
     unknownAuthor?: string;
@@ -246,7 +262,7 @@ export function Chat(props: ChatProps) {
     [updateView],
   );
   const setRewindTarget = useCallback(
-    (rewindTarget?: string) => updateView({ rewindTarget }),
+    (rewindTarget?: string) => updateView({ rewindTarget, rewindRejected: undefined }),
     [updateView],
   );
   const setRewinding = (rewinding: boolean) => updateView({ rewinding });
@@ -254,9 +270,17 @@ export function Chat(props: ChatProps) {
     (latestVisible: boolean) => updateView({ latestVisible }),
     [updateView],
   );
-  const { error, historyError, rewindTarget, rewinding, latestVisible, unknownAuthor } =
-    view.id === threadId ? view : {};
+  const {
+    error,
+    historyError,
+    rewindTarget,
+    rewindRejected,
+    rewinding,
+    latestVisible,
+    unknownAuthor,
+  } = view.id === threadId ? view : {};
   const currentId = useRef(threadId);
+  const composerElement = useRef<HTMLDivElement>(null);
   const getDraft = (key = draftKey) =>
     local
       ? (draftStore.getState().localDrafts.get(threadId)?.draft ?? emptyDraft)
@@ -286,8 +310,13 @@ export function Chat(props: ChatProps) {
     (listener: () => void) => store.subscribe(listener),
     [store],
   );
-  const historySnapshot = useCallback(() => !!store.checkpoint, [store]);
-  const historyLoaded = useSyncExternalStore(subscribeHistory, historySnapshot, historySnapshot);
+  const historySnapshot = useCallback(() => store.checkpoint?.historyGeneration, [store]);
+  const historyGeneration = useSyncExternalStore(
+    subscribeHistory,
+    historySnapshot,
+    historySnapshot,
+  );
+  const historyLoaded = historyGeneration !== undefined;
   const readableTurnId = useLatestReadableTurn(store);
   const sendingEntry = localThread?.sending
     ? localThread.creation?.entry
@@ -348,6 +377,21 @@ export function Chat(props: ChatProps) {
     enabled: online && !local && editable,
   });
   const queuedItems = editable ? (queueQuery.data?.items ?? []) : [];
+  const rewindRestriction = useDmRewind({
+    client,
+    threadId,
+    ownerId: scope.principalId,
+    dm: thread?.kind === "dm",
+    online,
+    busy:
+      active ||
+      queuedItems.length > 0 ||
+      pendingEntries.some((entry) => entry.state !== "rejected"),
+  });
+  const rewindReason =
+    rewindRejected ??
+    (rewindAttempt ? undefined : rewindRestrictionReason(rewindRestriction, rewindTarget));
+
   const queue = queuedItems.filter((entry) => entry.mode !== "prompt");
   // A steer or a prompt with a turn already shows in the timeline. The rest wait after the last
   // turn, such as a prompt held behind an earlier input that is still uploading.
@@ -407,8 +451,18 @@ export function Chat(props: ChatProps) {
   const attachments = useMemo(
     () =>
       localThread?.attachments ??
-      uploads.filter((attachment) => draft.attachments.includes(attachment.key)),
-    [localThread?.attachments, uploads, draft.attachments],
+      draftAttachments(draft.attachments, draft.attachmentReferences, uploads),
+    [localThread?.attachments, uploads, draft.attachments, draft.attachmentReferences],
+  );
+  const attachmentAvailable = useCallback(
+    (item: Attachment) =>
+      pool.isPublished(item.resourceId) ||
+      canUseStagedUpload(
+        attachmentStaging(item),
+        threadId,
+        store.checkpoint?.historyGeneration ?? historyGeneration,
+      ),
+    [historyGeneration, pool, store, threadId],
   );
   const refreshQueue = useCallback(() => refreshQueueQuery(queries, threadId), [queries, threadId]);
   useEffect(() => {
@@ -443,11 +497,14 @@ export function Chat(props: ChatProps) {
   }, [client, store, threadId, local, queries]);
   const regularDraftEmpty =
     draftKey === threadId ? !draft.hasText && !draft.attachments.length : false;
-  const autoReply = draftLoaded
-    ? autoReplyQuestion(answerable, replyChoice, regularDraftEmpty)
-    : undefined;
-  const chooseReply = (messageId: string, replying: boolean) =>
+  const autoReply =
+    draftLoaded && !rewindAttempt
+      ? autoReplyQuestion(answerable, replyChoice, regularDraftEmpty)
+      : undefined;
+  const chooseReply = (messageId: string, replying: boolean) => {
+    if (draftStore.getState().rewinds.has(threadId)) return;
     questionReplyStore.getState().choose(threadId, { messageId, replying });
+  };
   useEffect(() => {
     if (autoReply) chooseReply(autoReply, true);
   }, [autoReply, threadId]);
@@ -455,6 +512,7 @@ export function Chat(props: ChatProps) {
     undefined,
   );
   useEffect(() => {
+    if (rewindAttempt) return;
     const previous = previousReply.current;
     previousReply.current = replyMessageId
       ? { threadId, messageId: replyMessageId, ordinals: replyPrompts.map((item) => item.ordinal) }
@@ -473,11 +531,21 @@ export function Chat(props: ChatProps) {
       removeQuestionDraft(key);
       if (!leftover.text.trim() && !leftover.attachments.length && !leftover.skillIds.length)
         continue;
-      commitDraft(mergeClosedReply(getDraft(threadId), leftover), threadId);
+      const regular = getDraft(threadId);
+      commitDraft(
+        {
+          ...mergeClosedReply(regular, leftover),
+          attachmentReferences: [
+            ...(regular.attachmentReferences ?? []),
+            ...(leftover.attachmentReferences ?? []),
+          ],
+        },
+        threadId,
+      );
       moved = true;
     }
     if (moved) toast.add({ title: "The question closed. Your reply is now a regular draft." });
-  }, [replyMessageId, threadId]);
+  }, [replyMessageId, threadId, rewindAttempt]);
   useEffect(() => {
     const changed = previousActive.current !== active;
     previousActive.current = active;
@@ -543,6 +611,19 @@ export function Chat(props: ChatProps) {
       });
       return;
     }
+    if (
+      entry.submission.attachments.some(
+        (item) =>
+          !pool.isPublished(item.resourceId) &&
+          !canUseStagedUpload(attachmentStaging(item), threadId, checkpoint.historyGeneration),
+      )
+    ) {
+      setPending(entry.commandId, {
+        state: "rejected",
+        error: "Reattach or remove the missing files before sending.",
+      });
+      return;
+    }
     const questionReply = entry.submission.questionReply;
     if (questionReply && !(await questionStillOpen(questionReply))) {
       setPending(entry.commandId, {
@@ -577,7 +658,7 @@ export function Chat(props: ChatProps) {
       ),
       reasoning:
         serverActive && entry.submission.mode === "steer" ? undefined : entry.submission.reasoning,
-      attachmentIds: ids.filter((id): id is string => !!id),
+      attachmentIds: [...new Set(ids.filter((id): id is string => !!id))],
       skillIds: entry.submission.skillIds,
       command: entry.submission.command,
       ...(questionReply ? { questionReply } : {}),
@@ -612,7 +693,10 @@ export function Chat(props: ChatProps) {
       currentId.current !== threadId || canEdit.current,
     );
     if (outcome?.kind !== "accepted") return;
-    if (sent) showQueued(sent, outcome.receipt);
+    if (sent) {
+      pool.markPublished(sent.attachmentIds);
+      showQueued(sent, outcome.receipt);
+    }
     if (!awaitingProjection)
       for (const attachment of entry.submission.attachments) pool.release(threadId, attachment.key);
     void refreshQueue();
@@ -676,6 +760,10 @@ export function Chat(props: ChatProps) {
       props.onLocalSubmit(threadId, submission);
       return;
     }
+    if (submission.attachments.some((item) => !attachmentAvailable(item))) {
+      setError("Reattach or remove the missing files before sending.");
+      return;
+    }
     const entry: PendingInput = {
       commandId: crypto.randomUUID(),
       text: submission.text,
@@ -705,20 +793,10 @@ export function Chat(props: ChatProps) {
     );
     void refreshQueue();
   }
-  async function rewind() {
-    const rpc = client.rpc,
-      checkpoint = store.checkpoint;
-    if (
-      !draftLoaded ||
-      !canEdit.current ||
-      !rpc ||
-      !checkpoint ||
-      !rewindTarget ||
-      rewinding ||
-      active
-    )
-      return;
-    setRewinding(true);
+  async function prepareRewind(): Promise<RewindAttempt["prepared"]> {
+    const rpc = client.rpc;
+    const checkpoint = store.checkpoint;
+    if (!rpc || !checkpoint || !rewindTarget) return;
     let target = store.get(rewindTarget);
     while (target?.kind === "ready" && target.partsCursor) {
       const cursor = target.partsCursor;
@@ -726,7 +804,6 @@ export function Chat(props: ChatProps) {
       target = store.get(rewindTarget);
       if (target?.kind !== "ready" || target.partsCursor === cursor) {
         setError("Could not load the complete message. Try rewinding again.");
-        setRewinding(false);
         return;
       }
     }
@@ -738,41 +815,97 @@ export function Chat(props: ChatProps) {
         : undefined;
     if (!message) {
       setError("The message is no longer available.");
+      return;
+    }
+    const request = {
+      threadId,
+      commandId: crypto.randomUUID(),
+      historyGeneration: checkpoint.historyGeneration,
+      expectedRevision: checkpoint.projectionRevision,
+      turnId: rewindTarget,
+    };
+    const finish = await prepareRewindDraft({
+      parts: message.parts,
+      threadId,
+      pool,
+      onError: setError,
+    });
+    return finish ? { request, finish } : undefined;
+  }
+
+  async function rewind() {
+    if (
+      !draftLoaded ||
+      !canEdit.current ||
+      !rewindTarget ||
+      rewinding ||
+      rewindAttempt?.running ||
+      rewindAttempt?.completed ||
+      rewindReason ||
+      (!rewindAttempt && active)
+    )
+      return;
+    const pending = draftStore.getState().claimRewind(threadId, rewindTarget, draftKey);
+    if (!pending) return;
+    const setPendingAttempt = (next?: RewindAttempt) =>
+      draftStore.getState().setRewind(threadId, pending.owner, next);
+    setRewinding(true);
+    const prepared = pending.prepared ?? (await prepareRewind());
+    if (!prepared) {
+      setPendingAttempt();
       setRewinding(false);
       return;
     }
-    const restored = await rewindDraft({
-      parts: message.parts,
-      threadId,
-      resourceUrl,
-      pool,
+    const ready = { ...pending, prepared };
+    setPendingAttempt(ready);
+    const restored = await prepared.finish({
       onError: setError,
       rewind: async () => {
-        if (!canEdit.current || currentId.current !== threadId) return;
+        const rpc = client.rpc;
+        if (!rpc) return;
         return attempt(
-          () =>
-            rpc.threads.rewind({
-              threadId,
-              commandId: crypto.randomUUID(),
-              historyGeneration: checkpoint.historyGeneration,
-              expectedRevision: checkpoint.projectionRevision,
-              turnId: rewindTarget,
-            }),
-          setError,
+          () => rpc.threads.rewind(prepared.request),
+          (message) => {
+            const reason = rewindRejectionReason(message);
+            if (reason) {
+              setPendingAttempt();
+              updateView({ rewindRejected: reason });
+              return;
+            }
+            setError(message);
+          },
         );
       },
     });
     setRewinding(false);
-    if (!restored) return;
-    const current = getDraft();
-    commitDraft({
-      ...restored,
-      skillIds: [],
-      savedText: current.text || current.savedText,
-    });
-    setRewindTarget(undefined);
+    if (!restored) {
+      setPendingAttempt({ ...ready, running: false });
+      return;
+    }
+    setPendingAttempt({ ...ready, running: false, completed: restored });
     void refreshQueue();
   }
+  const applyRewindReplacement = useEventCallback(() => {
+    const pending = draftStore.getState().rewinds.get(threadId);
+    if (!pending?.completed || !props.foreground) return;
+    previousReply.current = undefined;
+    if (pending.draftKey && pending.draftKey !== threadId) removeQuestionDraft(pending.draftKey);
+    const choice = questionReplyStore.getState().choices.get(threadId);
+    if (choice) questionReplyStore.getState().choose(threadId, { ...choice, replying: false });
+    const completed = pending.completed;
+    const ready = draftAttachments(
+      completed.attachments,
+      completed.attachmentReferences,
+      pool.get(threadId),
+    ).flatMap((item) => {
+      const reference = readyUploadReference(item);
+      return reference ? [reference] : [];
+    });
+    commitDraft({ ...completed, skillIds: [], attachmentReferences: ready }, threadId);
+    draftStore.getState().setRewind(threadId, pending.owner);
+    updateView({ rewindTarget: undefined, rewindRejected: undefined });
+  });
+
   const onAction = useCallback(
     (messageId: string, part: Extract<DisplayPart, { type: "data-actions" }>, actionId: string) => {
       if (!client.rpc) return;
@@ -867,6 +1000,19 @@ export function Chat(props: ChatProps) {
       return;
     }
     const keys = drafts.flatMap((saved) => saved!.attachments);
+    const replies = draftAttachments(
+      keys,
+      drafts.flatMap((saved) => saved?.attachmentReferences ?? []),
+      pool.get(threadId),
+    );
+    if (replies.length !== keys.length || replies.some((item) => !attachmentAvailable(item))) {
+      setError("Reattach or remove the missing files before sending.");
+      return;
+    }
+    if (replies.length > 32) {
+      toast.add({ title: "A message can contain at most 32 attachments.", type: "error" });
+      return;
+    }
     chooseReply(messageId, false);
     updateProgress(messageId, () => undefined);
     submit(
@@ -876,7 +1022,7 @@ export function Chat(props: ChatProps) {
         // The composer keeps at most 32 skill references per draft.
         skillIds: [...new Set(drafts.flatMap((saved) => saved!.skillIds))].slice(0, 32),
         mode: "followup",
-        attachments: pool.get(threadId).filter((attachment) => keys.includes(attachment.key)),
+        attachments: replies,
       },
       target,
     );
@@ -884,7 +1030,7 @@ export function Chat(props: ChatProps) {
       removeQuestionDraft(questionDraftKey(threadId, messageId, prompt.ordinal));
   }
   const questionAdvance = useEventCallback(() => {
-    if (!replyQuestion) return;
+    if (rewindAttempt || !replyQuestion) return;
     const next = nextPromptStep(
       replyAnswered.map((answered, step) => answered || step === replyStep),
       replyStep,
@@ -895,14 +1041,14 @@ export function Chat(props: ChatProps) {
   const autoAdvance = useRef<ReturnType<typeof setTimeout>>(undefined);
   useEffect(() => () => clearTimeout(autoAdvance.current), [threadId, replyMessageId, replyStep]);
   const questionChoose = useEventCallback(async (ordinal: number, index: number) => {
-    if (!replyQuestion || replyPrompt?.ordinal !== ordinal) return;
+    if (rewindAttempt || !replyQuestion || replyPrompt?.ordinal !== ordinal) return;
     const messageId = replyQuestion.questionCallId;
     const key = draftKey;
     const current = getDraft(key);
     // An option replaces the typed answer, so the text moves to the regular draft instead of vanishing.
     if (current.text.trim()) {
       const regular = await loadDraft(threadId);
-      if (!regular) return;
+      if (!regular || draftStore.getState().rewinds.has(threadId)) return;
       commitDraft(
         mergeClosedReply<string, Draft>(regular, {
           text: current.text,
@@ -923,6 +1069,7 @@ export function Chat(props: ChatProps) {
     autoAdvance.current = setTimeout(questionAdvance, 200);
   });
   const questionStep = useEventCallback((step: number) => {
+    if (rewindAttempt) return;
     if (replyMessageId) updateProgress(replyMessageId, (current) => ({ ...current, step }));
   });
   const questionReply = useEventCallback((messageId: string) => chooseReply(messageId, true));
@@ -980,48 +1127,122 @@ export function Chat(props: ChatProps) {
     commitDraft({ ...getDraft(), commandId }),
   );
   const composerText = useEventCallback((text: string) => commitDraft({ ...getDraft(), text }));
-  const composerAttach = useEventCallback((files: File[], requireAll?: boolean) => {
+  function addDraftAttachments(
+    items: readonly (File | { reference: UploadReference; file?: File })[],
+    requireAll?: boolean,
+    keys?: readonly string[],
+  ) {
+    const current = getDraft();
+    const available = keys ? items.length : Math.max(0, 32 - current.attachments.length);
+    if (requireAll && items.length > available) return [];
+    const historyGeneration = store.checkpoint?.historyGeneration;
+    if (!keys && !local && historyGeneration === undefined) return [];
+    const added = items.slice(0, available).map((item, index) => {
+      const key = keys?.[index];
+      if (!(item instanceof File)) {
+        const reference = { ...item.reference, key: key ?? crypto.randomUUID() };
+        return item.file && reference.staging
+          ? pool.keepFile(threadId, reference.key, item.file, reference)
+          : referencedAttachment(reference);
+      }
+      if (local) return { ...draftAttachment(item), ...(key ? { key } : {}) };
+      if (key && historyGeneration === undefined) return pool.keepFile(threadId, key, item);
+      const uploadKey = pool.add(threadId, item, historyGeneration, key, draftKey);
+      return pool.get(threadId).find((attachment) => attachment.key === uploadKey)!;
+    });
+    const next = {
+      ...current,
+      attachments: [...current.attachments, ...added.map((item) => item.key)],
+      attachmentReferences: [
+        ...(current.attachmentReferences ?? []),
+        ...added.flatMap((item) => {
+          const reference = readyUploadReference(item);
+          return reference ? [reference] : [];
+        }),
+      ],
+    };
     if (local) {
-      const current = draftStore.getState().localDrafts.get(threadId);
-      if (!current) return [];
-      const available = 32 - current.attachments.length;
-      if (requireAll && files.length > available) return [];
-      const added = files.slice(0, available).map(draftAttachment);
       props.onLocalChange(threadId, (current) => ({
         ...current,
         attachments: [...current.attachments, ...added],
-        draft: {
-          ...current.draft,
-          attachments: [...current.draft.attachments, ...added.map((item) => item.key)],
-        },
+        draft: next,
       }));
-      return added;
+    } else {
+      commitDraft(next);
     }
-    const current = getDraft();
-    const available = 32 - current.attachments.length;
-    if (requireAll && files.length > available) return [];
-    const keys = files.slice(0, available).map((file) => pool.add(threadId, file));
-    commitDraft({ ...current, attachments: [...current.attachments, ...keys] });
-    return keys.map((key) => pool.get(threadId).find((attachment) => attachment.key === key)!);
-  });
+    return added;
+  }
+  const composerAttach = useEventCallback((files: File[], requireAll?: boolean) =>
+    addDraftAttachments(files, requireAll),
+  );
+  const composerPasteAttachments = useEventCallback(
+    (attachments: readonly Attachment[], restoreKeys?: boolean) => {
+      if (!restoreKeys && !local && !store.checkpoint) return;
+      const generation = store.checkpoint?.historyGeneration;
+      const items = attachments.flatMap<File | { reference: UploadReference; file?: File }>(
+        (attachment) => {
+          const reference = readyUploadReference(attachment);
+          if (reference && pool.isPublished(reference.resourceId))
+            return [{ reference: { ...reference, staging: undefined }, file: attachment.file }];
+          if (
+            reference &&
+            (restoreKeys || canUseStagedUpload(reference.staging, threadId, generation))
+          )
+            return [{ reference, file: attachment.file }];
+          return attachment.file ? [attachment.file] : [];
+        },
+      );
+      if (items.length !== attachments.length) {
+        setError("An attachment is unavailable in this conversation.");
+        return;
+      }
+      const added = addDraftAttachments(
+        items,
+        true,
+        restoreKeys ? attachments.map((item) => item.key) : undefined,
+      );
+      if (added.length === items.length) return added;
+      toast.add({ title: "A message can contain at most 32 attachments.", type: "error" });
+    },
+  );
   const composerRemoveAttachment = useEventCallback((key: string) => {
+    const current = getDraft();
+    const next = {
+      ...current,
+      attachments: current.attachments.filter((id) => id !== key),
+      attachmentReferences: current.attachmentReferences?.filter((item) => item.key !== key),
+    };
     if (local) {
       releaseDraftAttachments(attachments.filter((item) => item.key === key));
       props.onLocalChange(threadId, (current) => ({
         ...current,
         attachments: current.attachments.filter((item) => item.key !== key),
-        draft: {
-          ...current.draft,
-          attachments: current.draft.attachments.filter((id) => id !== key),
-        },
+        draft: next,
       }));
       return;
     }
     pool.remove(threadId, key);
-    const current = getDraft();
-    commitDraft({ ...current, attachments: current.attachments.filter((id) => id !== key) });
+    commitDraft(next);
   });
-  const composerRetryAttachment = useEventCallback((key: string) => pool.retry(threadId, key));
+  const composerRetryAttachment = useEventCallback((key: string) => {
+    const generation = store.checkpoint?.historyGeneration;
+    const attachment = pool.get(threadId).find((item) => item.key === key);
+    if (
+      attachment &&
+      generation !== undefined &&
+      (!attachment.staging || !canUseStagedUpload(attachment.staging, threadId, generation))
+    ) {
+      const current = getDraft();
+      pool.remove(threadId, key);
+      pool.add(threadId, attachment.file, generation, key, draftKey);
+      commitDraft({
+        ...current,
+        attachmentReferences: current.attachmentReferences?.filter((item) => item.key !== key),
+      });
+      return;
+    }
+    pool.retry(threadId, key);
+  });
   const composerModelChange = useEventCallback((modelId: string, reasoning?: ModelReasoning) => {
     if (local) {
       props.onLocalChange(threadId, (current) => ({ ...current, modelId, reasoning }));
@@ -1111,28 +1332,43 @@ export function Chat(props: ChatProps) {
       </QueuedMessages>
     ) : undefined;
   const composer = (
-    <div className="chat-bottom w-full max-w-[var(--ui-chat-width)] my-0 mx-auto pt-2 px-6 pb-6 max-workspace:px-3 max-workspace:pb-3">
-      {draft.savedText ? (
+    <div
+      ref={composerElement}
+      className="chat-bottom w-full max-w-[var(--ui-chat-width)] my-0 mx-auto pt-2 px-6 pb-6 max-workspace:px-3 max-workspace:pb-3"
+    >
+      {rewindAttempt && !rewindTarget ? (
         <Button
           type="button"
-          variant="ghost"
-          className="text-primary py-2 px-3 text-sm"
-          onClick={() => {
-            const current = getDraft();
-            commitDraft({
-              ...current,
-              text: current.savedText ?? "",
-              savedText: current.text || undefined,
-            });
-          }}
+          variant="secondary"
+          onClick={() => setRewindTarget(rewindAttempt.target)}
         >
-          Restore previous draft
+          Finish rewind
         </Button>
       ) : null}
       <div hidden={!editable}>
         <DraftComposer
           source={draftSource}
           documentKey={draftKey}
+          replacement={
+            props.foreground && rewindAttempt?.completed
+              ? {
+                  id: rewindAttempt.owner,
+                  text: rewindAttempt.completed.text,
+                  documentKey: threadId,
+                  previous:
+                    rewindAttempt.draftKey !== threadId
+                      ? {
+                          text: getDraft(threadId).text,
+                          skills:
+                            props.catalog?.skills.filter((skill) =>
+                              getDraft(threadId).skillIds.includes(skill.id),
+                            ) ?? [],
+                        }
+                      : undefined,
+                }
+              : undefined
+          }
+          onReplacementApplied={applyRewindReplacement}
           header={questionHeader()}
           placeholder={replyPrompt ? answerPlaceholder(replyChosen !== undefined) : undefined}
           answer={composerAnswer}
@@ -1148,6 +1384,9 @@ export function Chat(props: ChatProps) {
           onText={composerText}
           attachments={attachments}
           onAttach={composerAttach}
+          onPasteAttachments={composerPasteAttachments}
+          attachmentAvailable={attachmentAvailable}
+          attachmentDisabled={!local && !historyLoaded}
           onRemoveAttachment={composerRemoveAttachment}
           onRetryAttachment={composerRetryAttachment}
           active={active}
@@ -1215,7 +1454,8 @@ export function Chat(props: ChatProps) {
                 resourceUrl={messageResourceUrl}
                 upload={recoveryUpload}
                 onRewind={setRewindTarget}
-                rewindDisabled={active || thread?.kind === "dm"}
+                rewindDisabled={active || !!rewindAttempt}
+                rewindRestriction={rewindRestriction}
                 timestamps={thread?.kind === "dm"}
                 outline={outline}
                 onAction={onAction}
@@ -1226,35 +1466,17 @@ export function Chat(props: ChatProps) {
           </RecentContextProvider>
         </UploadProgressContext.Provider>
 
-        <Modal
+        <RewindDialog
           open={editable && !!rewindTarget}
-          title="Rewind this conversation?"
+          reason={rewindReason}
+          active={!rewindAttempt && active}
+          rewinding={rewinding || rewindAttempt?.running}
+          focusTarget={() =>
+            composerElement.current?.querySelector<HTMLElement>('[contenteditable="true"]') ?? null
+          }
           onClose={() => setRewindTarget(undefined)}
-        >
-          <p>
-            The selected turn and everything after it will leave the conversation. Its text and
-            attachments return to your composer. File changes and other tool effects remain.
-          </p>
-          {active ? <p>Wait for the agent to finish before rewinding.</p> : null}
-          <div className="dialog-actions flex justify-end gap-2 mt-6">
-            <Button
-              variant="secondary"
-              className="gap-2 rounded-sm px-4"
-              onClick={() => setRewindTarget(undefined)}
-            >
-              Keep conversation
-            </Button>
-            <Button
-              variant="destructive"
-              className="gap-2 rounded-sm px-4"
-              disabled={rewinding || active}
-              onClick={() => void rewind()}
-            >
-              <RotateCcw />
-              Rewind
-            </Button>
-          </div>
-        </Modal>
+          onRewind={() => void rewind()}
+        />
       </div>
     </MessageIdentityContext>
   );

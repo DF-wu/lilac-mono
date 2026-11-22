@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
 
 import {
-  CODEX_BASE_INSTRUCTIONS,
   fromDurableResolvedModelPlan,
+  fromDurableResolvedModelRequest,
   parseCoreConfigV1ToUniversal,
   providers,
   resolveModelChain,
@@ -12,6 +12,7 @@ import {
   resolveModelSlotResult,
   resolveModelSlotPlan,
   toDurableResolvedModelPlan,
+  toDurableResolvedModelRequest,
   withModelPlanReasoning,
   type CoreConfig,
 } from "../index";
@@ -216,7 +217,7 @@ describe("resolveModelSlot", () => {
     });
   });
 
-  it("uses codex_instructions as a top-level meta option for codex", () => {
+  it("ignores retired Codex instructions in v1 model options", () => {
     const cfg = baseConfig();
     cfg.basePrompt = "base prompt";
     cfg.models.main = {
@@ -225,24 +226,40 @@ describe("resolveModelSlot", () => {
         codex_instructions: "hello",
         openai: {
           instructions: "direct provider instruction",
+          systemMessageMode: "remove",
         },
       },
     };
 
     const resolved = resolveModelSlot(cfg, "main");
-    expect(resolved.providerOptions?.openai?.instructions).toBe("hello");
-    expect(resolved.providerOptions?.openai?.parallelToolCalls).toBe(true);
-    expect(resolved.providerOptions?.openai?.store).toBe(false);
-
-    // Ensure the meta key is not forwarded.
-    expect(resolved.providerOptions?.codex_instructions).toBeUndefined();
+    expect(resolved.providerOptions).toEqual({
+      openai: { parallelToolCalls: true, store: false, systemMessageMode: "developer" },
+    });
   });
 
-  it("uses basePrompt for codex instructions when codex_instructions is absent", () => {
+  it("restores old Codex plans with developer input and without retired instructions", () => {
+    const restored = fromDurableResolvedModelRequest({
+      spec: "codex/gpt-4o",
+      provider: "codex",
+      modelId: "gpt-4o",
+      reasoningDisplay: "detailed",
+      providerOptions: {
+        openai: {
+          instructions: "Former Codex prompt",
+          systemMessageMode: "remove",
+          parallelToolCalls: false,
+        },
+      },
+    });
+    expect(restored.providerOptions).toEqual({
+      openai: { parallelToolCalls: false, store: false, systemMessageMode: "developer" },
+    });
+  });
+
+  it("preserves explicitly configured Responses instructions for the OpenAI provider", () => {
     const cfg = baseConfig();
-    cfg.basePrompt = "base prompt";
     cfg.models.main = {
-      model: "codex/gpt-4o",
+      model: "openai/gpt-4o",
       options: {
         openai: {
           instructions: "direct provider instruction",
@@ -251,7 +268,7 @@ describe("resolveModelSlot", () => {
     };
 
     const resolved = resolveModelSlot(cfg, "main");
-    expect(resolved.providerOptions?.openai?.instructions).toBe("base prompt");
+    expect(resolved.providerOptions?.openai?.instructions).toBe("direct provider instruction");
   });
 
   it("uses response_commentary as a top-level meta option for openai", () => {
@@ -330,12 +347,17 @@ describe("resolveModelSlot", () => {
     expect(resolveModelSlot(cfg, "main").openaiServerCompaction).toBe(true);
   });
 
-  it("uses anthropic_prompt_cache as a top-level meta option", () => {
+  it.each([
+    ["legacy", true],
+    ["auto", undefined],
+    [true, undefined],
+    [false, false],
+  ] as const)("resolves the %s cache policy without forwarding it", (setting, override) => {
     const cfg = baseConfig();
     cfg.models.main = {
       model: "openrouter/anthropic/claude-sonnet-4.5",
       options: {
-        anthropic_prompt_cache: true,
+        anthropic_prompt_cache: setting,
         openrouter: {
           route: "fallback",
         },
@@ -343,14 +365,15 @@ describe("resolveModelSlot", () => {
     };
 
     const resolved = resolveModelSlot(cfg, "main");
-    expect(resolved.anthropicPromptCache).toBe(true);
+    const durable = toDurableResolvedModelRequest(resolved, "none");
+    expect(resolved.anthropicPromptCache).toBe(override);
+    expect(durable.anthropicPromptCache).toBe(override);
+    expect(fromDurableResolvedModelRequest(durable).anthropicPromptCache).toBe(override);
     expect(resolved.providerOptions?.openrouter?.route).toBe("fallback");
-
-    // Ensure the meta key is not forwarded.
     expect(resolved.providerOptions?.anthropic_prompt_cache).toBeUndefined();
   });
 
-  it("defaults anthropic_prompt_cache to disabled", () => {
+  it("leaves anthropic_prompt_cache unset when omitted", () => {
     const cfg = baseConfig();
     cfg.models.main = {
       model: "openrouter/anthropic/claude-sonnet-4.5",
@@ -358,6 +381,43 @@ describe("resolveModelSlot", () => {
 
     const resolved = resolveModelSlot(cfg, "main");
     expect(resolved.anthropicPromptCache).toBeUndefined();
+  });
+
+  it("preserves an Anthropic cache opt-out through inheritance and durable model resolution", () => {
+    const cfg = baseConfig();
+    cfg.models.def = {
+      sonnet: {
+        model: "openrouter/anthropic/claude-sonnet-4.5",
+        options: { anthropic_prompt_cache: "legacy" },
+      },
+    };
+    cfg.models.main = {
+      model: "sonnet",
+      options: { anthropic_prompt_cache: false },
+    };
+
+    const resolved = resolveModelSlot(cfg, "main");
+    const durable = toDurableResolvedModelRequest(resolved, "none");
+
+    expect(resolved.anthropicPromptCache).toBe(false);
+    expect(resolved.providerOptions?.anthropic_prompt_cache).toBeUndefined();
+    expect(durable.anthropicPromptCache).toBe(false);
+    expect(fromDurableResolvedModelRequest(durable).anthropicPromptCache).toBe(false);
+  });
+
+  it("keeps accepting an older configuration with a null Anthropic cache option", () => {
+    const cfg = parseCoreConfigV1ToUniversal({
+      models: {
+        main: {
+          model: "cerebras/gpt-oss-120b",
+          options: { anthropic_prompt_cache: null },
+        },
+      },
+    });
+
+    const resolved = resolveModelSlot(cfg, "main");
+    expect(resolved.anthropicPromptCache).toBeUndefined();
+    expect(resolved.providerOptions).toBeUndefined();
   });
 
   it("uses response_commentary as a top-level meta option for codex", () => {
@@ -371,7 +431,7 @@ describe("resolveModelSlot", () => {
 
     const resolved = resolveModelSlot(cfg, "main");
     expect(resolved.responseCommentary).toBe(true);
-    expect(resolved.providerOptions?.openai?.instructions).toBe(CODEX_BASE_INSTRUCTIONS);
+    expect(resolved.providerOptions?.openai).not.toHaveProperty("instructions");
     expect(resolved.providerOptions?.openai?.parallelToolCalls).toBe(true);
     expect(resolved.providerOptions?.openai?.store).toBe(false);
 
@@ -401,17 +461,12 @@ describe("resolveModelSlot", () => {
     const cfg = baseConfig();
     cfg.models.main = {
       model: "codex/gpt-4o",
-      options: {
-        openai: {
-          instructions: "direct provider instruction",
-        },
-      },
     };
 
     const resolved = resolveModelSlot(cfg, "main");
     expect(resolved.providerOptions).toEqual({
       openai: {
-        instructions: CODEX_BASE_INSTRUCTIONS,
+        systemMessageMode: "developer",
         parallelToolCalls: true,
         store: false,
       },

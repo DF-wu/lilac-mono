@@ -1,3 +1,4 @@
+import { closeHistory } from "@tiptap/pm/history";
 import { Extension, Node, getSchema, type Editor, type JSONContent } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
@@ -509,13 +510,40 @@ export function composerCompletionPrefix(editor: Editor): string {
     node.type.name === "hardBreak" ? "\n" : "",
   );
 }
-export function editorAttachmentKeys(doc: DocumentNode): Set<string> {
+export function editorAttachmentKeys(doc: DocumentNode | Fragment): Set<string> {
   const keys = new Set<string>();
   doc.descendants((node) => {
     if (node.type.name === "composer_attachment" && typeof node.attrs.attachmentKey === "string")
       keys.add(node.attrs.attachmentKey);
   });
   return keys;
+}
+
+function remapAttachmentFragment(fragment: Fragment, keys: ReadonlyMap<string, string>): Fragment {
+  const nodes: DocumentNode[] = [];
+  fragment.forEach((node) => {
+    const key =
+      node.type.name === "composer_attachment" ? keys.get(node.attrs.attachmentKey) : undefined;
+    if (key) {
+      nodes.push(node.type.create({ ...node.attrs, attachmentKey: key }, node.content, node.marks));
+      return;
+    }
+    nodes.push(node.isLeaf ? node : node.copy(remapAttachmentFragment(node.content, keys)));
+  });
+  return Fragment.fromArray(nodes);
+}
+
+export function remapAttachmentSlice(
+  slice: Slice,
+  schema: Schema,
+  keys: ReadonlyMap<string, string>,
+): Slice {
+  const remapped = new Slice(
+    remapAttachmentFragment(slice.content, keys),
+    slice.openStart,
+    slice.openEnd,
+  );
+  return Slice.fromJSON(schema, remapped.toJSON());
 }
 export type ComposerSkill = { id: string; name: string };
 export function editorSkillIds(doc: DocumentNode): string[] {
@@ -527,7 +555,11 @@ export function editorSkillIds(doc: DocumentNode): string[] {
 }
 export function insertEditorAttachment(
   editor: Editor,
-  attachment: Pick<Attachment, "key" | "file">,
+  attachment: Pick<Attachment, "key"> &
+    (
+      | { file: Pick<File, "name">; reference?: never }
+      | { file?: never; reference: Pick<NonNullable<Attachment["reference"]>, "name"> }
+    ),
 ) {
   const { from } = editor.state.selection;
   const previous = editor.state.doc.textBetween(Math.max(0, from - 1), from, "", "x");
@@ -535,7 +567,10 @@ export function insertEditorAttachment(
     ...(/\S/.test(previous) ? [{ type: "text", text: " " }] : []),
     {
       type: "composer_attachment",
-      attrs: { attachmentKey: attachment.key, name: attachment.file.name },
+      attrs: {
+        attachmentKey: attachment.key,
+        name: (attachment.file ?? attachment.reference).name,
+      },
     },
     { type: "text", text: " " },
   ]);
@@ -599,7 +634,11 @@ export function completeEditor(
   );
 }
 // Drafts store skill mentions as text. Restore badges for mentions of skills the draft selected.
-export function markEditorSkills(editor: Editor, skills: readonly ComposerSkill[]) {
+export function markEditorSkills(
+  editor: Editor,
+  skills: readonly ComposerSkill[],
+  emitUpdate = true,
+) {
   if (!skills.length) return;
   const pattern = skillMentionPattern(skills.map((skill) => skill.name));
   const { schema, tr } = editor.state;
@@ -622,7 +661,8 @@ export function markEditorSkills(editor: Editor, skills: readonly ComposerSkill[
       );
     }
   });
-  if (tr.docChanged) editor.view.dispatch(tr.setMeta("addToHistory", false));
+  if (tr.docChanged)
+    editor.view.dispatch(tr.setMeta("addToHistory", false).setMeta("preventUpdate", !emitUpdate));
 }
 export function replaceEditorDocument(editor: Editor, text: string) {
   const doc = readComposerDocument(text, editor.schema);
@@ -634,4 +674,36 @@ export function replaceEditorDocument(editor: Editor, text: string) {
       selection: TextSelection.atEnd(doc),
     }),
   );
+}
+
+function updateEditorContent(editor: Editor, content: JSONContent) {
+  editor.view.dispatch(closeHistory(editor.state.tr));
+  editor.commands.setContent(content, { emitUpdate: false });
+  editor.view.dispatch(closeHistory(editor.state.tr));
+}
+
+export function updateEditorDocument(editor: Editor, text: string) {
+  updateEditorContent(editor, readComposerDocument(text, editor.schema).toJSON());
+}
+
+export type ComposerReplacement = {
+  id: symbol;
+  text: string;
+  documentKey: string;
+  previous?: { text: string; skills: readonly ComposerSkill[] };
+};
+
+export function applyEditorRewind(
+  editor: Editor,
+  replacement: ComposerReplacement,
+  skills: readonly ComposerSkill[],
+) {
+  markEditorSkills(editor, skills, false);
+  if (replacement.previous?.text.trim()) {
+    const visible = editor.state.doc.toJSON();
+    updateEditorDocument(editor, replacement.previous.text);
+    markEditorSkills(editor, replacement.previous.skills, false);
+    updateEditorContent(editor, visible);
+  }
+  updateEditorDocument(editor, replacement.text);
 }

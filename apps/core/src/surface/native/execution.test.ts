@@ -1,3 +1,4 @@
+import { projectAssistantTextHistory } from "../bridge/request-composition/normalization";
 import { NativeQuestions } from "./questions";
 import { describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
@@ -88,6 +89,7 @@ function fixture(
   const published: { data: CmdRequestMessageData; headers: Record<string, string> }[] = [];
   let cancellations = 0;
   let cancellationFailure: Error | undefined;
+  let cancellationWait: (() => Promise<void>) | undefined;
   let publicationFailure: EventPublishContractInvalid | EventPublishTransportFailed | undefined;
   const bus: Pick<LilacBus, "publish"> = {
     publish: async (type, data, options) => {
@@ -114,6 +116,7 @@ function fixture(
     runner: () => ({
       cancelNativeSession: async () => {
         cancellations += 1;
+        await cancellationWait?.();
         return cancellationFailure ? Result.err(cancellationFailure) : Result.ok(undefined);
       },
     }),
@@ -167,6 +170,9 @@ function fixture(
     submit,
     request,
     cancellations: () => cancellations,
+    waitForCancellation: (wait?: () => Promise<void>) => {
+      cancellationWait = wait;
+    },
     setNow: (value: number) => {
       now = value;
     },
@@ -1524,6 +1530,430 @@ test("DM context includes a deferred notification after delivery", async () => {
   }
 });
 
+test("DM context boundary drops earlier turns even after steers diverge input and turn positions", async () => {
+  const f = fixture(undefined, true);
+  const finish = async (at: number, answer = "answer") => {
+    f.setNow(at);
+    const request = f.request();
+    const published = storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages);
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...request,
+        requestClient: "native",
+        messages: selectNativeRunMessages(
+          [...published, { role: "assistant", content: answer }],
+          request.requestId,
+          published,
+        ),
+      }),
+    );
+    value(await f.execution.runnerLifecycle.settled(request, "completed"));
+  };
+  try {
+    f.setDmGap(1_000);
+    f.setNow(1_000);
+    f.submit("old topic 1");
+    value(await f.execution.kick(f.thread.id));
+    // Two steers advance input positions ahead of turn positions without creating new turns.
+    f.setNow(1_050);
+    f.submit("steer 1", "steer");
+    value(await f.execution.kick(f.thread.id));
+    f.setNow(1_080);
+    f.submit("steer 2", "steer");
+    value(await f.execution.kick(f.thread.id));
+    // Settle the run request (not the steer publish) with a later completion time to verify
+    // turn completion timing reads this turn's input by turnId rather than by position.
+    f.setNow(1_500);
+    const firstRun = f.request(0);
+    const firstPublished = storedMessagesV1Schema.parse(f.published[0]!.data.messages);
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...firstRun,
+        requestClient: "native",
+        messages: [...firstPublished, { role: "assistant", content: "old answer 1" }],
+      }),
+    );
+    value(await f.execution.runnerLifecycle.settled(firstRun, "completed"));
+
+    // Turn 1 starts within the gap of Turn 0's completion (1_500 + 800 <= 2_500).
+    f.setNow(2_300);
+    const secondReceipt = f.submit("old topic 2");
+    value(await f.execution.kick(f.thread.id));
+    const secondInput = value(f.store.getInput(secondReceipt.inputId));
+    expect(secondInput.position).toBe(3);
+    expect(value(f.store.getTurnPosition(secondInput.turnId!))).toBe(1);
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).toContain("old topic 1");
+    await finish(2_400, "old answer 2");
+
+    // Advance past the gap from Turn 1's completion (2_400 + 1_000 < 4_000).
+    f.setNow(4_000);
+    expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBeNull();
+    const freshReceipt = f.submit("fresh topic");
+    value(await f.execution.kick(f.thread.id));
+    const freshInput = value(f.store.getInput(freshReceipt.inputId));
+    expect(value(f.execution.context("owner", f.thread.id))).toMatchObject({
+      active: true,
+      firstTurnPosition: 2,
+    });
+    expect(f.published.at(-1)!.data.messages).toHaveLength(1);
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).not.toContain("old topic");
+    expect(freshInput.canonicalHistoryStartRequestId).toBe(freshInput.requestId);
+    await finish(4_100, "fresh answer");
+
+    f.setNow(4_500);
+    const followUpReceipt = f.submit("follow up on fresh");
+    value(await f.execution.kick(f.thread.id));
+    const followUpInput = value(f.store.getInput(followUpReceipt.inputId));
+    expect(followUpInput.canonicalHistoryStartRequestId).toBe(freshInput.requestId);
+    expect(f.published.at(-1)!.data.messages).toHaveLength(3);
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).toContain("fresh topic");
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).not.toContain("old topic");
+  } finally {
+    f.close();
+  }
+});
+
+test("DM context boundary drops earlier turns after a DM rewind diverges positions", async () => {
+  const f = fixture(undefined, true);
+  value(
+    f.store.initializeDeployment({
+      titleModel: "fast",
+      transport: "auto",
+      outputStreaming: "paragraph",
+      dmContextGapMs: 1_000,
+      dmTimestampGapMs: 1_800_000,
+      oldMessageSelectionMaxAgeMs: null,
+      storageRetentionMaxAgeMs: null,
+      crossThreadSend: { triggerRun: true },
+    }),
+  );
+  const finish = async (at: number, turnId: string, answer: string) => {
+    f.setNow(at);
+    const request = f.request();
+    const published = storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages);
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...request,
+        requestClient: "native",
+        messages: selectNativeRunMessages(
+          [...published, { role: "assistant", content: answer }],
+          request.requestId,
+          published,
+        ),
+      }),
+    );
+    const thread = value(f.store.getThreadRecord(f.thread.id));
+    value(
+      f.store.projectTurn(
+        f.thread.id,
+        thread.historyGeneration,
+        `settled_${turnId}`,
+        turnId,
+        (slot) => Result.ok({ slot: { ...slot, state: "complete", settledAt: at }, changes: [] }),
+      ),
+    );
+    value(await f.execution.runnerLifecycle.settled(request, "completed"));
+  };
+  try {
+    f.setDmGap(1_000);
+    f.setNow(1_000);
+    const firstReceipt = f.submit("before rewind");
+    value(await f.execution.kick(f.thread.id));
+    await finish(1_100, firstReceipt.turnId!, "answer 0");
+
+    f.setNow(1_200);
+    const rewoundReceipt = f.submit("mistake");
+    value(await f.execution.kick(f.thread.id));
+    await finish(1_300, rewoundReceipt.turnId!, "mistake answer");
+
+    const thread = value(f.store.getThreadRecord(f.thread.id));
+    value(
+      await f.execution.rewind("owner", {
+        threadId: f.thread.id,
+        commandId: crypto.randomUUID(),
+        turnId: rewoundReceipt.turnId!,
+        historyGeneration: thread.historyGeneration,
+        revision: thread.revision,
+      }),
+    );
+
+    f.setNow(1_400);
+    const replacementReceipt = f.submit("replacement");
+    value(await f.execution.kick(f.thread.id));
+    await finish(1_500, replacementReceipt.turnId!, "replacement answer");
+
+    f.setNow(3_000);
+    const freshReceipt = f.submit("after gap");
+    value(await f.execution.kick(f.thread.id));
+    const freshInput = value(f.store.getInput(freshReceipt.inputId));
+    expect(value(f.execution.context("owner", f.thread.id))).toMatchObject({
+      active: true,
+      firstTurnPosition: 2,
+    });
+    expect(f.published.at(-1)!.data.messages).toHaveLength(1);
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).not.toContain("before rewind");
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).not.toContain("replacement");
+    expect(freshInput.canonicalHistoryStartRequestId).toBe(freshInput.requestId);
+  } finally {
+    f.close();
+  }
+});
+
+test("DM delivered posts stay in turn order after earlier steers diverge positions", async () => {
+  const f = fixture(undefined, true);
+  const post = (id: string, at: number) => {
+    f.setNow(at);
+    value(
+      f.store.postMessage("owner", f.thread.id, {
+        id,
+        role: "assistant",
+        metadata: { authorId: "lilac", createdAt: at, phase: "final" },
+        parts: [{ type: "text", text: id }],
+      }),
+    );
+  };
+  const texts = () =>
+    storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages).map((message) => {
+      const text =
+        typeof message.content === "string"
+          ? message.content
+          : message.content.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("\n");
+      return stripLeadingSurfaceMetadataLine(text);
+    });
+  try {
+    f.setDmGap(1_000);
+    f.setNow(1_000);
+    f.submit("old turn");
+    value(await f.execution.kick(f.thread.id));
+    f.setNow(1_050);
+    f.submit("old steer 1", "steer");
+    value(await f.execution.kick(f.thread.id));
+    f.setNow(1_080);
+    f.submit("old steer 2", "steer");
+    value(await f.execution.kick(f.thread.id));
+    f.setNow(1_100);
+    const oldRun = f.request(0);
+    const oldPublished = storedMessagesV1Schema.parse(f.published[0]!.data.messages);
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...oldRun,
+        requestClient: "native",
+        messages: [...oldPublished, { role: "assistant", content: "old answer" }],
+      }),
+    );
+    value(await f.execution.runnerLifecycle.settled(oldRun, "completed"));
+
+    // New context window after gap: Turn 1 -> Post 2 -> Turn 3.
+    // With two prior steers, Turn 1's input position (3) exceeds Post 2's turn position (2).
+    f.setNow(5_000);
+    f.submit("new window start");
+    value(await f.execution.kick(f.thread.id));
+    f.setNow(5_100);
+    const firstNewRun = f.request();
+    const firstNewPublished = storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages);
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...firstNewRun,
+        requestClient: "native",
+        messages: selectNativeRunMessages(
+          [...firstNewPublished, { role: "assistant", content: "new answer" }],
+          firstNewRun.requestId,
+          firstNewPublished,
+        ),
+      }),
+    );
+    value(await f.execution.runnerLifecycle.settled(firstNewRun, "completed"));
+
+    post("post-after-turn-1", 5_200);
+    f.setNow(5_300);
+    f.submit("after post");
+    value(await f.execution.kick(f.thread.id));
+    const currentTexts = texts();
+    expect(currentTexts.join("\n")).not.toContain("old turn");
+    expect(currentTexts.findIndex((t) => t === "post-after-turn-1")).toBeGreaterThan(
+      currentTexts.findIndex((t) => t.includes("new window start")),
+    );
+    expect(currentTexts.findIndex((t) => t === "post-after-turn-1")).toBeLessThan(
+      currentTexts.findIndex((t) => t.includes("after post")),
+    );
+  } finally {
+    f.close();
+  }
+});
+
+test("late steer settlement does not reopen an expired DM context window", async () => {
+  const deliveries = new Map<
+    string,
+    "missing" | "owned" | "completed" | "failed" | "cancelled" | "abandoned"
+  >();
+  const f = fixture(undefined, true, (deliveryId) =>
+    Result.ok(deliveries.get(deliveryId) ?? "missing"),
+  );
+  try {
+    f.setDmGap(1_000);
+    f.setNow(1_000);
+    const firstReceipt = f.submit("old topic");
+    value(await f.execution.kick(f.thread.id));
+    deliveries.set(value(f.store.getInput(firstReceipt.inputId)).deliveryId, "owned");
+
+    f.setNow(1_050);
+    const steerReceipt = f.submit("late steer", "steer");
+    value(await f.execution.kick(f.thread.id));
+    const steerDeliveryId = value(f.store.getInput(steerReceipt.inputId)).deliveryId;
+    deliveries.set(steerDeliveryId, "owned");
+
+    f.setNow(1_100);
+    const firstRun = f.request(0);
+    const firstPublished = storedMessagesV1Schema.parse(f.published[0]!.data.messages);
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...firstRun,
+        requestClient: "native",
+        messages: [...firstPublished, { role: "assistant", content: "old answer" }],
+      }),
+    );
+    deliveries.set(value(f.store.getInput(firstReceipt.inputId)).deliveryId, "completed");
+    value(await f.execution.runnerLifecycle.settled(firstRun, "completed"));
+
+    f.setNow(10_000);
+    expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBeNull();
+    // Late steer reconciliation stamps completedAt on the steer input well after expiry.
+    deliveries.set(steerDeliveryId, "completed");
+    value(await f.execution.kick(f.thread.id));
+    expect(value(f.store.getInput(steerReceipt.inputId)).completedAt).toBe(10_000);
+    expect(value(f.execution.context("owner", f.thread.id)).firstTurnPosition).toBeNull();
+
+    f.setNow(10_100);
+    f.submit("fresh topic");
+    value(await f.execution.kick(f.thread.id));
+    expect(f.published.at(-1)!.data.messages).toHaveLength(1);
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).not.toContain("old topic");
+  } finally {
+    f.close();
+  }
+});
+
+test("requeued steer with a higher turn position remains in the waiting DM prompt's context", async () => {
+  const deliveries = new Map<
+    string,
+    "missing" | "owned" | "completed" | "failed" | "cancelled" | "abandoned"
+  >();
+  const f = fixture(undefined, true, (deliveryId) =>
+    Result.ok(deliveries.get(deliveryId) ?? "missing"),
+  );
+  try {
+    f.setDmGap(1_000);
+    f.setNow(1_000);
+    const firstReceipt = f.submit("turn 0");
+    value(await f.execution.kick(f.thread.id));
+    const firstDeliveryId = value(f.store.getInput(firstReceipt.inputId)).deliveryId;
+    deliveries.set(firstDeliveryId, "owned");
+
+    // Steer arrives while turn 0 is running, then turn 0 completes and the steer is abandoned.
+    f.setNow(1_050);
+    const steerReceipt = f.submit("requeued steer", "steer");
+    value(await f.execution.kick(f.thread.id));
+    const steerDeliveryId = value(f.store.getInput(steerReceipt.inputId)).deliveryId;
+    deliveries.set(steerDeliveryId, "owned");
+
+    f.setNow(1_100);
+    const firstRun = f.request(0);
+    const firstPublished = storedMessagesV1Schema.parse(f.published[0]!.data.messages);
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...firstRun,
+        requestClient: "native",
+        messages: [...firstPublished, { role: "assistant", content: "answer 0" }],
+      }),
+    );
+    deliveries.set(firstDeliveryId, "completed");
+    value(await f.execution.runnerLifecycle.settled(firstRun, "completed"));
+
+    // After a gap, an uploading prompt opens turn 1 before the abandoned steer is requeued as turn 2.
+    f.setNow(5_000);
+    const upload = value(
+      f.store.reserveUpload("owner", {
+        threadId: f.thread.id,
+        filename: "note.txt",
+        mediaType: "text/plain",
+        size: 4,
+      }),
+    );
+    const waitingReceipt = f.submit("waiting prompt", "prompt", [upload.id]);
+    expect(value(f.store.getTurnPosition(waitingReceipt.turnId!))).toBe(1);
+
+    // Requeue the abandoned steer; it gets turn 2 (higher than waiting prompt's turn 1) and runs first.
+    deliveries.set(steerDeliveryId, "abandoned");
+    f.setNow(5_010);
+    value(await f.execution.kick(f.thread.id));
+    const steerInput = value(f.store.getInput(steerReceipt.inputId));
+    expect(value(f.store.getTurnPosition(steerInput.turnId!))).toBe(2);
+    const steerRun = f.request();
+    const steerPublished = storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages);
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...steerRun,
+        requestClient: "native",
+        messages: selectNativeRunMessages(
+          [...steerPublished, { role: "assistant", content: "steer answer" }],
+          steerRun.requestId,
+          steerPublished,
+        ),
+      }),
+    );
+    deliveries.set(steerInput.deliveryId, "completed");
+    value(await f.execution.runnerLifecycle.settled(steerRun, "completed"));
+
+    // Once the upload finishes, the waiting prompt sees the completed requeued steer in context.
+    const claimed = value(f.store.claimUpload("owner", upload.id));
+    value(
+      f.store.settleUpload(upload.id, {
+        attempt: claimed.attempt,
+        historyGeneration: 0,
+        state: "ready",
+        resourceUri: "resource://r1_00000000000000000000000000000001",
+      }),
+    );
+    f.setNow(5_050);
+    value(await f.execution.kick(f.thread.id));
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).toContain("requeued steer");
+    expect(JSON.stringify(f.published.at(-1)!.data.messages)).toContain("steer answer");
+
+    // Settling the waiting prompt keeps both turns in the subsequent prompt's DM window.
+    const waitingRun = f.request();
+    const waitingPublished = storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages);
+    const waitingUser = waitingPublished.at(-1)!;
+    const waitingUserText: StoredMessageV1 =
+      waitingUser.role === "user" && Array.isArray(waitingUser.content)
+        ? {
+            role: "user",
+            content: waitingUser.content.filter((part) => part.type === "text"),
+          }
+        : waitingUser;
+    value(
+      f.transcripts.saveRequestTranscript({
+        ...waitingRun,
+        requestClient: "native",
+        messages: [waitingUserText, { role: "assistant", content: "waiting answer" }],
+      }),
+    );
+    const waitingInput = value(f.store.getInput(waitingReceipt.inputId));
+    deliveries.set(waitingInput.deliveryId, "completed");
+    value(await f.execution.runnerLifecycle.settled(waitingRun, "completed"));
+
+    f.setNow(5_100);
+    f.submit("after both");
+    value(await f.execution.kick(f.thread.id));
+    const nextHistory = JSON.stringify(f.published.at(-1)!.data.messages);
+    expect(nextHistory).toContain("requeued steer");
+    expect(nextHistory).toContain("steer answer");
+    expect(nextHistory).toContain("waiting prompt");
+    expect(nextHistory).toContain("waiting answer");
+  } finally {
+    f.close();
+  }
+});
+
 describe("native turn transcripts", () => {
   type Mode = "full" | "turn" | "mixed";
   const labels = (messages: readonly StoredMessageV1[]) =>
@@ -1542,11 +1972,26 @@ describe("native turn transcripts", () => {
      * A checkpoint is a run that compacted. A recovered run inherited that compaction from its
      * checkpoint, so it has no compaction metadata.
      */
-    const finish = async (compaction?: "checkpoint" | "recovered") => {
+    const finish = async (
+      compaction?: "checkpoint" | "recovered",
+      thinking?: "signed" | "separate" | "repaired" | "replaced",
+    ) => {
       finished += 1;
       const request = f.request();
       const published = storedMessagesV1Schema.parse(f.published.at(-1)!.data.messages);
       const answer: StoredMessageV1 = { role: "assistant", content: `a${finished}` };
+      if (thinking === "signed")
+        answer.content = [
+          { type: "reasoning", text: "", providerOptions: { anthropic: { signature: "old" } } },
+          { type: "text", text: `a${finished}` },
+        ];
+      if (thinking === "separate")
+        published.push({
+          role: "assistant",
+          content: [
+            { type: "reasoning", text: "", providerOptions: { anthropic: { signature: "old" } } },
+          ],
+        });
       const all: StoredMessageV1[] = compaction
         ? [
             { role: "user", content: "<context-compaction>summary</context-compaction>" },
@@ -1562,13 +2007,32 @@ describe("native turn transcripts", () => {
           ...(compaction === "checkpoint"
             ? { contextMeta: { type: "compaction", formatVersion: 1 } as const, messages: all }
             : {
-                messages: turnRows
-                  ? selectNativeRunMessages(all, request.requestId, published)
-                  : all,
+                messages:
+                  thinking === "replaced"
+                    ? all.map((message): StoredMessageV1 => {
+                        if (message.role !== "assistant" || typeof message.content === "string")
+                          return message;
+                        return {
+                          ...message,
+                          content: message.content.map((part) =>
+                            part.type === "reasoning"
+                              ? {
+                                  ...part,
+                                  providerOptions: { anthropic: { signature: "replacement" } },
+                                }
+                              : part,
+                          ),
+                        };
+                      })
+                    : thinking === "repaired"
+                      ? projectAssistantTextHistory(all)
+                      : turnRows
+                        ? selectNativeRunMessages(all, request.requestId, published)
+                        : all,
               }),
         }),
       );
-      if (turnRows && !compaction) {
+      if (turnRows && !compaction && !thinking) {
         const saved = value(f.transcripts.getRequestTranscript({ requestId: request.requestId }));
         expect(labels(saved!.messages)).toEqual([`m${finished}`, `a${finished}`]);
       }
@@ -1585,6 +2049,78 @@ describe("native turn transcripts", () => {
     };
     return { f, finish, send };
   };
+
+  test.each(["signed", "separate"] as const)(
+    "retains later turns across a repaired thinking cutoff (%s)",
+    async (thinking) => {
+      const { f, finish, send } = harness("turn");
+      try {
+        await send(1_000);
+        await finish(undefined, thinking);
+        await send(2_000);
+        await finish();
+        await send(3_000);
+        await finish(undefined, "repaired");
+        f.setMaxAge(1_500);
+        expect((await send(3_100)).history).toEqual(["m2", "a2", "m3", "a3", "m4"]);
+        await finish();
+        expect((await send(3_600)).history).toEqual(["m3", "a3", "m4", "a4", "m5"]);
+      } finally {
+        f.close();
+      }
+    },
+  );
+
+  test.each(["signed", "separate"] as const)(
+    "trims two old turn rows from a repaired full snapshot (%s)",
+    async (thinking) => {
+      const { f, finish, send } = harness("turn");
+      try {
+        await send(1_000);
+        await finish(undefined, thinking);
+        await send(2_000);
+        await finish();
+        await send(3_000);
+        await finish();
+        await send(4_000);
+        await finish(undefined, "repaired");
+        f.setMaxAge(2_000);
+        expect((await send(4_100)).history).toEqual(["m3", "a3", "m4", "a4", "m5"]);
+      } finally {
+        f.close();
+      }
+    },
+  );
+
+  test("does not treat replacement thinking as a repaired cutoff", async () => {
+    const { f, finish, send } = harness("turn");
+    try {
+      await send(1_000);
+      await finish(undefined, "signed");
+      await send(2_000);
+      await finish(undefined, "replaced");
+      f.setMaxAge(1_500);
+      expect((await send(3_000)).history).toEqual(["m3"]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("retains repaired history across successive canonical starts", async () => {
+    const { f, finish, send } = harness("turn");
+    try {
+      await send(1_000);
+      await finish();
+      await send(2_000);
+      await finish(undefined, "signed");
+      f.setMaxAge(1_500);
+      expect((await send(3_000)).history).toEqual(["m2", "a2", "m3"]);
+      await finish(undefined, "repaired");
+      expect((await send(3_600)).history).toEqual(["m3", "a3", "m4"]);
+    } finally {
+      f.close();
+    }
+  });
 
   test.each<Mode>(["full", "turn", "mixed"])(
     "rebuilds the same history across an advancing cutoff from %s rows",
@@ -1838,4 +2374,196 @@ describe("native turn row differential", () => {
       await publishedHistories(true, scenario),
     );
   });
+});
+
+function rewindFixture() {
+  const f = fixture(undefined, true);
+  value(
+    f.store.initializeDeployment({
+      titleModel: "fast",
+      transport: "auto",
+      outputStreaming: "paragraph",
+      dmContextGapMs: 7_200_000,
+      dmTimestampGapMs: 1_800_000,
+      oldMessageSelectionMaxAgeMs: null,
+      storageRetentionMaxAgeMs: null,
+      crossThreadSend: { triggerRun: true },
+    }),
+  );
+  const input = f.submit("rewind me");
+  value(f.store.settleInput(input.inputId, "admitted"));
+  value(
+    f.store.projectTurn(f.thread.id, 0, "settled_rewind", input.turnId!, (slot) =>
+      Result.ok({ slot: { ...slot, state: "complete", settledAt: 1000 }, changes: [] }),
+    ),
+  );
+  value(f.store.markInputCompleted(input.inputId));
+  const request = {
+    threadId: f.thread.id,
+    turnId: input.turnId!,
+    commandId: "rewind",
+    historyGeneration: 0,
+    revision: value(f.store.getThreadRecord(f.thread.id)).revision,
+  };
+  return { ...f, rewindRequest: request };
+}
+
+test("retrying a completed DM rewind leaves a newer run alone", async () => {
+  const f = rewindFixture();
+  try {
+    const first = value(await f.execution.rewind("owner", f.rewindRequest));
+    f.submit("new prompt");
+    value(await f.execution.kick(f.thread.id));
+    const active = value(f.store.getThreadRecord(f.thread.id)).activeRunId;
+    expect(active).toBeDefined();
+    expect(value(await f.execution.rewind("owner", f.rewindRequest))).toEqual(first);
+    expect(f.cancellations()).toBe(1);
+    expect(value(f.store.getThreadRecord(f.thread.id)).activeRunId).toBe(active);
+  } finally {
+    f.close();
+  }
+});
+
+test("concurrent retries share the unfinished rewind cancellation", async () => {
+  const f = rewindFixture();
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  f.waitForCancellation(async () => {
+    started.resolve();
+    await release.promise;
+  });
+  try {
+    const first = f.execution.rewind("owner", f.rewindRequest);
+    await started.promise;
+    const second = f.execution.rewind("owner", f.rewindRequest);
+    release.resolve();
+    expect(value(await first)).toEqual(value(await second));
+    expect(f.cancellations()).toBe(1);
+  } finally {
+    release.resolve();
+    f.close();
+  }
+});
+
+test("DM rewind waits until an in-progress cancellation finishes", async () => {
+  const f = rewindFixture();
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  f.waitForCancellation(async () => {
+    started.resolve();
+    await release.promise;
+  });
+  try {
+    const canceling = f.execution.cancel("owner", f.thread.id);
+    await started.promise;
+    const request = {
+      ...f.rewindRequest,
+      revision: value(f.store.getThreadRecord(f.thread.id)).revision,
+    };
+    expect(
+      (await f.execution.rewind("owner", request)).match({
+        ok: () => undefined,
+        err: (error) => error.message,
+      }),
+    ).toBe("Wait for cancellation to finish.");
+    expect(value(f.store.getThreadRecord(f.thread.id)).historyGeneration).toBe(0);
+    release.resolve();
+    value(await canceling);
+    f.waitForCancellation();
+    value(
+      await f.execution.rewind("owner", {
+        ...request,
+        revision: value(f.store.getThreadRecord(f.thread.id)).revision,
+      }),
+    );
+  } finally {
+    release.resolve();
+    f.close();
+  }
+});
+
+test("overlapping cancellations block new DM rewind until both settle", async () => {
+  const f = rewindFixture();
+  const firstStarted = Promise.withResolvers<void>();
+  const secondStarted = Promise.withResolvers<void>();
+  const releaseFirst = Promise.withResolvers<void>();
+  const releaseSecond = Promise.withResolvers<void>();
+  let calls = 0;
+  f.waitForCancellation(async () => {
+    calls++;
+    if (calls === 1) {
+      firstStarted.resolve();
+      return releaseFirst.promise;
+    }
+    secondStarted.resolve();
+    return releaseSecond.promise;
+  });
+  try {
+    const first = f.execution.cancel("owner", f.thread.id);
+    await firstStarted.promise;
+    const second = f.execution.cancel("owner", f.thread.id);
+    await secondStarted.promise;
+    releaseFirst.resolve();
+    value(await first);
+    const request = {
+      ...f.rewindRequest,
+      revision: value(f.store.getThreadRecord(f.thread.id)).revision,
+    };
+    expect((await f.execution.rewind("owner", request)).isErr()).toBe(true);
+    expect(value(f.store.getThreadRecord(f.thread.id)).historyGeneration).toBe(0);
+    releaseSecond.resolve();
+    value(await second);
+    f.waitForCancellation();
+    value(
+      await f.execution.rewind("owner", {
+        ...request,
+        revision: value(f.store.getThreadRecord(f.thread.id)).revision,
+      }),
+    );
+  } finally {
+    releaseFirst.resolve();
+    releaseSecond.resolve();
+    f.close();
+  }
+});
+
+test("completed rewind receipts remain readable during a later cancellation", async () => {
+  const f = rewindFixture();
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  try {
+    const reply = value(await f.execution.rewind("owner", f.rewindRequest));
+    f.submit("new prompt");
+    value(await f.execution.kick(f.thread.id));
+    f.waitForCancellation(async () => {
+      started.resolve();
+      await release.promise;
+    });
+    const cancel = f.execution.cancel("owner", f.thread.id);
+    await started.promise;
+    expect(value(await f.execution.rewind("owner", f.rewindRequest))).toEqual(reply);
+    expect(f.cancellations()).toBe(2);
+    release.resolve();
+    value(await cancel);
+  } finally {
+    release.resolve();
+    f.close();
+  }
+});
+
+test("the original rewind command finishes after cancellation fails post-mutation", async () => {
+  const f = rewindFixture();
+  try {
+    f.failCancellation(new Error("runner unavailable"));
+    expect((await f.execution.rewind("owner", f.rewindRequest)).isErr()).toBe(true);
+    expect(value(f.store.getThreadRecord(f.thread.id))).toMatchObject({
+      historyGeneration: 1,
+      mutationPending: true,
+    });
+    f.failCancellation();
+    expect(value(await f.execution.rewind("owner", f.rewindRequest)).text).toBe("rewind me");
+    expect(value(f.store.getThreadRecord(f.thread.id)).mutationPending).toBe(false);
+  } finally {
+    f.close();
+  }
 });
