@@ -1347,6 +1347,7 @@ export function Chat(props: ChatProps) {
       ) : null}
       <div hidden={!editable}>
         <DraftComposer
+          dictationDisabled={!props.foreground}
           source={draftSource}
           documentKey={draftKey}
           replacement={

@@ -3621,6 +3621,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               category: "wire" as const,
             },
             {
+              identity: { module: "src/dictation.ts", exportName: "decodeDictationText" },
+              category: "wire" as const,
+            },
+            {
               identity: { module: "src/computer-viewer.ts", exportName: "decodeComputerCommand" },
               category: "wire" as const,
             },
@@ -4457,6 +4461,9 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
         : []),
       ...(root === "apps/web"
         ? [{ module: "src/clerk-signout.ts", exportName: "signOutActiveClerk" }]
+        : []),
+      ...(root === "apps/web"
+        ? [{ module: "src/dictation.ts", exportName: "decodeDictationText" }]
         : []),
       ...(root === "apps/web"
         ? [

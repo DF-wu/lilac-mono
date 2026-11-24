@@ -1,5 +1,6 @@
 import { KeybindingsSettings } from "./KeybindingsSettings";
 import { NotificationSettings } from "./NotificationSettings";
+import { DictationSettings } from "./DictationSettings";
 import type { SettingsTab } from "../router";
 import { useWorkspace } from "../workspace-context";
 import { useStore } from "zustand";
@@ -272,6 +273,7 @@ export function Settings({
               <h2>Thread</h2>
               <SidebarPreferences />
               <NotificationSettings preferences={notifications} />
+              <DictationSettings preferences={preferences} />
               <h2>Access</h2>
               <dl className="settings-account grid gap-4 mb-6">
                 <div>

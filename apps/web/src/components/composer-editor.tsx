@@ -1,5 +1,6 @@
 import { closeHistory, isHistoryTransaction } from "@tiptap/pm/history";
 import { Kbd } from "./ui/kbd";
+import { toast } from "./ui/toast";
 import { createPortal } from "react-dom";
 import { shortcutOverlayOpen } from "../shortcuts";
 import { shouldFocusComposer } from "../composer-focus";
@@ -64,6 +65,7 @@ import { Slice } from "@tiptap/pm/model";
 import type { EditorView } from "@tiptap/pm/view";
 import {
   composerExtensions,
+  appendEditorDictation,
   attachmentNode,
   referenceNode,
   workflowRunNode,
@@ -323,6 +325,7 @@ export type ComposerEditorHandle = {
   submissionText: () => string;
   draftText: () => string;
   hasMissingAttachments: () => boolean;
+  appendDictation: (text: string) => void;
 };
 export type ComposerEditorProps = {
   ref?: Ref<ComposerEditorHandle>;
@@ -730,6 +733,14 @@ const ComposerEditorInstance = memo(function ComposerEditorInstance(
       capturePaste: () => (editor ? captureEditorPaste(editor) : { cancel() {}, insert() {} }),
       submissionText: () => (editor ? writeComposerDocument(editor.state.doc, false) : props.text),
       draftText: () => (editor ? writeComposerDocument(editor.state.doc) : props.text),
+      appendDictation(text) {
+        if (!editor || current.current.disabled) return;
+        if (!appendEditorDictation(editor, text)) {
+          toast.add({ title: "Draft is too long. Shorten it before dictating.", type: "error" });
+          return;
+        }
+        editor.commands.focus("end");
+      },
       hasMissingAttachments: () =>
         !!editor &&
         [...editorAttachmentKeys(editor.state.doc)].some(
