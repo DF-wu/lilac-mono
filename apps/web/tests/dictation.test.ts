@@ -92,6 +92,51 @@ test("rejects unsafe destinations before requesting a microphone", async () => {
   expect(h.errors).toHaveLength(1);
   expect(h.states).toEqual([]);
 });
+test.each([
+  "http://asr.example.test/v1/audio/transcriptions",
+  "http://localhost.example.test/asr",
+  "http://127.0.0.1.example.test/asr",
+  "http://127.0.0.2/asr",
+  "http://[::ffff:127.0.0.1]/asr",
+])("rejects non-loopback HTTP credentials before permission or upload: %s", async (endpoint) => {
+  const microphone = mock(async () => stream);
+  const fetcher = mock(async () => Response.json({ text: "Synthetic speech" }));
+  navigator.mediaDevices.getUserMedia = microphone;
+  globalThis.fetch = fetcher as unknown as typeof fetch;
+  const h = harness();
+  await h.take.start({ ...config, endpoint });
+  expect(microphone).not.toHaveBeenCalled();
+  expect(fetcher).not.toHaveBeenCalled();
+  expect(h.states).toEqual([]);
+  expect(h.errors).toHaveLength(1);
+  expect(h.errors[0]).toContain("HTTPS");
+  expect(h.errors[0]).not.toContain(config.token);
+});
+test.each([
+  { endpoint: "https://asr.example.test/v1/audio/transcriptions", token: config.token },
+  { endpoint: "http://localhost:6017/v1/audio/transcriptions", token: config.token },
+  { endpoint: "http://127.0.0.1:6017/v1/audio/transcriptions", token: config.token },
+  { endpoint: "http://[::1]:6017/v1/audio/transcriptions", token: config.token },
+  { endpoint: "http://asr.example.test/v1/audio/transcriptions", token: "" },
+])("preserves permitted credential and tokenless transports: %s", async ({ endpoint, token }) => {
+  const microphone = mock(async () => stream);
+  const fetcher = mock(async (url: string, options: RequestInit) => {
+    expect(url).toBe(endpoint);
+    expect(options.headers).toEqual(token ? { Authorization: `Bearer ${token}` } : {});
+    expect(options.redirect).toBe("error");
+    return Response.json({ text: "Synthetic speech" });
+  });
+  navigator.mediaDevices.getUserMedia = microphone;
+  globalThis.fetch = fetcher as unknown as typeof fetch;
+  const h = harness();
+  await h.take.start({ ...config, endpoint, token });
+  expect(microphone).toHaveBeenCalledTimes(1);
+  h.take.stop();
+  await h.terminal;
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(h.texts).toEqual(["Synthetic speech"]);
+  expect(h.errors).toEqual([]);
+});
 test.each([false, true])(
   "uploads typed multipart without cookies, redirects, or Core headers (mp4=%s)",
   async (useMp4) => {

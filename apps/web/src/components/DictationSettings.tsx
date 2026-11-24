@@ -13,7 +13,7 @@ export function DictationSettings({
   const endpoint = useStore(preferences, (state) => state.asrEndpoint);
   const model = useStore(preferences, (state) => state.asrModel);
   const token = useStore(preferences, (state) => state.asrToken);
-  const error = endpoint ? validateDictationEndpoint(endpoint) : undefined;
+  const error = endpoint ? validateDictationEndpoint(endpoint, token) : undefined;
   const actions = preferences.getState();
   return (
     <section className="space-y-4 mb-8" aria-label="Dictation">

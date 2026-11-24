@@ -64,7 +64,7 @@ export function DictationButton({
     };
   }, [dictation]);
   if (!endpoint) return null;
-  const unavailable = validateDictationEndpoint(endpoint) ?? dictationSupport();
+  const unavailable = validateDictationEndpoint(endpoint, token) ?? dictationSupport();
   const recording = state === "recording";
   const busy = state !== "idle";
   const label = recording ? "Stop dictation" : "Start dictation";

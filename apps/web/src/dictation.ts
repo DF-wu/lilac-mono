@@ -13,7 +13,7 @@ export function decodeDictationText(value: unknown): Result<string, string> {
   return Result.ok(decoded.data.text);
 }
 
-export function validateDictationEndpoint(value: string): string | undefined {
+export function validateDictationEndpoint(value: string, token = ""): string | undefined {
   const parsed = Result.try({ try: () => new URL(value), catch: () => "Invalid URL" });
   if (parsed.isErr()) return "Enter a full HTTP(S) transcription URL.";
   const url = parsed.value;
@@ -25,6 +25,9 @@ export function validateDictationEndpoint(value: string): string | undefined {
     url.search
   )
     return "Use an HTTP(S) URL without credentials, query, or fragment.";
+  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (token && url.protocol === "http:" && !loopback)
+    return "Service API tokens require HTTPS outside localhost, 127.0.0.1, or [::1].";
   return undefined;
 }
 
@@ -114,7 +117,7 @@ export function createDictation(callbacks: {
   }
   async function start(config: DictationConfig) {
     if (take) return;
-    const invalid = validateDictationEndpoint(config.endpoint) ?? dictationSupport();
+    const invalid = validateDictationEndpoint(config.endpoint, config.token) ?? dictationSupport();
     if (invalid) {
       callbacks.error(invalid);
       return;

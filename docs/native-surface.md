@@ -47,6 +47,11 @@ cannot guarantee cancellation of work already admitted by the service.
   `https://chat.example.com`. An empty allowlist rejects browser requests. Keep model `whisper-1`;
   CapsWriter selects the actual recognizer separately. This feature does not change service settings.
 - If using a personal token, allow `Authorization` in the service's OPTIONS preflight response.
+  Tokens require HTTPS unless the parsed hostname is exactly `localhost`, `127.0.0.1`, or `[::1]`.
+  Other HTTP destinations are rejected before microphone permission when a token is present.
+  Without a token, HTTP remains available when the browser permits it, but remote HTTP can expose
+  audio as well as transcription results. Use HTTPS for private speech sent over the network;
+  CORS permission does not encrypt traffic.
   Native omits cookies, Core headers, and referrers and rejects redirects. Enter the final endpoint,
   not a URL that redirects. Use a token intended for your service and browser usage; other scripts
   running in the page can access browser memory. Provider support for browser CORS is required.
