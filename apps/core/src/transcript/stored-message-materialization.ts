@@ -24,6 +24,7 @@ import {
   type ResourceAccess,
   type ResourceAccessError,
 } from "../resource";
+import { convertHeifForModel, isHeifMediaType } from "../resource/heif-model-image";
 import {
   defaultStoredBlobFilename,
   normalizeStoredMessagesV1,
@@ -842,7 +843,12 @@ async function materializeStoredResource(input: {
       }),
     ];
   }
-  if (verifiedKind === "image" && read.blob.byteLength > RESOURCE_IMAGE_INLINE_MAX_BYTES) {
+  const needsHeifConversion = isHeifMediaType(read.classification.mediaType);
+  if (
+    verifiedKind === "image" &&
+    !needsHeifConversion &&
+    read.blob.byteLength > RESOURCE_IMAGE_INLINE_MAX_BYTES
+  ) {
     await cancelVerifiedResourceRead(read);
     return omittedImageParts(input.part);
   }
@@ -860,14 +866,28 @@ async function materializeStoredResource(input: {
     return [marker, ...resourceInlineGuidance({ part: input.part, code: "unsupported" })];
   }
 
+  const modelFile = needsHeifConversion
+    ? await convertHeifForModel(consumed.value, filename)
+    : { data: consumed.value, mediaType: verifiedMediaType, filename: input.part.filename };
+  if (!modelFile) {
+    return [
+      marker,
+      ...resourceInlineGuidance({
+        part: input.part,
+        code: "unsupported",
+        guidance:
+          "HEIF attachment could not be converted for the model. Use resource.materialize to access the original.",
+      }),
+    ];
+  }
   const data = input.toolResult
-    ? { type: "data" as const, data: Buffer.from(consumed.value).toString("base64") }
-    : consumed.value;
+    ? { type: "data" as const, data: Buffer.from(modelFile.data).toString("base64") }
+    : modelFile.data;
   const file = {
     type: "file" as const,
     data,
-    mediaType: verifiedMediaType,
-    ...(input.part.filename === undefined ? {} : { filename: input.part.filename }),
+    mediaType: modelFile.mediaType,
+    ...(modelFile.filename === undefined ? {} : { filename: modelFile.filename }),
   };
   if (!read.imagePreview) return [marker, file];
   const preview = read.imagePreview;

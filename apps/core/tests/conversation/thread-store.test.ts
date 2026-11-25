@@ -39,6 +39,7 @@ import {
   ConversationThread,
   resolveConversationThreadSummarizationToolOperation,
 } from "../../src/tool-server/tools/conversation-thread";
+import { hasHeicDecoder, heicBytes } from "../test-support/heic";
 
 function serverToolValue<T>(result: ServerToolResult<T>): T {
   return result.match({
@@ -3310,6 +3311,64 @@ describe("conversation thread store", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  async function buildNativeImageSummary(data: Uint8Array, mimeType: string) {
+    const [message] = await buildThreadSummaryModelMessages({
+      previous: "(none)",
+      promptContextSection: null,
+      omittedMessages: 0,
+      messages: [
+        {
+          surface: "native",
+          channelId: "t1",
+          messageId: "m1",
+          ordinal: 0,
+          userId: "u1",
+          text: "See photo",
+          ts: 1,
+          attachments: [
+            {
+              id: "a1",
+              url: "resource://r1_photo",
+              filename: "photo.heic",
+              mimeType,
+              size: data.length,
+              data,
+            },
+          ],
+        },
+      ],
+    });
+    if (message?.role !== "user" || !Array.isArray(message.content)) {
+      throw new Error("Expected multipart summary");
+    }
+    return message.content[2];
+  }
+
+  it("keeps a corrupt HEIC attachment as metadata in the summary", async () => {
+    const part = await buildNativeImageSummary(new Uint8Array([1, 2, 3]), "image/heic");
+    expect(part).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("HEIF attachment could not be converted"),
+    });
+  });
+
+  it.skipIf(!hasHeicDecoder)(
+    "converts HEIC summary attachments regardless of their MIME label",
+    async () => {
+      for (const mime of ["image/heif", "image/jpeg", "application/octet-stream"]) {
+        const part = await buildNativeImageSummary(heicBytes, mime);
+        expect(part).toMatchObject({
+          type: "file",
+          mediaType: "image/jpeg",
+          filename: "photo.jpg",
+        });
+        if (part?.type !== "file" || !(part.data instanceof Uint8Array))
+          throw new Error("Expected converted JPEG bytes");
+        expect(await new Bun.Image(part.data).metadata()).toMatchObject({ format: "jpeg" });
+      }
+    },
+  );
 
   it("omits unsupported utility media before downloading it", async () => {
     const originalFetch = globalThis.fetch;

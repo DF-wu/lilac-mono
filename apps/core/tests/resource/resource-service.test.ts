@@ -27,6 +27,7 @@ import type {
   ResourceStore,
   ResourceUnretainedFinalization,
 } from "../../src/resource/store";
+import { hasHeicDecoder, heicBytes } from "../test-support/heic";
 
 function success<T, E>(result: ResultType<T, E>): T {
   return result.match({
@@ -1200,6 +1201,54 @@ function previewBitmap(): Uint8Array {
 }
 
 describe("model image previews", () => {
+  test.skipIf(!hasHeicDecoder)(
+    "materializes both small and large HEIC originals as JPEG",
+    async () => {
+      const { materializeStoredMessagesV1 } =
+        await import("../../src/transcript/stored-message-materialization");
+      const large = new Uint8Array(1024 * 1024 + heicBytes.length);
+      large.set(heicBytes);
+      new DataView(large.buffer).setUint32(heicBytes.length, 1024 * 1024);
+      large.set(new TextEncoder().encode("free"), heicBytes.length + 4);
+      for (const bytes of [heicBytes, large]) {
+        const f = await fixture({ bytes, filename: "photo.heic", declaredMediaType: "image/heic" });
+        const messages = [
+          {
+            role: "user" as const,
+            content: [
+              {
+                type: "resource" as const,
+                uri: f.descriptor.uri,
+                filename: "photo.heic",
+                mediaType: "image/heic",
+              },
+            ],
+          },
+        ];
+        const [message] = success(
+          await materializeStoredMessagesV1({
+            messages,
+            blobStore: f.blobStore,
+            resourceAccess: f.service,
+            resourceTarget: { family: "ai-sdk", supportsImage: true, supportsPdf: true },
+          }),
+        );
+        expect(message?.content).toContainEqual(
+          expect.objectContaining({
+            type: "file",
+            mediaType: "image/jpeg",
+            filename: "photo.jpg",
+          }),
+        );
+        const original = success(
+          await f.service.open(f.descriptor.uri, { maxBytes: bytes.length }),
+        );
+        expect(success(await consumeVerifiedResourceRead(original))).toEqual(bytes);
+        await closeFixture(f.service, f.blobStore);
+      }
+    },
+  );
+
   test("fits an image, shares concurrent conversion, reuses the blob, and preserves original reads", async () => {
     const bytes = previewBitmap();
     const f = await fixture({ bytes, filename: "wide.bmp", declaredMediaType: "image/bmp" });

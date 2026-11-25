@@ -16,6 +16,7 @@ import {
 import { SqliteTranscriptStore } from "../../../src/transcript/transcript-store";
 import { CoreResourceService, consumeVerifiedResourceRead } from "../../../src/resource/service";
 import { ResourceOriginAdapterRegistry } from "../../../src/resource/origin";
+import { hasHeicDecoder, heicBytes } from "../../test-support/heic";
 
 function value<T, E>(result: ResultType<T, E>): T {
   return result.match({
@@ -822,3 +823,57 @@ test("conversation summary hydration reads verified native upload bytes", async 
   expect(content).toContain("native_attachment");
   expect(content).toContain("content unavailable");
 });
+
+test.skipIf(!hasHeicDecoder)(
+  "summarizes a Native HEIC upload with a generic browser MIME type",
+  async () => {
+    const f = await fixture();
+    const reservation = value(
+      f.service.reserve("alice", {
+        threadId: f.thread.id,
+        filename: "photo.heic",
+        mediaType: "application/octet-stream",
+        size: heicBytes.byteLength,
+      }),
+    );
+    const upload = value(
+      await f.service.upload("alice", reservation.id, new Blob([heicBytes]).stream()),
+    );
+    f.publish(upload.id);
+    const surface = new NativeSurfaceStore(f.db, f.native);
+    surface.initialize().unwrap();
+    const message = surface.listMessages("alice", f.thread.id, { limit: 10 }).unwrap()[0]!;
+    const hydrated = value(
+      await hydrateNativeConversationAttachments(
+        { store: f.native, surface, resources: f.service },
+        { surface: "native", channelId: f.thread.id, messageId: message.message.id },
+        1024,
+      ),
+    );
+    const [summary] = await buildThreadSummaryModelMessages({
+      previous: "",
+      promptContextSection: null,
+      omittedMessages: 0,
+      messages: [
+        {
+          surface: "native",
+          channelId: f.thread.id,
+          messageId: message.message.id,
+          ordinal: 0,
+          userId: "alice",
+          text: "See photo",
+          ts: Date.now(),
+          attachments: hydrated.attachments,
+        },
+      ],
+    });
+    expect(hydrated.attachments[0]?.mimeType).toBe("application/octet-stream");
+    expect(summary?.content).toContainEqual(
+      expect.objectContaining({
+        type: "file",
+        mediaType: "image/jpeg",
+        filename: "photo.jpg",
+      }),
+    );
+  },
+);
