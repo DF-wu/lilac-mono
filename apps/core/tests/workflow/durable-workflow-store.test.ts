@@ -1398,9 +1398,19 @@ describe("workflow audit recovery invariants", () => {
       db.run("DROP TABLE workflow_cancellation_outbox");
       db.run("DROP INDEX idx_workflow_runs_claim");
       db.run("DROP INDEX idx_workflow_waits_deadline");
-      db.run("DELETE FROM workflow_schema_migrations WHERE version = 28");
+      db.run("DROP INDEX idx_workflow_runs_origin_user");
+      db.run("DELETE FROM workflow_schema_migrations WHERE version >= 28");
+      expect(
+        db
+          .query<{ version: number }, []>(
+            "SELECT MAX(version) AS version FROM workflow_schema_migrations",
+          )
+          .get()?.version,
+      ).toBe(27);
       store = new DurableWorkflowStore(file);
-      expect(store.listMigrations().at(-1)?.version).toBe(28);
+      expect(store.listMigrations().map((migration) => migration.version)).toEqual([
+        ...WORKFLOW_MIGRATION_VERSIONS,
+      ]);
       expect(workflowStoreValue(store.getRun("run-1"))?.progressTarget).toEqual(target);
       expect(workflowStoreValue(store.getWait("run-1", "reply"))?.match).toEqual(match);
       expect(store.createOperation(operation("run-1", "agent"), "worker")).toBe(true);
