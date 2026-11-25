@@ -19,7 +19,7 @@ apps/core/scripts/generate-config-schemas.ts  # fail-closed Zod conversion and v
 apps/core/scripts/generate-design-tool-activities.ts  # includes the existing fork workflow content format in generated fixture types
 apps/core/src/conversation/thread-search-protocol.ts  # carries Telegram filters, allowlists, source paths, and hits across the search worker boundary
 apps/core/src/conversation/thread-search-worker.ts  # opens the Telegram conversation source in each search worker
-apps/core/src/conversation/thread-service.ts  # telegram surface labels and chat allowlist checks
+apps/core/src/conversation/thread-service.ts  # Telegram surface labels and chat allowlists plus HEIF conversion and fallback for summaries
 apps/core/src/conversation/thread-store.ts  # telegram source branch, telegram_thread kind, chat allowlist clause
 apps/core/src/conversation/thread-summarization-worker-protocol.ts  # telegram surface enum and source path fields
 apps/core/src/conversation/thread-summarization-worker.ts  # opens the telegram source and bot name in the worker
@@ -27,6 +27,7 @@ apps/core/src/conversation/thread-worker.ts  # forwards the telegram source and 
 apps/core/src/custom-commands/manager.ts  # menu alias index and @target-aware command parsing
 apps/core/src/generated/config-schemas/core-config.schema.json  # generated from fork input schemas including Telegram and OpenAI search
 apps/core/src/github/webhook/github-webhook-server.ts  # final publication policy, UUID delivery identity repair and redacted contract error logging (#107)
+apps/core/src/resource/service.ts  # leaves HEIF bytes available for model conversion instead of the Bun image preview
 apps/core/src/runtime/compose-builtin-surface-runtimes.ts  # includes the Telegram runtime descriptor entry
 apps/core/src/runtime/create-core-runtime.ts  # constructs and registers the Telegram surface module
 apps/core/src/runtime/main.ts  # settles Core creation/start Results through the fork-owned startCoreRuntime helper
@@ -39,6 +40,7 @@ apps/core/src/surface/bridge/request-composition/normalization.ts  # platform-aw
 apps/core/src/surface/bridge/request-ids.ts  # telegram:<session>:<message> request-id form
 apps/core/src/surface/bridge/subscribe-from-bus.ts  # platform-generic relay refs
 apps/core/src/surface/builtin-surface-protocols.ts  # registers telegramSurfaceProtocol in the closed catalog
+apps/core/src/surface/native/conversation-attachments.ts  # reads HEIF uploads that the browser labels as generic binary files
 apps/core/src/surface/native/runtime.ts  # composes the opt-in fork-owned Discord recorder at native ingress and shutdown
 apps/core/src/surface/native/store.ts  # committed display notifications, durable Discord child routing, and PR113 revoked-steer admission and assistant attribution
 apps/core/src/surface/native/push.test.ts  # updates the native schema upgrade regression for durable Discord child routing
@@ -57,6 +59,7 @@ apps/core/src/tool-server/tools/web-search/types.ts  # "openai" provider id
 apps/core/src/tool-server/tools/web.ts  # openai environment/policy plumbing; web.extract skips search-only providers
 apps/core/src/tool-server/tools/web/provider-page-extraction.ts  # openai environment and supportsPageExtraction
 apps/core/src/tools/bash-impl.ts  # forwards LILAC_ORIGIN_SESSION_ID to tool processes
+apps/core/src/transcript/stored-message-materialization.ts  # converts verified HEIF resources before model submission
 apps/core/src/transcript/transcript-store.ts  # Telegram platform filters
 apps/core/src/workflow/durable-workflow-store.ts  # Telegram target revalidation
 apps/core/src/workflow/workflow-domain.ts  # Telegram workflow targets
@@ -67,8 +70,10 @@ apps/core/src/workflow/workflow-progress-view.ts  # Telegram progress card rende
 apps/core/src/workflow/workflow-trigger-scheduler.ts  # rechecks Telegram target authorization before fire
 apps/core/src/workflow/workflow-waits.ts  # Telegram reply waits
 apps/core/tests/conversation/cross-surface.test.ts  # preserves current source revisions with the Telegram-aware search worker integration
+apps/core/tests/conversation/thread-store.test.ts  # covers HEIF conversion, wrong MIME labels, and summary fallback
 apps/core/tests/github/github-webhook-dispatch.test.ts  # F19: Final publication/sentinel prompt policy over upstream admission
 apps/core/tests/heartbeat/heartbeat-service.test.ts  # machine-independent quiet-hours timezone test
+apps/core/tests/resource/resource-service.test.ts  # covers HEIF conversion around the inline size limit and preservation of originals
 apps/core/tests/runtime/compose-builtin-surface-runtimes.test.ts  # covers the Telegram runtime entry
 apps/core/tests/runtime/config-schemas.test.ts  # verifies fork editor schema acceptance and removed image config diagnostics
 apps/core/tests/surface/authenticated-request.test.ts  # Telegram principals
@@ -78,6 +83,7 @@ apps/core/tests/surface/bridge/bus-agent-runner.test.ts  # Telegram authority
 apps/core/tests/surface/bridge/subscribe-from-bus.test.ts  # platform-generic relay refs
 apps/core/tests/surface/native/operator-integration.test.ts  # Inherited verification: Real operator gateway fixture uses an ephemeral listener, preserving production port
 apps/core/tests/surface/native/resources-live.test.ts  # verifies exclusive concurrent saves without assuming asynchronous authorization order
+apps/core/tests/surface/native/resources.test.ts  # covers generic binary HEIC uploads through summary hydration
 apps/core/tests/surface/native/search.test.ts  # verifies single-thread context isolation, message ordinals and pagination
 apps/core/tests/surface/operation-contract.test.ts  # resolve-attachment operation
 apps/core/tests/surface/runtime-descriptor.test.ts  # Telegram descriptor
