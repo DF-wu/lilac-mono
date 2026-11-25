@@ -185,7 +185,8 @@ jobs:
             LILAC_BUILD_DIRTY=false
           tags: lilac:ci-${{ matrix.variant.name }}
           cache-from: type=gha,scope=ci-lilac-mono-amd64-${{ matrix.variant.name }}
-          cache-to: type=gha,mode=max,scope=ci-lilac-mono-amd64-${{ matrix.variant.name }}
+          # PR caches cannot warm main or other PRs. Avoid uploading a full cache for each variant.
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,mode=max,scope=ci-lilac-mono-amd64-{0}', matrix.variant.name) || '' }}
 
       - name: Verify image
         run: |
