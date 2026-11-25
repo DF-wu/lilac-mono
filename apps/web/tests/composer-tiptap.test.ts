@@ -11,6 +11,7 @@ import {
   editorAttachmentKeys,
   remapAttachmentSlice,
   composerExtensions,
+  appendEditorDictation,
   attachmentNode,
   referenceNode,
   workflowRunNode,
@@ -43,6 +44,28 @@ const citation: AssistantCitation = {
   prefix: "",
   suffix: "",
 };
+
+it("appends literal dictation while preserving formatted text, attachments, and undo", () => {
+  const original = "**Typed** [file.txt](attachment:file)\n\nKeep this paragraph.";
+  const editor = headlessEditor(original);
+  editor.registerPlugin(history());
+  expect(appendEditorDictation(editor, "Spoken *literal* text.")).toBe(true);
+  expect(writeComposerDocument(editor.state.doc)).toStartWith(original);
+  expect(editorAttachmentKeys(editor.state.doc).has("file")).toBe(true);
+  const speech = editor.state.doc.lastChild!;
+  expect(speech.textContent).toBe("Spoken *literal* text.");
+  expect(speech.firstChild?.marks).toEqual([]);
+  undo(editor.state, editor.view.dispatch);
+  expect(writeComposerDocument(editor.state.doc)).toBe(original);
+  editor.destroy();
+});
+it("rejects dictation that exceeds the draft limit without changing existing text", () => {
+  const editor = headlessEditor("x".repeat(65_530));
+  const before = writeComposerDocument(editor.state.doc);
+  expect(appendEditorDictation(editor, "too much speech")).toBe(false);
+  expect(writeComposerDocument(editor.state.doc)).toBe(before);
+  editor.destroy();
+});
 
 it("keeps pasted Markdown tables editable as source through draft and submission", () => {
   const table = [

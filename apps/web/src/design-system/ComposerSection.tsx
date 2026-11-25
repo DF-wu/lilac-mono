@@ -19,6 +19,8 @@ import { Button } from "../components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../components/ui/collapsible";
 import { Markdown } from "../components/Markdown";
 import { Composer } from "../components/Composer";
+import { DictationSettings } from "../components/DictationSettings";
+import { createPreferences } from "../preferences";
 import { noop, Section, Specimen } from "./shared";
 import { editorDemoPaths } from "./SettingsDemos";
 
@@ -72,6 +74,9 @@ export const composerCatalog: DisplayCatalog = {
   ],
 };
 export function ComposerSpecimen() {
+  const [dictationPreferences] = useState(() =>
+    createPreferences({ installationId: "design-system", principalId: "dictation-preview" }),
+  );
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(false);
   const [typeToFocus, setTypeToFocus] = useState(false);
@@ -119,6 +124,15 @@ export function ComposerSpecimen() {
       <Specimen title="Models">
         <ModelSelectorDemo />
       </Specimen>
+      <Collapsible>
+        <CollapsibleTrigger render={<Button variant="ghost" />}>
+          <ChevronRight />
+          Dictation setup
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <DictationSettings preferences={dictationPreferences} />
+        </CollapsibleContent>
+      </Collapsible>
       <div className="ds-composer my-4">
         <FloatingChatMenu
           sidebarOpen={sidebarOpen}
@@ -132,6 +146,7 @@ export function ComposerSpecimen() {
           onDelete={() => toast.add({ title: "Delete selected", type: "info" })}
         />
         <Composer
+          dictationPreferences={dictationPreferences}
           typeToFocus={typeToFocus}
           text={text}
           onText={setText}

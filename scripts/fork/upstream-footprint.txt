@@ -112,7 +112,7 @@ docker/verify-image.sh  # verifies the container identity variants
 docs/core-config-migrations.md  # documents fork v2 config keys
 docs/docker-deployment.md  # documents container identity variants and optional native Discord recording setup
 docs/heartbeat.md  # clarifies that the fork's Telegram surface is not a heartbeat default destination
-docs/native-surface.md  # links the fork-only recorder setup and delivery guarantees
+docs/native-surface.md  # documents fork-only Discord recording and browser dictation setup, delivery guarantees, and limits
 package.json  # fork:footprint script and scripts/fork lint, format, and typecheck coverage
 packages/agent/adapters/ai-sdk/adapter.ts  # executes parsed local tool calls on nonstandard finish reasons
 packages/agent/auto-compaction.ts  # applies the existing current-input boundary in compaction preflight; selection policy is owned by this upstream module
@@ -169,7 +169,7 @@ apps/core/tests/surface/bridge/bus-agent-runner-controls.test.ts  # preserves de
 apps/core/tests/surface/bridge/bus-agent-runner-session-queue.test.ts  # fences late steering during failure finalization
 apps/core/tests/tools/orchestrate.test.ts  # real durable publication regression for keyed live-to-ended concurrency
 apps/core/tests/workflow/workflow-subagent-convergence.test.ts  # concurrent, reopened-store and hard-exit receipt regressions; real bus deadlines
-apps/web/src/components/composer-editor.tsx  # preserves caret and selection across Activity editor recreation
+apps/web/src/components/composer-editor.tsx  # preserves caret and selection across Activity editor recreation and exposes literal dictation insertion through the editor handle
 packages/client-protocol/compat/previous-release/actionsPartSchema.schema.json  # removes generated schema absent from verified release build-3c01ce2c29a6-42575569714-1
 packages/client-protocol/compat/previous-release/bootstrap.get.schema.json  # regenerated from verified historical release schemas
 packages/client-protocol/compat/previous-release/bootstrap.schema.json  # regenerated from verified historical release schemas
@@ -224,3 +224,13 @@ packages/fs/src/search-backend.ts  # PR119: carries requested metadata mode to t
 packages/fs/tests/read-byte-prefix.test.ts  # PR119: rejects growth between whole-file size preflight and bounded read
 packages/fs/src/node-host.ts  # PR119: reads a bounded prefix from the opened handle without capping at stale metadata size
 apps/remote-runner/src/fsops.rs  # PR119: bounded prefix reads observe growth after opened-handle metadata
+
+# --- Native browser microphone dictation
+apps/web/src/components/Chat.tsx  # cancels dictation when a chat stays mounted after navigation
+apps/web/src/components/Composer.tsx  # mounts the fork-owned dictation controls and cancels takes before existing submit actions
+apps/web/src/components/Settings.tsx  # mounts fork-owned dictation settings in the existing account options panel
+apps/web/src/components/composer-tiptap.ts  # appends literal dictation in one bounded undoable transaction without replacing formatted drafts or badges
+apps/web/src/design-system/ComposerSection.tsx  # exercises production dictation settings and controls in the existing composer specimen
+apps/web/src/preferences.ts  # scopes dictation URL/model preferences to installation and principal while keeping service tokens in memory
+apps/web/tests/composer-tiptap.test.ts  # verifies literal dictation preserves formatted drafts, attachment identity, limits, and undo
+apps/web/tests/preferences.test.ts  # verifies dictation preference isolation and memory-only token reset and exclusion from storage

@@ -31,6 +31,19 @@ import type { Attachment } from "../types";
 import { skillMentionPattern } from "./skill-mentions";
 import { isWorkflowRunId, splitWorkflowRunIds } from "../workflow-run-id";
 
+/** Append literal speech in one undoable transaction without replacing the typed document. */
+export function appendEditorDictation(editor: Editor, text: string): boolean {
+  if (!text.trim()) return false;
+  const paragraph = editor.schema.nodes.paragraph!.create(null, editor.schema.text(text));
+  const transaction = closeHistory(editor.state.tr).insert(
+    editor.state.doc.content.size,
+    paragraph,
+  );
+  if (writeComposerDocument(transaction.doc).length > 65_536) return false;
+  editor.view.dispatch(transaction);
+  return true;
+}
+
 export const attachmentNode = Node.create({
   name: "composer_attachment",
   group: "inline",

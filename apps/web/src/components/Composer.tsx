@@ -53,6 +53,8 @@ import { IconButton, VirtualList, attempt } from "./ui";
 import type { ComposerEditorHandle } from "./composer-editor";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "./ui/select";
 import { Popover, PopoverTrigger, PopoverContent } from "./ui/popover";
+import { DictationButton } from "./DictationButton";
+import type { createPreferences } from "../preferences";
 
 // The compiler cannot memoize a component that contains `import()`.
 const loadComposerEditor = () => import("./composer-editor");
@@ -67,6 +69,8 @@ import { inputDeliveryOptions } from "../input-mode";
 export type ComposerProps = Partial<Pick<ChatCommon, "client" | "scope" | "catalog">> & {
   text: string;
   documentKey?: string;
+  dictationPreferences?: ReturnType<typeof createPreferences>;
+  dictationDisabled?: boolean;
   replacement?: ComposerReplacement;
   onReplacementApplied?: () => void;
   loadingDraft?: boolean;
@@ -119,6 +123,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       ? `Steer ${agent.displayName}, or queue a follow-up…`
       : `Message ${agent.displayName}…`);
   const input = useRef<ComposerEditorHandle>(null);
+  const dictation = useRef<{ cancel: () => void }>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const insertingCompletion = useRef<"hide" | "keep">(undefined);
   const [mode, setMode] = useState<"steer" | "followup">("steer");
@@ -291,6 +296,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       return;
     }
     if (answer) {
+      dictation.current?.cancel();
       answer.onAdvance();
       return;
     }
@@ -313,12 +319,14 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       return;
     }
     if (command?.kind === "builtin" && command.id === "cancel") {
+      dictation.current?.cancel();
       props.onCancel();
       onText("");
       setCommandId(undefined);
       return;
     }
     if (command?.kind === "builtin" && command.id === "model") {
+      dictation.current?.cancel();
       document.getElementById("composer-model")?.focus();
       onText("");
       setCommandId(undefined);
@@ -329,6 +337,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       submittedCommand = { id: custom.id, arguments: plainText.slice(custom.name.length + 2) };
     if (command?.id === "compact")
       submittedCommand = { id: "compact", arguments: plainText.slice("/compact".length).trim() };
+    dictation.current?.cancel();
     props.onSubmit({
       text: input.current?.submissionText() ?? text,
       ...(attachments.length ? { attachmentText: input.current?.draftText() ?? text } : {}),
@@ -688,6 +697,22 @@ export const Composer = memo(function Composer(props: ComposerProps) {
             <ALargeSmall className="size-5" />
           </IconButton>
           <span ref={setFormattingSlot} className="composer-formatting-slot contents" />
+          {(props.dictationPreferences ?? workspace?.preferences) ? (
+            <DictationButton
+              ref={dictation}
+              preferences={(props.dictationPreferences ?? workspace?.preferences)!}
+              documentKey={props.documentKey}
+              replacement={props.replacement}
+              disabled={
+                disabled ||
+                !!props.dictationDisabled ||
+                !!props.submitting ||
+                !!props.loadingDraft ||
+                !editorReady
+              }
+              onText={(value) => input.current?.appendDictation(value)}
+            />
+          ) : null}
           <ModelSelector
             client={client}
             reasoning={props.reasoning}

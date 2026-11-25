@@ -11,6 +11,72 @@ Use [Local setup](#local-setup) and [Clerk](#clerk) to configure access, [Settin
 for runtime settings, and [Persistence and rollback](#persistence-and-rollback) before upgrading.
 The container console is covered under [Temporary operator console](#temporary-operator-console).
 
+## Microphone dictation
+
+In **Settings → Settings → Dictation**, enter the complete transcription URL, such as
+`https://asr.example.com/v1/audio/transcriptions`. Leave it empty to disable dictation. Choose the
+service's model ID; `whisper-1` is the default and the required compatibility ID for CapsWriter.
+An optional service API token is sent as a bearer token. URL and model are saved only for this
+Native installation and account in this browser. The token stays only in the current tab's memory;
+reload, sign-out, changing accounts/installations, or editing the URL clears it. It is never added to
+Core configuration or Core authentication. Do not enter credentials or tokens in the URL; URLs with
+credentials, query strings, or fragments are rejected and are not saved.
+
+The microphone button appears after a URL is configured. Select **Start dictation**, allow microphone
+access, speak, then select **Stop dictation**. Audio is sent directly from your browser to the
+configured service, without a Core proxy. The returned text is appended as an editable paragraph to
+the current draft, preserving existing formatting, attachments, and references. It never sends a
+message automatically. Review the text before sending; Undo can remove the inserted paragraph.
+**Cancel dictation** discards the take or aborts an in-flight request. Navigation, leaving the chat
+foreground, switching drafts, submitting, read-only state, tab hiding, and unmount also cancel the
+take; late permission grants and responses cannot insert into a different draft. Cancelling an upload
+cannot guarantee cancellation of work already admitted by the service.
+
+### Browser and service setup
+
+- Open Native in a secure context (HTTPS, or browser-trusted localhost) and allow microphone access.
+  Current Chromium and Safari recording formats are negotiated as WebM/Opus or MP4; the service must
+  support the chosen container/codec. There is no audio conversion in Native.
+- The URL must be reachable **from the browser's device**, not just from Core or a container.
+  A loopback URL refers to that device. HTTPS Native pages may block HTTP ASR as mixed content.
+  Browser Local Network Access policies may require permission for a local/private service. Use a
+  browser-reachable HTTPS endpoint where required; changing CORS alone does not bypass these rules.
+- Allow the exact Native page origin (scheme, host, port) on the service. In
+  [CapsWriter's OpenAI-compatible API](https://github.com/DF-wu/CapsWriter-Offline-Container/blob/5b9d8a6f5eaba56f6e68b1b58c515ba4ff8856c9/docs/en/openai-api.md),
+  the operator sets `CAPSWRITER_HTTP_API_CORS_ORIGINS` to the Native origin, for example
+  `https://chat.example.com`. An empty allowlist rejects browser requests. Keep model `whisper-1`;
+  CapsWriter selects the actual recognizer separately. This feature does not change service settings.
+- If using a personal token, allow `Authorization` in the service's OPTIONS preflight response.
+  Tokens require HTTPS unless the parsed hostname is exactly `localhost`, `127.0.0.1`, or `[::1]`.
+  Other HTTP destinations are rejected before microphone permission when a token is present.
+  Without a token, HTTP remains available when the browser permits it, but remote HTTP can expose
+  audio as well as transcription results. Use HTTPS for private speech sent over the network;
+  CORS permission does not encrypt traffic.
+  Native omits cookies, Core headers, and referrers and rejects redirects. Enter the final endpoint,
+  not a URL that redirects. Use a token intended for your service and browser usage; other scripts
+  running in the page can access browser memory. Provider support for browser CORS is required.
+
+Each take stops after two minutes. Takes larger than 10 MiB are discarded, and transcription times
+out after 30 seconds. Responses must contain a non-empty JSON `text` string of at most 32,000
+characters; insertion also respects the existing 65,536-character draft limit. No streaming, TTS,
+automatic retries, or saved audio are provided. Audio remains in memory until sent or discarded;
+the configured service owns its own retention policy. On failure the typed draft stays intact.
+
+For microphone errors, check browser site permissions and device availability. For network errors,
+check the final URL, mixed-content/Local Network Access policy, and the service's CORS response in
+browser developer tools. HTTP 401/403 usually means token or origin permission; 413 means service
+upload limits; 429/503 means service capacity or availability. Try a shorter take after a timeout.
+Malformed or empty responses require a compatible JSON transcription endpoint. Do not share tokens,
+audio, or transcripts when reporting an issue.
+
+The request uses platform `MediaRecorder` and multipart `FormData` (`file`, `model`,
+`response_format=json`), leaving Content-Type and its multipart boundary to the browser, following the
+[OpenAI transcription contract](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create/).
+The stop-to-transcribe lifecycle and MIME negotiation were informed by
+[Open WebUI's recorder](https://github.com/open-webui/open-webui/blob/0666e59d26a4d056e0bacee41742486badd71cf8/src/lib/components/chat/MessageInput/VoiceRecording.svelte)
+and [LibreChat's STT hook](https://github.com/LibreChat-AI/LibreChat/blob/4700c44eb77c142b4f9f8b87476924f22890eb39/client/src/hooks/Input/useSpeechToTextExternal.ts).
+Lilac deliberately uses a direct browser CORS request instead of their server relay architecture.
+
 ## Local setup
 
 Build the web assets with `bun run build:web`. Enable the surface in a version-3 (or existing version-2)
