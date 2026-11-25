@@ -61,6 +61,7 @@ import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import { captureError } from "../shared/error-capture";
 
 import { ResourceImagePreviews } from "./image-preview";
+import { isHeifMediaType } from "./heif-model-image";
 
 export type VerifiedResourceRead = {
   readonly imagePreview?: ResourceImagePreview;
@@ -477,6 +478,7 @@ export class CoreResourceService implements ResourceRegistry, ResourceAccess {
     if (
       options.modelImage &&
       decision.read.classification.kind === "image" &&
+      !isHeifMediaType(decision.read.classification.mediaType) &&
       decision.read.blob.byteLength > RESOURCE_IMAGE_INLINE_MAX_BYTES
     ) {
       return this.#imagePreviews.open(decision.read, record);

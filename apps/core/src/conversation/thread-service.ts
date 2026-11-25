@@ -71,6 +71,8 @@ import {
 } from "../surface/bridge/request-composition/attachments";
 import { stripLeadingContinueDirective } from "../surface/discord/discord-request-router/common";
 import { isSqliteBusyError } from "../shared/sqlite";
+import { convertHeifForModel, isHeifMediaType } from "../resource/heif-model-image";
+import { classifyResourcePrefix } from "../resource/resource-mime";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 
 const SUMMARY_HEAD_MESSAGES = 40;
@@ -978,7 +980,12 @@ export async function buildThreadSummaryModelMessages(input: {
     }
     const message = input.messages[index]!;
     content.push({ type: "text", text: formatMessageForSummary(message) });
-    for (const attachment of message.attachments) {
+    for (const original of message.attachments) {
+      const detected = original.data && (await classifyResourcePrefix({ prefix: original.data }));
+      const attachment =
+        detected && isHeifMediaType(detected.mediaType)
+          ? { ...original, mimeType: detected.mediaType }
+          : original;
       if (message.surface !== undefined && message.surface !== "discord" && !attachment.data) {
         content.push({
           type: "text",
@@ -1016,7 +1023,26 @@ export async function buildThreadSummaryModelMessages(input: {
         });
         continue;
       }
+      const position = content.length;
       await appendDiscordAttachmentsToUserContent(content, [attachment], attachmentState);
+      const part = content[position];
+      if (part?.type !== "file" || !(part.data instanceof Uint8Array)) continue;
+      const downloaded = !attachment.data && (await classifyResourcePrefix({ prefix: part.data }));
+      const heifMime =
+        downloaded && isHeifMediaType(downloaded.mediaType) ? downloaded.mediaType : part.mediaType;
+      if (!isHeifMediaType(heifMime)) continue;
+      const jpeg = await convertHeifForModel(part.data, part.filename);
+      content[position] = jpeg
+        ? { type: "file", ...jpeg }
+        : {
+            type: "text",
+            text: attachmentMetadataText({
+              ...attachment,
+              mediaType: heifMime,
+              surface: message.surface,
+              reason: "HEIF attachment could not be converted for the summary model",
+            }),
+          };
     }
   }
   return [{ role: "user", content }];

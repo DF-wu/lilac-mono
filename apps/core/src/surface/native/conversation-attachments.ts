@@ -6,6 +6,7 @@ import {
   type ConversationThreadSummaryAttachment,
 } from "../../conversation/thread-service";
 import { consumeVerifiedResourceRead } from "../../resource/service";
+import { hasHeifFilename } from "../../resource/heif-model-image";
 import type { NativeStore } from "./store";
 import type { NativeSurfaceStore } from "./store-surface";
 import type { NativeResourceService } from "./resources";
@@ -45,10 +46,11 @@ export function hydrateNativeConversationAttachments(
       };
       attachments.push(attachment);
       if (upload.state !== "ready" || !upload.resourceUri) continue;
-      if (
-        upload.size > remainingBytes ||
-        !canInlineConversationAttachment(upload.mediaType, upload.size)
-      )
+      const mediaType =
+        upload.mediaType === "application/octet-stream" && hasHeifFilename(upload.filename)
+          ? "image/heif"
+          : upload.mediaType;
+      if (upload.size > remainingBytes || !canInlineConversationAttachment(mediaType, upload.size))
         continue;
       const readResult = await dependencies.resources
         .scopedAccess(thread.starterId)
