@@ -41,7 +41,7 @@ from a partially applied migration. Starting an older binary alone does not undo
    Verify native deployment settings and subagent authority after adopting v3.
 
 Rollback uses the matching pre-upgrade databases and blob storage together. Current workflow schema
-28, transcript schema 14, and native schema 8 are not readable by older builds. Strict record codecs
+29, transcript schema 15, and native schema 8 are not readable by older builds. Strict record codecs
 can also change within a schema version; a matching version number alone does not establish downgrade
 compatibility. Keep producers stopped while restoring. Never remove migration markers to force an
 older binary to open current data.
@@ -337,6 +337,18 @@ older builds reject newer output event variants. Keep native state, transcripts,
 and retained output events together. Historical standalone messages without a known request remain
 unlinked; startup only restores links it can prove from retained native inputs.
 
+### Skip reply preview resets
+
+On a successful `skip_reply`, Core sends `discardPreview: true` on `evt.agent.output.text.reset`
+to withdraw the Discord preview. A native `evt.native.output` step reset can carry `textOnly: true`
+to clear the draft and keep the working activity. Older strict decoders reject both new fields.
+Drain active turns and upgrade the Discord relay and native projection consumer before restarting
+the runner that publishes these events. Existing reset events without the fields remain readable.
+
+Before rollback, let the upgraded consumers finish pending resets and stop the producers. Restore
+the matching pre-upgrade Redis and database backups together if an older consumer would replay
+retained reset events carrying either field.
+
 ### Native computer viewer through Core
 
 `computer.read.desktop.url` can now be a root-relative `/computer.html?...` URL. Native web resolves
@@ -377,7 +389,7 @@ Use `--dry-run` for a read-only preflight. The normal command preflights and the
 invocation. It accepts only supported legacy schemas, verifies every copied object's SHA-256 and byte
 length, rewrites each database only after its required objects exist, and removes replaced legacy byte
 columns and files. The offline command emits transcript schema 6 and workflow schema 26; current Core
-then applies transcript schemas 7 through 14 and workflow schemas 27 through 28 during startup. Databases below
+then applies transcript schemas 7 through 15 and workflow schemas 27 through 29 during startup. Databases below
 those blob baselines, including partially migrated legacy databases, stop startup with the migration command.
 
 The migration copies durable transcript, projection, lineage, and workflow artifact content. It discards
@@ -448,6 +460,22 @@ A process interrupted immediately after a delayed backend decision write can lea
 file after deletion. It cannot resurrect readable content or a durable blob reference. Completed calls
 clean that file; removing every such interrupted marker would require a separate backend storage change.
 
+### Agent-requested provider options in workflow records
+
+Workflow `agent()` operation inputs and dispatch policies may carry an `options` object: the provider
+options an agent requested for `agent()`, `subagent_delegate`, or `orchestrate send`. The schema
+version does not change, and existing records decode unchanged. Older builds decode both records with
+strict codecs, so they reject any operation or policy written with `options` and cannot recover or
+follow up the run that owns it. Before rolling back, let subagent and workflow runs started with
+options finish or cancel them, or restore the pre-upgrade workflow database.
+
+### Workflow schema 29: runs by origin user
+
+Core upgrades workflow schema 28 to 29 online. It adds an index on
+`(origin_client, origin_user_id, created_at DESC, run_id DESC)` so `orchestrate list` can page the
+runs one surface user started. Existing records are unchanged. Older builds reject schema 29; restore
+the pre-upgrade workflow database to roll back.
+
 ### Workflow schema 28: cancellation intent and atomic waits
 
 Core upgrades workflow schema 27 to 28 online. It adds the run-claim index on
@@ -485,7 +513,7 @@ streams remain tail-only, and supported trimming preserves all managed pending f
 
 ### Transcript storage
 
-Current `agent-transcripts.db` uses schema 14. Schemas below the managed-blob baseline of 6 require
+Current `agent-transcripts.db` uses schema 15. Schemas below the managed-blob baseline of 6 require
 the offline command above. Startup applies supported later migrations in a transaction and validates
 foreign keys. These migrations retain canonical history and add resource/ownership references,
 deferred-tool snapshots, deleted-output aliases, native retention, and image-preview metadata.
@@ -493,7 +521,8 @@ deferred-tool snapshots, deleted-output aliases, native retention, and image-pre
 Native ownership in schemas 12/13 prevents global transcript pruning from deleting native history
 behind the surface. Rewind, deletion, and configured native retention release those references.
 Schema 14 adds nullable image-preview metadata; originals and resource IDs remain unchanged, and
-missing previews regenerate on demand. Restore a pre-upgrade backup for older binaries.
+missing previews regenerate on demand. Schema 15 adds Discord skip decisions keyed by channel and
+user message. Restore a pre-upgrade backup for older binaries.
 
 Prefix-lineage tool snapshots replace the old session-wide `session_loaded_tools` union. That table
 is dropped because its selection cannot be assigned to a branch safely. Existing descendants inherit

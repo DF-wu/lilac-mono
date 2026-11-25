@@ -751,6 +751,39 @@ export class NativeStore {
     );
   }
 
+  /** The messages a subagent run's stream showed, or null when it has no stream. */
+  agentStreamMessages(runId: string): NativeStoreResult<DisplayMessage[] | null> {
+    return Result.gen(function* () {
+      const stream = yield* this.findAgentStream(runId);
+      if (!stream) return Result.ok(null);
+      const turn = yield* this.readRecord("turn", stream.turnId);
+      return Result.ok(turn?.kind === "turn" ? turn.value.messages : null);
+    }, this);
+  }
+
+  /** Rewrites a subagent run's stream messages in one transaction; null leaves them unchanged. */
+  rewriteAgentStream(
+    runId: string,
+    rewrite: (messages: readonly DisplayMessage[]) => DisplayMessage[] | null,
+  ): NativeStoreResult<void> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const stream = yield* this.findAgentStream(runId);
+        const turn = stream ? yield* this.readRecord("turn", stream.turnId) : null;
+        if (!stream || turn?.kind !== "turn") return Result.ok(undefined);
+        const messages = rewrite(turn.value.messages);
+        if (!messages) return Result.ok(undefined);
+        this.writeRecord(
+          turn.value.turnId,
+          { ...turn, value: { ...turn.value, messages } },
+          stream.id,
+        );
+        this.bump(stream, "reset", turn.value.turnId);
+        return Result.ok(undefined);
+      }, this),
+    );
+  }
+
   settleAgentStream(stream: NativeAgentStreamRecord, state: "complete" | "failed" | "canceled") {
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
@@ -1081,6 +1114,8 @@ export class NativeStore {
       archived?: boolean;
       excludeSettled?: boolean;
       query?: string;
+      /** Agent discovery: archived threads and the actor's own DM as well as the sidebar's. */
+      includeArchivedAndOwnDm?: boolean;
     } = {},
   ): NativeStoreResult<NativeThread[]> {
     return nativeStoreTransaction(this.db, () =>
@@ -1098,7 +1133,7 @@ export class NativeStore {
         if (!Number.isSafeInteger(cursorTime) || cursorTime < 0)
           return Result.err(nativeFailure("invalid", "Thread cursor is invalid"));
         const records = yield* this.readRows(
-          `SELECT r.* FROM native_records r WHERE r.kind='thread' AND (r.updated_at < ? OR (r.updated_at = ? AND r.id > ?)) AND ( ? = 'owner' OR json_extract(r.data_json,'$.value.starterId') = ? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?)) AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.kind') IS NULL AND json_extract(r.data_json,'$.value.archived')=? AND json_extract(r.data_json,'$.value.title') LIKE ? ESCAPE '\\' AND (?=0 OR NOT EXISTS(SELECT 1 FROM native_thread_preferences p WHERE p.user_id=? AND p.thread_id=r.id AND p.section='settled')) ORDER BY r.updated_at DESC,r.id LIMIT ?`,
+          `SELECT r.* FROM native_records r WHERE r.kind='thread' AND (r.updated_at < ? OR (r.updated_at = ? AND r.id > ?)) AND ( ? = 'owner' OR json_extract(r.data_json,'$.value.starterId') = ? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?)) AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND (json_extract(r.data_json,'$.value.kind') IS NULL OR (?=1 AND json_extract(r.data_json,'$.value.kind')='dm' AND json_extract(r.data_json,'$.value.starterId')=?)) AND (?=1 OR json_extract(r.data_json,'$.value.archived')=?) AND json_extract(r.data_json,'$.value.title') LIKE ? ESCAPE '\\' AND (?=0 OR NOT EXISTS(SELECT 1 FROM native_thread_preferences p WHERE p.user_id=? AND p.thread_id=r.id AND p.section='settled')) ORDER BY r.updated_at DESC,r.id LIMIT ?`,
           [
             cursorTime,
             cursorTime,
@@ -1106,6 +1141,9 @@ export class NativeStore {
             user.role,
             actorId,
             actorId,
+            options.includeArchivedAndOwnDm ? 1 : 0,
+            actorId,
+            options.includeArchivedAndOwnDm ? 1 : 0,
             options.archived ? 1 : 0,
             `%${(options.query ?? "").replace(/[\\%_]/g, "\\$&")}%`,
             options.excludeSettled ? 1 : 0,

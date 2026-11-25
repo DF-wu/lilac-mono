@@ -40,6 +40,7 @@ import { Panic, Result, TaggedError, type Result as ResultType } from "better-re
 import type {
   ConfiguredModelChainEntry,
   CoreConfig,
+  JSONObject,
   CustomCommandResult,
   DurableResolvedModelRequest,
   ModelCapabilityInfo,
@@ -49,8 +50,13 @@ import type {
   ResolvedModelRef,
 } from "@stanley2058/lilac-utils";
 import {
+  AgentProviderOptionsInvalid,
+  captureTelemetryAgentRun,
+  captureTelemetryError,
   CUSTOM_COMMAND_TOOL_NAME,
+  isTelemetryUsageCaptureActive,
   deriveSubagentIdleTimeoutMs,
+  parseAgentProviderOptions,
   env,
   formatTaggedErrorForLog,
   getCoreConfig,
@@ -85,6 +91,7 @@ import {
   classifyHistoryProviderFamily,
   createAgentRunIdleWatchdog,
   createRetryBackoffBudget,
+  sumLanguageModelUsage,
   type AiSdkPiAgentOptions,
   type AiSdkPiAgentEvent,
   type AgentInputQueueId,
@@ -169,6 +176,14 @@ import type {
 } from "./request-delivery";
 import type { AcceptedRequestDelivery } from "./request-delivery/types";
 import { type AgentRunJournal, type AgentRunRecoveryHead } from "./agent-run-journal";
+import {
+  acceptedSkipReplyOutput,
+  completedSkipReply,
+  latestDiscordInput,
+  saveDiscordSkip,
+  decodeSkipReplyReason,
+  discordResponseStart,
+} from "../../tools/skip-reply";
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "./bridge-log";
 import { recordRequestLatencyStage } from "./request-latency-trace";
@@ -957,14 +972,33 @@ export class SubagentPermissionProfileNotConfigured extends TaggedError(
 
 type AgentRunModelResolutionError =
   | AgentRunModelSelectionInvalid
+  | AgentProviderOptionsInvalid
   | SubagentPermissionProfileNotConfigured
   | ModelResolutionFailed;
+
+/** Requested options override the alias options of the same namespace key by key. */
+function withRequestedProviderOptions(
+  head: ResolvedModelRef,
+  options: JSONObject | undefined,
+): ResultType<ResolvedModelRef, AgentProviderOptionsInvalid> {
+  if (!options) return Result.ok(head);
+  return parseAgentProviderOptions(head.provider, options).map((requested) => {
+    if (Object.keys(requested).length === 0) return head;
+    const providerOptions = { ...head.providerOptions };
+    for (const [namespace, value] of Object.entries(requested)) {
+      providerOptions[namespace] = { ...providerOptions[namespace], ...value };
+    }
+    return { ...head, providerOptions };
+  });
+}
 
 export function resolveAgentRunModelResult(params: {
   cfg: CoreConfig;
   runProfile: AgentRunProfile;
   requestModelOverride?: string;
   reasoningOverride?: ModelReasoningEffort;
+  /** Agent-requested options for the head model's provider, validated against its schema. */
+  providerOptionsOverride?: JSONObject;
   resolvedModelRequest?: DurableResolvedModelRequest;
 }): ResultType<ResolvedModelPlan, AgentRunModelResolutionError> {
   if (params.resolvedModelRequest) {
@@ -1042,10 +1076,11 @@ export function resolveAgentRunModelResult(params: {
         fallbackSource: "models.main.fallback",
       });
   const fallbacks = resolveAgentRunModelFallbacksResult(params);
-  return Result.all([resolved, fallbacks]).map(([plan, fallbackValues]) => ({
-    head: applyHeadReasoning(plan.head),
-    fallbacks: fallbackValues,
-  }));
+  return Result.all([resolved, fallbacks]).andThen(([plan, fallbackValues]) =>
+    withRequestedProviderOptions(applyHeadReasoning(plan.head), params.providerOptionsOverride).map(
+      (head) => ({ head, fallbacks: fallbackValues }),
+    ),
+  );
 }
 
 export function resolveAgentRunModel(params: {
@@ -1053,6 +1088,7 @@ export function resolveAgentRunModel(params: {
   runProfile: AgentRunProfile;
   requestModelOverride?: string;
   reasoningOverride?: ModelReasoningEffort;
+  providerOptionsOverride?: JSONObject;
   resolvedModelRequest?: DurableResolvedModelRequest;
 }): ResolvedModelPlan {
   const resolved = resolveAgentRunModelResult(params);
@@ -3083,6 +3119,7 @@ export async function startBusAgentRunner(params: {
           task,
           requestDeliveryId: entry.requestDeliveryId ?? entry.queueEntryId,
           idleTimeoutMs: deriveSubagentIdleTimeoutMs(cfg.agent.idleTimeoutMs),
+          config: cfg,
           sender,
         }),
       );
@@ -3234,6 +3271,7 @@ export async function startBusAgentRunner(params: {
     }
     const mcpImages = new McpImageCheckpointRegistry();
     let recoveredQueuedControlStoredMessages: StoredMessageV1[] = [];
+    const admittedDiscordMessageIds = new Set<string>();
 
     if (next.recovery && next.storedRecoveryCheckpoint) {
       const materialized = await materializeMcpImageCheckpoint({
@@ -3298,7 +3336,12 @@ export async function startBusAgentRunner(params: {
           ({ requestDeliveryId, outcome }) => [requestDeliveryId, outcome] as const,
         ),
       );
+      const checkpointOrigin = latestDiscordInput(next.recovery.checkpointMessages);
+      if (checkpointOrigin) admittedDiscordMessageIds.add(checkpointOrigin);
       for (const entry of mergedControls.reapplied) {
+        const ref = entry.currentTurnMessageRef;
+        if (ref?.platform === "discord" && ref.channelId === sessionId)
+          admittedDiscordMessageIds.add(ref.messageId);
         if (entry.requestDeliveryId && !retained.has(entry.requestDeliveryId)) {
           retained.set(entry.requestDeliveryId, {
             kind: "completed",
@@ -3373,6 +3416,7 @@ export async function startBusAgentRunner(params: {
     const routerSessionMode = parseRouterSessionModeFromRaw(next.raw);
 
     let activeAgent: AiSdkPiAgent<ToolSet> | null = null;
+    const getActiveAgent = (): AiSdkPiAgent<ToolSet> | null => activeAgent;
     const requiresAgentRecovery = (): boolean => activeAgent?.state.recoveryRequired !== undefined;
     let claudeCodeRun: MaterializedClaudeCodeRun | null = null;
     let coreNamedClaudeRuntime: CoreNamedClaudeRuntime | null = null;
@@ -3880,7 +3924,74 @@ export async function startBusAgentRunner(params: {
     let roundEstimatedCostCount = 0;
 
     let resolvedModelLabel = "unknown";
+    let resolvedModelId: string | undefined;
+    let resolvedProviderName: string | undefined;
+    let resolvedModelSpec: string | undefined;
     let resolvedProviderFamily: HistoryProviderState["lastFamily"] = "ai-sdk";
+    let telemetryTurns = 0;
+    let telemetryToolCallCount = 0;
+    let telemetryDidSwitchModel = false;
+    let telemetryAccumulatedUsage: LanguageModelUsage | undefined;
+    const resolveTelemetryTransport = (provider: string | undefined): string => {
+      const observed = getActiveAgent()?.getLastExecutionTransport();
+      if (observed) return observed;
+      if (provider === "claude-code") return "claude-code";
+      return "ai-sdk";
+    };
+    const emitTelemetryAgentRun = (params: {
+      readonly status: "resolved" | "cancelled" | "failed";
+      readonly durationMs: number;
+      readonly provider?: string;
+      readonly modelId?: string;
+      readonly modelSpec?: string;
+      readonly ttftMs?: number | null;
+      readonly transcriptMessageCount?: number;
+      readonly estimatedCostUsd?: number;
+      readonly errorTag?: string;
+      readonly statusCode?: number;
+    }): void => {
+      if (!isTelemetryUsageCaptureActive()) return;
+      Result.try({
+        try: () => {
+          const surface = isHeartbeatSessionId(headers.session_id)
+            ? "heartbeat"
+            : (headers.request_client ?? "unknown");
+          const usage = telemetryAccumulatedUsage ?? runStats.totalUsage;
+          captureTelemetryAgentRun({
+            status: params.status,
+            surface,
+            isSubagent: runProfile !== "primary",
+            isWorkflow: workflowHint !== null,
+            isHeartbeat: isHeartbeatSessionId(headers.session_id),
+            provider: params.provider,
+            modelId: params.modelId,
+            modelSpec: params.modelSpec,
+            transport: resolveTelemetryTransport(params.provider),
+            didSwitchModel: telemetryDidSwitchModel,
+            durationMs: params.durationMs,
+            ttftMs: params.ttftMs,
+            turns: telemetryTurns,
+            toolCallCount: telemetryToolCallCount,
+            compacted: completedCompactionCount > 0 || transcriptHasCompactionCheckpoint,
+            transcriptMessageCount: params.transcriptMessageCount,
+            inputTokens: usage?.inputTokens,
+            outputTokens: usage?.outputTokens,
+            totalTokens: usage?.totalTokens,
+            noCacheTokens: usage?.inputTokenDetails.noCacheTokens,
+            cacheReadTokens: usage?.inputTokenDetails.cacheReadTokens,
+            cacheWriteTokens: usage?.inputTokenDetails.cacheWriteTokens,
+            textTokens: usage?.outputTokenDetails.textTokens,
+            reasoningTokens: usage?.outputTokenDetails.reasoningTokens,
+            estimatedCostUsd: params.estimatedCostUsd,
+            requestId: headers.request_id,
+            sessionId: headers.session_id,
+            errorTag: params.errorTag,
+            statusCode: params.statusCode,
+          });
+        },
+        catch: () => undefined,
+      });
+    };
     let requestTerminalKind: "completed" | "failed" | "cancelled" = "failed";
     let shouldTerminalizeRequest = true;
     let terminalMarkerAttempted = false;
@@ -4345,6 +4456,9 @@ export async function startBusAgentRunner(params: {
           const initialResolvedModel = modelPlan.head;
           nativeOutput?.model(initialResolvedModel.spec, initialResolvedModel.reasoning);
           resolvedModelLabel = initialResolvedModel.modelId;
+          resolvedModelId = initialResolvedModel.modelId;
+          resolvedProviderName = initialResolvedModel.provider;
+          resolvedModelSpec = initialResolvedModel.spec;
           resolvedProviderFamily = classifyHistoryProviderFamily({
             type: initialResolvedModel.provider,
           });
@@ -4881,10 +4995,14 @@ export async function startBusAgentRunner(params: {
             setCurrentTurnContext(currentTurnUserId, currentTurnMessageRef);
             activeModelIndex = nextFallback.index;
             didSwitchModel = true;
+            telemetryDidSwitchModel = true;
             modelCapabilityInfo = nextBinding.capabilityInfo;
             costEstimateStatus = nextBinding.costEstimateStatus;
             costEstimateReason = nextBinding.costEstimateReason;
             resolvedModelLabel = nextBinding.resolved.modelId;
+            resolvedModelId = nextBinding.resolved.modelId;
+            resolvedProviderName = nextBinding.resolved.provider;
+            resolvedModelSpec = nextBinding.resolved.spec;
             resolvedProviderFamily = classifyHistoryProviderFamily({
               type: nextBinding.resolved.provider,
             });
@@ -5096,6 +5214,8 @@ export async function startBusAgentRunner(params: {
           ) => {
             currentTurnUserId = userId;
             currentTurnMessageRef = messageRef;
+            if (messageRef?.platform === "discord" && messageRef.channelId === headers.session_id)
+              admittedDiscordMessageIds.add(messageRef.messageId);
             if (state.activeRun) state.activeRun.currentTurnUserId = userId;
             if (state.activeRun) state.activeRun.currentTurnMessageRef = messageRef;
             activeBinding.requestContext.currentTurnUserId = userId;
@@ -5627,8 +5747,27 @@ export async function startBusAgentRunner(params: {
             agent.replaceMessages(messages);
           };
 
+          const recordSkipDecision = (
+            inputMessages: readonly ModelMessage[],
+            decision: NonNullable<ReturnType<typeof completedSkipReply>>,
+          ) => {
+            if (runProfile !== "primary" || next.requestClient !== "discord") return;
+            const saved = saveDiscordSkip({
+              messages: inputMessages,
+              requestId: headers.request_id,
+              channelId: headers.session_id,
+              admittedMessageIds: admittedDiscordMessageIds,
+              store: params.transcriptStore,
+              decision,
+            });
+            if (saved?.isErr()) return signalBusAgentRunnerHostFailure(saved.error);
+          };
           agent.setTurnBoundaryHandler(async (context) => {
             removePendingSilentTurn();
+            skippedReply = turnHasSkipReplyCall
+              ? completedSkipReply(agent.state.messages)
+              : undefined;
+            if (skippedReply) recordSkipDecision(context.modelInputMessages, skippedReply);
 
             lastBoundaryModelInputMessages = context.modelInputMessages;
             const drained = await drainDeferredCompletions({
@@ -5642,6 +5781,7 @@ export async function startBusAgentRunner(params: {
               context.modelInputMessages,
             );
             return {
+              endAfterTools: Boolean(skippedReply),
               append: [...decision.append, ...jobEvents.append, ...answers],
               forceNextTurn:
                 decision.forceNextTurn || jobEvents.forceNextTurn || answers.length > 0,
@@ -5653,6 +5793,7 @@ export async function startBusAgentRunner(params: {
           let finalText = "";
           let stableFinalText = "";
           let stablePartialText = state.activeRun?.partialText ?? "";
+          let attemptStartPhase: ReturnType<typeof openAIMessagePhase>;
           let attemptStartFinalText = stableFinalText;
           let attemptStartPartialText = stablePartialText;
           const currentTurnToolCallIds = new Set<string>();
@@ -5666,12 +5807,74 @@ export async function startBusAgentRunner(params: {
             phaseBoundaryPrefixChars: number;
           }> = [];
           let bufferNoReplyTurnText = true;
+          let turnHasSkipReplyCall = false;
+          let skippedReply: ReturnType<typeof completedSkipReply>;
           let lastCompletedTurnWasSilent = false;
           let turnFinalAnswerText = "";
           let turnHasFinalAnswerPhase = false;
           let lastCompletedTurnFinalAnswerText: string | undefined;
           let currentTextPhase: ReturnType<typeof openAIMessagePhase>;
           let retainedTextPhase: ReturnType<typeof openAIMessagePhase>;
+          const publishSkipPreviewReset = () => {
+            if (next.requestClient !== "discord") return;
+            return outputPublisher.publishTextReset({
+              text: stablePartialText,
+              phase: retainedTextPhase,
+              discardPreview: true,
+            });
+          };
+          const restoreCheckpointSkip = async (checkpoint: readonly ModelMessage[]) => {
+            const decision = completedSkipReply(checkpoint);
+            if (!decision) return;
+            recordSkipDecision(checkpoint, decision);
+            await publishSkipPreviewReset();
+            return decision;
+          };
+          const retractSkipPreview = () => {
+            if (
+              nativeOutput &&
+              (finalText !== attemptStartFinalText || nativeOutput.hasPendingText())
+            )
+              nativeOutput.reset(crypto.randomUUID(), nativeStepId(), true);
+            finalText = stableFinalText = attemptStartFinalText;
+            stablePartialText = attemptStartPartialText;
+            if (state.activeRun?.requestId === next.requestId)
+              state.activeRun.partialText = stablePartialText;
+            lastCompletedTurnFinalAnswerText = undefined;
+            retainedTextPhase = attemptStartPhase;
+            turnTextStartIndex = finalText.length;
+            turnPartialTextStartIndex = stablePartialText.length;
+            pendingNoReplyTurnText = "";
+            pendingNoReplyTurnOutputs = [];
+            void publishSkipPreviewReset();
+          };
+          const finishSkipReplyCall = (
+            event: Extract<AiSdkPiAgentEvent<ToolSet>, { type: "tool_execution_end" }>,
+          ) => {
+            const accepted = !event.isError && acceptedSkipReplyOutput(event.output);
+            const context = {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              toolCallId: event.toolCallId,
+              reason: decodeSkipReplyReason(event),
+            };
+            if (accepted) {
+              logger.info("reply skipped", formatBridgeLogContext(context));
+              retractSkipPreview();
+              return;
+            }
+            logger.warn(
+              "skip_reply rejected",
+              formatBridgeLogContext({
+                ...context,
+                resultPreview: formatToolLogPreview({
+                  toolName: event.toolName,
+                  event,
+                  field: "result",
+                }),
+              }),
+            );
+          };
           const assistantTextPhaseByPartId = new Map<
             string,
             NonNullable<ReturnType<typeof openAIMessagePhase>>
@@ -5821,12 +6024,26 @@ export async function startBusAgentRunner(params: {
 
             if (event.type === "agent_end") {
               runStats.totalUsage = event.totalUsage;
+              if (isTelemetryUsageCaptureActive()) {
+                Result.try({
+                  try: () => {
+                    telemetryAccumulatedUsage = sumLanguageModelUsage(
+                      telemetryAccumulatedUsage,
+                      event.totalUsage,
+                    );
+                  },
+                  catch: () => undefined,
+                });
+              }
               runStats.finalMessages = event.messages;
             }
 
             if (event.type === "turn_start") {
               runWait.resume();
+              turnHasSkipReplyCall = false;
+              skippedReply = undefined;
               nativeStep += 1;
+              attemptStartPhase = retainedTextPhase;
               attemptStartFinalText = stableFinalText;
               attemptStartPartialText = stablePartialText;
               currentTurnToolCallIds.clear();
@@ -5892,6 +6109,7 @@ export async function startBusAgentRunner(params: {
               stablePartialText = state.activeRun?.partialText ?? stablePartialText;
 
               turnEndCount++;
+              telemetryTurns += 1;
               runStats.lastTurnFinishReason = event.finishReason;
               runStats.lastTurnEndAt = Date.now();
 
@@ -6181,6 +6399,15 @@ export async function startBusAgentRunner(params: {
               outputPublisher.flush();
             }
 
+            if (
+              (event.type === "tool_execution_start" || event.type === "tool_execution_end") &&
+              event.toolName === "skip_reply"
+            ) {
+              turnHasSkipReplyCall = true;
+              if (event.type === "tool_execution_end") finishSkipReplyCall(event);
+              return;
+            }
+
             if (event.type === "tool_execution_start") {
               runWait.toolStarted(
                 event.toolCallId,
@@ -6212,6 +6439,7 @@ export async function startBusAgentRunner(params: {
             }
 
             if (event.type === "tool_execution_end") {
+              telemetryToolCallCount += 1;
               runWait.toolEnded(event.toolCallId);
               state.activeRun?.activeTools.delete(event.toolCallId);
               const started = toolStartMs.get(event.toolCallId);
@@ -6333,11 +6561,14 @@ export async function startBusAgentRunner(params: {
               recoveredQueuedControlStoredMessages,
               activeBinding,
             );
-            initialMessages = [
-              buildResumePrompt(next.recovery.partialText),
-              ...recoveredQueuedControls,
-            ];
-            responseStartIndex = agent.state.messages.length + initialMessages.length;
+            const checkpoint = next.recovery.checkpointMessages;
+            skippedReply = await restoreCheckpointSkip(checkpoint);
+            initialMessages = skippedReply
+              ? recoveredQueuedControls
+              : [buildResumePrompt(next.recovery.partialText), ...recoveredQueuedControls];
+            responseStartIndex = skippedReply
+              ? skippedCheckpointResponseStart(checkpoint, next.requestClient)
+              : agent.state.messages.length + initialMessages.length;
           } else if (parsedCustomCommand) {
             initialMessages = [...next.messages];
             agent.appendMessages(initialMessages);
@@ -6571,7 +6802,7 @@ export async function startBusAgentRunner(params: {
           } else if (initialMessagesEndWithGeneratedContext) {
             agent.appendMessages(initialMessages);
             await waitForRunAtHost(agent.continue());
-          } else {
+          } else if (initialMessages.length > 0 || !skippedReply) {
             await waitForRunAtHost(agent.prompt(initialMessages));
           }
 
@@ -6677,7 +6908,7 @@ export async function startBusAgentRunner(params: {
           const isHeartbeatAckOnly =
             isHeartbeatSessionId(headers.session_id) && isHeartbeatAckText(terminalDeliveryText);
           const delivery =
-            finalText.length === 0 && lastCompletedTurnWasSilent
+            finalText.length === 0 && ((!isCancelled && skippedReply) || lastCompletedTurnWasSilent)
               ? "skip"
               : resolveReplyDeliveryFromFinalText(terminalDeliveryText);
           if (
@@ -6699,7 +6930,8 @@ export async function startBusAgentRunner(params: {
           }
 
           const shouldSkipSurfaceReply = delivery === "skip" || isHeartbeatAckOnly;
-          if (shouldSkipSurfaceReply) {
+          // skip_reply already logged its decision with the reason.
+          if (shouldSkipSurfaceReply && !skippedReply) {
             logger.info("agent requested skip reply", {
               requestId: headers.request_id,
               sessionId: headers.session_id,
@@ -6708,9 +6940,24 @@ export async function startBusAgentRunner(params: {
           }
 
           const transcriptStore = params.transcriptStore;
+          const skippedDiscordWake = Boolean(
+            skippedReply && next.requestClient === "discord" && isJobWakeRequestRaw(next.raw),
+          );
+          // Composition replays this row after the skipped Discord input. A compacted run's response
+          // slice is not aligned with its input, so it keeps only the skip decision row.
+          const shouldSaveDiscordSkipTranscript = Boolean(
+            skippedReply &&
+            runProfile === "primary" &&
+            next.requestClient === "discord" &&
+            completedCompactionCount === 0,
+          );
           if (
             transcriptStore &&
-            (!shouldSkipSurfaceReply || runProfile !== "primary" || next.requestClient === "native")
+            (skippedDiscordWake ||
+              shouldSaveDiscordSkipTranscript ||
+              !shouldSkipSurfaceReply ||
+              runProfile !== "primary" ||
+              next.requestClient === "native")
           ) {
             const persistedTranscript = await captureBusAgentRunnerOperation(
               "successful transcript persistence",
@@ -6729,6 +6976,7 @@ export async function startBusAgentRunner(params: {
                     return buildPersistedHeartbeatMessages(finalText);
                   }
 
+                  if (skippedDiscordWake) return [...finalMessagesForPersistence];
                   return selectPersistedTranscriptMessages({
                     finalMessages: finalMessagesForPersistence,
                     responseStartIndex,
@@ -6775,6 +7023,7 @@ export async function startBusAgentRunner(params: {
                   state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage;
                 const canPublishCorePrimaryClaude =
                   corePrimaryClaudeRuntime !== null &&
+                  !shouldSkipSurfaceReply &&
                   terminalPrimaryLineage?.state === "complete" &&
                   !isCompactionCheckpoint;
 
@@ -7063,6 +7312,16 @@ export async function startBusAgentRunner(params: {
             },
             isCancelled ? "cancelled" : "completed",
           );
+          emitTelemetryAgentRun({
+            status: isCancelled ? "cancelled" : "resolved",
+            durationMs: Date.now() - runStartedAt,
+            provider: activeBinding.resolved.provider,
+            modelId: activeBinding.resolved.modelId,
+            modelSpec: activeBinding.resolved.spec,
+            ttftMs,
+            transcriptMessageCount: (runStats.finalMessages ?? agent.state.messages).length,
+            estimatedCostUsd: estimatedCostUsdTotal,
+          });
           logger.info(
             "agent run resolved",
             formatBridgeLogContext({
@@ -7365,6 +7624,63 @@ export async function startBusAgentRunner(params: {
           message: failure.message,
           details: failure.details,
         };
+        const failedDurationMs = Date.now() - runStartedAt;
+        const failedSurface = isHeartbeatSessionId(headers.session_id)
+          ? "heartbeat"
+          : (headers.request_client ?? "unknown");
+        const latestModelView = getActiveAgent()?.getLatestModelView();
+        let telemetryFailureSource = failedSurface;
+        if (next.recovery) telemetryFailureSource = "wal-recovery";
+        else if (completedCompactionCount > 0) telemetryFailureSource = "compaction";
+        emitTelemetryAgentRun({
+          status: "failed",
+          durationMs: failedDurationMs,
+          provider: resolvedProviderName,
+          modelId: resolvedModelId,
+          modelSpec: resolvedModelSpec,
+          estimatedCostUsd: roundEstimatedCostUsdTotal,
+          errorTag: failure.causeTag ?? failure._tag,
+          statusCode: projectedError.details?.statusCode,
+        });
+        const failedTransport = resolveTelemetryTransport(resolvedProviderName);
+        captureTelemetryError({
+          module: "surface:bus-agent-runner",
+          event: "agent run failed",
+          errorTag: failure.causeTag ?? failure._tag,
+          errorName: failure.errorName,
+          errorCode: failure.errorCode,
+          errorStack: failure.errorStack,
+          requestId: headers.request_id,
+          sessionId: headers.session_id,
+          runId: workflowHint?.runId,
+          provider: resolvedProviderName,
+          transport: failedTransport,
+          surface: failedSurface,
+          durationMs: failedDurationMs,
+          aiError: projectedError.details,
+          rawErrorMessage: projectedError.message,
+          ...(latestModelView
+            ? {
+                transcriptContext: {
+                  messages: latestModelView.messages,
+                  preProjectionMessages: latestModelView.preProjectionMessages,
+                  target: {
+                    provider: resolvedProviderName,
+                    transport: failedTransport,
+                    routed:
+                      resolvedProviderName === "openrouter" || resolvedProviderName === "vercel",
+                  },
+                  provenance: {
+                    source: telemetryFailureSource,
+                    compacted: completedCompactionCount > 0 || transcriptHasCompactionCheckpoint,
+                    didSwitchModel: telemetryDidSwitchModel,
+                    step: latestModelView.step,
+                    ...(latestModelView.wireContext ? latestModelView.wireContext : {}),
+                  },
+                },
+              }
+            : {}),
+        });
         logger.error(
           "agent run failed",
           formatBridgeLogContext({
@@ -8272,6 +8588,15 @@ async function publishLifecycle(params: {
     ok: () => () => undefined,
     err: (error) => () => signalBusAgentRunnerHostFailure(error),
   })();
+}
+
+/** A recovered Discord skip keeps the work after its triggering input, not only the skip pair. */
+function skippedCheckpointResponseStart(
+  checkpoint: readonly ModelMessage[],
+  requestClient: string,
+): number {
+  const start = requestClient === "discord" ? discordResponseStart(checkpoint) : 0;
+  return start > 0 ? start : Math.max(0, checkpoint.length - 2);
 }
 
 export function selectPersistedTranscriptMessages(input: {

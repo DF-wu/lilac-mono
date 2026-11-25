@@ -1377,6 +1377,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         },
         category: "persistence",
       },
+      {
+        identity: { module: "src/tools/skip-reply.ts", exportName: "decodeSkipReplyReason" },
+        category: "projection",
+      },
       ...["formatQuestionToolArgs", "createQuestionTool.execute"].map((exportName) => ({
         identity: { module: "src/tools/question.ts", exportName },
         category: "request" as const,
@@ -1727,10 +1731,12 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: { module: "claude-sdk-call.ts", exportName: "executeClaudeSdkCall.receive" },
         category: "plugin",
       },
-      ...["decodeClaudeToolContent", "restoreClaudeToolOutput"].map((exportName) => ({
-        identity: { module: "claude-sdk-call.ts", exportName },
-        category: "plugin" as const,
-      })),
+      ...["claudeCodeOptions", "decodeClaudeToolContent", "restoreClaudeToolOutput"].map(
+        (exportName) => ({
+          identity: { module: "claude-sdk-call.ts", exportName },
+          category: "plugin" as const,
+        }),
+      ),
       ...[
         "decodeClaudeNativeSessionStart",
         "decodeClaudeContextUsage",
@@ -1897,7 +1903,7 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         },
         category: "projection",
       },
-      ...["readString", "readStringOrNumber"].map((exportName) => ({
+      ...["readString", "readStringOrNumber", "extractNativeProviderError"].map((exportName) => ({
         identity: { module: "ai-error.ts", exportName },
         category: "projection" as const,
       })),
@@ -2063,12 +2069,17 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
       ...[
         "addNormalizedArgFields",
         "normalizeRecordForOpenObserve",
+        "emitTelemetryObservation",
         "captureOpenObserveRequestFailure",
         "signalOpenObservePanic",
       ].map((exportName) => ({
         identity: { module: "logging.ts", exportName },
         category: "projection" as const,
       })),
+      {
+        identity: { module: "transcript-shape.ts", exportName: "summarizePart" },
+        category: "projection" as const,
+      },
       {
         identity: { module: "llm-wire-debug.ts", exportName: "redactValue" },
         category: "projection",
@@ -2416,6 +2427,14 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
           exportName: "normalizeRecordForOpenObserve",
         },
         reason: "Projects a generic logger record into the OpenObserve transport shape.",
+      },
+      {
+        identity: {
+          module: "logging.ts",
+          exportName: "emitTelemetryObservation",
+        },
+        reason:
+          "Projects generic logger arguments into allowlisted telemetry breadcrumb observations.",
       },
       {
         identity: { module: "llm-wire-debug.ts", exportName: "redactValue" },
@@ -2935,6 +2954,7 @@ const CORE_WORKFLOW_STORE_READ_RESULT_APIS = [
   "DurableWorkflowStore.getRun",
   "DurableWorkflowStore.listRuns",
   "DurableWorkflowStore.listSubagentRuns",
+  "DurableWorkflowStore.listRunsByOriginUser",
   "DurableWorkflowStore.listRunsWithExpiredClaims",
   "DurableWorkflowStore.listActiveRuns",
   "DurableWorkflowStore.listRunsNeedingProjectionReconciliation",
@@ -3759,7 +3779,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : []),
       ...(root === "apps/web"
-        ? ["decodeWebBootstrap", "decodeWebAuthInfo"].map((exportName) => ({
+        ? ["decodeWebBootstrap", "decodeWebAuthInfo", "decodeWebUploadError"].map((exportName) => ({
             identity: { module: "src/http.ts", exportName },
             category: "wire" as const,
           }))
@@ -4483,6 +4503,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             "localLogin",
             "decodeWebBootstrap",
             "decodeWebAuthInfo",
+            "decodeWebUploadError",
             "responseStatus",
             "request",
             "bootstrapResult",

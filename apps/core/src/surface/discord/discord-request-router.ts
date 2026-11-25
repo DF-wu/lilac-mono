@@ -1,3 +1,9 @@
+import {
+  collectSkipReplyKeys,
+  completedSkipReply,
+  skipReplyKey,
+  discordSkippedReply,
+} from "../../tools/skip-reply";
 import type { JobWakeDelivery } from "../../jobs/job-service";
 import { createFreshOnlyLineage } from "../../shared/core-primary-lineage";
 import { captureError } from "../../shared/error-capture";
@@ -29,6 +35,7 @@ import type { MsgRefFor } from "../runtime-descriptor";
 import type { MsgRef, SurfaceMessage, SurfaceSelf } from "../types";
 import { normalizeDiscordRaw, type NormalizedDiscordRaw } from "./discord-raw-normalizer";
 import {
+  CORE_SURFACE_PROJECTION_FORMAT_VERSION,
   CoreOwnedBlobIntegrityError,
   type TranscriptStore,
 } from "../../transcript/transcript-store";
@@ -1862,10 +1869,34 @@ export async function startDiscordRequestRouter(
       sessionId: input.sessionId,
     });
     const history = transcript?.match({ ok: (value) => value, err: () => null });
-    if (!history) return Result.ok("unavailable");
+    const skip = discordSkippedReply(
+      params.transcriptStore,
+      input.sessionId,
+      input.originMessageId,
+    );
+    if (!history && !skip) return Result.ok("unavailable");
+    // A row ending in a skip holds a response nobody saw, possibly to another input. The origin's
+    // own input and saved turn replace it below.
+    const skippedRow = Boolean(skip && history && completedSkipReply(history.messages));
+    const wakeHistory = history && !skippedRow ? [...history.messages] : [];
+    if (skip && !collectSkipReplyKeys(wakeHistory).includes(skipReplyKey(skip))) {
+      const projection = params.transcriptStore
+        ?.getCoreSurfaceProjection?.({
+          requestClient: "discord",
+          surfaceId: `discord:${input.sessionId}`,
+          sessionId: input.sessionId,
+          messageId: input.originMessageId,
+          projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+        })
+        .match({ ok: (value) => value, err: () => null });
+      wakeHistory.push(
+        ...(projection?.canonicalMessages ?? [{ role: "user" as const, content: origin.text }]),
+        ...skip.messages,
+      );
+    }
     const prepared = await prepareStoredMessagesForBus({
       blobStore: params.blobStore,
-      messages: [...history.messages, { role: "user", content: input.promptText }],
+      messages: [...wakeHistory, { role: "user", content: input.promptText }],
     });
     const bus = prepared.match({ ok: (value) => value, err: () => null });
     if (!bus) return Result.ok("unavailable");
@@ -1888,7 +1919,7 @@ export async function startDiscordRequestRouter(
       sessionMode: isDm ? "active" : getSessionMode(cfg, input.sessionId, parentChannelId, guildId),
       messages: bus.messages,
       inputHandles: bus.inputHandles,
-      corePrimaryLineage: createFreshOnlyLineage("job-wake", history.messages.length),
+      corePrimaryLineage: createFreshOnlyLineage("job-wake", wakeHistory.length),
       originMessage: origin,
       raw: {
         triggerType: "reply",

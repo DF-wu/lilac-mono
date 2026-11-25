@@ -243,3 +243,9 @@ names an `openai-compatible/...` model. Use a source checkout path instead of
 - [`fork-differences.md`](./fork-differences.md): status, limitations, and the Fork Code Layout row
 - `apps/core/src/tool-server/tools/web-search/openai-web-search-provider.ts`: request, decoding, and result mapping
 - `apps/core/src/tool-server/tools/web-search/openai-web-search-model.ts`: `tools.web.openai.model` resolution
+
+## Search attempt deadline
+
+OpenAI Responses searches, including OpenAI-compatible gateways, have 30 seconds per attempt.
+Other search providers retain 10 seconds. Retryable failures retain one same-provider retry
+before configured fallback; caller cancellation stops retry and fallback.

@@ -2,10 +2,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { tool } from "ai";
 import { z } from "zod";
-import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
+import { lilacEventTypes, type AdapterPlatform, type LilacBus } from "@stanley2058/lilac-event-bus";
 import {
+  agentVisibleProviderOptions,
   createLogger,
   formatTaggedErrorForLog,
+  MODEL_REASONING_EFFORTS,
   resolveSubagentPermissionProfileName,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
@@ -17,7 +19,9 @@ import { deriveRequestDeliveryId } from "../shared/request-delivery-id";
 import type { SurfaceThreadControlResolver } from "../surface/runtime-descriptor";
 import type { RegisteredSurfacePlatform } from "../surface/types";
 import {
+  boundTimelineText,
   projectThreadTimeline,
+  sliceTimelineItem,
   type SurfaceThreadControlPort,
   type ThreadControlCaller,
   type ThreadTimelineItem,
@@ -26,6 +30,7 @@ import {
 import { subagentMessages, type SubagentReader } from "../surface/native/subagents";
 import type { TranscriptStore } from "../transcript/transcript-store";
 import type { DurableWorkflowStore } from "../workflow/durable-workflow-store";
+import { followUpRunSettings } from "../workflow/subagent-follow-up";
 import { sha256 } from "../workflow/workflow-definition";
 import {
   SUBAGENT_RUN_ID_PREFIX,
@@ -37,10 +42,21 @@ import { cancelWorkflowRun } from "../workflow/workflow-run-cancel";
 import {
   buildSubagentDelegationRegistration,
   delegablePermissionProfiles,
+  MODEL_PROVIDER_OPTIONS_DESCRIPTION,
+  modelProviderOptionsInputSchema,
   parseSubagentDepth,
+  subagentModelSelectionIssue,
   type SubagentDelegationHandle,
   type SubagentDelegationRegistration,
 } from "./subagent";
+import {
+  listDiscordThreads,
+  parseTimeCursor,
+  searchThreads,
+  type DirectoryClient,
+  type OrchestrateDirectoryPorts,
+  type ThreadRow,
+} from "./orchestrate-directory";
 import { adaptToolResultToHost, preserveToolPanic } from "./tool-result-adapters";
 
 export class OrchestrateInputInvalid extends TaggedError("OrchestrateInputInvalid")<{
@@ -67,11 +83,21 @@ type OrchestrateError =
 
 const DEFAULT_LIMIT = 20;
 const DEFAULT_MAX_CHARS = 2_000;
+const RESULT_ITEM_ID = "result";
+const DEFAULT_SEARCH_LIMIT = 10;
+const MAX_SEARCH_LIMIT = 50;
+const DEFAULT_SNIPPET_CHARS = 300;
 const TERMINAL_RUN_STATES = new Set<WorkflowRun["state"]>(["succeeded", "failed", "cancelled"]);
 const WORKFLOW_RUN_PREFIX = "wfrun:";
 
-export const orchestrateActions = ["read", "send", "interrupt"] as const;
+export const orchestrateActions = ["read", "send", "interrupt", "list", "search"] as const;
 export type OrchestrateAction = (typeof orchestrateActions)[number];
+const READ_ONLY_ACTIONS = [
+  "read",
+  "list",
+  "search",
+] as const satisfies readonly OrchestrateAction[];
+const DIRECTORY_CLIENTS = ["native", "discord"] as const satisfies readonly DirectoryClient[];
 
 function createOrchestrateInputSchema(
   actions: readonly [OrchestrateAction, ...OrchestrateAction[]],
@@ -83,9 +109,37 @@ function createOrchestrateInputSchema(
       .trim()
       .min(1)
       .max(256)
+      .optional()
       .describe(
-        "Target: a subagent run id (wfrun:subagent:…), a workflow run id (wfrun:…), or a thread id.",
+        "read, send, interrupt: a subagent run id (wfrun:subagent:…), a workflow run id (wfrun:…), or a thread id.",
       ),
+    client: z
+      .enum(DIRECTORY_CLIENTS)
+      .optional()
+      .describe(
+        "read of a thread id, list with scope user: the surface, by default the one that started this run. search: only this surface; by default every surface this run can reach.",
+      ),
+    scope: z
+      .enum(["conversation", "user"])
+      .optional()
+      .describe(
+        "list: conversation (default) lists the subagents in this conversation, nested ones included; user lists the user's threads or runs.",
+      ),
+    kind: z
+      .enum(["thread", "subagent", "workflow"])
+      .optional()
+      .describe("list with scope user: thread (default), subagent, or workflow."),
+    state: z
+      .enum(["active", "finished", "all"])
+      .optional()
+      .describe("list of subagents or workflows: active, finished, or all (default)."),
+    query: z
+      .string()
+      .trim()
+      .min(1)
+      .max(500)
+      .optional()
+      .describe("search: words to find in thread summaries and messages."),
     view: z
       .enum(["messages", "activity"])
       .optional()
@@ -95,7 +149,7 @@ function createOrchestrateInputSchema(
       .min(1)
       .max(256)
       .optional()
-      .describe("read: cursor from a previous read, to page to older items."),
+      .describe("read, list: cursor from a previous result, to page to older items."),
     after: z
       .string()
       .min(1)
@@ -108,20 +162,57 @@ function createOrchestrateInputSchema(
       .min(1)
       .max(100)
       .optional()
-      .describe(`read: items per page, default ${DEFAULT_LIMIT}.`),
+      .describe(
+        `read, list: items per page, default ${DEFAULT_LIMIT}. search: results, default ${DEFAULT_SEARCH_LIMIT}, at most ${MAX_SEARCH_LIMIT}.`,
+      ),
     maxCharsPerItem: z
       .number()
       .int()
       .min(1)
       .max(20_000)
       .optional()
-      .describe(`read: characters kept per item, default ${DEFAULT_MAX_CHARS}.`),
+      .describe(
+        `read: characters kept per item, default ${DEFAULT_MAX_CHARS}. search: characters per snippet, default ${DEFAULT_SNIPPET_CHARS}.`,
+      ),
+    itemId: z
+      .string()
+      .min(1)
+      .max(512)
+      .optional()
+      .describe(
+        "read: read one item instead of a page, such as a truncated item, or result for a run's result. Use with textOffset.",
+      ),
+    textOffset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("read with itemId: where to start, usually the item's nextTextOffset."),
     message: z.string().min(1).max(65_536).optional().describe("send: the message to deliver."),
     mode: z
       .enum(["auto", "queue", "steer"])
       .optional()
       .describe(
-        "send: auto (default) steers a running target and starts an idle one; queue waits for the current run to finish; steer only delivers to a running target.",
+        "send: auto (default) steers a running target and starts an idle one; queue waits for the current run to finish; steer delivers to a running target, and a subagent that is not running gets a follow-up run as with auto.",
+      ),
+    model: z
+      .string()
+      .min(1)
+      .max(200)
+      .optional()
+      .describe(
+        "send to a subagent: run the follow-up on this model alias or provider/model. Omit to keep the model it last ran with.",
+      ),
+    reasoning: z
+      .enum(MODEL_REASONING_EFFORTS)
+      .optional()
+      .describe(
+        "send to a subagent: reasoning for the follow-up. When omitted, the last setting carries over while the model stays the same.",
+      ),
+    options: modelProviderOptionsInputSchema
+      .optional()
+      .describe(
+        `send to a subagent: provider options for the follow-up. They replace the earlier options; {} clears them. When omitted, the earlier options carry over while the provider stays the same. ${MODEL_PROVIDER_OPTIONS_DESCRIPTION}`,
       ),
     commandId: z
       .string()
@@ -139,11 +230,14 @@ function createOrchestrateInputSchema(
 }
 
 export type OrchestrateInput = z.output<ReturnType<typeof createOrchestrateInputSchema>>;
+/** Input for an action on one target, which names it by id. */
+type TargetInput = OrchestrateInput & { readonly id: string };
 
 export function formatOrchestrateToolArgs(input: unknown): string {
   const decoded = createOrchestrateInputSchema(orchestrateActions).safeParse(input);
   if (!decoded.success) return "orchestrate";
-  return [decoded.data.action, decoded.data.id].join(" ");
+  const { action, id, query, scope } = decoded.data;
+  return [action, id ?? query ?? scope].filter(Boolean).join(" ");
 }
 
 type DelegateHandler = (
@@ -168,6 +262,7 @@ export type OrchestrateToolOptions = {
   readonly requestDeliveryKnown?: (requestDeliveryId: string) => boolean;
   readonly bus?: LilacBus;
   readonly progressCards?: Pick<WorkflowProgressCardService, "requestProjection">;
+  readonly directory?: OrchestrateDirectoryPorts;
   readonly delegate?: DelegateHandler;
   readonly now?: () => number;
 };
@@ -190,6 +285,11 @@ function denied(message: string) {
 
 function storeFailure(error: Error): OrchestrateOperationFailed {
   return new OrchestrateOperationFailed({ message: preserveToolPanic(error).message });
+}
+
+/** A send with model settings starts a new run on them instead of steering the current one. */
+function changesModelSettings(input: OrchestrateInput): boolean {
+  return input.model !== undefined || input.reasoning !== undefined || input.options !== undefined;
 }
 
 function bounded(text: string, maxChars: number) {
@@ -257,11 +357,25 @@ type ThreadAccess = {
   readonly caller: ThreadControlCaller;
 };
 
+/** The verified user a run acts for. */
+type RunIdentity = {
+  readonly platform: AdapterPlatform;
+  readonly userId: string;
+};
+
+function isoTime(ms: number): string {
+  return new Date(ms).toISOString();
+}
+
+function directoryFailure(error: Error): OrchestrateOperationFailed {
+  return new OrchestrateOperationFailed({ message: error.message });
+}
+
 export function createOrchestrateTool(options: OrchestrateToolOptions) {
   const requestContext = options.requestContext;
   const actions: readonly [OrchestrateAction, ...OrchestrateAction[]] = options.canControl
     ? orchestrateActions
-    : ["read"];
+    : READ_ONLY_ACTIONS;
   const inputSchema = createOrchestrateInputSchema(actions);
   const now = options.now ?? Date.now;
 
@@ -269,25 +383,56 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
    * A primary run's initiator is trusted only after its ingress was verified. A child's initiator
    * comes from its durable workflow origin, which Core wrote.
    */
-  function threadAccess(): ThreadAccess | null {
+  function identity(): RunIdentity | null {
     const initiator = requestContext.requestInitiator;
-    if (!initiator || !options.threadControl || !isAdapterPlatform(initiator.platform)) return null;
+    if (!initiator || !isAdapterPlatform(initiator.platform)) return null;
     if (options.runProfile === "primary" && requestContext.serverOwnedRequest !== true) return null;
-    const port = options.threadControl.resolve(initiator.platform);
-    if (!port) return null;
+    return { platform: initiator.platform, userId: initiator.userId };
+  }
+
+  /**
+   * The user ids a run may act as on a surface: its own, or the Discord accounts a native user
+   * linked through Clerk. Links are looked up on each use, so an unlinked account stops working.
+   */
+  async function userIdsOn(known: RunIdentity, platform: AdapterPlatform) {
+    if (platform === known.platform) return [known.userId];
+    const native = options.directory?.native;
+    if (platform !== "discord" || known.platform !== "native" || !native) return [];
+    return native.linkedDiscordIds(known.userId);
+  }
+
+  /** Thread control on a surface, by default the one that started this run. */
+  async function threadAccess(platform?: AdapterPlatform): Promise<ThreadAccess | null> {
+    const known = identity();
+    if (!known || !options.threadControl) return null;
+    const surface = platform ?? known.platform;
+    const userId = (await userIdsOn(known, surface))[0];
+    const port = userId ? options.threadControl.resolve(surface) : null;
+    if (!userId || !port) return null;
     return {
       port,
       caller: {
-        userId: initiator.userId,
+        userId,
         sourceThreadId: requestContext.requestInitiatorSessionId ?? requestContext.sessionId,
       },
     };
   }
 
-  function requireThreadAccess(): ResultType<ThreadAccess, OrchestrateError> {
-    const access = threadAccess();
+  async function requireThreadAccess(
+    platform?: AdapterPlatform,
+  ): Promise<ResultType<ThreadAccess, OrchestrateError>> {
+    const access = await threadAccess(platform);
     if (access) return Result.ok(access);
-    return unavailable("Thread control is unavailable on this surface");
+    if (!platform) return unavailable("Thread control is unavailable on this surface");
+    return unavailable(
+      `This run cannot reach ${platform} threads; a native user reaches Discord only through a linked Discord account`,
+    );
+  }
+
+  /** The surface whose thread a run reports to, when the run records one. */
+  function runSurface(run: WorkflowRun): AdapterPlatform | undefined {
+    const client = run.origin.client;
+    return client && client !== "unknown" && isAdapterPlatform(client) ? client : undefined;
   }
 
   function requireWorkflows(): ResultType<DurableWorkflowStore, OrchestrateError> {
@@ -381,7 +526,8 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
     return Result.gen(async function* () {
       const root = yield* rootSession(run);
       if (root === (yield* callerRootSession())) return Result.ok(undefined);
-      const access = threadAccess();
+      // The run's own surface decides; a thread id on another surface could name a different thread.
+      const access = await threadAccess(runSurface(run));
       const readable = access
         ? await access.port.read(access.caller, root, {
             view: "messages",
@@ -396,7 +542,12 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
   }
 
   /** Only the session that launched a subagent may message or stop it. */
-  function authorizeSubagentControl(run: WorkflowRun) {
+  function authorizeSubagentControl(
+    run: WorkflowRun,
+  ): ResultType<
+    Extract<WorkflowRun["completionTarget"], { kind: "live_parent" }>,
+    OrchestrateError
+  > {
     if (!options.canControl) return denied("This run can only read targets");
     if (
       run.completionTarget.kind !== "live_parent" ||
@@ -408,13 +559,35 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
 
   function readInput(input: OrchestrateInput) {
     if (input.before && input.after) return invalid("Pass before or after, not both");
+    if (input.textOffset !== undefined && !input.itemId)
+      return invalid("textOffset requires itemId");
+    if (input.itemId && (input.before || input.after))
+      return invalid("itemId reads one item; omit before and after");
     return Result.ok({
       view: (input.view ?? "messages") as ThreadTimelineView,
       before: input.before,
       after: input.after,
       limit: input.limit ?? DEFAULT_LIMIT,
       maxCharsPerItem: input.maxCharsPerItem ?? DEFAULT_MAX_CHARS,
+      ...(input.itemId ? { item: { id: input.itemId, textOffset: input.textOffset ?? 0 } } : {}),
     });
+  }
+
+  /** An item read of a run's result, which `read` reports under the id `result`. */
+  function resultItem(
+    resultText: string | null,
+    item: { readonly textOffset: number },
+    maxChars: number,
+  ): ThreadTimelineItem[] {
+    if (resultText === null) return [];
+    return [
+      {
+        id: RESULT_ITEM_ID,
+        role: "assistant",
+        kind: "text",
+        ...boundTimelineText(resultText, maxChars, item.textOffset),
+      },
+    ];
   }
 
   async function readSubagent(run: WorkflowRun, input: OrchestrateInput) {
@@ -433,11 +606,37 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
         : yield* (
             options.transcripts?.getRequestTranscript?.({ requestId }) ?? Result.ok(null)
           ).mapError(storeFailure);
+      // Item IDs name activities by their message, as they did before transcript tool parts took
+      // call-derived IDs, so IDs from an earlier read still select the same item.
       const display = subagentMessages(
         live?.messages ?? saved?.messages ?? [],
         live?.streaming,
         live?.activeTools,
-      );
+      ).map((message) => ({
+        ...message,
+        parts: message.parts.map((part) =>
+          part.type === "data-activity" ? { ...part, id: message.id } : part,
+        ),
+      }));
+      const resultText = TERMINAL_RUN_STATES.has(run.state) ? runResultText(run) : null;
+      const header = {
+        kind: "subagent" as const,
+        id: run.runId,
+        state: run.state,
+        running: !TERMINAL_RUN_STATES.has(run.state),
+      };
+      if (read.item) {
+        const items =
+          read.item.id === RESULT_ITEM_ID
+            ? resultItem(resultText, read.item, read.maxCharsPerItem)
+            : sliceTimelineItem(
+                projectThreadTimeline(display, "activity", Number.MAX_SAFE_INTEGER),
+                read.item,
+                read.maxCharsPerItem,
+              );
+        if (items.length === 0) return invalid(`No item '${read.item.id}' in this subagent`);
+        return Result.ok({ ...header, items });
+      }
       const page = yield* pageItems(
         projectThreadTimeline(display, read.view, read.maxCharsPerItem),
         read,
@@ -447,18 +646,25 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
             workflows.getWorkflowRequestDispatchPolicy(operation.requestId!).mapError(storeFailure),
           )
         : Result.ok(null);
-      const resultText = TERMINAL_RUN_STATES.has(run.state) ? runResultText(run) : null;
+      const reasoning = policy?.resolvedModelRequest.reasoning;
+      const effectiveOptions = policy
+        ? agentVisibleProviderOptions(
+            policy.resolvedModelRequest.provider,
+            policy.resolvedModelRequest.providerOptions,
+          )
+        : undefined;
       return Result.ok({
-        kind: "subagent" as const,
-        id: run.runId,
-        state: run.state,
-        running: !TERMINAL_RUN_STATES.has(run.state),
+        ...header,
         profile: target.profile,
         sessionName: target.sessionName,
         ...(target.title ? { title: target.title } : {}),
         ...(policy ? { model: policy.resolvedModelRequest.spec } : {}),
+        ...(reasoning ? { reasoning } : {}),
+        ...(effectiveOptions ? { options: effectiveOptions } : {}),
         ...(run.terminalDetail ? { detail: run.terminalDetail } : {}),
-        ...(resultText === null ? {} : { result: bounded(resultText, read.maxCharsPerItem) }),
+        ...(resultText === null
+          ? {}
+          : { result: boundTimelineText(resultText, read.maxCharsPerItem) }),
         ...page,
       });
     });
@@ -468,6 +674,14 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
     return Result.gen(async function* () {
       const read = yield* readInput(input);
       const revision = yield* Result.await(authorizeWorkflowRead(run));
+      if (read.item) {
+        if (read.item.id !== RESULT_ITEM_ID)
+          return invalid(`Workflow runs support only itemId ${RESULT_ITEM_ID}`);
+        const resultText = TERMINAL_RUN_STATES.has(run.state) ? runResultText(run) : null;
+        const items = resultItem(resultText, read.item, read.maxCharsPerItem);
+        if (items.length === 0) return invalid("This workflow run has no result yet");
+        return Result.ok({ kind: "workflow" as const, id: run.runId, state: run.state, items });
+      }
       const workflows = yield* requireWorkflows();
       const window = yield* pageWindow(workflows.countOperations(run.runId), read);
       const items =
@@ -495,15 +709,17 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
           state: operation.state,
           ...(operation.error ? { error: bounded(operation.error, read.maxCharsPerItem) } : {}),
         })),
-        ...(resultText === null ? {} : { result: bounded(resultText, read.maxCharsPerItem) }),
+        ...(resultText === null
+          ? {}
+          : { result: boundTimelineText(resultText, read.maxCharsPerItem) }),
       });
     });
   }
 
-  async function readThread(input: OrchestrateInput) {
+  async function readThread(input: TargetInput) {
     return Result.gen(async function* () {
       const read = yield* readInput(input);
-      const access = yield* requireThreadAccess();
+      const access = yield* Result.await(requireThreadAccess(input.client));
       const result = yield* Result.await(
         access.port
           .read(access.caller, input.id, read)
@@ -609,6 +825,34 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
     });
   }
 
+  /**
+   * The run a subagent is working on, other than `runId`: its running run, or else its newest
+   * queued one. Follow-ups on one child run one at a time, so at most one is running.
+   */
+  function liveSuccessor(
+    childSessionId: string,
+    runId: string,
+  ): ResultType<WorkflowRun | null, OrchestrateError> {
+    return Result.gen(function* () {
+      const workflows = yield* requireWorkflows();
+      let newest: WorkflowRun | null = null;
+      // Each page holds up to 100 runs plus one that signals another page.
+      for (let offset = 0; ; offset += 100) {
+        const runs = yield* workflows
+          .listSubagentRuns(requestContext.sessionId, offset)
+          .mapError(storeFailure);
+        for (const candidate of runs.slice(0, 100)) {
+          if (candidate.runId === runId || TERMINAL_RUN_STATES.has(candidate.state)) continue;
+          if (candidate.completionTarget.kind !== "live_parent") continue;
+          if (candidate.completionTarget.childSessionId !== childSessionId) continue;
+          if (candidate.state === "running") return Result.ok(candidate);
+          if (!newest || candidate.createdAt > newest.createdAt) newest = candidate;
+        }
+        if (runs.length <= 100) return Result.ok(newest);
+      }
+    });
+  }
+
   function replayKeyedSend(run: WorkflowRun, commandId: string | undefined) {
     return Result.gen(function* () {
       if (!commandId || run.completionTarget.kind !== "live_parent") return Result.ok(null);
@@ -660,12 +904,29 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
       const depth = parseSubagentDepth(ctx);
       if (depth >= options.maxDepth)
         return denied("This run cannot start subagents (depth limit reached)");
-      // A follow-up keeps the model and reasoning the subagent ran with.
       const policy = operation?.requestId
         ? yield* requireWorkflows().andThen((workflows) =>
             workflows.getWorkflowRequestDispatchPolicy(operation.requestId!).mapError(storeFailure),
           )
         : null;
+      const settings = followUpRunSettings({
+        policy,
+        targetReasoning: target.reasoning,
+        requested: {
+          ...(input.model !== undefined ? { model: input.model } : {}),
+          ...(input.reasoning !== undefined ? { reasoning: input.reasoning } : {}),
+          ...(input.options !== undefined ? { options: input.options } : {}),
+        },
+        config: options.config,
+      });
+      if (changesModelSettings(input)) {
+        const issue = subagentModelSelectionIssue(options.config, {
+          ...(settings.modelOverride ? { model: settings.modelOverride } : {}),
+          ...(input.reasoning !== undefined ? { reasoning: input.reasoning } : {}),
+          ...(input.options !== undefined ? { options: input.options } : {}),
+        });
+        if (issue) return invalid(issue);
+      }
       const registration = buildSubagentDelegationRegistration({
         ctx,
         toolCallId,
@@ -681,10 +942,7 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
         ...(target.title ? { title: target.title } : {}),
         idleTimeoutMs: options.idleTimeoutMs,
         depth: depth + 1,
-        ...(policy?.model ? { modelOverride: policy.model } : {}),
-        ...((policy?.reasoning ?? target.reasoning)
-          ? { reasoningOverride: (policy?.reasoning ?? target.reasoning)! }
-          : {}),
+        ...settings,
       });
       if (registration.childSessionId !== target.childSessionId)
         return denied("Only the conversation that launched this subagent can continue it");
@@ -758,13 +1016,12 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
       // A keyed retry returns what the first attempt did, even if the child has changed state.
       const replayed = yield* replayKeyedSend(run, input.commandId);
       if (replayed) return Result.ok(replayed);
-      if (mode !== "queue" && operation && isLive(run, operation))
+      const live = mode !== "queue" && operation && isLive(run, operation) ? operation : null;
+      if (live && changesModelSettings(input) && mode === "steer")
+        return invalid("model, reasoning, and options apply to a new run; use mode auto or queue");
+      if (live && !changesModelSettings(input))
         return Result.ok(
-          yield* Result.await(steerSubagent(run, operation, { ...input, message }, toolCallId)),
-        );
-      if (mode === "steer")
-        return unavailable(
-          "target-ended: the subagent is not running; use mode auto to send it as a follow-up",
+          yield* Result.await(steerSubagent(run, live, { ...input, message }, toolCallId)),
         );
       // A follow-up on the same child session waits for any unfinished run there.
       return Result.ok(
@@ -773,12 +1030,12 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
     });
   }
 
-  async function sendThread(input: OrchestrateInput) {
+  async function sendThread(input: TargetInput) {
     return Result.gen(async function* () {
       // Subagents control only their own children; other threads belong to primary runs.
       if (!options.canControl || options.runProfile !== "primary")
         return denied("Only a primary run can message or stop another thread");
-      const access = yield* requireThreadAccess();
+      const access = yield* Result.await(requireThreadAccess());
       const sent = yield* Result.await(
         access.port
           .send(access.caller, input.id, {
@@ -813,6 +1070,10 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
           now: now(),
         }).then((value) => value.mapError(storeFailure)),
       );
+      const successor =
+        !cancelled.changed && run.completionTarget.kind === "live_parent"
+          ? yield* liveSuccessor(run.completionTarget.childSessionId, run.runId)
+          : null;
       return Result.ok({
         kind:
           run.completionTarget.kind === "live_parent"
@@ -821,16 +1082,22 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
         id: run.runId,
         status: cancelled.changed ? ("cancelled" as const) : ("ended" as const),
         state: cancelled.run?.state ?? run.state,
+        ...(successor
+          ? {
+              liveRunId: successor.runId,
+              hint: "This run had already ended. liveRunId is the subagent's current run; interrupt that id to stop it.",
+            }
+          : {}),
       });
     });
   }
 
-  async function interruptThread(input: OrchestrateInput) {
+  async function interruptThread(input: TargetInput) {
     return Result.gen(async function* () {
       // Subagents control only their own children; other threads belong to primary runs.
       if (!options.canControl || options.runProfile !== "primary")
         return denied("Only a primary run can message or stop another thread");
-      const access = yield* requireThreadAccess();
+      const access = yield* Result.await(requireThreadAccess());
       const interrupted = yield* Result.await(
         access.port
           .interrupt(access.caller, input.id, input.runId ? { runId: input.runId } : {})
@@ -842,14 +1109,244 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
     });
   }
 
+  function invalidInput(error: Error) {
+    return new OrchestrateInputInvalid({ message: error.message });
+  }
+
+  /** A keyset page of runs: at most `limit` rows, older than `before`, filtered by state. */
+  function runPage(input: OrchestrateInput) {
+    return parseTimeCursor(input.before)
+      .mapError(invalidInput)
+      .map((before) => ({
+        limit: input.limit ?? DEFAULT_LIMIT,
+        ...(before ? { before: { createdAt: before.time, runId: before.id } } : {}),
+        ...(input.state === "active" ? { terminal: false } : {}),
+        ...(input.state === "finished" ? { terminal: true } : {}),
+      }));
+  }
+
+  /** This run's own subagent run id, so a listing can mark it. */
+  function callerRunId(): ResultType<string | null, OrchestrateError> {
+    if (options.runProfile === "primary" || !options.workflows) return Result.ok(null);
+    return options.workflows
+      .getOperationByRequestId(requestContext.requestId)
+      .mapError(storeFailure)
+      .map((operation) => operation?.runId ?? null);
+  }
+
+  function subagentRow(run: WorkflowRun, selfRunId: string | null) {
+    return Result.gen(function* () {
+      const target = run.completionTarget;
+      if (target.kind !== "live_parent") return Result.ok([]);
+      const workflows = yield* requireWorkflows();
+      const parent = yield* workflows
+        .getOperationByRequestId(target.parentRequestId)
+        .mapError(storeFailure);
+      return Result.ok([
+        {
+          kind: "subagent" as const,
+          id: run.runId,
+          ...(run.origin.client ? { client: run.origin.client } : {}),
+          ...(parent ? { parentId: parent.runId } : {}),
+          ...(target.title ? { title: target.title } : {}),
+          profile: target.profile,
+          state: run.state,
+          startedAt: isoTime(run.startedAt ?? run.createdAt),
+          ...(run.terminalAt ? { endedAt: isoTime(run.terminalAt) } : {}),
+          controllable: authorizeSubagentControl(run).match({ ok: () => true, err: () => false }),
+          self: run.runId === selfRunId,
+        },
+      ]);
+    });
+  }
+
+  function workflowRow(run: WorkflowRun) {
+    return Result.gen(function* () {
+      const workflows = yield* requireWorkflows();
+      const revision = yield* workflows.getRevision(run.revisionId).mapError(storeFailure);
+      return Result.ok([
+        {
+          kind: "workflow" as const,
+          id: run.runId,
+          ...(run.origin.client ? { client: run.origin.client } : {}),
+          ...(revision ? { name: revision.name } : {}),
+          state: run.state,
+          startedAt: isoTime(run.startedAt ?? run.createdAt),
+          ...(run.terminalAt ? { endedAt: isoTime(run.terminalAt) } : {}),
+        },
+      ]);
+    });
+  }
+
+  /** One page of runs, given one more than the page holds so the cursor shows another page. */
+  function runRows(runs: readonly WorkflowRun[], limit: number) {
+    return Result.gen(function* () {
+      const selfRunId = yield* callerRunId();
+      const page = runs.slice(0, limit);
+      const items = [];
+      for (const run of page)
+        items.push(
+          ...(run.completionTarget.kind === "live_parent"
+            ? yield* subagentRow(run, selfRunId)
+            : yield* workflowRow(run)),
+        );
+      const last = page.at(-1);
+      return Result.ok({
+        items,
+        ...(last && runs.length > page.length ? { before: `${last.createdAt}_${last.runId}` } : {}),
+      });
+    });
+  }
+
+  function listConversation(input: OrchestrateInput) {
+    return Result.gen(function* () {
+      if ((input.kind ?? "subagent") !== "subagent" || input.client)
+        return invalid(
+          "scope conversation lists subagents; use scope user for threads, workflows, or another client",
+        );
+      const page = yield* runPage(input);
+      const workflows = yield* requireWorkflows();
+      const root = yield* callerRootSession();
+      const runs = yield* workflows
+        .listSubagentRuns(root, 0, { ...page, throughWorkflows: true })
+        .mapError(storeFailure);
+      return runRows(runs, page.limit);
+    });
+  }
+
+  async function listUserThreads(
+    client: AdapterPlatform,
+    userId: string,
+    input: OrchestrateInput,
+  ): Promise<ResultType<{ items: ThreadRow[]; before?: string }, OrchestrateError>> {
+    const limit = input.limit ?? DEFAULT_LIMIT;
+    const native = options.directory?.native;
+    const discord = options.directory?.discordAdapter?.();
+    if (client === "native" && native)
+      return native
+        .threads(userId, { limit, ...(input.before ? { cursor: input.before } : {}) })
+        .mapError(directoryFailure)
+        .map((page) => ({
+          items: page.items.map((thread) => ({
+            kind: "thread" as const,
+            id: thread.id,
+            client: "native" as const,
+            title: thread.title,
+            updatedAt: isoTime(thread.updatedAt),
+            active: thread.active,
+          })),
+          ...(page.nextCursor ? { before: page.nextCursor } : {}),
+        }));
+    if (client === "discord" && discord)
+      return (
+        await listDiscordThreads({
+          adapter: discord,
+          config: (await options.directory?.getConfig?.()) ?? options.config,
+          limit,
+          ...(input.before ? { cursor: input.before } : {}),
+        })
+      ).mapError(directoryFailure);
+    return unavailable(`Listing ${client} threads is unavailable in this runtime`);
+  }
+
+  async function listUserRuns(
+    client: AdapterPlatform,
+    userIds: readonly string[],
+    input: OrchestrateInput & { kind: "subagent" | "workflow" },
+  ) {
+    return Result.gen(async function* () {
+      const page = yield* runPage(input);
+      const workflows = yield* requireWorkflows();
+      // Workflow runs are readable only within this run's project, so list only those.
+      const project = input.kind === "workflow" ? yield* Result.await(projectScope()) : undefined;
+      const runs = yield* workflows
+        .listRunsByOriginUser({
+          client,
+          userIds,
+          kind: input.kind,
+          ...(project ? { canonicalProjectId: project } : {}),
+          ...page,
+          limit: page.limit + 1,
+        })
+        .mapError(storeFailure);
+      return runRows(runs, page.limit);
+    });
+  }
+
+  async function listUser(input: OrchestrateInput) {
+    return Result.gen(async function* () {
+      const known = yield* requireIdentity();
+      const client = input.client ?? known.platform;
+      const userIds = await userIdsOn(known, client);
+      if (userIds.length === 0) return denied(`This run's user has no linked ${client} account`);
+      const kind = input.kind ?? "thread";
+      if (kind !== "thread")
+        return Result.ok(yield* Result.await(listUserRuns(client, userIds, { ...input, kind })));
+      if (input.state) return invalid("state applies to subagent and workflow lists");
+      return Result.ok(yield* Result.await(listUserThreads(client, userIds[0]!, input)));
+    });
+  }
+
+  function requireIdentity(): ResultType<RunIdentity, OrchestrateError> {
+    const known = identity();
+    if (known) return Result.ok(known);
+    return unavailable("This run has no verified surface user to list or search as");
+  }
+
+  async function search(input: OrchestrateInput) {
+    return Result.gen(async function* () {
+      if (!input.query) return invalid("search requires query");
+      const known = yield* requireIdentity();
+      const identities: { client: DirectoryClient; userId: string }[] = [];
+      for (const client of input.client ? [input.client] : DIRECTORY_CLIENTS) {
+        const userId = (await userIdsOn(known, client))[0];
+        if (userId) identities.push({ client, userId });
+      }
+      if (identities.length === 0)
+        return denied(`This run's user has no linked ${input.client ?? known.platform} account`);
+      const items = yield* Result.await(
+        searchThreads({
+          ports: options.directory ?? {},
+          config: (await options.directory?.getConfig?.()) ?? options.config,
+          identities,
+          query: input.query,
+          limit: Math.min(input.limit ?? DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT),
+          snippetChars: input.maxCharsPerItem ?? DEFAULT_SNIPPET_CHARS,
+        }).then((found) => found.mapError(directoryFailure)),
+      );
+      return Result.ok({ items });
+    });
+  }
+
   async function execute(
     input: OrchestrateInput,
     toolCallId: string,
   ): Promise<ResultType<unknown, OrchestrateError>> {
+    const directoryAction = input.action === "list" || input.action === "search";
+    if (directoryAction && input.id) return invalid(`${input.action} does not take an id`);
+    if (input.action === "search") return await search(input);
+    if (input.action === "list")
+      return input.scope === "user" ? await listUser(input) : listConversation(input);
+    const id = input.id;
+    if (!id) return invalid(`${input.action} requires id`);
+    return await executeOnTarget({ ...input, id }, toolCallId);
+  }
+
+  async function executeOnTarget(
+    input: TargetInput,
+    toolCallId: string,
+  ): Promise<ResultType<unknown, OrchestrateError>> {
     const isRun = input.id.startsWith(WORKFLOW_RUN_PREFIX);
+    const isSubagent = input.id.startsWith(SUBAGENT_RUN_ID_PREFIX);
     switch (true) {
       case input.action === "send" && !input.message:
         return invalid("send requires message");
+      case changesModelSettings(input) && (input.action !== "send" || !isSubagent):
+        return invalid("model, reasoning, and options apply only to send to a subagent");
+      case input.itemId !== undefined && input.action !== "read":
+        return invalid("itemId and textOffset apply only to read");
+      case input.client !== undefined && (isRun || input.action !== "read"):
+        return invalid("client applies to reading a thread id, list, and search");
       case input.action === "send" && isRun && !input.id.startsWith(SUBAGENT_RUN_ID_PREFIX):
         return invalid("Workflow runs do not accept messages; read or interrupt them instead");
       case !isRun && input.action === "read":
@@ -870,19 +1367,27 @@ export function createOrchestrateTool(options: OrchestrateToolOptions) {
           return await sendSubagent(run, input, toolCallId);
         case "interrupt":
           return await interruptRun(run);
+        case "list":
+        case "search":
+          return invalid(`${input.action} does not take an id`);
       }
     });
   }
 
   return tool({
     description: [
-      "Read, message, or stop your subagents, workflow runs, and other threads.",
+      "Find, read, message, or stop your subagents, workflow runs, and other threads.",
       "Pass the id from a subagent_delegate result (workflowRunId), a workflow run id, or a thread id.",
-      "- read: progress and history. Use view activity to see tool calls and their output. Results never change the target.",
+      "- list: ids to act on. By default, the subagents in this conversation, with controllable marking the ones you may message or stop. scope user lists the user's threads, subagents, or workflows.",
+      "- search: threads whose summaries or messages match query, with each thread's id and client.",
+      "- read: progress and history. Use view activity to see tool calls and their output. Results never change the target. Pass a search result's client with its thread id. A truncated item has nextTextOffset; read the rest with itemId and textOffset.",
       "- send: deliver a message. A running target receives it as steering. A subagent that is not running gets a follow-up run in the same conversation, which reports back as a subagent_result like a deferred delegation. send returns once the message is accepted; it does not wait for a reply.",
+      "- send with model, reasoning, or options: the subagent's next run uses them. The message waits for any current run instead of steering it.",
       "- interrupt: stop the target's current run.",
       "Workflow runs accept read and interrupt only. To start a new subagent, use subagent_delegate.",
-      ...(options.canControl ? [] : ["This run can only read."]),
+      ...(options.canControl
+        ? []
+        : ["This run can find and read targets but not message or stop them."]),
     ].join("\n"),
     inputSchema,
     execute: async (input, { toolCallId }) => {

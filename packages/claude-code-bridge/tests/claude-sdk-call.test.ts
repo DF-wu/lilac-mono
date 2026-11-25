@@ -105,6 +105,47 @@ function fixture(frames: SDKMessage[]) {
 }
 
 describe("direct Claude SDK execution", () => {
+  test.each([true, false])(
+    "gates Claude skip permission on the full assistant batch, sibling=%s",
+    async (sibling) => {
+      const f = fixture([]);
+      const settings = claudeRuntime(f.input.model)!.settings;
+      const factory = settings.queryFactory!;
+      let decision: string | undefined;
+      f.input.model = createClaudeCode()("opus", {
+        canUseTool: async (_name, input) => ({ behavior: "allow", updatedInput: input }),
+        queryFactory: (request) => ({
+          ...factory(request),
+          async *[Symbol.asyncIterator]() {
+            const stream = (event: object) => frame({ type: "stream_event", event });
+            yield stream({ type: "message_start" });
+            yield stream({
+              type: "content_block_start",
+              index: 0,
+              content_block: { type: "tool_use", name: "mcp__lilac__skip_reply", id: "skip" },
+            });
+            const permission = request.options!.canUseTool!(
+              "mcp__lilac__skip_reply",
+              {},
+              { toolUseID: "skip", requestId: "permission", signal: AbortSignal.timeout(2000) },
+            );
+            if (sibling)
+              yield stream({
+                type: "content_block_start",
+                index: 1,
+                content_block: { type: "tool_use", name: "mcp__lilac__read", id: "read" },
+              });
+            yield stream({ type: "message_stop" });
+            decision = (await permission)?.behavior;
+            yield result();
+          },
+        }),
+      });
+      await executeClaudeSdkCall(f.input);
+      expect(decision).toBe(sibling ? "deny" : "allow");
+    },
+  );
+
   test("preserves a cleanup Panic over an ordinary utility query failure", async () => {
     const panic = new Panic({ message: "cleanup invariant" });
     const model = createClaudeCode()("opus", {
@@ -200,6 +241,23 @@ describe("direct Claude SDK execution", () => {
       content: [{ type: "text" }, { toolCallId: "a" }, { toolCallId: "b" }],
     });
     expect(truncateToLastValidBoundary(output.newMessages).droppedMessageCount).toBe(0);
+  });
+
+  test("forwards claude-code provider options without overriding Lilac settings", async () => {
+    const f = fixture([result()]);
+    await executeClaudeSdkCall({
+      ...f.input,
+      providerOptions: {
+        "claude-code": {
+          taskBudget: { total: 50_000 },
+          settings: { fastMode: true, includeGitInstructions: true },
+          permissionMode: "bypassPermissions",
+        },
+      },
+    });
+    expect(f.options()?.taskBudget).toEqual({ total: 50_000 });
+    expect(f.options()?.settings).toMatchObject({ fastMode: true, includeGitInstructions: false });
+    expect(f.options()?.permissionMode).toBeUndefined();
   });
 
   test("uses the preset plus Lilac instructions and preserves streamed text, reasoning, tools and usage", async () => {

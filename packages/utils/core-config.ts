@@ -119,6 +119,7 @@ export type {
   RetentionLimit,
   SubagentExecution,
   SubagentPermissionProfileConfig,
+  TelemetryConfig,
   UniversalCoreConfig,
 } from "./core-config/types";
 

@@ -30,6 +30,24 @@ function reasoningOptions(
   return { effort: reasoning === "minimal" ? "low" : reasoning };
 }
 
+const claudeCodeProviderOptionsSchema = z.object({
+  taskBudget: z.object({ total: z.number() }).optional(),
+  settings: z.object({ fastMode: z.boolean().optional() }).optional(),
+});
+
+/** The `claude-code` provider options this bridge forwards; other keys are ignored. */
+function claudeCodeOptions(
+  providerOptions: AiSdkModelCallInput["providerOptions"],
+): Pick<Options, "taskBudget"> & { settings?: { fastMode?: boolean } } {
+  const parsed = claudeCodeProviderOptionsSchema.safeParse(providerOptions?.["claude-code"] ?? {});
+  if (!parsed.success) return {};
+  const { taskBudget, settings } = parsed.data;
+  return {
+    ...(taskBudget ? { taskBudget } : {}),
+    ...(settings?.fastMode !== undefined ? { settings: { fastMode: settings.fastMode } } : {}),
+  };
+}
+
 function systemText(system: AiSdkModelCallInput["system"]): string {
   if (typeof system === "string") return system;
   if (Array.isArray(system)) return system.map((part) => part.content).join("\n\n");
@@ -196,6 +214,72 @@ function userContent(messages: readonly ModelMessage[]): UserContent {
   return content.length ? content : [{ type: "text", text: "Continue." }];
 }
 
+// Claude can request permission for the first tool while the model is still emitting sibling blocks.
+function gateClaudeSkipPermission(authorize: Options["canUseTool"]) {
+  type Event = Extract<SDKMessage, { type: "stream_event" }>["event"];
+  const skipName = "mcp__lilac__skip_reply";
+  let batch = Promise.withResolvers<string | undefined>();
+  let skipId: string | undefined;
+  let mixed = false;
+  const decisions = new Map<string, Promise<string | undefined>>();
+  function observe(event: Event) {
+    switch (event.type) {
+      case "message_start":
+        batch.resolve(undefined);
+        batch = Promise.withResolvers();
+        skipId = undefined;
+        mixed = false;
+        return;
+      case "content_block_start": {
+        const block = event.content_block;
+        if (
+          block.type === "text" ||
+          block.type === "thinking" ||
+          block.type === "redacted_thinking"
+        )
+          return;
+        if (block.type !== "tool_use" || block.name !== skipName) {
+          mixed = true;
+          return;
+        }
+        if (skipId) mixed = true;
+        skipId = block.id;
+        decisions.set(block.id, batch.promise);
+        return;
+      }
+      case "message_delta":
+        if (!event.delta.stop_reason) return;
+        break;
+      case "message_stop":
+        break;
+      default:
+        return;
+    }
+    batch.resolve(mixed ? undefined : skipId);
+  }
+  const canUseTool: Options["canUseTool"] =
+    authorize &&
+    (async (name, input, options) => {
+      if (name !== skipName) return authorize(name, input, options);
+      const id = options.toolUseID;
+      const decision = decisions.get(id);
+      const aborted = Promise.withResolvers<undefined>();
+      const cancel = () => aborted.resolve(undefined);
+      if (options.signal.aborted) cancel();
+      options.signal.addEventListener("abort", cancel, { once: true });
+      const standalone = decision && (await Promise.race([decision, aborted.promise])) === id;
+      options.signal.removeEventListener("abort", cancel);
+      decisions.delete(id);
+      if (!standalone || options.signal.aborted)
+        return {
+          behavior: "deny",
+          message: "Call skip_reply separately from other tools.",
+        };
+      return authorize(name, input, options);
+    });
+  return { observe, canUseTool, close: () => batch.resolve(undefined) };
+}
+
 export async function executeClaudeSdkCall(
   input: AiSdkModelCallInput,
 ): Promise<AiSdkModelCallResult> {
@@ -213,6 +297,7 @@ export async function executeClaudeSdkCall(
     streamingInput: _streamingInput,
     ...settings
   } = runtime.settings;
+  const skipPermission = gateClaudeSkipPermission(settings.canUseTool);
   const prompt = createClaudeInput({
     type: "user",
     message: { role: "user", content: userContent(input.messages) },
@@ -353,6 +438,7 @@ export async function executeClaudeSdkCall(
     }
     if (message.type !== "stream_event") return;
     const event = message.event;
+    skipPermission.observe(event);
     if (event.type === "content_block_start") {
       const block = event.content_block;
       blockId = `${message.uuid}:${event.index}`;
@@ -418,18 +504,21 @@ export async function executeClaudeSdkCall(
         raw: { type: "tool-input-delta", id, delta: delta.partial_json },
       });
   };
+  const modelOptions = claudeCodeOptions(input.providerOptions);
   const result = await Result.tryPromise({
     try: async () => {
       const activeQuery = queryFactory({
         prompt,
         options: {
           ...settings,
+          canUseTool: skipPermission.canUseTool,
           model: runtime.modelId,
           env: { ...process.env, ...settings.env },
           abortController,
           includePartialMessages: true,
           extraArgs: { ...settings.extraArgs, "replay-user-messages": null },
           ...reasoningOptions(input.reasoning),
+          ...(modelOptions.taskBudget ? { taskBudget: modelOptions.taskBudget } : {}),
           systemPrompt: {
             type: "preset",
             preset: "claude_code",
@@ -437,6 +526,7 @@ export async function executeClaudeSdkCall(
             append: systemText(input.system),
           },
           settings: {
+            ...modelOptions.settings,
             includeGitInstructions: false,
             attribution: { commit: "", pr: "" },
             autoMemoryEnabled: false,
@@ -462,6 +552,7 @@ export async function executeClaudeSdkCall(
     catch: (cause): {} | null | undefined => cause,
   });
   queryOpen = false;
+  skipPermission.close();
   const cleanup = Result.try({
     try: () => run?.close(),
     catch: (cause): {} | null | undefined => cause,
