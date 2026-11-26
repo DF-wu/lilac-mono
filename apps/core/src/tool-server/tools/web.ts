@@ -316,12 +316,11 @@ function webFailure(error: unknown, signal?: AbortSignal): ServerToolFailure {
 function classifySearchAttemptFailure(
   cause: Error | Panic,
   timedOut: boolean,
+  timeoutMs: number,
   callerSignal?: AbortSignal,
 ): WebSearchFailure {
   if (Panic.is(cause)) preserveToolPanic(cause);
-  const error = timedOut
-    ? new Error(`Web search timed out after ${WEB_SEARCH_ATTEMPT_TIMEOUT_MS}ms.`)
-    : cause;
+  const error = timedOut ? new Error(`Web search timed out after ${timeoutMs}ms.`) : cause;
   const failure = webFailure(error, callerSignal);
   return {
     kind: "failure",
@@ -335,9 +334,11 @@ async function searchWithDeadline(
   input: z.output<typeof webSearchInputSchema>,
   callerSignal?: AbortSignal,
 ): Promise<WebSearchProviderOutcome> {
+  // Fork: Responses search (including compatible routes) gets 30 seconds per attempt.
+  const timeoutMs = provider.id === "openai" ? 30_000 : WEB_SEARCH_ATTEMPT_TIMEOUT_MS;
   const deadline = new AbortController();
   const signal = callerSignal ? AbortSignal.any([callerSignal, deadline.signal]) : deadline.signal;
-  const timer = setTimeout(() => deadline.abort(), WEB_SEARCH_ATTEMPT_TIMEOUT_MS);
+  const timer = setTimeout(() => deadline.abort(), timeoutMs);
   const searched = await Result.tryPromise({
     try: () => withAbortSignal(signal, () => provider.search(input, { signal })),
     catch: captureWebFailure,
@@ -347,6 +348,7 @@ async function searchWithDeadline(
     return classifySearchAttemptFailure(
       searched.error.cause,
       deadline.signal.aborted,
+      timeoutMs,
       callerSignal,
     );
   }

@@ -175,10 +175,17 @@ export function defaultNativeSurfaceConfig(): NativeSurfaceConfig {
   };
 }
 
+export type TelemetryConfig = {
+  errors: boolean;
+  usage: boolean;
+};
+
 export type UniversalCoreConfig = {
   configVersion: CoreConfigVersion;
 
   blobStorage: BlobStorageConfig;
+
+  telemetry: TelemetryConfig;
 
   tools: {
     fsBackend: "fff" | "node-rg";

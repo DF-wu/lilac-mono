@@ -4,7 +4,7 @@ Language: [`English (primary / canonical)`](./fork-differences.md) · [`Traditio
 
 This document describes the current differences between [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) and [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono).
 
-The current integration baseline is upstream commit [`f5292545`](https://github.com/stanley2058/lilac-mono/commit/f5292545a13d7795f79e15dc0ea06fd1a3425025). The [November 11 integration inventory](./fork-integration-20261111/README.md) records the earlier PR #101 baseline, F01–F23 dispositions, source ownership and offline migration support. Older dated reports retain their historical baselines.
+The current integration baseline is upstream commit [`20a10872`](https://github.com/stanley2058/lilac-mono/commit/20a108725d6d5e30dddbf6907718badef33e9ab7). The [November 11 integration inventory](./fork-integration-20261111/README.md) records the earlier PR #101 baseline, F01–F23 dispositions, source ownership and offline migration support. Older dated reports retain their historical baselines.
 
 > [!IMPORTANT]
 > This is a maintenance document, not a permanent compatibility commitment. After an upstream sync, differences that have been accepted upstream or no longer exist must be removed from this table or reclassified.
@@ -12,6 +12,18 @@ The current integration baseline is upstream commit [`f5292545`](https://github.
 The [2026-10-22 maintenance review](./fork-review-2026-10-22.md) records which extensions remain
 necessary, the integration defects corrected against its baseline, and the retired watchdog patch.
 The [PR #95 integration report](./fork-integration-pr95.md) records the later v3 migration and validation.
+
+## November 26 sync candidate
+
+The [PR #120 verification record](./pr120-sync-20261126.md) records the pinned refs,
+conflict decisions, inherited major findings, and local verification limits. This candidate
+preserves Native microphone dictation (#124) and HEIF model-input conversion (#126).
+Upstream telemetry is inherited with `errors: false` and `usage: false`; either
+`LILAC_TELEMETRY_DISABLED=1` or `DO_NOT_TRACK=1` overrides opt-in. No telemetry service
+or provider configuration is added by the fork.
+
+OpenAI Responses `web.search`, including compatible gateways, has a 30-second deadline
+per attempt. Other providers keep 10 seconds; the existing retry and fallback policy is unchanged.
 
 ## Inherited Native Runner and Preview Updates
 

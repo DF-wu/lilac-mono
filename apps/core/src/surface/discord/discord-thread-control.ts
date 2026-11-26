@@ -13,6 +13,8 @@ import {
 import {
   boundTimelineText,
   type SurfaceThreadControlPort,
+  type ThreadReadInput,
+  type ThreadReadResult,
   type ThreadTimelineItem,
 } from "../thread-control";
 import type { SurfaceToolTargetRouting } from "../protocol";
@@ -46,6 +48,7 @@ function timelineItem(
   message: SurfaceMessage,
   selfUserId: string,
   maxCharsPerItem: number,
+  textOffset = 0,
 ): ThreadTimelineItem | null {
   if (message.deleted || !message.text.trim()) return null;
   const fromSelf = message.userId === selfUserId;
@@ -53,7 +56,7 @@ function timelineItem(
     id: message.ref.messageId,
     role: fromSelf ? "assistant" : "user",
     kind: "text",
-    ...boundTimelineText(message.text, maxCharsPerItem),
+    ...boundTimelineText(message.text, maxCharsPerItem, textOffset),
     ...(!fromSelf && message.userName ? { author: message.userName } : {}),
   };
 }
@@ -100,6 +103,30 @@ export function createDiscordThreadControl(input: {
     );
   }
 
+  /** One message from its text offset, for continuing a truncated item. */
+  async function readItem(
+    channelId: string,
+    header: Pick<ThreadReadResult, "threadId" | "title">,
+    item: NonNullable<ThreadReadInput["item"]>,
+    maxChars: number,
+  ) {
+    const message = await adapter.readMsg({ platform: "discord", channelId, messageId: item.id });
+    if (message.isErr()) return Result.err(message.error);
+    const self = await selfUserId();
+    if (self.isErr()) return Result.err(self.error);
+    const read =
+      message.value && timelineItem(message.value, self.value, maxChars, item.textOffset);
+    return Result.ok({ ...header, activeRunId: null, items: read ? [read] : [], hasMore: false });
+  }
+
+  async function selfUserId() {
+    const self = await captureDiscordThreadReadOperation(
+      () => adapter.getSelf(),
+      "Discord identity is unavailable",
+    );
+    return self.map((value) => value.userId);
+  }
+
   return {
     async read(_caller, threadId, read) {
       const config = await captureDiscordThreadReadOperation(
@@ -109,31 +136,27 @@ export function createDiscordThreadControl(input: {
       if (config.isErr()) return Result.err(config.error);
       const target = await resolveChannel(threadId, config.value);
       if (target.isErr()) return Result.err(target.error);
-      const { sessionRef } = target.value;
-      const { channelId } = sessionRef;
-      const messages = await adapter.listMsg(sessionRef, {
+      const { channelId } = target.value.sessionRef;
+      const alias = bestEffortAliasForDiscordChannelId({ channelId, cfg: config.value });
+      const header = { threadId: channelId, title: alias ? `#${alias}` : channelId };
+      if (read.item) return await readItem(channelId, header, read.item, read.maxCharsPerItem);
+      const messages = await adapter.listMsg(target.value.sessionRef, {
         limit: read.limit,
         ...(read.before ? { beforeMessageId: read.before } : {}),
         ...(read.after ? { afterMessageId: read.after } : {}),
       });
       if (messages.isErr()) return Result.err(messages.error);
-      const self = await captureDiscordThreadReadOperation(
-        () => adapter.getSelf(),
-        "Discord identity is unavailable",
-      );
+      const self = await selfUserId();
       if (self.isErr()) return Result.err(self.error);
       // Discord returns pages newest first; agents read oldest first, as on native.
       const ordered = [...messages.value].sort(bySnowflake);
       const first = ordered[0]?.ref.messageId;
       const last = ordered.at(-1)?.ref.messageId ?? read.after;
-      const alias = bestEffortAliasForDiscordChannelId({ channelId, cfg: config.value });
       return Result.ok({
-        threadId: channelId,
-        title: alias ? `#${alias}` : channelId,
+        ...header,
         activeRunId: null,
-        // Discord keeps only posted messages, so both views return the same text items.
         items: ordered.flatMap(
-          (message) => timelineItem(message, self.value.userId, read.maxCharsPerItem) ?? [],
+          (message) => timelineItem(message, self.value, read.maxCharsPerItem) ?? [],
         ),
         hasMore: Boolean(first && messages.value.length >= read.limit),
         ...(first && messages.value.length >= read.limit ? { before: first } : {}),

@@ -744,7 +744,7 @@ describe("durable workflow store minimal dispatch schema", () => {
       );
       expect(store.listMigrations().at(-1)).toMatchObject({
         version: WORKFLOW_SCHEMA_VERSION,
-        name: "workflow cancellation outbox and atomic wait journaling",
+        name: "workflow runs by origin user",
       });
     } finally {
       store.close();
@@ -1292,6 +1292,58 @@ it("lists bounded subagent pages for only the requested parent session, includin
   }
 });
 
+it("maps follow-up subagent runs to the first and previous runs of their child session", () => {
+  const store = new DurableWorkflowStore(":memory:");
+  try {
+    store.createRevision(revision());
+    const session = (id: string, childSessionId: string, createdAt: number) => {
+      const child = liveParentRun(id, "parent-request");
+      child.createdAt = createdAt;
+      if (child.completionTarget.kind === "live_parent")
+        child.completionTarget = { ...child.completionTarget, childSessionId };
+      expect(store.createRun(child)).toBe(true);
+    };
+    session("first", "child-a", 10);
+    session("other", "child-b", 11);
+    session("second", "child-a", 12);
+    session("third", "child-a", 13);
+    expect(
+      workflowStoreValue(
+        store.listSubagentFollowUps("session-1", ["first", "other", "third", "second"]),
+      ),
+    ).toEqual(
+      new Map([
+        ["second", { firstRunId: "first", previousRunId: "first" }],
+        ["third", { firstRunId: "first", previousRunId: "second" }],
+      ]),
+    );
+    expect(workflowStoreValue(store.listSubagentFollowUps("session-1", ["first"]))).toEqual(
+      new Map(),
+    );
+  } finally {
+    store.close();
+  }
+});
+
+it("orders same-millisecond follow-ups by registration, not run ID", () => {
+  const store = new DurableWorkflowStore(":memory:");
+  try {
+    store.createRevision(revision());
+    for (const id of ["z-first", "a-second"]) {
+      const child = liveParentRun(id, "parent-request");
+      child.createdAt = 10;
+      if (child.completionTarget.kind === "live_parent")
+        child.completionTarget = { ...child.completionTarget, childSessionId: "child-a" };
+      expect(store.createRun(child)).toBe(true);
+    }
+    expect(workflowStoreValue(store.listSubagentFollowUps("session-1", ["a-second"]))).toEqual(
+      new Map([["a-second", { firstRunId: "z-first", previousRunId: "z-first" }]]),
+    );
+  } finally {
+    store.close();
+  }
+});
+
 describe("workflow audit recovery invariants", () => {
   it("upgrades and reopens Telegram targets and atomic reply waits with durable cancellation", () => {
     const file = dbPath("telegram-schema28");
@@ -1346,9 +1398,19 @@ describe("workflow audit recovery invariants", () => {
       db.run("DROP TABLE workflow_cancellation_outbox");
       db.run("DROP INDEX idx_workflow_runs_claim");
       db.run("DROP INDEX idx_workflow_waits_deadline");
-      db.run("DELETE FROM workflow_schema_migrations WHERE version = 28");
+      db.run("DROP INDEX idx_workflow_runs_origin_user");
+      db.run("DELETE FROM workflow_schema_migrations WHERE version >= 28");
+      expect(
+        db
+          .query<{ version: number }, []>(
+            "SELECT MAX(version) AS version FROM workflow_schema_migrations",
+          )
+          .get()?.version,
+      ).toBe(27);
       store = new DurableWorkflowStore(file);
-      expect(store.listMigrations().at(-1)?.version).toBe(28);
+      expect(store.listMigrations().map((migration) => migration.version)).toEqual([
+        ...WORKFLOW_MIGRATION_VERSIONS,
+      ]);
       expect(workflowStoreValue(store.getRun("run-1"))?.progressTarget).toEqual(target);
       expect(workflowStoreValue(store.getWait("run-1", "reply"))?.match).toEqual(match);
       expect(store.createOperation(operation("run-1", "agent"), "worker")).toBe(true);
@@ -1915,7 +1977,9 @@ for (const historicalVersion of [26, 27]) {
       const previousWait = workflowStoreValue(store.getWait("run-1", "sleep"));
       store.close();
       // Remove exactly the additive migrations after the supported blob baseline.
-      db.run(`DROP TRIGGER workflow_operation_cancellation_intent;
+      db.run(`DROP INDEX idx_workflow_runs_origin_user;
+        DELETE FROM workflow_schema_migrations WHERE version = 29;
+        DROP TRIGGER workflow_operation_cancellation_intent;
         DROP TABLE workflow_cancellation_outbox;
         DROP INDEX idx_workflow_runs_claim;
         DROP INDEX idx_workflow_waits_deadline;
@@ -1932,7 +1996,7 @@ for (const historicalVersion of [26, 27]) {
           .get()?.version,
       ).toBe(historicalVersion);
       store = new DurableWorkflowStore(file);
-      expect(store.listMigrations().at(-1)?.version).toBe(28);
+      expect(store.listMigrations().at(-1)?.version).toBe(29);
       expect(workflowStoreValue(store.getRun("run-1"))).toEqual(previousRun);
       expect(workflowStoreValue(store.getWait("run-1", "sleep"))).toEqual(previousWait);
       const wakeup = Promise.withResolvers<void>();

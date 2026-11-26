@@ -549,6 +549,10 @@ const museumSubagent = subagent("demo_subagent_museum", subagentActivities.museu
 const weatherSubagentDone = subagent("demo_subagent_weather", subagentActivities.weather.done);
 const museumSubagentDone = subagent("demo_subagent_museum", subagentActivities.museum.done);
 const planSubagent = subagent("demo_subagent_plan", subagentActivities.museum.working);
+const weatherFollowUp = subagent(
+  "demo_subagent_weather_follow_up",
+  subagentActivities.weather.done,
+);
 const subagentUpdate = message("demo_subagent_update", [
   {
     type: "text",
@@ -580,6 +584,46 @@ const foldedActivityMessages = [
     ),
   ]),
 ];
+
+// Synthesize tiny playable 8 kHz mono WAV chimes so demo audio attachments play and download locally.
+function demoWaveClip(frequencyHz: number, durationSec: number): { url: string; size: number } {
+  const sampleRate = 8000;
+  const samples = Math.floor(sampleRate * durationSec);
+  const bytes = new Uint8Array(44 + samples);
+  const view = new DataView(bytes.buffer);
+  const writeAscii = (offset: number, value: string) => {
+    for (let i = 0; i < value.length; i++) bytes[offset + i] = value.charCodeAt(i);
+  };
+  writeAscii(0, "RIFF");
+  view.setUint32(4, 36 + samples, true);
+  writeAscii(8, "WAVE");
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate, true);
+  view.setUint16(32, 1, true);
+  view.setUint16(34, 8, true);
+  writeAscii(36, "data");
+  view.setUint32(40, samples, true);
+  for (let i = 0; i < samples; i++) {
+    const fade = Math.min(1, i / 400, (samples - i) / 400);
+    const wave = Math.sin((2 * Math.PI * frequencyHz * i) / sampleRate);
+    bytes[44 + i] = Math.round(128 + wave * 36 * fade);
+  }
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return { url: `data:audio/wav;base64,${btoa(binary)}`, size: bytes.byteLength };
+}
+
+const demoAudioEn = demoWaveClip(440, 0.4);
+const demoAudioJa = demoWaveClip(523.25, 0.5);
+
+export const demoResourceUrls: ReadonlyMap<string, string> = new Map([
+  ["demo_audio_en_res", demoAudioEn.url],
+  ["demo_audio_ja_res", demoAudioJa.url],
+]);
 
 export const agentWorkStages: AgentWorkStage[] = [
   {
@@ -781,6 +825,22 @@ export const agentWorkStages: AgentWorkStage[] = [
     ],
   },
   {
+    id: "subagents-follow-up",
+    label: "Subagents · follow-up",
+    description:
+      "The parent asks the weather subagent a follow-up. Both rows open one agent with the whole conversation.",
+    frames: [
+      turn([
+        delegation,
+        weatherSubagentDone,
+        museumSubagentDone,
+        parentRouteDone,
+        subagentUpdate,
+        weatherFollowUp,
+      ]),
+    ],
+  },
+  {
     id: "subagents-nested",
     label: "Subagents · nested",
     description:
@@ -800,6 +860,57 @@ export const agentWorkStages: AgentWorkStage[] = [
     label: "Complete",
     description: "The final answer stays visible; prior work collapses into the work summary.",
     frames: [turn([work, commentary, final], "complete")],
+  },
+  {
+    id: "attachments-complete",
+    label: "Attachments · complete",
+    description:
+      "Attachments produced during tool work hoist to the bottom of the final reply instead of folding away.",
+    frames: [
+      turn(
+        [
+          work,
+          commentary,
+          message("demo_audio_en", [
+            {
+              type: "data-resource",
+              id: "demo_audio_en_res",
+              data: {
+                resourceId: "demo_audio_en_res",
+                name: "lilac-en.wav",
+                mediaType: "audio/wav",
+                size: demoAudioEn.size,
+                state: "ready",
+              },
+            },
+          ]),
+          message("demo_audio_ja", [
+            {
+              type: "data-resource",
+              id: "demo_audio_ja_res",
+              data: {
+                resourceId: "demo_audio_ja_res",
+                name: "lilac-ja.wav",
+                mediaType: "audio/wav",
+                size: demoAudioJa.size,
+                state: "ready",
+              },
+            },
+          ]),
+          message(
+            "demo_attachments_final",
+            [
+              {
+                type: "text",
+                text: "Rendered fresh English and Japanese voice samples. Both clips are attached below for review.",
+              },
+            ],
+            "final",
+          ),
+        ],
+        "complete",
+      ),
+    ],
   },
   {
     id: "full-turn-working",
@@ -853,7 +964,7 @@ export const agentWorkStages: AgentWorkStage[] = [
     id: "steering-complete",
     label: "Steering · complete",
     description:
-      "All intermediate work and steering prompts collapse together, with the final response below.",
+      "Steering prompts stay visible in order, splitting work into independent collapsed segments above the final response.",
     frames: [finalSteering],
   },
   {
@@ -963,14 +1074,45 @@ agentWorkStages.unshift({
   frames: conversationFrames,
 });
 
-const demoSubagentSamples = {
+/** The follow-up the parent sends after the weather check, and the reply. */
+const weatherFollowUpExchange: DisplayMessage[] = [
+  {
+    id: "demo_weather_follow_up_prompt",
+    role: "user",
+    parts: [{ type: "text", text: "Is the riverside path shaded around noon?" }],
+  },
+  {
+    id: "demo_weather_follow_up_reply",
+    role: "assistant",
+    metadata: { phase: "final" },
+    parts: [{ type: "text", text: "Mostly. Trees cover the east bank; the west bank is open." }],
+  },
+];
+
+type DemoSubagentSample = {
+  profile: "restricted" | "full";
+  name: string;
+  sample: keyof typeof subagentTranscripts;
+  /** The demo run this follow-up continues. */
+  firstRunId?: string;
+  /** The follow-up's own exchange after the session's earlier transcript. */
+  followUp?: readonly DisplayMessage[];
+};
+const demoSubagentSamples: Record<string, DemoSubagentSample> = {
   demo_subagent_weather: {
     profile: "restricted",
     name: "Weather and riverside",
     sample: "weather",
   },
   demo_subagent_museum: { profile: "full", name: "Museum visit", sample: "museum" },
-} as const;
+  demo_subagent_weather_follow_up: {
+    profile: "restricted",
+    name: "Weather and riverside",
+    sample: "weather",
+    firstRunId: "demo_subagent_weather",
+    followUp: weatherFollowUpExchange,
+  },
+};
 
 type NestedDemoAgent = {
   profile: string;
@@ -1062,9 +1204,7 @@ function nestedDemoSubagents(
 }
 
 function demoSubagentSample(id: string) {
-  return id in demoSubagentSamples
-    ? demoSubagentSamples[id as keyof typeof demoSubagentSamples]
-    : undefined;
+  return Object.hasOwn(demoSubagentSamples, id) ? demoSubagentSamples[id] : undefined;
 }
 
 export function demoSubagents(slot: ReadyTurnSlot): SubagentSummary[] {
@@ -1083,6 +1223,7 @@ export function demoSubagents(slot: ReadyTurnSlot): SubagentSummary[] {
       return [
         {
           id: part.id,
+          ...(sample.firstRunId ? { firstRunId: sample.firstRunId } : {}),
           activityId: part.id,
           turnId: slot.turnId,
           profile: sample.profile,
@@ -1092,7 +1233,7 @@ export function demoSubagents(slot: ReadyTurnSlot): SubagentSummary[] {
           name: sample.name,
           state: part.data.state,
           title: running ? title : "Completed",
-          startedAt: demoTime + 3000,
+          startedAt: demoTime + (sample.firstRunId ? 40_000 : 3000),
         },
       ];
     }),
@@ -1104,5 +1245,7 @@ export function demoSubagentTranscript(agent: SubagentSummary): DisplayMessage[]
   if (nested) return nestedDemoTranscript(nested);
   const sample = demoSubagentSample(agent.id);
   if (!sample) return [];
-  return subagentTranscripts[sample.sample][agent.state === "running" ? "running" : "complete"];
+  const transcript =
+    subagentTranscripts[sample.sample][agent.state === "running" ? "running" : "complete"];
+  return [...transcript, ...(sample.followUp ?? [])];
 }

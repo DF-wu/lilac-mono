@@ -222,11 +222,14 @@ function resetAttempt(
   const prefix = attemptPrefix(event.requestId, payload.previousAttemptId);
   const selectedPrefix =
     payload.stepId === undefined ? prefix : `${prefix}${digest(payload.stepId)}_`;
-  const removed = slot.messages.filter((message) => message.id.startsWith(selectedPrefix));
+  const matches = (message: DisplayMessage) =>
+    message.id.startsWith(selectedPrefix) &&
+    (!payload.textOnly || message.parts.some((part) => part.type === "text"));
+  const removed = slot.messages.filter(matches);
   return {
     slot: {
       ...slot,
-      messages: slot.messages.filter((message) => !message.id.startsWith(selectedPrefix)),
+      messages: slot.messages.filter((message) => !matches(message)),
     },
     changes: removed.map((message) => ({
       kind: "remove-message",
@@ -491,25 +494,62 @@ function updateMetadata(
   };
 }
 
+function splitBySteer(messages: readonly DisplayMessage[]): DisplayMessage[][] {
+  const segments: DisplayMessage[][] = [[]];
+  for (const message of messages) {
+    if (message.role === "user" && message.metadata?.inputMode === "steer") {
+      segments.push([]);
+      continue;
+    }
+    segments.at(-1)!.push(message);
+  }
+  return segments;
+}
+
+function normalizeSegmentFinalPhase(
+  projection: ProjectedTurn,
+  segment: readonly DisplayMessage[],
+  unspecified: ReadonlySet<string>,
+  trailingOnly: boolean,
+): ProjectedTurn {
+  if (
+    segment.some(
+      (message) =>
+        message.role === "assistant" &&
+        message.metadata?.phase === "final" &&
+        !message.metadata.inputId,
+    )
+  )
+    return projection;
+  let candidates = segment;
+  if (trailingOnly) {
+    const lastActivity = segment.findLastIndex((message) =>
+      message.parts.some((part) => part.type === "data-activity"),
+    );
+    candidates = segment.slice(lastActivity + 1);
+  }
+  const last = candidates.findLast(
+    (message) => unspecified.has(message.id) && message.parts.some((part) => part.type === "text"),
+  );
+  return last ? updateMetadata(projection, last.id, { phase: "final" }) : projection;
+}
+
 function normalizeFinalPhase(
   projection: ProjectedTurn,
   prior: NativeOutputProjectionState,
 ): ProjectedTurn {
-  if (
-    projection.slot.messages.some(
-      (message) => message.role === "assistant" && message.metadata?.phase === "final",
-    )
-  )
-    return projection;
   const unspecified = new Set(
     prior.messages
       .filter((message) => message.unspecifiedPhase)
       .map((message) => message.messageId),
   );
-  const last = projection.slot.messages.findLast(
-    (message) => unspecified.has(message.id) && message.parts.some((part) => part.type === "text"),
-  );
-  return last ? updateMetadata(projection, last.id, { phase: "final" }) : projection;
+  if (unspecified.size === 0) return projection;
+  const segments = splitBySteer(projection.slot.messages);
+  let output = projection;
+  for (const [index, segment] of segments.entries()) {
+    output = normalizeSegmentFinalPhase(output, segment, unspecified, index < segments.length - 1);
+  }
+  return output;
 }
 
 export function projectNativeOutput(

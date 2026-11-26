@@ -989,6 +989,94 @@ describe("web search and permits", () => {
     expect(calls).toEqual(["tavily"]);
   });
 
+  it.each(["openai/gpt-5.6", "openai-compatible/gpt-5.6-terra"])(
+    "accepts a %s search result after 10 seconds and before 30 seconds",
+    async (model) => {
+      jest.useFakeTimers({ now: 0 });
+      const started = deferred<AbortSignal>();
+      const completed = deferred<readonly []>();
+      const search = jest.fn(
+        async (
+          _input: Parameters<WebSearchProvider["search"]>[0],
+          options: Parameters<WebSearchProvider["search"]>[1],
+        ) => {
+          started.resolve(options!.signal!);
+          return completed.promise;
+        },
+      );
+      const tool = new Web({
+        ...baseWebDependencies,
+        loadWebToolConfig: async () => ({
+          extractProviders: ["openai"],
+          fetchMode: "auto",
+          firecrawlPolicy: undefined,
+          openaiPolicy: { model, searchContextSize: "medium" },
+        }),
+        getProviderEnvironment: () => ({
+          ...emptyEnvironment,
+          openai: { apiKey: "openai-test-key" },
+          openaiCompatible: {
+            apiKey: "compatible-test-key",
+            baseUrl: "http://gateway.internal/v1",
+          },
+        }),
+        createSearchProviders: (config) => {
+          expect(config.openai?.apiKey).toBe(
+            model.startsWith("openai-compatible/") ? "compatible-test-key" : "openai-test-key",
+          );
+          return [configuredProvider("openai", search)];
+        },
+      });
+
+      const pending = tool.call("search", { query: "slow hosted search" });
+      const signal = await started.promise;
+      jest.advanceTimersByTime(20_000);
+      expect(signal.aborted).toBe(false);
+      completed.resolve([]);
+
+      await expect(toolValue(pending)).resolves.toEqual([]);
+      expect(search).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("gives OpenAI two 30-second attempts before falling back to 10-second attempts", async () => {
+    jest.useFakeTimers({ now: 0 });
+    const starts = Array.from({ length: 4 }, () => deferred<AbortSignal>());
+    const calls: string[] = [];
+    const tool = createTool({
+      providers: ["openai", "exa"].map((id) =>
+        configuredProvider(id, async (_input, options) => {
+          const start = starts[calls.length]!;
+          calls.push(id);
+          start.resolve(options!.signal!);
+          return new Promise(() => {});
+        }),
+      ),
+    });
+
+    const pending = tool.call("search", { query: "stall OpenAI then fallback" });
+    for (const [index, start] of starts.entries()) {
+      const signal = await start.promise;
+      const duration = index < 2 ? 30_000 : 10_000;
+      jest.advanceTimersByTime(duration - 1);
+      expect(signal.aborted).toBe(false);
+      expect(calls).toHaveLength(index + 1);
+      jest.advanceTimersByTime(1);
+      expect(signal.aborted).toBe(true);
+    }
+
+    expect(calls).toEqual(["openai", "openai", "exa", "exa"]);
+    await expect(pending).resolves.toMatchObject({
+      status: "error",
+      error: {
+        kind: "timeout",
+        code: "web_timeout",
+        message:
+          "web.search failed across fallback providers: openai: Web search timed out after 30000ms. | exa: Web search timed out after 10000ms.",
+      },
+    });
+  });
+
   it("gives each provider two independent 10-second attempts", async () => {
     jest.useFakeTimers({ now: 0 });
     const providerIds = ["firecrawl", "exa", "tavily"];
