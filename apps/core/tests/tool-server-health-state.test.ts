@@ -319,6 +319,29 @@ describe("tool server health state", () => {
       expect(onUnhealthy).toHaveBeenCalledTimes(1);
     });
 
+    it("exits on the third consecutive sample at the rss ceiling by default", async () => {
+      const logger = createLogger({ module: "health-state-test" });
+      spyOn(logger, "warn").mockImplementation(() => undefined);
+      const onUnhealthy = mock(() => undefined);
+      const health = createToolServerHealthState({
+        logger,
+        runtimeDiagnosticSampler: () => RUNTIME_SAMPLE,
+        onUnhealthy,
+      });
+      setMemory({ rss: 8191, heapUsed: 170, external: 40 });
+      await health.runWatchdog();
+      await health.runWatchdog();
+      await health.runWatchdog();
+      expect(onUnhealthy).not.toHaveBeenCalled();
+
+      setMemory({ rss: 8192, heapUsed: 170, external: 40 });
+      await health.runWatchdog();
+      await health.runWatchdog();
+      expect(onUnhealthy).not.toHaveBeenCalled();
+      await health.runWatchdog();
+      expect(onUnhealthy).toHaveBeenCalledTimes(1);
+    });
+
     it("logs the limit when an rss warning escalates into a failure", async () => {
       const { health, onUnhealthy, warnings } = createWatchedHealth();
       setMemory({ rss: 3200, heapUsed: 170, external: 40 });
