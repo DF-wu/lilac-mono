@@ -1,6 +1,7 @@
 import { createLogger, formatTaggedErrorForLog, getCoreConfig } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError } from "better-result";
 
+import { installIsolateMemoryResponder } from "../shared/isolate-memory";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import {
   decodeThreadMaterializerWorkerRequest,
@@ -101,6 +102,7 @@ async function runRequest(request: ThreadMaterializerWorkerRequest): Promise<voi
   respond({ id: request.id, ok: false, error: failure.message });
 }
 
+installIsolateMemoryResponder("thread-materializer");
 let requestQueue = Promise.resolve();
 
 self.addEventListener("message", (event: MessageEvent<unknown>) => {

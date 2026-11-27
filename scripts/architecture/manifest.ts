@@ -4940,6 +4940,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               module: "src/conversation/thread-materializer-worker-protocol.ts",
               exportName,
             })),
+            {
+              module: "src/shared/isolate-memory.ts",
+              exportName: "decodeIsolateMemoryMessage",
+            },
             ...["decodeGithubAppSecret", "readGithubAppSecretResult"].map((exportName) => ({
               module: "src/github/github-app.ts",
               exportName,

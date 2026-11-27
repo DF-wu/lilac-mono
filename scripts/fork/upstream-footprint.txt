@@ -17,19 +17,20 @@ __tests__/release-gate.test.ts  # F21: Verified candidate, publication freshness
 apps/core/package.json  # grammY dependency
 apps/core/scripts/generate-config-schemas.ts  # fail-closed Zod conversion and version-correct legacy web provider aliases
 apps/core/scripts/generate-design-tool-activities.ts  # includes the existing fork workflow content format in generated fixture types
+apps/core/src/conversation/thread-materializer-worker-isolate.ts  # answers isolate memory probes
 apps/core/src/conversation/thread-search-protocol.ts  # carries Telegram filters, allowlists, source paths, and hits across the search worker boundary
-apps/core/src/conversation/thread-search-worker.ts  # opens the Telegram conversation source in each search worker
+apps/core/src/conversation/thread-search-worker.ts  # opens the Telegram conversation source in each search worker; answers isolate memory probes
 apps/core/src/conversation/thread-service.ts  # Telegram surface labels and chat allowlists plus HEIF conversion and fallback for summaries
 apps/core/src/conversation/thread-store.ts  # telegram source branch, telegram_thread kind, chat allowlist clause
 apps/core/src/conversation/thread-summarization-worker-protocol.ts  # telegram surface enum and source path fields
-apps/core/src/conversation/thread-summarization-worker.ts  # opens the telegram source and bot name in the worker
+apps/core/src/conversation/thread-summarization-worker.ts  # opens the telegram source and bot name in the worker; answers isolate memory probes
 apps/core/src/conversation/thread-worker.ts  # forwards the telegram source and hydrates telegram refs
 apps/core/src/custom-commands/manager.ts  # menu alias index and @target-aware command parsing
 apps/core/src/generated/config-schemas/core-config.schema.json  # generated from fork input schemas including Telegram and OpenAI search
 apps/core/src/github/webhook/github-webhook-server.ts  # final publication policy, UUID delivery identity repair and redacted contract error logging (#107)
 apps/core/src/resource/service.ts  # leaves HEIF bytes available for model conversion instead of the Bun image preview
 apps/core/src/runtime/compose-builtin-surface-runtimes.ts  # includes the Telegram runtime descriptor entry
-apps/core/src/runtime/create-core-runtime.ts  # constructs and registers the Telegram surface module
+apps/core/src/runtime/create-core-runtime.ts  # constructs and registers the Telegram surface module; collects worker isolate memory and starts the memory sampler
 apps/core/src/runtime/main.ts  # settles Core creation/start Results through the fork-owned startCoreRuntime helper
 apps/core/src/ssh/ssh-exec.ts  # PR119: preserves bounded output drain and handles cancelled dispatch, async stdin failures, Panic cleanup, and surviving process-group helpers
 apps/core/src/surface/adapter.ts  # adds the optional attachment-resolver capability and resolve-attachment operation
@@ -138,7 +139,7 @@ packages/utils/prompt-templates/TOOLS.md  # mentions Telegram t.me links for con
 packages/utils/tests/core-config.versioning.test.ts  # v1/v2 drift test for fork keys
 packages/utils/tests/core-config.web-search-provider.test.ts  # covers the openai provider config
 scripts/architecture/architecture.test.ts  # expects the Telegram request router event consumer
-scripts/architecture/core-final-boundary-identities.ts  # registers the attachment-resolver capability predicate
+scripts/architecture/core-final-boundary-identities.ts  # registers the attachment-resolver capability predicate and the isolate memory channel decoder
 scripts/architecture/manifest.ts  # registers fork module boundaries, codecs, and exception adapters
 scripts/architecture/precise-exception-identities.ts  # registers fork module exception identities
 scripts/run-gates.ts  # runs external custom-media source/bundle regression and typecheck in the repository gate

@@ -217,6 +217,8 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
     "decodeThreadMaterializerWorkerResponse",
   ],
   ["src/conversation/thread-materializer-worker-isolate.ts", "addEventListener.<callback@2>"],
+  ["src/shared/isolate-memory.ts", "decodeIsolateMemoryMessage"],
+  ["src/shared/isolate-memory.ts", "openIsolateMemoryChannel.onMessage.<callback>"],
   [
     "src/conversation/thread-materializer-worker.ts",
     "startConversationThreadMaterializer.configureWorker.setMessageHandler.<callback@1>",

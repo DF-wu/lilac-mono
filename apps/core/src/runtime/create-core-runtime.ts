@@ -12,6 +12,8 @@ import {
 } from "../surface/native/runtime";
 import { maintainWorkflowArtifactPublications } from "../workflow/workflow-artifact-store";
 import { captureError } from "../shared/error-capture.js";
+import { createIsolateMemoryCollector } from "../shared/isolate-memory";
+import { startMemorySampler, type MemorySampler } from "./memory-sampler";
 import type { LogLevel } from "@stanley2058/simple-module-logger";
 import {
   configureTelemetry,
@@ -1261,6 +1263,8 @@ export async function createCoreRuntime(
     return finishCoreRuntimeCreateFailure(mcpRegistryFailure, eventBusResources);
   }
   let surfaceRuntimeRegistry: SurfaceRuntimeRegistry | null = null;
+  const isolateMemory = createIsolateMemoryCollector();
+  let memorySampler: MemorySampler | null = null;
   let runtimeFullyStarted = false;
   let routerSubscriptionHealthy = true;
   let mcpRegistryInitPromise: Promise<void> | null = null;
@@ -1519,6 +1523,7 @@ export async function createCoreRuntime(
               ...surfaceMemoryDiagnostics,
               openObserve: getOpenObserveDiagnostics(),
               telemetry: getTelemetryDiagnostics(),
+              isolates: await isolateMemory.collect(),
             },
           }
         : {}),
@@ -3070,6 +3075,11 @@ export async function createCoreRuntime(
           }
 
           runtimeFullyStarted = routerSubscriptionHealthy;
+          memorySampler ??= startMemorySampler({
+            logger: createLogger({ module: "runtime-memory" }),
+            collector: isolateMemory,
+            activeLevel1WorkCount: () => stopAgentRunner?.getActiveLevel1Work().length ?? 0,
+          });
 
           logger.info(
             `Core runtime started (tool-server port=${toolServerPort}, subscriptionPrefix=${subscriptionPrefix})`,
@@ -3123,6 +3133,9 @@ export async function createCoreRuntime(
     if (stopPass === "none") return;
     const wasFullyStarted = runtimeFullyStarted;
     runtimeFullyStarted = false;
+    memorySampler?.stop();
+    memorySampler = null;
+    if (stopPass === "full") isolateMemory.close();
     started = false;
     conversationThreadSummarizationStopping = true;
     const cleanup = createCoreRuntimeCleanupSupervisor(priorPanic);
