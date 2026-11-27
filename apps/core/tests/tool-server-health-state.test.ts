@@ -257,6 +257,8 @@ describe("tool server health state", () => {
         { rss: 1534, heapUsed: 169, external: 34 },
         { rss: 1763, heapUsed: 243, external: 20 },
         { rss: 1662, heapUsed: 603, external: 88 },
+        // 2026-11-27 Catalina: retained burst capacity outside the main isolate.
+        { rss: 4284, heapUsed: 286, external: 22 },
       ]) {
         setMemory(memory);
         expect((await memoryCheck(health))?.ok).toBe(true);
@@ -268,7 +270,10 @@ describe("tool server health state", () => {
 
     it("warns without restarting while only rss is elevated, then recovers", async () => {
       const { health, onUnhealthy, warnings } = createWatchedHealth();
-      setMemory({ rss: 1600, heapUsed: 170, external: 40 });
+      setMemory({ rss: 2900, heapUsed: 170, external: 40 });
+      await health.runWatchdog();
+      expect(warnings()).toEqual([]);
+      setMemory({ rss: 3072, heapUsed: 170, external: 40 });
       await health.runWatchdog();
       await health.runWatchdog();
       await health.runWatchdog();
@@ -301,22 +306,47 @@ describe("tool server health state", () => {
 
     it("restarts at the rss ceiling even when the main isolate is small", async () => {
       const { health, onUnhealthy } = createWatchedHealth();
-      setMemory({ rss: 4096, heapUsed: 170, external: 40 });
+      setMemory({ rss: 8191, heapUsed: 170, external: 40 });
+      expect((await memoryCheck(health))?.ok).toBe(true);
+      setMemory({ rss: 8192, heapUsed: 170, external: 40 });
 
       expect(await memoryCheck(health)).toMatchObject({
         ok: false,
-        reason: `rss ${4096 * MiB} exceeded limit ${4096 * MiB}`,
+        reason: `rss ${8192 * MiB} exceeded limit ${8192 * MiB}`,
       });
       await health.runWatchdog();
       await health.runWatchdog();
       expect(onUnhealthy).toHaveBeenCalledTimes(1);
     });
 
+    it("exits on the third consecutive sample at the rss ceiling by default", async () => {
+      const logger = createLogger({ module: "health-state-test" });
+      spyOn(logger, "warn").mockImplementation(() => undefined);
+      const onUnhealthy = mock(() => undefined);
+      const health = createToolServerHealthState({
+        logger,
+        runtimeDiagnosticSampler: () => RUNTIME_SAMPLE,
+        onUnhealthy,
+      });
+      setMemory({ rss: 8191, heapUsed: 170, external: 40 });
+      await health.runWatchdog();
+      await health.runWatchdog();
+      await health.runWatchdog();
+      expect(onUnhealthy).not.toHaveBeenCalled();
+
+      setMemory({ rss: 8192, heapUsed: 170, external: 40 });
+      await health.runWatchdog();
+      await health.runWatchdog();
+      expect(onUnhealthy).not.toHaveBeenCalled();
+      await health.runWatchdog();
+      expect(onUnhealthy).toHaveBeenCalledTimes(1);
+    });
+
     it("logs the limit when an rss warning escalates into a failure", async () => {
       const { health, onUnhealthy, warnings } = createWatchedHealth();
-      setMemory({ rss: 1600, heapUsed: 170, external: 40 });
+      setMemory({ rss: 3200, heapUsed: 170, external: 40 });
       await health.runWatchdog();
-      setMemory({ rss: 1600, heapUsed: 800, external: 40 });
+      setMemory({ rss: 3200, heapUsed: 800, external: 40 });
       await health.runWatchdog();
       await health.runWatchdog();
 

@@ -183,9 +183,11 @@ const DEFAULT_TOOL_CALL_OVERDUE_GRACE_MS = 15_000;
 // Worker isolates share this process, so RSS includes bursts that a restart cannot usefully bound.
 // heapUsed and external exclude worker heaps, which makes them the restart signal for Core itself.
 // The RSS ceiling still catches native leaks and runaway workers, which those counters cannot see.
+// Fork: a busy deployment starts near 1.8 GiB and retains burst capacity, so 4 GiB restarted healthy
+// Core after about a day; 8 GiB keeps the runaway guard while leaving room for concurrent runs.
 const DEFAULT_MAX_MAIN_ISOLATE_BYTES = 768 * 1024 * 1024;
-const DEFAULT_MAX_RSS_BYTES = 4_096 * 1024 * 1024;
-const DEFAULT_WARN_RSS_BYTES = 1_500 * 1024 * 1024;
+const DEFAULT_MAX_RSS_BYTES = 8_192 * 1024 * 1024;
+const DEFAULT_WARN_RSS_BYTES = 3_072 * 1024 * 1024;
 const MEMORY_HISTORY_SIZE = 60;
 
 function previewReason(reason: unknown): string {

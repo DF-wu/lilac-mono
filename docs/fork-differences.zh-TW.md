@@ -51,6 +51,7 @@ skill 遷移未完成事項。Native 工具送訊息預設排隊投遞，不啟�
 | Compatible-provider tool images | 把 tool results 的圖片移至完整平行 tool-result group 後方，成為附有來源標籤的 user image message，讓通用 Chat Completions 接收視覺輸入而非序列化圖片資料 | `packages/utils/openai-compatible-tool-images.ts`、`packages/utils/tests/openai-compatible-tool-images.test.ts` | 僅轉換 provider view，canonical history 不變；endpoint 與模型仍須支援 user image inputs；官方 OpenAI Responses 路徑不使用此 shim |
 | Container delivery | Build workflow 發布經驗證的 `catalina`、`claudia` 與 SHA tags，`latest` 指向 `catalina`；每個 variant 都有各自的帳號與 home directory，image 另加入 `rsync` | [`build-image.yml`](../.github/workflows/build-image.yml)、[`Dockerfile`](../Dockerfile) | 兩個發布 variant 都使用 UID/GID 3000；host bind mounts 必須允許該數字身分存取 |
 | Upstream maintenance | 每 6 小時檢查 upstream；乾淨候選合併通過完整 CI 後更新 `main` 並發布映像；Git 衝突開 PR，由 Claude 唯讀分析並要求 `Catalina-df` review | [`sync-upstream.yml`](../.github/workflows/sync-upstream.yml)、[設定說明](./upstream-sync.md) | CI 失敗停止更新；衝突解決與整合驗證由人工負責 |
+| Core memory watchdog | `process.memory` watchdog 在 RSS 達 8 GiB（原為 4 GiB）時重啟 Core，RSS 警告事件從 3 GiB（原為 1.5 GiB）開始；768 MiB 主 isolate 上限不變 | `apps/core/src/tool-server/health-state.ts`、fork issue [#128](https://github.com/DF-wu/lilac-mono/issues/128) | 上限依部署主機寫死，該主機未設容器記憶體上限。較高上限只會延後保留記憶體造成的重啟，不會回收記憶體 |
 
 ## Telegram 現況
 
