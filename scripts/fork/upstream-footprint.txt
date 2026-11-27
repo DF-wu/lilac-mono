@@ -48,6 +48,7 @@ apps/core/src/surface/native/push.test.ts  # updates the native schema upgrade r
 # --- OpenAI web.search provider (staged for an upstream contribution; remove once accepted)
 apps/core/src/surface/types.ts  # adds "telegram" to the closed SessionRef/MsgRef unions
 apps/core/src/tool-server/create-tool-server.ts  # x-lilac-origin-session-id header and initiator-scoped restricted calls
+apps/core/src/tool-server/health-state.ts  # 8 GiB RSS watchdog ceiling and 3 GiB warning level for the deployment host
 apps/core/src/tool-server/request-control-authority.ts  # origin session authority
 apps/core/src/tool-server/tools/conversation-thread.ts  # telegram in the surface filter enum
 apps/core/src/tool-server/tools/image-script.ts  # adds the openaiCompatible provider to the script providers
@@ -88,6 +89,7 @@ apps/core/tests/surface/native/search.test.ts  # verifies single-thread context 
 apps/core/tests/surface/operation-contract.test.ts  # resolve-attachment operation
 apps/core/tests/surface/runtime-descriptor.test.ts  # Telegram descriptor
 apps/core/tests/tool-server-create-tool-server.test.ts  # origin-session authority
+apps/core/tests/tool-server-health-state.test.ts  # covers the 8 GiB RSS ceiling and 3 GiB warning level
 apps/core/tests/tool-server-image-generation.test.ts  # isolates the openaiCompatible provider from the environment
 apps/core/tests/tool-server-surface.test.ts  # Telegram session listing
 apps/core/tests/tools/bash.test.ts  # probes stdin with readSync to distinguish EBADF from EOF across cat implementations
