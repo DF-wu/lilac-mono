@@ -9,6 +9,7 @@ import { createXai } from "@ai-sdk/xai";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGroq } from "@ai-sdk/groq";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import type { OpenAICompatibleProvider } from "@ai-sdk/openai-compatible";
 import { createGateway } from "ai";
 import { createClaudeCode } from "./claude-sdk";
@@ -43,6 +44,7 @@ export type Providers =
   | "anthropic"
   | "claude-code"
   | "groq"
+  | "google"
   | "vercel"
   | (string & {});
 
@@ -422,6 +424,12 @@ export function getModelProviders() {
       ? createGroq({
           baseURL: env.providers.groq.baseUrl,
           apiKey: env.providers.groq.apiKey,
+        })
+      : null,
+    google: env.providers.google
+      ? createGoogleGenerativeAI({
+          baseURL: env.providers.google.baseUrl,
+          apiKey: env.providers.google.apiKey,
         })
       : null,
     vercel: env.providers.vercel

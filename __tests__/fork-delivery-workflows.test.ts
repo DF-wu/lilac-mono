@@ -146,9 +146,14 @@ test("image publishers serialize each variant across direct, manual and reusable
 
 test("all CI jobs check out the requested candidate and footprint is strict", async () => {
   const ci = await workflow("ci.yml");
-  for (const job of Object.values(ci.jobs)) {
+  for (const [name, job] of Object.entries(ci.jobs)) {
     const checkout = job.steps?.find((step) => step.uses?.startsWith("actions/checkout@"));
-    expect(checkout?.with?.ref).toBe("${{ inputs.ref || github.sha }}");
+    // The source-checks aggregator only inspects job results and has no source checkout.
+    if (!checkout) {
+      expect(name).toBe("source-checks");
+      continue;
+    }
+    expect(checkout.with?.ref).toBe("${{ inputs.ref || github.sha }}");
   }
   const footprint = ci.jobs["fork-footprint"]?.steps?.find(
     (step) => step.name === "Check modified upstream files against the allowlist",

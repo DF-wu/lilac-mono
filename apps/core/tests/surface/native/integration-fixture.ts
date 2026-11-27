@@ -137,6 +137,8 @@ export async function createNativeIntegrationFixture(
   options: {
     realBus?: boolean;
     mcpRegistry?: NativeRuntimeOptions["mcpRegistry"];
+    mcpOAuth?: NativeRuntimeOptions["mcpOAuth"];
+    mcpOAuthCallback?: NativeRuntimeOptions["mcpOAuthCallback"];
     port?: number;
     operatorTokenSha256?: string;
     password?: string;
@@ -163,6 +165,8 @@ export async function createNativeIntegrationFixture(
       dataDir: string;
       config: CoreConfig;
     }) => Promise<void>;
+    /** Text of the editable config files shown in Settings. */
+    configFiles?: { core?: string; mcp?: string };
   } = {},
 ) {
   const root = await mkdtemp(path.join(tmpdir(), "lilac-native-integration-"));
@@ -183,8 +187,14 @@ export async function createNativeIntegrationFixture(
   config.conversation.thread.summarization.enabled = false;
   await options.prepare?.({ workspaceRoot, dataDir, config });
   integrationValue(resolveAgentRunModelResult({ cfg: config, runProfile: "primary" }));
-  await writeFile(path.join(dataDir, "core-config.yaml"), "configVersion: 2\n");
-  await writeFile(path.join(dataDir, "mcp-config.yaml"), "configVersion: 1\nservers: {}\n");
+  await writeFile(
+    path.join(dataDir, "core-config.yaml"),
+    options.configFiles?.core ?? "configVersion: 2\n",
+  );
+  await writeFile(
+    path.join(dataDir, "mcp-config.yaml"),
+    options.configFiles?.mcp ?? "configVersion: 1\nservers: {}\n",
+  );
   const username = "owner";
   const password = options.password ?? "native-fixture-password";
   const installation = integrationValue(
@@ -360,6 +370,7 @@ export async function createNativeIntegrationFixture(
       customCommands,
       mcpRegistry: options.mcpRegistry ?? {
         reload: async () => Result.ok([]),
+        list: () => [],
         getCatalogServers: () => [],
         getTools: () => [],
       },
@@ -377,6 +388,8 @@ export async function createNativeIntegrationFixture(
           return "failed" as const;
         }),
       operatorTokenSha256: options.operatorTokenSha256,
+      ...(options.mcpOAuth ? { mcpOAuth: options.mcpOAuth } : {}),
+      ...(options.mcpOAuthCallback ? { mcpOAuthCallback: options.mcpOAuthCallback } : {}),
       reportFatalError: (error) => {
         fatalErrors.push(error);
       },

@@ -21,6 +21,7 @@ import {
   displayMessageSchema,
   displayPartSchema,
   MAX_REPLAY_BATCH_BYTES,
+  MAX_REPLAY_TEXT_LENGTH,
 } from "./replay.ts";
 import {
   nativeDeploymentSettingsSchema,
@@ -47,6 +48,8 @@ import {
   threadListSchema,
   toolModeSchema,
   mcpReloadReplySchema,
+  mcpStatusReplySchema,
+  mcpAuthorizeReplySchema,
   sidebarSectionSchema,
   sidebarPreferencesSchema,
   sidebarPageSchema,
@@ -155,6 +158,10 @@ export const turnPageSchema = z
       message: "Turn page exceeds the batch byte budget",
     },
   );
+export const activityTextSchema = z.strictObject({
+  detail: z.string().max(MAX_REPLAY_TEXT_LENGTH).optional(),
+  output: z.string().max(MAX_REPLAY_TEXT_LENGTH).optional(),
+});
 export const pushSubscriptionSchema = z.strictObject({
   endpoint: z.url().max(2048),
   keys: z.strictObject({
@@ -225,6 +232,10 @@ export const nativeContract = {
         }),
       )
       .output(turnPageSchema),
+    /** The full text of an activity part whose `omitted` field names left-out text. */
+    activity: procedure
+      .input(displayStreamInputSchema.extend({ turnId: identitySchema, partId: identitySchema }))
+      .output(activityTextSchema),
   },
   computer: {
     read: procedure.input(threadIdInput).output(
@@ -528,6 +539,10 @@ export const nativeContract = {
       )
       .output(configDocumentSchema),
     reloadMcp: procedure.input(z.strictObject({})).output(mcpReloadReplySchema),
+    mcpStatus: procedure.input(z.strictObject({})).output(mcpStatusReplySchema),
+    authorizeMcp: procedure
+      .input(z.strictObject({ serverId: z.string().min(1).max(256) }))
+      .output(mcpAuthorizeReplySchema),
   },
   references: {
     range: procedure.input(conversationReferenceSchema).output(conversationReferenceSchema),
@@ -649,6 +664,7 @@ export type BootstrapReply = z.infer<typeof bootstrapReplySchema>;
 export type BootstrapInput = z.infer<typeof bootstrapInputSchema>;
 export type CatalogEvent = z.infer<typeof catalogEventSchema>;
 export type TurnPage = z.infer<typeof turnPageSchema>;
+export type ActivityText = z.infer<typeof activityTextSchema>;
 export type HydrationInput = z.infer<typeof hydrationInputSchema>;
 export type NativeErrorCode = keyof typeof nativeErrorMap;
 

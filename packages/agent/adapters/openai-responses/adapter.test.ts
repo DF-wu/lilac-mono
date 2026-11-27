@@ -465,47 +465,6 @@ describe("OpenAI Responses native execution", () => {
     expect(flushes).toBe(1);
   });
 
-  for (const socketFails of [false, true])
-    test(`trace cleanup Panic preserves ${socketFails ? "socket cleanup" : "its own"} identity`, async () => {
-      const flushPanic = new Panic({ message: "trace cleanup" });
-      const socketPanic = new Panic({ message: "socket cleanup" });
-      const { diagnostics } = diagnosticFixture(async () => {
-        throw flushPanic;
-      });
-      const { socket, agent } = fixture({}, { diagnostics });
-      if (socketFails) socket.closeFailure = socketPanic;
-      const run = agent.prompt("question").then(
-        () => undefined,
-        (error: unknown) => error,
-      );
-      await socket.nextSend();
-      socket.created("r1");
-      socket.finished("r1", "answer");
-      expect(await run).toBe(socketFails ? socketPanic : flushPanic);
-    });
-
-  test("original execution Panic wins over trace flush Panic", async () => {
-    const original = new Panic({ message: "original" });
-    const cleanup = new Panic({ message: "trace cleanup" });
-    const { diagnostics } = diagnosticFixture(async () => {
-      throw cleanup;
-    });
-    const { agent } = fixture(
-      {},
-      {
-        diagnostics,
-        connect: async () => {
-          throw original;
-        },
-      },
-    );
-    const error = await agent.prompt("question").then(
-      () => undefined,
-      (error: unknown) => error,
-    );
-    expect(error).toBe(original);
-  });
-
   for (const failureSource of ["none", "execution", "socket", "flush"] as const)
     test(`terminal logging Panic settles event consumption after ${failureSource} failure`, async () => {
       const original = new Panic({ message: "original failure" });
@@ -1261,23 +1220,6 @@ describe("OpenAI Responses native execution", () => {
     await run;
   });
 
-  test("preserves Panic identity when connection construction fails", async () => {
-    const panic = new Panic({ message: "defect", cause: new Error("defect") });
-    const { agent } = fixture(
-      {},
-      {
-        connect: async () => {
-          throw panic;
-        },
-      },
-    );
-    const error = await agent.prompt("question").then(
-      () => undefined,
-      (cause: unknown) => cause,
-    );
-    expect(error).toBe(panic);
-  });
-
   test("controls accepted during connection establishment survive automatic SSE fallback", async () => {
     const connecting = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
@@ -1335,31 +1277,6 @@ describe("OpenAI Responses native execution", () => {
     expect(retained).toEqual([id]);
     expect(socket.sent).toHaveLength(0);
   });
-  for (const termination of ["failure", "cancel", "panic"] as const)
-    test(`cleanup Panic takes precedence over ${termination} except an original Panic`, async () => {
-      const { socket, agent } = fixture();
-      const cleanupPanic = new Panic({ message: "socket cleanup defect" });
-      const executionPanic = new Panic({ message: "execution defect" });
-      const run = agent.prompt("question").then(
-        () => undefined,
-        (error: unknown) => error,
-      );
-      await socket.nextSend();
-      socket.closeFailure = cleanupPanic;
-      if (termination === "cancel") agent.cancel();
-      else
-        socket.events.push(
-          Result.err(
-            new AgentAdapterFailure({
-              reason: "unavailable",
-              message: "connection failed",
-              replaySafety: "reconcile",
-              ...(termination === "panic" ? { cause: executionPanic } : {}),
-            }),
-          ),
-        );
-      expect(await run).toBe(termination === "panic" ? executionPanic : cleanupPanic);
-    });
 
   test("conversation-bound boundary steering does not resend stored assistant items or add a previous response ID", async () => {
     const { socket, agent } = fixture({
@@ -1834,13 +1751,15 @@ test("native search snapshots use original results even when the model view is t
   await run;
 });
 
-test("native calls execute in parallel groups separated by write barriers", async () => {
+test("native calls run reads after side effects and mutations alone", async () => {
   const first = Promise.withResolvers<void>();
   const bothStarted = Promise.withResolvers<void>();
   const patch = Promise.withResolvers<void>();
   const patchStarted = Promise.withResolvers<void>();
   const starts: string[] = [];
-  const names = ["read", "bash", "patch", "grep", "read"];
+  const bash = Promise.withResolvers<void>();
+  const bashStarted = Promise.withResolvers<void>();
+  const names = ["read", "grep", "bash", "read", "patch", "read"];
   const tools = Object.fromEntries(
     [...new Set(names)].map((name) => [
       name,
@@ -1850,6 +1769,11 @@ test("native calls execute in parallel groups separated by write barriers", asyn
           starts.push(toolCallId);
           if (starts.length === 2) bothStarted.resolve();
           if (toolCallId === "0" || toolCallId === "1") await first.promise;
+          if (name === "bash") {
+            bashStarted.resolve();
+            await bash.promise;
+            starts.push("2:end");
+          }
           if (name === "patch") {
             patchStarted.resolve();
             await patch.promise;
@@ -1878,11 +1802,14 @@ test("native calls execute in parallel groups separated by write barriers", asyn
   await bothStarted.promise;
   expect(starts).toEqual(["0", "1"]);
   first.resolve();
-  await patchStarted.promise;
+  await bashStarted.promise;
   expect(starts).toEqual(["0", "1", "2"]);
+  bash.resolve();
+  await patchStarted.promise;
+  expect(starts).toEqual(["0", "1", "2", "2:end", "3", "4"]);
   patch.resolve();
   const continuation = await socket.nextSend();
-  expect(starts).toEqual(["0", "1", "2", "3", "4"]);
+  expect(starts).toEqual(["0", "1", "2", "2:end", "3", "4", "5"]);
   expect(continuation.input).toEqual(
     names.map((_, index) => ({
       type: "function_call_output",

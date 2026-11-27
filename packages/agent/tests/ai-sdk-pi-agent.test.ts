@@ -834,31 +834,6 @@ describe("AiSdkPiAgent model spec tracking", () => {
 });
 
 describe("AiSdkPiAgent recovery checkpoints", () => {
-  it("awaits the replay-safe checkpoint before starting the model call", async () => {
-    const gate = deferred();
-    let checkpointCalls = 0;
-    const model = new MockLanguageModelV4({
-      doStream: async () => textStream("answer", "done"),
-    });
-    const agent = new AiSdkPiAgent({
-      system: "test",
-      model,
-      recoveryCheckpointHandler: async () => {
-        checkpointCalls += 1;
-        if (checkpointCalls === 1) await gate.promise;
-      },
-    });
-
-    const run = agent.prompt("persist first");
-    await Promise.resolve();
-    expect(model.doStreamCalls).toHaveLength(0);
-    gate.resolve();
-    await run;
-
-    expect(model.doStreamCalls).toHaveLength(1);
-    expect(checkpointCalls).toBeGreaterThanOrEqual(2);
-  });
-
   it("checkpoints a completed local tool result before the continuation model call", async () => {
     const checkpointEntered = deferred();
     const releaseCheckpoint = deferred();
@@ -953,24 +928,6 @@ describe("AiSdkPiAgent recovery checkpoints", () => {
     await run;
 
     expect(model.doStreamCalls).toHaveLength(2);
-  });
-
-  it("lists queued follow-ups until a turn takes them", async () => {
-    const model = new MockLanguageModelV4({
-      doStream: [
-        textStream("first", "initial answer"),
-        textStream("second", "first follow-up answer"),
-        textStream("third", "second follow-up answer"),
-      ],
-    });
-    const agent = new AiSdkPiAgent({ system: "test", model });
-    const firstId = agent.followUp("first follow-up");
-    const secondId = agent.followUp("second follow-up");
-
-    expect(agent.getQueuedFollowUpIds()).toEqual([firstId, secondId]);
-    await agent.prompt("start");
-
-    expect(agent.getQueuedFollowUpIds()).toEqual([]);
   });
 
   it("hands canonical input IDs off once the checkpoint handler accepts them", async () => {

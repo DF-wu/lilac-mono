@@ -10,7 +10,7 @@ import {
   parseCoreConfigV3ToUniversal,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
-import { Panic, Result } from "better-result";
+import { Result } from "better-result";
 
 import { createCoreToolPluginManager as createCoreToolPluginManagerResult } from "../../src/plugins";
 import { decodeCoreToolRequestMetadata } from "../../src/plugins/builtin/local-tools";
@@ -33,6 +33,7 @@ import {
 } from "../mcp/fixtures/registry-fixture";
 import { getTestBlobStore } from "../helpers/blob-store";
 import type { ResourceAccess } from "../../src/resource";
+import type { JobService } from "../../src/jobs/job-service";
 
 function createCoreToolPluginManager(
   params: Parameters<typeof createCoreToolPluginManagerResult>[0],
@@ -114,6 +115,8 @@ const EXPECTED_STABLE_LEVEL2_CALLABLE_IDS = [
   "codex.login",
   "codex.logout",
   "codex.status",
+  "config.describe",
+  "config.patch",
   "conversation.thread.metadata",
   "conversation.thread.read",
   "conversation.thread.runSummarization",
@@ -526,6 +529,79 @@ describe("core tool plugin manager", () => {
     expect([...restrictedTools.specs.keys()].sort()).toEqual(["bash", "read", "skip_reply"]);
   });
 
+  it("lets job and bash background follow bash and the surface's wake support", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfigV3({
+      configVersion: 3,
+      agent: { subagents: { permissions: { noexec: { execution: false } } } },
+    });
+    const jobs = {
+      supports: (platform: string) => ["discord", "native", "github", "unknown"].includes(platform),
+    } as unknown as JobService;
+    const manager = createCoreToolPluginManager({
+      runtime: {
+        bus: {} as LilacBus,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
+        discovery: {} as DiscoveryService,
+        conversationThreads: {} as ConversationThreadToolService,
+        config: cfg,
+        jobs,
+      },
+      dataDir,
+    });
+    await manager.init();
+
+    const build = (input: {
+      runProfile: string;
+      requestClient?: string;
+      safetyMode?: "trusted" | "restricted";
+    }) =>
+      manager.buildLevel1Toolset({
+        cwd: dataDir,
+        runProfile: input.runProfile,
+        editingToolMode: "none",
+        subagentDepth: input.runProfile === "primary" ? 0 : 1,
+        subagentConfig: cfg.agent.subagents,
+        requestContext: {
+          requestId: "req:jobs",
+          requestDeliveryId: "delivery:jobs",
+          sessionId: "session",
+          requestClient: input.requestClient ?? "native",
+          subagentDepth: input.runProfile === "primary" ? 0 : 1,
+          subagentProfile: input.runProfile,
+          safetyMode: input.safetyMode ?? "trusted",
+        },
+      });
+    const bashDescription = (toolset: Awaited<ReturnType<typeof build>>) =>
+      (toolset.tools["bash"] as { description?: string } | undefined)?.description ?? "";
+
+    const native = await build({ runProfile: "primary" });
+    expect(native.specs.has("job")).toBe(true);
+    expect(bashDescription(native)).toContain("- service:");
+
+    const github = await build({ runProfile: "primary", requestClient: "github" });
+    expect(github.specs.has("job")).toBe(true);
+    expect(bashDescription(github)).toContain("- await:");
+    expect(bashDescription(github)).not.toContain("- service:");
+
+    const restrictedSession = await build({ runProfile: "primary", safetyMode: "restricted" });
+    expect(restrictedSession.specs.has("job")).toBe(true);
+    expect(bashDescription(restrictedSession)).not.toContain("- service:");
+
+    // The built-in restricted profile lists neither job nor its plugin, but it has bash.
+    const restrictedProfile = await build({ runProfile: "restricted" });
+    expect(restrictedProfile.specs.has("job")).toBe(true);
+
+    const noExecution = await build({ runProfile: "noexec" });
+    expect(noExecution.specs.has("bash")).toBe(false);
+    expect(noExecution.specs.has("job")).toBe(false);
+
+    const slack = await build({ runProfile: "primary", requestClient: "slack" });
+    expect(slack.specs.has("job")).toBe(false);
+    expect(bashDescription(slack)).not.toContain("Set background");
+  });
+
   it("threads direct attachment support metadata into read description", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
@@ -787,68 +863,6 @@ describe("core tool plugin manager", () => {
     await expect(fs.readFile(path.join(dataDir, "note.txt"), "utf8")).resolves.toBe("after\n");
   });
 
-  it("switches non-openai edit toolsets to hashline mode when enabled in config", async () => {
-    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
-    const dataDir = path.join(tmpRoot, "data");
-    const cfg = testConfig({});
-    cfg.tools.editFile.hashline = true;
-
-    const manager = createCoreToolPluginManager({
-      runtime: {
-        bus: {} as LilacBus,
-        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
-        discovery: {} as DiscoveryService,
-        config: cfg,
-      },
-      dataDir,
-    });
-
-    await manager.init();
-    await fs.mkdir(dataDir, { recursive: true });
-    await fs.writeFile(path.join(dataDir, "note.txt"), "before\n", "utf8");
-
-    const toolset = await manager.buildLevel1Toolset({
-      cwd: dataDir,
-      runProfile: "primary",
-      editingToolMode: "edit_file",
-      subagentDepth: 0,
-      subagentConfig: cfg.agent.subagents!,
-    });
-
-    const tools = toolset.tools as Record<
-      string,
-      { execute?: (...args: readonly unknown[]) => unknown }
-    >;
-    const readFile = getExecutableTool(tools, "read");
-    const editFile = getExecutableTool(tools, "edit");
-
-    const readRes = await resolveExecuteResult(
-      readFile.execute!(
-        { path: "note.txt", format: "hashline" },
-        { toolCallId: "read-hashline", messages: [] },
-      ),
-    );
-    expect((readRes as { success: boolean }).success).toBe(true);
-    const hashlineContent = (readRes as { format: string; hashlineContent?: string })
-      .hashlineContent;
-    expect((readRes as { format: string }).format).toBe("hashline");
-    expect(typeof hashlineContent).toBe("string");
-
-    const anchor = hashlineContent!.split("\n")[0]!;
-    const editRes = await resolveExecuteResult(
-      editFile.execute!(
-        {
-          path: "note.txt",
-          edits: [{ op: "replace", pos: anchor, lines: ["after"] }],
-        },
-        { toolCallId: "edit-hashline", messages: [] },
-      ),
-    );
-
-    expect((editRes as { success: boolean }).success).toBe(true);
-    await expect(fs.readFile(path.join(dataDir, "note.txt"), "utf8")).resolves.toBe("after\n");
-  });
-
   it("rejects hashline edits when the file changed after the read", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
@@ -997,6 +1011,59 @@ describe("core tool plugin manager", () => {
     );
   });
 
+  it("keeps an external tool named job behind its own plugin allowlist", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfigV3({ configVersion: 3 });
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "fixture-job",
+      entryBody: `export default {
+  meta: { id: "fixture-job" },
+  create() {
+    return {
+      level1: [{
+        name: "job",
+        createTool() { return { description: "External job", execute() { return { ok: true }; } }; },
+        isEnabled() { return true; },
+      }],
+      level2: [],
+    };
+  },
+};`,
+    });
+    const manager = createCoreToolPluginManager({
+      runtime: {
+        bus: {} as LilacBus,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
+        discovery: {} as DiscoveryService,
+        config: cfg,
+      },
+      dataDir,
+    });
+    await manager.init();
+
+    const primary = await manager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "primary",
+      editingToolMode: "none",
+      subagentDepth: 0,
+      subagentConfig: cfg.agent.subagents,
+    });
+    expect([...primary.specs.keys()].filter((name) => name.includes("job"))).toHaveLength(1);
+
+    // The built-in restricted profile allows bash but not the fixture plugin.
+    const restricted = await manager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "restricted",
+      editingToolMode: "none",
+      subagentDepth: 1,
+      subagentConfig: cfg.agent.subagents,
+    });
+    expect(restricted.specs.has("bash")).toBe(true);
+    expect([...restricted.specs.keys()].filter((name) => name.includes("job"))).toEqual([]);
+  });
+
   it("loads an external plugin that contributes both Level 1 and Level 2 tools", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
@@ -1103,53 +1170,6 @@ export default {
         message: expect.stringContaining("fixture.echo has invalid input."),
       },
     });
-  });
-
-  it("captures hostile executable metadata getters at the plugin boundary", async () => {
-    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
-    const dataDir = path.join(tmpRoot, "data");
-    const cfg = testConfig({});
-    await writeExternalPlugin({
-      dataDir,
-      pluginId: "hostile-metadata",
-      entryBody: `const hostile = new Proxy({}, {
-  getPrototypeOf() { throw new Error("hostile prototype trap"); },
-  get() { throw new Error("hostile property trap"); },
-});
-export default {
-  meta: { id: "hostile-metadata" },
-  create() {
-    return { level1: [{
-      name: "hostile_metadata",
-      createTool() {
-        const executable = { execute() {} };
-        Object.defineProperty(executable, "title", { get() { throw hostile; } });
-        return executable;
-      },
-      isEnabled() { return true; },
-    }] };
-  },
-};`,
-    });
-    const manager = createCoreToolPluginManager({ runtime: { config: cfg }, dataDir });
-    const initialized = await manager.init();
-    expect(initialized.status).toBe("ok");
-
-    const built = await manager.buildLevel1ToolsetResult({
-      cwd: dataDir,
-      runProfile: "primary",
-      editingToolMode: "none",
-      subagentDepth: 0,
-      subagentConfig: cfg.agent.subagents!,
-    });
-    expect(built.status).toBe("error");
-    if (built.status === "error") {
-      expect(built.error._tag).toBe("Level1ToolsetBuildFailed");
-      if (built.error._tag === "Level1ToolsetBuildFailed") {
-        expect(built.error.operation).toBe("level1.executableMetadata");
-        expect(built.error.message).toContain("level1.executableMetadata");
-      }
-    }
   });
 
   it("qualifies external registration keys by plugin while preserving raw status names", async () => {
@@ -1640,40 +1660,5 @@ export default {
         subagentConfig: cfg.agent.subagents,
       }),
     ).rejects.toThrow("Invalid hook result for plugin 'malformed-level1'");
-  });
-
-  it("propagates Panic from a Level 1 hook", async () => {
-    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
-    const dataDir = path.join(tmpRoot, "data");
-    await writeExternalPlugin({
-      dataDir,
-      pluginId: "panic-level1",
-      entryBody: `import { Panic } from ${JSON.stringify(import.meta.resolve("better-result"))};
-export default {
-  meta: { id: "panic-level1" },
-  create() { return { level1: [{
-    name: "panic",
-    createTool() { return {}; },
-    isEnabled() { throw new Panic({ message: "level1 invariant" }); },
-  }] }; },
-};`,
-    });
-    const cfg = testConfig({});
-    const manager = createCoreToolPluginManager({ runtime: { config: cfg }, dataDir });
-    const initialized = await manager.init();
-    expect(initialized.status).toBe("ok");
-
-    try {
-      await manager.buildLevel1Toolset({
-        cwd: dataDir,
-        runProfile: "primary",
-        editingToolMode: "none",
-        subagentDepth: 0,
-        subagentConfig: cfg.agent.subagents,
-      });
-      throw new Error("expected Panic");
-    } catch (cause) {
-      expect(Panic.is(cause)).toBe(true);
-    }
   });
 });

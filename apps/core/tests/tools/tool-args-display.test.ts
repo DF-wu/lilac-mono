@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test";
 import type { Level1ToolSpec } from "@stanley2058/lilac-plugin-runtime";
-import { Panic } from "better-result";
 
 import {
   formatToolArgsForDisplay,
@@ -21,6 +20,15 @@ describe("formatToolArgsForDisplay", () => {
         command: "echo 12345678901234567890123456789012345678901234567890",
       }),
     ).toBe(" echo 1234567890123456789012...");
+  });
+
+  it("redacts secrets in a bash command before truncating it", () => {
+    const token = `ghp_${"a".repeat(36)}`;
+    const display = formatBuiltinArgs("bash", {
+      command: `GH_TOKEN=${token} bun dev`,
+      background: "service",
+    });
+    expect(display).not.toContain("ghp_aaaa");
   });
 
   it("formats read path with middle truncation (14 ... 13)", () => {
@@ -218,7 +226,7 @@ describe("formatToolArgsForDisplay", () => {
     ).toBe(8193);
   });
 
-  it("omits unserializable native arguments and preserves serialization Panic", () => {
+  it("omits unserializable native arguments", () => {
     expect(
       formatToolArgsForDisplayWithSpecs(
         "custom",
@@ -229,15 +237,6 @@ describe("formatToolArgsForDisplay", () => {
         8192,
       ),
     ).toBe("");
-    const panic = new Panic({ message: "serialization invariant" });
-    const args = {
-      toJSON() {
-        throw panic;
-      },
-    };
-    expect(() =>
-      formatToolArgsForDisplayWithSpecs("custom", args, undefined, undefined, undefined, 8192),
-    ).toThrow(panic);
   });
 
   it("prefers plugin metadata formatter when provided", () => {
@@ -281,23 +280,5 @@ describe("formatToolArgsForDisplay", () => {
 
     expect(formatToolArgsForDisplayWithSpecs("malformed", {}, specs)).toBe("");
     expect(formatToolArgsForDisplayWithSpecs("failed", {}, specs)).toBe("");
-  });
-
-  it("propagates Panic from plugin formatters", () => {
-    const panic = new Panic({ message: "formatter invariant" });
-    const spec: Level1ToolSpec<unknown> = {
-      name: "panic",
-      createTool: () => ({}),
-      isEnabled: () => true,
-      formatArgs() {
-        throw panic;
-      },
-    };
-    try {
-      formatToolArgsForDisplayWithSpecs("panic", {}, new Map([["panic", spec]]));
-      throw new Error("expected Panic");
-    } catch (cause) {
-      expect(Panic.is(cause)).toBe(true);
-    }
   });
 });

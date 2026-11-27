@@ -2625,12 +2625,6 @@ export class ConversationThreadService {
     const promptContext = cfg.conversation.thread.summarization.includePromptContext
       ? await loadPromptContext()
       : null;
-    if (promptContext) {
-      this.logger.debug("thread summarization prompt context loaded", {
-        jobId,
-        hash: promptContext.hash,
-      });
-    }
 
     const allEligible = this.params.store.listEligibleForSummarization({
       now: input.now,
@@ -2648,21 +2642,23 @@ export class ConversationThreadService {
         : Math.min(10_000, Math.max(1, Math.floor(input.limit)));
     const eligible = limit === undefined ? allEligible : allEligible.slice(0, limit);
     const eligibility = countSummarizationEligibility(allEligible);
-    this.logger.debug("thread summarization eligibility completed", {
-      jobId,
-      eligible: eligible.length,
-      eligibleTotal: allEligible.length,
-      eligibility,
-      limit,
-      trigger: input.trigger ?? "manual",
-      dryRun: input.dryRun === true,
-      threadId: input.threadId,
-      beforeTs: input.beforeTs,
-      afterTs: input.afterTs,
-      force: input.force === true,
-      clear: input.clear === true,
-      promptContext: !!promptContext,
-    });
+    if (allEligible.length > 0) {
+      this.logger.debug("thread summarization eligibility completed", {
+        jobId,
+        eligible: eligible.length,
+        eligibleTotal: allEligible.length,
+        eligibility,
+        limit,
+        trigger: input.trigger ?? "manual",
+        dryRun: input.dryRun === true,
+        threadId: input.threadId,
+        beforeTs: input.beforeTs,
+        afterTs: input.afterTs,
+        force: input.force === true,
+        clear: input.clear === true,
+        promptContext: !!promptContext,
+      });
+    }
 
     const result: ConversationThreadRunSummarizationResult = {
       dryRun: input.dryRun ?? false,
@@ -2687,11 +2683,6 @@ export class ConversationThreadService {
     }
 
     if (eligible.length === 0) {
-      this.logger.debug("thread summarization skipped: no eligible threads", {
-        jobId,
-        force: input.force === true,
-        clear: input.clear === true,
-      });
       return result;
     }
 

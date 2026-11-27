@@ -189,7 +189,6 @@ describe("core config versioning", () => {
       "glob",
       "grep",
       "fuzzy_search",
-      "batch",
     ]);
     expect(parsed.agent.subagents.permissions.restricted.execution).toBe(false);
     expect(parsed.agent.subagents.permissions.full.execution).toBe("native");
@@ -217,7 +216,6 @@ describe("core config versioning", () => {
       "glob",
       "grep",
       "fuzzy_search",
-      "batch",
     ]);
     expect(parsed.agent.subagents.permissions.restricted.execution).toBe("native");
     expect(parsed.agent.subagents.permissions.full.execution).toBe("native");
