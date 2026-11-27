@@ -261,6 +261,7 @@ function safeJsonPreview(value: ToolJsonObject, maxChars = 2000): string {
 
 function safeToolInputPreview(callableId: string, input: ToolJsonObject): string {
   if (callableId === "mcp.add") return "<redacted mcp.add input>";
+  if (callableId === "config.patch") return "<redacted config.patch input>";
   if (callableId.startsWith("workflow.")) return "<redacted workflow input>";
   return safeJsonPreview(input);
 }
@@ -1578,10 +1579,6 @@ export function createToolServer(options: ToolServerOptions) {
         cwd: ctx.cwd,
         inputBytes,
         timeoutMs,
-      });
-
-      logger.debug("tool call input", {
-        callableId: body.callableId,
         input: safeToolInputPreview(body.callableId, input),
       });
 

@@ -326,7 +326,11 @@ import {
   shouldCancelRunPolicyRequest,
   unconsumedControlDisposition,
 } from "./bus-agent-runner/session-queue";
-import { applyToRunningAgent, type RunningAgentControlTarget } from "./bus-agent-runner/controls";
+import {
+  applyToRunningAgent,
+  type RunningAgentControlTarget,
+  userInputText,
+} from "./bus-agent-runner/controls";
 import { subagentFollowUpRegistration } from "../../workflow/subagent-follow-up";
 export { mergeToSingleUserMessage } from "./bus-agent-runner/controls";
 export {
@@ -3511,17 +3515,7 @@ export async function startBusAgentRunner(params: {
       recovering: next.recovery !== undefined,
       recoveryOutputFrontier: next.recovery?.nativeOutputFrontier,
       workflowRunId: workflowHint?.runId,
-      prompt: next.messages
-        .filter((message) => message.role === "user")
-        .map((message) =>
-          typeof message.content === "string"
-            ? message.content
-            : message.content
-                .filter((part) => part.type === "text")
-                .map((part) => part.text)
-                .join(""),
-        )
-        .join("\n\n"),
+      prompt: userInputText(next.messages),
     });
     let nativeStep = 0;
     let nativeHasText = false;
@@ -4792,6 +4786,12 @@ export async function startBusAgentRunner(params: {
                 controlCapability: controlCapability ?? undefined,
                 readFileDirectImageSupported: resourceProviderTarget.supportsImage,
                 readFileDirectPdfSupported: resourceProviderTarget.supportsPdf,
+                ...(resourceProviderTarget.supportsAudio
+                  ? { readFileDirectAudioSupported: true }
+                  : {}),
+                ...(resourceProviderTarget.supportsVideo
+                  ? { readFileDirectVideoSupported: true }
+                  : {}),
                 onActivity: (source: "tool" | "subagent") => markRunActivity(source),
                 onSubagentDelegate:
                   workflowSubagentDispatcher &&
@@ -6038,6 +6038,13 @@ export async function startBusAgentRunner(params: {
               runStats.finalMessages = event.messages;
             }
 
+            if (event.type === "inputs_applied" && state.activeRun?.requestId === next.requestId) {
+              for (const inputId of event.inputIds) {
+                const entry = state.activeRun.queuedControlEntries.get(inputId);
+                if (entry) nativeOutput?.input(userInputText(entry.messages));
+              }
+            }
+
             if (event.type === "turn_start") {
               runWait.resume();
               turnHasSkipReplyCall = false;
@@ -6871,6 +6878,13 @@ export async function startBusAgentRunner(params: {
               );
               runIdleWatchdog?.start();
               if (cancelledByRequestId.has(headers.request_id)) break;
+              continue;
+            }
+            // A job that ended after the drain above left an event this request has not seen.
+            if (
+              continuationSignalVersion !== continuationWaitVersion &&
+              params.jobs?.hasPendingEvents(next.sessionId)
+            ) {
               continue;
             }
             if (!deferredWaitState?.hasOutstandingRuns || !liveParentSession) {

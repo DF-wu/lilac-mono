@@ -11,7 +11,9 @@ import type { DurableWorkflowStore } from "../../../src/workflow/durable-workflo
 import { seedNativeWorkflowRun } from "./workflow-fixture";
 import { seedNativeSubagent } from "./subagent-fixture";
 import type { SqliteTranscriptStore } from "../../../src/transcript/transcript-store";
+import type { StoredMessageV1 } from "@stanley2058/lilac-event-bus";
 import { createHash } from "node:crypto";
+import { createFixtureMcp } from "./mcp-fixture";
 
 const HTML_PREVIEW_ICON =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#8b5cf6" stroke-width="2" stroke-linecap="round"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>';
@@ -504,14 +506,47 @@ function seedBrowserAgentFollowUps(
     ["Reply with the token and the value plus 10.", "ORCHID-739 27"],
   ] as const;
   const title = "Orchestrate follow-up configuration smoke test with a long title";
-  const history: { role: "user" | "assistant"; content: string }[] = [];
+  const history: StoredMessageV1[] = [];
+  // A long command result, which the panel loads only when its row opens.
+  const work: StoredMessageV1[] = [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool-call",
+          toolCallId: "browser-follow-up-env",
+          toolName: "bash",
+          input: { command: "env | sort" },
+        },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "browser-follow-up-env",
+          toolName: "bash",
+          output: {
+            type: "text",
+            value: Array.from({ length: 40 }, (_, line) => `SETTING_${line}=value-${line}`).join(
+              "\n",
+            ),
+          },
+        },
+      ],
+    },
+  ];
   const runs = exchanges.map(([prompt, reply], index) => {
     const child = seedNativeSubagent(store, workflows, thread.id, {
       id: `browser-follow-up-${index}`,
       childSessionId: "child-session-browser-follow-up",
       title,
     });
-    history.push({ role: "user", content: prompt }, { role: "assistant", content: reply });
+    history.push({ role: "user", content: prompt }, ...(index === 0 ? work : []), {
+      role: "assistant",
+      content: reply,
+    });
     transcripts
       .saveRequestTranscript({
         requestId: child.requestId,
@@ -569,6 +604,84 @@ function seedBrowserAgentFollowUps(
   return thread.id;
 }
 
+/** Representative config files so the Settings forms have values to show. */
+const BROWSER_FIXTURE_CONFIG_FILES = {
+  core: [
+    "# yaml-language-server: $schema=./.schemas/core-config.schema.json",
+    "configVersion: 3",
+    "basePrompt: You are Lilac.",
+    "models:",
+    "  main:",
+    "    model: openai/gpt-5.4 # primary",
+    "    reasoning: medium",
+    "    fallback: [anthropic/claude-sonnet-4.6]",
+    "  fast:",
+    "    model: openai/gpt-5.4-mini",
+    "  def:",
+    "    writer:",
+    "      model: anthropic/claude-opus-4.6",
+    "      comment: Long-form drafts and edits.",
+    "  catalog:",
+    "    providers: { openai: enabled, groq: disabled }",
+    "  rules:",
+    '    - match: "openai/gpt-5*"',
+    "      reasoning: medium",
+    "      options: { response_commentary: true }",
+    '    - match: "anthropic/*"',
+    "      unset: [anthropic.thinking]",
+    "surface:",
+    "  discord:",
+    "    botName: lilac",
+    '    statusMessage: "Answering questions in #ops and drafting release notes for the next deploy window"',
+    '    allowedGuildIds: ["123456789012345678"]',
+    '    allowedChannelIds: ["223456789012345678"]',
+    "  router:",
+    "    defaultMode: mention",
+    "    sessionModes:",
+    '      "223456789012345678":',
+    "        mode: active",
+    "agent:",
+    "  subagents:",
+    "    delegatePromptOverlay: |-",
+    "      ## Model routing",
+    "",
+    "      Prefer the fast model for lookups and summaries.",
+    "      Use `writer` for long-form drafts.",
+    "entity:",
+    "  sessions:",
+    "    discord:",
+    '      ops: "223456789012345678"',
+    "conversation:",
+    "  thread:",
+    "    summarization:",
+    "      enabled: true",
+    "tools:",
+    "  output:",
+    "    artifactTtl: 3d",
+    "",
+  ].join("\n"),
+  mcp: [
+    "configVersion: 1",
+    "servers:",
+    "  github:",
+    "    transport: http",
+    "    url: https://api.githubcopilot.com/mcp/",
+    "    headers:",
+    '      Authorization: { env: GITHUB_TOKEN, prefix: "Bearer " }',
+    "  computer_use:",
+    "    transport: http",
+    "    url: http://computer-use-gateway:8080/mcp/sessions/default/streamable",
+    "    description: On-demand, sandboxed, and session-scoped desktops for GUI tasks.",
+    "    headers:",
+    "      Authorization: { file: /data/secret/computer-use-auth.json, pointer: /token }",
+    "  filesystem:",
+    "    transport: stdio",
+    "    command: npx",
+    '    args: [-y, "@modelcontextprotocol/server-filesystem", /tmp]',
+    "",
+  ].join("\n"),
+};
+
 export async function startNativeBrowserFixture(
   mcpRegistry?: NativeRuntimeOptions["mcpRegistry"],
   options: { port?: number; webOrigins?: string[]; clerk?: BrowserFixtureClerkAuth } = {},
@@ -576,12 +689,20 @@ export async function startNativeBrowserFixture(
   const port = options.port ?? Number(process.env.TEST_NATIVE_PORT ?? 8789);
   const clerk = options.clerk;
   let threads: ReturnType<typeof seedNativeBrowserFixture> | undefined;
+  let fixtureDataDir = "";
+  const simulated = mcpRegistry
+    ? undefined
+    : createFixtureMcp({ dataDir: () => fixtureDataDir, publicUrl: `http://127.0.0.1:${port}` });
   const fixture = await createNativeIntegrationFixture({
-    mcpRegistry,
+    mcpRegistry: mcpRegistry ?? simulated?.registry,
+    ...(simulated
+      ? { mcpOAuth: simulated.mcpOAuth, mcpOAuthCallback: simulated.mcpOAuthCallback }
+      : {}),
     // Prompts that mention an HTML preview get a reply with a saved chart page.
     model: new MockLanguageModelV4({ modelId: "native-fixture", doStream: fixtureStream }),
     questions: true,
     port,
+    configFiles: BROWSER_FIXTURE_CONFIG_FILES,
     allowedOrigins: [
       `http://127.0.0.1:${port}`,
       `http://localhost:${port}`,
@@ -606,6 +727,7 @@ export async function startNativeBrowserFixture(
           ],
         }),
     async prepare({ workspaceRoot, dataDir, config }) {
+      fixtureDataDir = dataDir;
       threads = await restoreNativeBrowserSnapshot(dataDir);
       // Snapshot thread IDs repeat; a fresh cache scope prevents replaying an earlier dev session.
       config.surface.native.installationId = `native-browser-fixture-${crypto.randomUUID()}`;
@@ -683,6 +805,7 @@ export async function startNativeBrowserFixture(
     },
   });
   if (!threads) throw new Error("Browser fixture data was not seeded");
+  await simulated?.registry.reload();
   seedBrowserWorkflowViews(fixture.store, fixture.workflows);
   seedBrowserWorkflowHistory(fixture.workflows);
   const seeded = {

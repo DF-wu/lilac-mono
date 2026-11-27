@@ -211,6 +211,12 @@ selected file, using revisions to reject concurrent edits. Core keeps its existi
 Save writes the document; Reload applies it through the existing MCP registry. The UI does not edit
 `.env` or credential files. Listener and authentication settings take effect when Core restarts.
 
+Add server in the MCP editor walks through the connection, its credentials (none, an access token
+header, or OAuth for remote servers; environment variables for local commands), and a connection
+check. It writes only the new `servers.<id>` entry and keeps other unsaved form edits. For OAuth servers,
+and for saved OAuth servers that need sign-in, the owner opens the provider's page from the dialog. Core
+receives the callback at `<publicUrl>/api/mcp/oauth/callback`, stores the tokens, and reloads that server.
+
 The owner can change the agent's display name and upload a PNG, JPEG, WebP or GIF avatar up to 2 MiB.
 These settings persist in the native service-user record; the service identity remains `lilac`.
 Authenticated participants see the same identity across threads. Avatar URLs include a content
@@ -264,6 +270,13 @@ Settings > Deployment controls response streaming for the instance. Paragraph pu
 blank-line boundaries. Full publishes the buffered text at model-step completion or tool handoff. Clients never receive token-by-token text.
 Compaction and activity remain explicit display events. Native structured questions use web question
 cards; the TUI has no answer controls.
+
+Activity rows leave tool output on the server and carry only the first 256 characters of thinking
+text, which titles the row. The row records the full length of what it left out in `omitted`, and
+opening the row loads the text with `streams.activity`. Tool details stay in the row because row
+titles are built from them. A
+subagent's stream stores each exchange as its own turn, so its panel loads earlier exchanges as the
+reader scrolls up to them.
 
 Old-message selection and storage retention are separate settings:
 `oldMessageSelectionMaxAgeMs` and `storageRetentionMaxAgeMs`. Both default to `null`, which disables

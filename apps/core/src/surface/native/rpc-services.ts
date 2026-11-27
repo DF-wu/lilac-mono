@@ -55,7 +55,7 @@ export type NativeRpcServiceOptions = {
   workingIndicators?: () => readonly string[];
   catalogs: Pick<NativeCatalogService, "get" | "subscribe"> &
     Partial<Pick<NativeCatalogService, "selection" | "models">>;
-  config: Pick<NativeConfigService, "read" | "save" | "reloadMcp">;
+  config: Pick<NativeConfigService, "read" | "save" | "reloadMcp" | "mcpStatus" | "authorizeMcp">;
   titles?: Pick<NativeTitleGeneration, "regenerate">;
   execution: Pick<
     NativeExecution,
@@ -694,6 +694,21 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
           }),
         );
       },
+      activity(principal, input) {
+        const { turnId, partId } = input;
+        if (input.target.kind === "thread")
+          return store.activityText(principal.userId, {
+            threadId: input.target.threadId,
+            turnId,
+            partId,
+          });
+        return resolveStream(principal, input.target).andThen((id) =>
+          store.agentStreamActivityText(principal.userId, input.target.threadId, id, {
+            turnId,
+            partId,
+          }),
+        );
+      },
     },
     links: {
       async preview(_principal, input, signal) {
@@ -1106,6 +1121,33 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
             ...(outcome.error ? { error: outcome.error } : {}),
           })),
         }));
+      },
+      mcpStatus(principal) {
+        return config.mcpStatus(principal.userId).map(({ servers, oauthCallbackUrl }) => ({
+          servers: servers.map((status) =>
+            status.status === "available"
+              ? {
+                  name: status.serverId,
+                  transport: status.transport,
+                  state: status.status,
+                  toolCount: status.toolCount,
+                }
+              : {
+                  name: status.serverId,
+                  transport: status.transport,
+                  state: status.status,
+                  error: status.error.slice(0, 4096),
+                },
+          ),
+          ...(oauthCallbackUrl ? { oauthCallbackUrl } : {}),
+        }));
+      },
+      async authorizeMcp(principal, input) {
+        return (await config.authorizeMcp(principal.userId, input.serverId)).map((result) =>
+          result.status === "authorized"
+            ? { status: result.status }
+            : { status: result.status, authorizationUrl: result.authorizationUrl },
+        );
       },
     },
     references: {

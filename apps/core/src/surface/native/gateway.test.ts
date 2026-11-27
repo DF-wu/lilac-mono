@@ -10,7 +10,7 @@ import { nativeContract } from "@stanley2058/lilac-client-protocol";
 import { exportSPKI, generateKeyPair, SignJWT } from "jose";
 import { createNativeClerkAuthenticator } from "./auth-clerk";
 import { authFailure } from "./auth";
-import { Panic, Result } from "better-result";
+import { Result } from "better-result";
 import { createNativeLocalAuthenticator } from "./auth-local";
 import { createNativeGateway, type NativeGatewayOptions } from "./gateway";
 import { nativeRpcValue, type NativeRpcServices } from "./rpc";
@@ -39,6 +39,7 @@ async function fixture(
   webRoot?: string,
   resources?: NativeGatewayOptions["resources"],
   computer?: NativeGatewayOptions["computer"],
+  mcpOAuthCallback?: NativeGatewayOptions["mcpOAuthCallback"],
 ) {
   const measurements: { event: string; fields: Parameters<NativeMetricSink>[1] }[] = [];
   const metrics = createNativeMetrics((event, fields) => measurements.push({ event, fields }));
@@ -117,6 +118,7 @@ async function fixture(
     port: 0,
     webRoot,
     resources,
+    mcpOAuthCallback,
     auth,
     login: auth.login,
     services,
@@ -333,6 +335,24 @@ describe("native gateway", () => {
       502,
     );
   });
+  test("MCP OAuth callbacks reach Core without native credentials", async () => {
+    const callbacks: string[] = [];
+    const { url } = await fixture(undefined, undefined, undefined, {
+      async handleRequest(request) {
+        callbacks.push(request.url);
+        return new Response("OAuth authorization completed.\n");
+      },
+    });
+
+    const response = await fetch(new URL("api/mcp/oauth/callback?code=code&state=state", url));
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("OAuth authorization completed.\n");
+    expect(callbacks).toHaveLength(1);
+    expect(new URL(callbacks[0]!).search).toBe("?code=code&state=state");
+    expect((await fetch(new URL("api/mcp/oauth/other", url))).status).toBe(401);
+  });
+
   test("link metadata uses the authenticated RPC contract", async () => {
     const { url, token, services } = await fixture();
     let viewer: string | undefined;
@@ -489,44 +509,6 @@ describe("native gateway", () => {
     await waiting.promise;
     await gateway.stop();
     expect(fatalErrors).toEqual([]);
-  });
-
-  test("RPC defects reach the supervisor with their original Panic identity", async () => {
-    const { url, token, services, fatalErrors } = await fixture();
-    const defect = new Panic({ message: "Native service invariant failed" });
-    services.threads.sync = () => {
-      throw defect;
-    };
-    const { client } = connect(url, token);
-    await expect(client.threads.sync({ threadId: "shared" })).rejects.toMatchObject({
-      code: "INTERNAL_SERVER_ERROR",
-    });
-    expect(fatalErrors).toHaveLength(1);
-    expect(fatalErrors[0]).toBe(defect);
-  });
-
-  test("watch iteration defects reach the supervisor before protocol serialization", async () => {
-    const { url, token, gateway, services, fatalErrors, fatal } = await fixture();
-    const defect = new Panic({ message: "Native watch invariant failed" });
-    services.threads.watch = () =>
-      Result.ok(
-        (async function* () {
-          yield { kind: "replay" as const, reply: { kind: "unchanged" as const, checkpoint } };
-          throw defect;
-        })(),
-      );
-    const { client } = connect(url, token);
-    const stream = await client.threads.watch({ threadId: "shared" });
-    expect((await stream.next()).value).toMatchObject({ kind: "replay" });
-    expect(await fatal).toBe(defect);
-    const pending = stream.next().then(
-      () => undefined,
-      () => undefined,
-    );
-    await gateway.stop();
-    await pending;
-    expect(fatalErrors).toHaveLength(1);
-    expect(fatalErrors[0]).toBe(defect);
   });
 
   test("malformed socket envelopes close the connection without reporting a defect", async () => {

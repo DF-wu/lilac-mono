@@ -275,8 +275,8 @@ test("follow-up subagent runs name the run that started their session", () => {
 
 function agentStreamMessages(f: ReturnType<typeof fixture>, streamId: string) {
   const replay = f.native.syncAgentStream("owner", f.thread.id, streamId).unwrap();
-  const slot = replay.kind === "window" ? replay.slots[0] : undefined;
-  return slot?.kind === "ready" ? slot.messages : [];
+  const slots = replay.kind === "window" ? replay.slots : [];
+  return slots.flatMap((slot) => (slot.kind === "ready" ? slot.messages : []));
 }
 
 function prepareFollowUp(f: ReturnType<typeof fixture>, followUp: ReturnType<typeof addFollowUp>) {
@@ -475,7 +475,133 @@ test("a steered follow-up stream from before seeding still gains earlier exchang
   const stream = f.service
     .stream("owner", { threadId: f.thread.id, agentId: followUp.runId })
     .unwrap();
-  expect(texts(agentStreamMessages(f, stream.id))).toEqual(["Research", "Done", "Next", "Answer"]);
+  expect(texts(agentStreamMessages(f, stream.id))).toEqual([
+    "Research",
+    "Done",
+    "Next",
+    "Answer",
+    "Also check the weekend",
+  ]);
+});
+
+const toolActivity = (toolCallId: string): DisplayMessage => ({
+  id: `np_${toolCallId}`,
+  role: "assistant",
+  parts: [
+    {
+      type: "data-activity",
+      id: createHash("sha256").update(toolCallId).digest("hex").slice(0, 24),
+      data: { kind: "tool", label: "Read", state: "complete" },
+    },
+  ],
+});
+const reply = (id: string, text: string): DisplayMessage => ({
+  id,
+  role: "assistant",
+  parts: [{ type: "text", text }],
+});
+const toolCall = (toolCallId: string, text?: string): StoredMessageV1 => ({
+  role: "assistant",
+  content: [
+    ...(text ? [{ type: "text" as const, text }] : []),
+    { type: "tool-call" as const, toolCallId, toolName: "read", input: {} },
+  ],
+});
+const toolResult = (toolCallId: string): StoredMessageV1 => ({
+  role: "tool",
+  content: [
+    {
+      type: "tool-result",
+      toolCallId,
+      toolName: "read",
+      output: { type: "text", value: "ok" },
+    },
+  ],
+});
+
+function endedStream(f: ReturnType<typeof fixture>, messages: DisplayMessage[]) {
+  f.run.state = "succeeded";
+  f.native
+    .ensureAgentStream({
+      parentThreadId: f.thread.id,
+      parentRequestId: f.input.requestId,
+      runId: f.run.runId,
+      requestId: f.executionRequestId,
+      state: "complete",
+      startedAt: 2,
+      messages,
+    })
+    .unwrap();
+  return () =>
+    agentStreamMessages(
+      f,
+      f.service.stream("owner", { threadId: f.thread.id, agentId: f.run.runId }).unwrap().id,
+    );
+}
+
+test("an ended run's stream gains the steers its transcript holds where the run read them", () => {
+  const f = fixture();
+  const open = endedStream(f, [
+    ...subagentMessages([{ role: "user", content: "Research" }]),
+    toolActivity("a"),
+    reply("np_checking", "Checking more."),
+    toolActivity("b"),
+    reply("np_partial_1", "Partial answer.\n\n"),
+    reply("np_partial_2", "More"),
+    reply("np_short", "Short."),
+  ]);
+  f.setSaved([
+    { role: "user", content: "Research" },
+    toolCall("a"),
+    toolResult("a"),
+    toolCall("b", "Checking more."),
+    toolResult("b"),
+    { role: "user", content: "Also check the weekend" },
+    {
+      role: "user",
+      content: "<LILAC_GENERATED:v1>",
+      providerOptions: { lilac: { generated: { version: 1, kind: "job_event", id: "job" } } },
+    },
+    { role: "assistant", content: "Partial answer.\n\nMore" },
+    { role: "user", content: "Keep it short" },
+    { role: "assistant", content: "Short." },
+  ]);
+  const shown = (messages: readonly DisplayMessage[]) =>
+    messages.map((message) => [
+      message.role,
+      message.metadata?.inputMode,
+      texts([message]).join("") || message.parts[0]?.type,
+    ]);
+  const expected = [
+    ["user", undefined, "Research"],
+    ["assistant", undefined, "data-activity"],
+    ["assistant", undefined, "Checking more."],
+    ["assistant", undefined, "data-activity"],
+    ["user", "steer", "Also check the weekend"],
+    ["assistant", undefined, "Partial answer.\n\n"],
+    ["assistant", undefined, "More"],
+    ["user", "steer", "Keep it short"],
+    ["assistant", undefined, "Short."],
+  ];
+  expect(shown(open())).toEqual(expected);
+  expect(shown(open())).toEqual(expected);
+});
+
+test("an ended run's steer backfill leaves out a compaction summary ahead of the stream", () => {
+  const f = fixture();
+  const open = endedStream(f, [
+    ...subagentMessages([{ role: "user", content: "Research" }]),
+    toolActivity("c"),
+    reply("np_done", "Done"),
+  ]);
+  f.setSaved([
+    { role: "user", content: "Summary of the earlier conversation" },
+    toolCall("c"),
+    toolResult("c"),
+    { role: "user", content: "Also check the weekend" },
+    { role: "assistant", content: "Done" },
+  ]);
+  expect(texts(open())).toEqual(["Research", "Also check the weekend", "Done"]);
 });
 
 test("a queued follow-up opened before it starts still shows its prompt once it runs", () => {
@@ -593,18 +719,6 @@ test("live named-session history and streaming content preserve IDs at completio
     live.messages.map((message) => message.id),
   );
   expect(saved.messages.at(-1)?.metadata?.incomplete).toBeUndefined();
-});
-
-test("completed subagent reads the execution transcript rather than the delegation ID", () => {
-  const f = fixture();
-  f.run.state = "succeeded";
-  expect(f.operations[0]!.requestId).not.toBe(f.target.childRequestId);
-  const page = f.read().unwrap();
-  expect(page.unavailable).toBe(false);
-  expect(page.messages.map((message) => message.parts[0])).toEqual([
-    { type: "text", text: "Research" },
-    { type: "text", text: "Done" },
-  ]);
 });
 
 test("subagents without a dispatched operation stay waiting or report unavailable after termination", () => {
@@ -751,4 +865,325 @@ test("read exposes a currently executing tool even before its history commit", (
     data: { label: "search", state: "running" },
   });
   expect(page.agent.title).toBe("search");
+});
+
+test("steer backfill matches live steers despite trimming and batching", () => {
+  const f = fixture();
+  const steer = (id: string, text: string): DisplayMessage => ({
+    id,
+    role: "user",
+    metadata: { inputMode: "steer" },
+    parts: [{ type: "text", text }],
+  });
+  const open = endedStream(f, [
+    ...subagentMessages([{ role: "user", content: "Research" }]),
+    toolActivity("a"),
+    steer("np_padded", "  check logs"),
+    toolActivity("b"),
+    steer("np_dates", "Check dates"),
+    steer("np_prices", "Check prices"),
+    reply("np_done", "Done"),
+  ]);
+  f.setSaved([
+    { role: "user", content: "Research" },
+    toolCall("a"),
+    toolResult("a"),
+    { role: "user", content: "check logs" },
+    toolCall("b"),
+    toolResult("b"),
+    { role: "user", content: "Check dates\n\nCheck prices" },
+    { role: "assistant", content: "Done" },
+  ]);
+  expect(texts(open())).toEqual([
+    "Research",
+    "  check logs",
+    "Check dates",
+    "Check prices",
+    "Done",
+  ]);
+});
+
+test("steer backfill places a steer after the thinking and reply that preceded it", () => {
+  const f = fixture();
+  const open = endedStream(f, [
+    ...subagentMessages([{ role: "user", content: "Research" }]),
+    {
+      id: "np_thinking",
+      role: "assistant",
+      parts: [
+        {
+          type: "data-activity",
+          id: "thinking",
+          data: { kind: "thinking", label: "Thinking", state: "complete" },
+        },
+      ],
+    },
+    reply("np_looking", "Looking."),
+    reply("np_done", "Done"),
+  ]);
+  f.setSaved([
+    { role: "user", content: "Research" },
+    {
+      role: "assistant",
+      content: [
+        { type: "reasoning", text: "Plan" },
+        { type: "text", text: "Looking." },
+      ],
+    },
+    { role: "user", content: "Hurry" },
+    { role: "assistant", content: "Done" },
+  ]);
+  expect(texts(open())).toEqual(["Research", "Looking.", "Hurry", "Done"]);
+});
+
+test("steer backfill does not take a later message with the same text for a missing steer", () => {
+  const f = fixture();
+  const open = endedStream(f, [
+    ...subagentMessages([{ role: "user", content: "Research" }]),
+    toolActivity("a"),
+    toolActivity("b"),
+    {
+      id: "np_later",
+      role: "user",
+      metadata: { inputMode: "steer" },
+      parts: [{ type: "text", text: "check the logs" }],
+    },
+    reply("np_done", "Done"),
+  ]);
+  f.setSaved([
+    { role: "user", content: "Research" },
+    toolCall("a"),
+    toolResult("a"),
+    { role: "user", content: "check the logs" },
+    toolCall("b"),
+    toolResult("b"),
+    { role: "user", content: "check the logs" },
+    { role: "assistant", content: "Done" },
+  ]);
+  const messages = open();
+  expect(texts(messages)).toEqual(["Research", "check the logs", "check the logs", "Done"]);
+  expect(messages[2]?.metadata?.inputMode).toBe("steer");
+  expect(messages[3]?.parts[0]?.type).toBe("data-activity");
+});
+
+test("steer backfill keeps a repeated steer separated by a reply on its own side", () => {
+  const f = fixture();
+  const open = endedStream(f, [
+    ...subagentMessages([{ role: "user", content: "Research" }]),
+    reply("np_looking", "Looking."),
+    {
+      id: "np_hurry",
+      role: "user",
+      metadata: { inputMode: "steer" },
+      parts: [{ type: "text", text: "Hurry" }],
+    },
+    reply("np_done", "Done"),
+  ]);
+  f.setSaved([
+    { role: "user", content: "Research" },
+    { role: "user", content: "Hurry" },
+    { role: "assistant", content: "Looking." },
+    { role: "user", content: "Hurry" },
+    { role: "assistant", content: "Done" },
+  ]);
+  expect(texts(open())).toEqual(["Research", "Hurry", "Looking.", "Hurry", "Done"]);
+});
+
+test("steer backfill anchors on a reply the stream shows once when compaction dropped the rest", () => {
+  const f = fixture();
+  const open = endedStream(f, [
+    ...subagentMessages([{ role: "user", content: "Research" }]),
+    reply("np_logs_1", "Looking at\n\n"),
+    reply("np_logs_2", "the logs."),
+    reply("np_done", "Done"),
+  ]);
+  f.setSaved([
+    { role: "user", content: "Summary of the earlier conversation" },
+    { role: "assistant", content: "Looking at\n\nthe logs." },
+    { role: "user", content: "Hurry" },
+    { role: "assistant", content: "Done" },
+  ]);
+  expect(texts(open())).toEqual(["Research", "Looking at\n\n", "the logs.", "Hurry", "Done"]);
+});
+
+test("steer backfill aligns on generated messages a transcript projection shows", () => {
+  const f = fixture();
+  const saved: StoredMessageV1[] = [
+    { role: "user", content: "Research" },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: '<LILAC_GENERATED:v1>\n{"kind":"job_event","id":"job"}' },
+        { type: "text", text: "job finished" },
+        { type: "text", text: "</LILAC_GENERATED:v1>" },
+      ],
+      providerOptions: { lilac: { generated: { version: 1, kind: "job_event", id: "job" } } },
+    },
+    { role: "assistant", content: "Looking." },
+    { role: "user", content: "Hurry" },
+    { role: "assistant", content: "Done" },
+  ];
+  const open = endedStream(f, subagentMessages(saved));
+  f.setSaved(saved);
+  expect(texts(open()).filter((text) => text === "Hurry")).toEqual(["Hurry"]);
+});
+
+test("steer backfill finds a live interrupt input past the reply it cut short", () => {
+  const f = fixture();
+  const open = endedStream(f, [
+    ...subagentMessages([{ role: "user", content: "Research" }]),
+    { ...reply("np_partial", "Half a"), metadata: { incomplete: true } },
+    {
+      id: "np_hurry",
+      role: "user",
+      metadata: { inputMode: "steer" },
+      parts: [{ type: "text", text: "Hurry" }],
+    },
+    reply("np_done", "Done"),
+  ]);
+  f.setSaved([
+    { role: "user", content: "Research" },
+    { role: "user", content: "Hurry" },
+    { role: "assistant", content: "Done" },
+  ]);
+  expect(texts(open())).toEqual(["Research", "Half a", "Hurry", "Done"]);
+});
+
+function streamSlots(f: ReturnType<typeof fixture>, streamId: string) {
+  const replay = f.native.syncAgentStream("owner", f.thread.id, streamId).unwrap();
+  if (replay.kind !== "window") throw new Error("Expected a window");
+  return replay.slots.map((slot) =>
+    slot.kind === "ready" ? [slot.state, texts(slot.messages)] : [slot.kind],
+  );
+}
+
+function prompt(text: string, steer = false): DisplayMessage {
+  return {
+    id: `user_${createHash("sha256").update(text).digest("hex").slice(0, 24)}`,
+    role: "user",
+    ...(steer ? { metadata: { inputMode: "steer" as const } } : {}),
+    parts: [{ type: "text", text }],
+  };
+}
+
+test("a follow-up stream keeps each exchange in its own turn and runs in the last", () => {
+  const f = fixture();
+  f.setSaved([
+    { role: "user", content: "Research" },
+    { role: "assistant", content: "Done" },
+  ]);
+  const stream = prepareFollowUp(f, addFollowUp(f));
+  expect(streamSlots(f, stream.id)).toEqual([
+    ["complete", ["Research", "Done"]],
+    ["running", ["Next"]],
+  ]);
+  const replay = f.native.syncAgentStream("owner", f.thread.id, stream.id).unwrap();
+  expect(replay.kind === "window" ? replay.slots.at(-1)?.slotId : undefined).toBe(stream.turnId);
+});
+
+test("steers and a chunked prompt stay in the exchange they join", () => {
+  const f = fixture();
+  const open = endedStream(f, [
+    prompt("Research"),
+    prompt("more of the prompt"),
+    reply("np_a", "Looking."),
+    prompt("Hurry", true),
+    reply("np_b", "Done"),
+    prompt("Next"),
+    reply("np_c", "Also done"),
+  ]);
+  open();
+  const stream = f.native.findAgentStream(f.run.runId).unwrap()!;
+  expect(streamSlots(f, stream.id)).toEqual([
+    ["complete", ["Research", "more of the prompt", "Looking.", "Hurry", "Done"]],
+    ["complete", ["Next", "Also done"]],
+  ]);
+});
+
+test("a stream from before exchanges had their own turns splits when an ended run opens", () => {
+  const f = fixture();
+  const open = endedStream(f, [
+    prompt("Research"),
+    reply("np_a", "Done"),
+    prompt("Next"),
+    reply("np_b", "Also done"),
+  ]);
+  const stream = f.native.findAgentStream(f.run.runId).unwrap()!;
+  const db = databases.at(-1)!;
+  const rows = db
+    .query<{ data_json: string }, [string]>(
+      "SELECT data_json FROM native_records WHERE kind='turn' AND thread_id=? ORDER BY position",
+    )
+    .all(stream.id)
+    .map((row) => JSON.parse(row.data_json));
+  const legacy = rows.at(-1);
+  legacy.value = {
+    ...legacy.value,
+    position: 0,
+    messages: rows.flatMap((row) => row.value.messages),
+  };
+  db.query("DELETE FROM native_records WHERE kind='turn' AND thread_id=?").run(stream.id);
+  db.query(
+    "INSERT INTO native_records(kind,id,thread_id,position,updated_at,format_version,data_json) VALUES('turn',?,?,0,0,1,?)",
+  ).run(stream.turnId, stream.id, JSON.stringify(legacy));
+  expect(streamSlots(f, stream.id)).toEqual([
+    ["complete", ["Research", "Done", "Next", "Also done"]],
+  ]);
+  open();
+  expect(streamSlots(f, stream.id)).toEqual([
+    ["complete", ["Research", "Done"]],
+    ["complete", ["Next", "Also done"]],
+  ]);
+});
+
+test("earlier exchanges past the replay window load on demand", () => {
+  const f = fixture();
+  const exchanges = Array.from({ length: 7 }, (_, index) => [
+    prompt(`Prompt ${index}`),
+    reply(`np_${index}`, `Reply ${index}`),
+  ]).flat();
+  const open = endedStream(f, exchanges);
+  open();
+  const stream = f.native.findAgentStream(f.run.runId).unwrap()!;
+  const slots = streamSlots(f, stream.id);
+  expect(slots[0]).toEqual(["deferred"]);
+  expect(slots.at(-1)).toEqual(["complete", ["Prompt 6", "Reply 6"]]);
+  const replay = f.native.syncAgentStream("owner", f.thread.id, stream.id).unwrap();
+  const deferred = replay.kind === "window" ? replay.slots[0] : undefined;
+  if (deferred?.kind !== "deferred") throw new Error("Expected a deferred range");
+  const hydration = f.native
+    .hydrateAgentStream("owner", f.thread.id, stream.id, {
+      threadId: stream.id,
+      historyGeneration: replay.checkpoint.historyGeneration,
+      projectionRevision: replay.checkpoint.projectionRevision,
+      slotId: deferred.slotId,
+    })
+    .unwrap();
+  expect(
+    hydration.slots.flatMap((slot) => (slot.kind === "ready" ? texts(slot.messages) : [])),
+  ).toEqual(["Prompt 0", "Reply 0", "Prompt 1", "Reply 1"]);
+});
+
+test("a stream's previews stay readable from messages in its earlier exchanges", () => {
+  const f = fixture();
+  const open = endedStream(f, [
+    prompt("Research"),
+    reply("np_a", "See the page."),
+    prompt("Next"),
+    reply("np_b", "Done"),
+  ]);
+  open();
+  const stream = f.native.findAgentStream(f.run.runId).unwrap()!;
+  f.native
+    .saveHtmlPreview({
+      threadId: f.thread.id,
+      turnId: stream.turnId,
+      path: "/tmp/page.html",
+      error: "missing",
+    })
+    .unwrap();
+  const preview = f.native
+    .readHtmlPreview("owner", { threadId: f.thread.id, messageId: "np_a", path: "/tmp/page.html" })
+    .unwrap();
+  expect(preview.turnId).toBe(stream.turnId);
 });

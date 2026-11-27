@@ -220,7 +220,6 @@ scripts/oxlint-plugins/production-syntax.test.mts  # PR119: covers var writes an
 apps/core/tests/surface/bridge/bus-agent-runner-core-primary.test.ts  # PR119: isolates the compaction fixture system prompt from operator-owned global skills while retaining real compaction
 apps/core/tests/tool-server-skills.test.ts  # PR119: asserts invocation-cwd skill results independently of unrelated global discovery warnings
 apps/core/tests/tool-server/ssh.test.ts  # PR119: gives the SSH child fixture its real stdin pipe contract when testing stream and exit failures
-apps/core/tests/ssh/remote-runner-transport.test.ts  # PR119: synchronizes fallback PID readiness and observes bounded asynchronous process cleanup without fixed waits
 apps/core/tests/ssh/ssh-exec.test.ts  # PR119: covers overflow cleanup and exact supported SSH error paths
 packages/fs/src/fs-impl.ts  # PR119: carries glob detail mode to backends and enforces whole-file limits during bounded reads
 packages/fs/src/search-backend.ts  # PR119: carries requested metadata mode to the private remote glob backend
@@ -237,3 +236,11 @@ apps/web/src/design-system/ComposerSection.tsx  # exercises production dictation
 apps/web/src/preferences.ts  # scopes dictation URL/model preferences to installation and principal while keeping service tokens in memory
 apps/web/tests/composer-tiptap.test.ts  # verifies literal dictation preserves formatted drafts, attachment identity, limits, and undo
 apps/web/tests/preferences.test.ts  # verifies dictation preference isolation and memory-only token reset and exclusion from storage
+
+# --- PR127 mechanical integration
+__tests__/run-gates.test.ts  # preserves explicit custom-media and fork typecheck coverage under the upstream split gate runner
+apps/core/src/generated/config-schemas/config-fields.ts  # derives typed editor paths for retained Telegram and OpenAI search configuration
+apps/core/tests/runtime/config-files.test.ts  # proves the shared patch path preserves fork settings and disabled opt-in defaults
+apps/core/tests/ssh/remote-runner-hosts.ts  # shares the fork's bounded process-exit assertion with upstream's relocated SSH tests
+apps/core/tests/ssh/remote-runner-shell-fallback.test.ts  # retains PID-before-readiness and bounded cleanup assertions after upstream relocation
+apps/web/src/config-ui/core-manifest.ts  # retains fork configuration in the YAML editor alongside upstream structured forms

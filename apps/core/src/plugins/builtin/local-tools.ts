@@ -53,6 +53,8 @@ import {
   formatSubagentDelegateToolArgs,
 } from "../../tools/tool-args-display";
 import { defineLevel1Tool } from "./define-level1-tool";
+import { resolveBackgroundJobModes } from "./job";
+import { LOCAL_TOOLS_PLUGIN_ID } from "./plugin-ids";
 import { type CoreLevel1ToolSpec, type CoreToolPlugin } from "../types";
 import { isWebFetchAllowedForNativeProfile } from "../profile-authority";
 
@@ -78,6 +80,8 @@ const coreToolRequestMetadataSchema = z
     readFileDirectAttachmentSupported: z.boolean().optional(),
     readFileDirectImageSupported: z.boolean().optional(),
     readFileDirectPdfSupported: z.boolean().optional(),
+    readFileDirectAudioSupported: z.boolean().optional(),
+    readFileDirectVideoSupported: z.boolean().optional(),
     controlCapability: z.string().optional(),
     onSubagentDelegate: z.custom<DelegateHandler>(isDelegateHandler).optional(),
     onActivity: z.custom<AgentActivityHandler>(isAgentActivityHandler).optional(),
@@ -94,12 +98,16 @@ export function decodeCoreToolRequestMetadata(
 function getReadFileDirectMediaSupport(context: CoreToolBuildContext): {
   readonly image: boolean;
   readonly pdf: boolean;
+  readonly audio: boolean;
+  readonly video: boolean;
 } {
   const metadata = decodeCoreToolRequestMetadata(context.requestContext?.metadata);
   const legacy = metadata.readFileDirectAttachmentSupported === true;
   return {
     image: metadata.readFileDirectImageSupported ?? legacy,
     pdf: metadata.readFileDirectPdfSupported ?? legacy,
+    audio: metadata.readFileDirectAudioSupported === true,
+    video: metadata.readFileDirectVideoSupported === true,
   };
 }
 
@@ -123,6 +131,8 @@ function getFsTools(context: CoreToolBuildContext): ReturnType<typeof fsTool> {
     fsBackend: context.runtime.config?.tools.fsBackend,
     readFileDirectImageSupported: directMediaSupport.image,
     readFileDirectPdfSupported: directMediaSupport.pdf,
+    readFileDirectAudioSupported: directMediaSupport.audio,
+    readFileDirectVideoSupported: directMediaSupport.video,
     readRemoteMedia: canReadRemoteMedia(context) ? readRemoteMedia : undefined,
     maxOutputBytes: context.runtime.config?.tools.output.maxPreviewBytes,
     maxInlineMediaBytesPerPart: context.runtime.config?.tools.media.maxInlineBytesPerPart,
@@ -368,7 +378,14 @@ export const BUILTIN_LEVEL1_TOOLS = {
       const controlCapability = decodeCoreToolRequestMetadata(
         requestContext?.metadata,
       ).controlCapability;
+      // The plugin generation can lag the config, so offer background only beside a loaded `job`.
+      const backgroundModes = context.getLevel1ToolSpecs().has("job")
+        ? resolveBackgroundJobModes(context)
+        : null;
       return bashToolWithCwd(cwd, {
+        ...(backgroundModes && runtime.jobs
+          ? { background: { service: runtime.jobs, modes: backgroundModes, runProfile } }
+          : {}),
         artifacts: runtime.toolResultArtifacts,
         outputConfig: runtime.config?.tools.output,
         onActivity: onActivity ? () => onActivity("tool") : undefined,
@@ -512,7 +529,7 @@ export function createLocalToolSpecs(): CoreLevel1ToolSpec[] {
 export function createBuiltinLocalToolsPlugin(): CoreToolPlugin {
   return {
     meta: {
-      id: "builtin-local-tools",
+      id: LOCAL_TOOLS_PLUGIN_ID,
       name: "Built-in Local Tools",
     },
     create() {

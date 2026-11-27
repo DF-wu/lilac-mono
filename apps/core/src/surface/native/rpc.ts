@@ -132,6 +132,9 @@ export function createNativeRouter(
       turnPage: secured.streams.turnPage.handler(async ({ input, context, signal }) =>
         nativeRpcValue(await services.streams.turnPage(context.principal, input, signal)),
       ),
+      activity: secured.streams.activity.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.streams.activity(context.principal, input, signal)),
+      ),
     },
     computer: {
       read: secured.computer.read.handler(async ({ input, context, signal }) =>
@@ -341,6 +344,12 @@ export function createNativeRouter(
       ),
       reloadMcp: secured.config.reloadMcp.handler(async ({ input, context, signal }) =>
         nativeRpcValue(await services.config.reloadMcp(context.principal, input, signal)),
+      ),
+      mcpStatus: secured.config.mcpStatus.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.config.mcpStatus(context.principal, input, signal)),
+      ),
+      authorizeMcp: secured.config.authorizeMcp.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.config.authorizeMcp(context.principal, input, signal)),
       ),
     },
     search: {

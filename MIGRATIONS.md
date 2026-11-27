@@ -55,6 +55,17 @@ you want to keep explicit breakpoints. The new default uses five-minute automati
 first-party Anthropic agent calls. See [Core configuration upgrades](docs/core-config-migrations.md#anthropic-prompt-caching)
 for opt-out and rollback instructions.
 
+### MCP OAuth callback through the native gateway
+
+When `surface.native.enabled` is true, MCP OAuth redirects to
+`<surface.native.publicUrl>/api/mcp/oauth/callback` and Core no longer listens on
+`localhost:1456`. This also applies when `publicUrl` keeps its `http://localhost:8789` default. Add
+the new redirect URL to each static OAuth client (`client.type: static`) before signing in again;
+tokens already stored keep refreshing. Dynamic clients now record `redirect_uris` in their credential
+file. The next sign-in after the callback URL changes registers a replacement client and saves it
+with the new tokens; older builds ignore the field. `config.mcpStatus` gains `oauthCallbackUrl` and
+the owner-only `config.authorizeMcp` procedure is new, so deploy Core and web together.
+
 ### Native transport selection
 
 Native deployment settings add `transport`, with `auto`, `websocket`, and `http-sse` values.
@@ -117,12 +128,18 @@ or history is deleted by this change.
 ### Batch retirement
 
 The `batch` tool and tool-call expansion API are removed. Ordinary model-issued calls run concurrently
-in received-order groups separated by `write`, `edit`, and `patch` calls, including their legacy
-aliases. Each mutation waits for the preceding group and finishes before the following group starts.
-Bash calls may race. The Claude MCP bridge applies barriers in request-receipt order; Claude owns when
-it submits those requests. Existing `tools.batch.maxCalls`, `supportsBatch`, and `editTargets` fields
-remain accepted for configuration/plugin compatibility but no longer control execution. Remove them
-from maintained configurations and plugins. Old transcripts remain replayable; a newly attempted
+in received-order groups. Core classifies each call by tool name, ignoring an `mcp__lilac__` prefix:
+`read`, `read_file`, `grep`, `glob`, `fuzzy_search`, and `model_catalog` are read-only; `write`,
+`write_file`, `edit`, `edit_file`, `patch`, and `apply_patch` are exclusive; every other call, including
+Bash, is side-effecting. Adjacent read-only calls share a group, adjacent side-effecting calls share a
+group, and each exclusive call runs alone. Each group waits for the preceding group to finish. Adjacent
+Bash calls may race. The Claude MCP bridge receives calls one at a time and queues them in receipt order.
+When a group finishes, it starts calls from the head of the queue until the next call cannot join that
+group. A new call joins a running group only when its class matches, the class is not exclusive, and no
+call is waiting ahead of it. Claude owns when it submits those requests. Existing
+`tools.batch.maxCalls`, `supportsBatch`, and `editTargets` fields remain accepted for
+configuration/plugin compatibility but no longer control execution. Remove them from maintained
+configurations and plugins. Old transcripts remain replayable; a newly attempted
 `batch` call receives the ordinary unknown-tool error.
 
 ### Skill read tool replacement
@@ -348,6 +365,29 @@ the runner that publishes these events. Existing reset events without the fields
 Before rollback, let the upgraded consumers finish pending resets and stop the producers. Restore
 the matching pre-upgrade Redis and database backups together if an older consumer would replay
 retained reset events carrying either field.
+
+### Subagent steers in native output
+
+`evt.native.output` adds an `input` payload. Core publishes it when a subagent run takes a steer or
+follow-up mid-response, and the native projection shows it as a steer in the subagent panel. Older
+strict decoders reject the new payload type, so drain native work and upgrade the projection consumer
+with the runner. Opening an ended subagent panel also inserts the steers its stored stream lacks from
+the saved transcript, rewriting that stream once. Native schema versions are unchanged. Before rollback,
+stop producers and restore matching Redis backups if an older consumer would replay retained `input`
+events.
+
+### Activity text on demand and per-exchange subagent turns
+
+Display activity parts gain an optional `omitted` field, and `streams.activity` returns the text it
+names. Core leaves tool output, and thinking text past its first 256 characters, out of replay
+windows, deltas, hydration and turn pages. Stored turns keep the full text. Older strict clients reject the new
+field, so deploy Core, web and TUI together and reload open tabs. The client cache projection version
+moves to 3, which discards cached rows that still hold the full text.
+
+Subagent streams now store one turn per exchange; the run's own turn holds the last one. Opening an
+ended subagent's panel splits a stream stored as one turn, once. Native schema versions are unchanged.
+An older Core reads only the run's own turn, so after rollback a split stream shows only its last
+exchange. Restore the pre-upgrade native database to keep earlier exchanges visible in older builds.
 
 ### Native computer viewer through Core
 
@@ -732,6 +772,29 @@ Core now removes ended jobs and their output files every hour while job wakes ar
 using the existing retention period. Previously this ran only during restart reconciliation.
 The job schema is unchanged. Export retained output before it reaches the retention limit;
 deleted output cannot be recovered by downgrading.
+
+### Background jobs move into bash
+
+`bash` starts background jobs through new optional `background` (`await` or `service`) and `label`
+fields, and its result adds an optional `job` summary. The `job` tool keeps only `list`, `read`, and
+`stop`; a `start` call now fails input validation, and the updated descriptions point the agent to
+`bash`. Existing jobs and their events are unchanged. `job` and background starts follow `bash` in
+subagent permission profiles, so the built-in `restricted` profile and custom profiles that allow
+`bash` gain them without a config change. Remove `bash` from a profile, or set its `execution` to
+`false`, to keep background jobs from it. The built-in `restricted` defaults no longer list the
+retired `batch` tool; a configured list that still names it is unaffected. Only `service` jobs wake an idle
+session now. An `await` job lost in a restart reports to its recovered request or the session's next
+run. Disabling `builtin-job` or `builtin-local-tools` in `plugins.disabled` removes both `job` and
+`bash`'s `background` field.
+
+GitHub requests, heartbeat runs, and restricted sessions can now start `await` jobs. Restricted
+sessions and profiles with restricted execution run jobs in restricted Bash inside Core. The first
+start of `background-jobs.db` without the widened platform check rebuilds the `background_jobs`
+table in one transaction to accept `github` and `unknown` owners, keeping every row. Startup then
+recreates the table's indexes.
+An older build rejects any row with a `github` or `unknown` owner, running or ended, which breaks
+`job list` and restart reconciliation. Roll back with the pre-upgrade `background-jobs.db`, or drain
+work and delete those rows first.
 
 ## MCP and computer-use integration
 
