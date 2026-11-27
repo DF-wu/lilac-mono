@@ -52,6 +52,7 @@ skill 遷移未完成事項。Native 工具送訊息預設排隊投遞，不啟�
 | Container delivery | Build workflow 發布經驗證的 `catalina`、`claudia` 與 SHA tags，`latest` 指向 `catalina`；每個 variant 都有各自的帳號與 home directory，image 另加入 `rsync` | [`build-image.yml`](../.github/workflows/build-image.yml)、[`Dockerfile`](../Dockerfile) | 兩個發布 variant 都使用 UID/GID 3000；host bind mounts 必須允許該數字身分存取 |
 | Upstream maintenance | 每 6 小時檢查 upstream；乾淨候選合併通過完整 CI 後更新 `main` 並發布映像；Git 衝突開 PR，由 Claude 唯讀分析並要求 `Catalina-df` review | [`sync-upstream.yml`](../.github/workflows/sync-upstream.yml)、[設定說明](./upstream-sync.md) | CI 失敗停止更新；衝突解決與整合驗證由人工負責 |
 | Core memory watchdog | `process.memory` watchdog 在 RSS 達 8 GiB（原為 4 GiB）時重啟 Core，RSS 警告事件從 3 GiB（原為 1.5 GiB）開始；768 MiB 主 isolate 上限不變 | `apps/core/src/tool-server/health-state.ts`、fork issue [#128](https://github.com/DF-wu/lilac-mono/issues/128) | 上限依部署主機寫死，該主機未設容器記憶體上限。較高上限只會延後保留記憶體造成的重啟，不會回收記憶體 |
+| Worker isolate memory telemetry | Core 的每個 worker isolate（thread search、materializer、summarization）透過 `BroadcastChannel` 回報自己的 heap 計數。`process.memory` 診斷與記憶體事件觀測值在 `isolates` 下列出這些數值；Core 每 10 分鐘記錄一筆 `runtime.memory.sample`，包含 RSS、主 isolate 與各 worker heap，以及每 30 秒取樣的 RSS 與主 `heapTotal` 高點 | `apps/core/src/shared/isolate-memory.ts`、`apps/core/src/runtime/memory-sampler.ts`、fork issue [#129](https://github.com/DF-wu/lilac-mono/issues/129) | 只做觀測，不會回收或重建 worker。worker 計數是各 isolate 自己的值，RSS 則是整個行程；`heapUsed` 是各 isolate 上次 GC 時的值。忙碌中的 worker 會在當前同步工作結束後才回覆，超過 1 秒則列為未回應 |
 
 ## Telegram 現況
 
@@ -141,6 +142,7 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 | Compatible-provider tool images | `packages/utils/openai-compatible-tool-images.ts` | `packages/utils/model-provider.ts` 僅包裝 `openai-compatible` chat provider |
 | Legacy blob cutover | Historical upstream offline tool at `f2c90667ac5616796c992602ca5fb5be726cf40d` | Automatic startup migration and backups are retired. Follow the [current offline support and rollback procedure](./fork-integration-20261111/migration.md). |
 | Core 啟動 Result 邊界 | `apps/core/src/runtime/start-core-runtime.ts` | `runtime/main.ts` 委派此 helper 處理 Core 建立與啟動的 Result；它不會執行自動 blob migration |
+| Worker isolate memory telemetry | `apps/core/src/shared/isolate-memory.ts`（channel 協定、worker 回應端、collector）與 `apps/core/src/runtime/memory-sampler.ts` | `conversation/thread-search-worker.ts`、`thread-materializer-worker-isolate.ts`、`thread-summarization-worker.ts` 各一行 `installIsolateMemoryResponder`；`runtime/create-core-runtime.ts`（collector、`isolates` 記憶體診斷、sampler 啟停）；`scripts/architecture/manifest.ts` 與 `core-final-boundary-identities.ts` 的 decoder 登錄 |
 | Architecture gate | 無 | `scripts/architecture/manifest.ts`、`precise-exception-identities.ts` 與 `core-final-boundary-identities.ts` 註冊 fork 模組；`architecture.test.ts` 預期 Telegram request router 的 event consumer |
 
 `bun run fork:footprint` 會列出所有相對於 `upstream/main` merge base 有差異的 upstream 檔案，遇到不在 [`scripts/fork/upstream-footprint.txt`](../scripts/fork/upstream-footprint.txt) 裡的檔案就失敗；清單中每一筆都記錄該接縫存在的理由。它也會回報檔案已不再有差異的過期項目，讓清單隨著 upstream 接收改動而縮小。CI 在每次 push 到 `main` 與每個 pull request 都會執行。

@@ -22,6 +22,7 @@ import {
 } from "./thread-service";
 import { ConversationThreadStore, type ConversationSurface } from "./thread-store";
 import { createDiscordEntityMapper } from "../entity/entity-mapper";
+import { installIsolateMemoryResponder } from "../shared/isolate-memory";
 import { DiscordSurfaceStore } from "../surface/store/discord-surface-store";
 
 const logger = createLogger({ module: "conversation-thread-worker-isolate" });
@@ -253,6 +254,8 @@ const jobQueue = createSerialJobQueue<ThreadSummarizationWorkerRequest>({
     logger.debug("conversation thread summarization worker queue idle");
   },
 });
+
+installIsolateMemoryResponder("thread-summarization");
 
 self.addEventListener("message", (event: MessageEvent<unknown>) => {
   const decoded = decodeThreadSummarizationParentMessage(event.data);

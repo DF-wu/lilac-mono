@@ -1,5 +1,6 @@
 import { Panic, Result, type Result as ResultType } from "better-result";
 import type { PersistedDataError } from "@stanley2058/lilac-utils";
+import { installIsolateMemoryResponder } from "../shared/isolate-memory";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import { ConversationThreadStore, type ConversationThreadSearchHit } from "./thread-store";
 import {
@@ -72,6 +73,7 @@ async function run(request: ThreadSearchRequest): Promise<void> {
     Result.err(new Panic({ message: "Thread search worker defect", cause: result.reason })),
   );
 }
+installIsolateMemoryResponder("thread-search");
 let queue = Promise.resolve();
 self.addEventListener("message", (event: MessageEvent<unknown>) => {
   const request = adaptToolResultToHost(decodeThreadSearchRequest(event));
