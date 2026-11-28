@@ -203,8 +203,8 @@ the only provider, `web.extract` reports:
 
 - Results are mediated: snippets are summaries by the configured model, not
   page excerpts, and the mediator has no conversation context.
-- Each search attempt is one extra model call. It incurs the mediator's token
-  cost and the hosted search fee.
+- A search attempt that runs on the provider can incur mediator token charges
+  and hosted search fees.
 - Date and topic constraints are prompt guidance, not filters. `searchDepth`
   is ignored.
 - Search only; `web.extract` never uses this provider.

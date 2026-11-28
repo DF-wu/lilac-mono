@@ -76,7 +76,7 @@ notification-only. Deploy Core and web together and review [migration and rollba
 
 | Area | Behavior retained by the fork | Owner or verification |
 | --- | --- | --- |
-| HEIF model input | Converts verified HEIC/HEIF attachments to bounded JPEGs for model input and conversation summaries. The original remains available through the resource tools | [Attachment handling](./native-surface.md#heif-attachments), fork [#126](https://github.com/DF-wu/lilac-mono/pull/126), `apps/core/src/resource/heif-model-image.ts` |
+| HEIF model input | Converts verified HEIC/HEIF attachments to bounded JPEGs for model input and conversation summaries. Originals stored as resources remain available through the resource tools | [Attachment handling](./native-surface.md#heif-attachments), fork [#126](https://github.com/DF-wu/lilac-mono/pull/126), `apps/core/src/resource/heif-model-image.ts` |
 | Native browser cache | Uses transaction-derived IndexedDB recency for thread eviction across tabs and clock ties | `apps/web/src/cache.ts` and `apps/web/tests/cache.test.ts`, fork [#114](https://github.com/DF-wu/lilac-mono/pull/114) |
 | Origin-session authority | Preserves the request initiator's session for scoped surface actions and restricted tool calls | `request-control-authority.ts`, [PR #101 runtime inventory](./fork-integration-20261111/runtime.md) |
 | Redis subscription cleanup | Concurrent cleanup shares the same operation, with retry after a failed cleanup | `packages/event-bus/redis-streams-bus.ts` and `packages/event-bus/tests/redis-streams-bus.test.ts` |

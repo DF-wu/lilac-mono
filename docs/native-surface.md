@@ -81,8 +81,9 @@ Lilac deliberately uses a direct browser CORS request instead of their server re
 
 Core can convert verified HEIC and HEIF image attachments to JPEG for model input and conversation
 summaries. The converter uses the first frame, applies orientation, strips metadata, and limits
-output to 1600 × 1600 pixels and 1 MiB. The original stays available through `resource.materialize`.
-If conversion fails, Core supplies attachment metadata and materialization guidance to the model.
+output to 1600 × 1600 pixels and 1 MiB. If conversion fails, Core supplies attachment metadata to
+the model. For stored resource attachments, Core also tells the model how to get the original with
+`resource.materialize`. The Discord summary path reports the conversion failure in its metadata.
 
 The Core container image includes ImageMagick. When running Core from source, put ImageMagick 7's
 `magick` on Core's `PATH` and check that `magick -list format` reports HEIC read support.

@@ -68,7 +68,7 @@ skill 遷移未完成事項。Native 工具送訊息預設排隊投遞，不啟�
 
 | 領域 | Fork 保留的行為 | 程式碼或驗證 |
 | --- | --- | --- |
-| HEIF 模型輸入 | 將驗證過的 HEIC/HEIF 附件轉成有大小上限的 JPEG，供模型與對話摘要使用。原檔仍可透過資源工具取得 | [附件處理](./native-surface.md#heif-attachments)、fork [#126](https://github.com/DF-wu/lilac-mono/pull/126)、`apps/core/src/resource/heif-model-image.ts` |
+| HEIF 模型輸入 | 將驗證過的 HEIC/HEIF 附件轉成有大小上限的 JPEG，供模型與對話摘要使用。已存為資源的原檔仍可透過資源工具取得 | [附件處理](./native-surface.md#heif-attachments)、fork [#126](https://github.com/DF-wu/lilac-mono/pull/126)、`apps/core/src/resource/heif-model-image.ts` |
 | Native 瀏覽器快取 | 由 IndexedDB 交易決定討論串的存取順序，確保多分頁與時間戳相同時仍能按順序淘汰 | `apps/web/src/cache.ts`、`apps/web/tests/cache.test.ts`、fork [#114](https://github.com/DF-wu/lilac-mono/pull/114) |
 | 原始 session 權限 | 為受限的工具呼叫與 surface 操作保留請求發起者的 session | `request-control-authority.ts`、[PR #101 執行階段盤點](./fork-integration-20261111/runtime.md) |
 | Redis 訂閱清理 | 並行清理共用同一次操作，失敗後可以重試 | `packages/event-bus/redis-streams-bus.ts`、`packages/event-bus/tests/redis-streams-bus.test.ts` |
