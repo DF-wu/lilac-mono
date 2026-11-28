@@ -29,3 +29,9 @@ promises to implement:
 - Core tool-triggered checkpoint deletion depends on receiving the Discord gateway deletion event;
   the deletion tool does not unlink the checkpoint mapping directly.
 - Persistent compaction checkpoints have limited end-to-end deletion and time-based cleanup coverage.
+- Telegram checks allowlists before accepting ingress. Its local outbox can replay previously
+  accepted events after an allowlist changes. Revocation semantics for accepted work need a policy decision.
+- Discord conversation summaries represent `.heic` attachments labeled `application/octet-stream`
+  as metadata. Using the filename as a hint there would expand which generic attachments Core downloads.
+- The memory collector can finish a probe after all known workers answer, before a newly started
+  worker replies. That worker may be absent from later samples if the same response order repeats.

@@ -9,6 +9,7 @@ Language: [`English (primary / canonical)`](../README.md) · [`Traditional Chine
 | Document | Contents |
 | --- | --- |
 | [`fork-differences.md`](./fork-differences.md) | Current differences from upstream, limitations, sync policy, and upstreamed contributions |
+| [`upstream-sync.md`](./upstream-sync.md) | Upstream sync workflow, conflict review, and image publication |
 | [`fork-review-2026-10-22.md`](./fork-review-2026-10-22.md) | Fork maintenance review against upstream `4f7eedb8`: retained extensions, retired patches, fixes, and verification limits |
 | [`../PROJECT.md`](../PROJECT.md) | Durable Core architecture, terminology, workspace ownership, trust boundaries, and persistence guide |
 | [`../MIGRATIONS.md`](../MIGRATIONS.md) | Core configuration and storage-format migration contract |
@@ -21,6 +22,7 @@ Language: [`English (primary / canonical)`](../README.md) · [`Traditional Chine
 | --- | --- |
 | [`docker-deployment.md`](./docker-deployment.md) | Docker/Compose, operator tokens, persistence, UID, security boundaries, and diagnostics |
 | [`native-surface.md`](./native-surface.md) | Native Web surface: authentication, configuration, operation, and the temporary operator console |
+| [`native-discord-mirror.md`](./native-discord-mirror.md) | Optional Native conversation recording, Discord child routing, and delivery limits |
 | [`heartbeat.md`](./heartbeat.md) | Proactive follow-ups: setup, legacy inbox migration, supported destinations, delivery verification, and scheduling limits |
 | [`native-surface-verification.md`](./native-surface-verification.md) | Historical verification record for the former standalone native client; current console setup is in `native-surface.md` |
 | [`telegram-surface.md`](./telegram-surface.md) | BotFather, allowlists, groups, forum topics, workflows, conversation memory, verification, and limitations |

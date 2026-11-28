@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { setTimeout } from "node:timers/promises";
 import { Result } from "better-result";
 import type { NativeStore } from "./store";
-import { readDiscordMirrorReply, type MirrorFetch } from "./discord-mirror-webhook";
+import { fetchDiscordMirrorReply, type MirrorFetch } from "./discord-mirror-webhook";
 
 export function discordMirrorThreadName(title: string, nativeThreadId: string): string {
   const suffix = createHash("sha256").update(nativeThreadId).digest("hex").slice(0, 10);
@@ -49,38 +49,18 @@ export function createDiscordMirrorThreads(options: {
       });
       if (waited.isErr()) return { status: 0, reply: null };
       if (options.signal.aborted || !current()) return { status: 0, reply: null };
-      const captured = await Result.tryPromise({
-        try: async () => {
-          const response = await send(url, {
-            method,
-            redirect: "error",
-            signal: AbortSignal.any([options.signal, AbortSignal.timeout(10_000)]),
-            headers: {
-              ...(token ? { Authorization: `Bot ${token}` } : {}),
-              ...(body ? { "Content-Type": "application/json" } : {}),
-            },
-            ...(body ? { body: JSON.stringify(body) } : {}),
-          });
-          const reply = await readDiscordMirrorReply(response);
-          return {
-            status: response.status,
-            reply,
-            retry: response.headers.get("retry-after"),
-            remaining: response.headers.get("x-ratelimit-remaining"),
-            reset: response.headers.get("x-ratelimit-reset-after"),
-          };
+      const response = await fetchDiscordMirrorReply(send, url, options.signal, () => ({
+        method,
+        headers: {
+          ...(token ? { Authorization: `Bot ${token}` } : {}),
+          ...(body ? { "Content-Type": "application/json" } : {}),
         },
-        catch: () => null,
-      });
-      const response = captured.match({ ok: (value) => value, err: () => null });
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      }));
       if (!response) return null;
-      const reset = Number(response.reset);
-      if (response.remaining === "0" && Number.isFinite(reset) && reset > 0)
-        blockedUntil = Date.now() + reset * 1000;
+      if (response.resetAfterMs > 0) blockedUntil = Date.now() + response.resetAfterMs;
       if (response.status === 429) {
-        const seconds = response.reply?.retry_after ?? Number(response.retry ?? 1);
-        blockedUntil =
-          Date.now() + (Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : 1000);
+        blockedUntil = Date.now() + response.retryAfterMs;
         if (attempt === 2 || blockedUntil - Date.now() > 30_000) return response;
         continue;
       }

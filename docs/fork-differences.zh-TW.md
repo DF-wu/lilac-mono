@@ -4,13 +4,21 @@
 
 本文件描述 [`DF-wu/lilac-mono`](https://github.com/DF-wu/lilac-mono) 相對於 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的現行差異。
 
-目前整合基準為 upstream commit [`20a10872`](https://github.com/stanley2058/lilac-mono/commit/20a108725d6d5e30dddbf6907718badef33e9ab7)。[11 月 11 日整合紀錄](./fork-integration-20261111/README.md) 記錄較早的 PR #101 基準、F01–F23 功能處置、程式碼歸屬與離線遷移支援。其他有日期的報告保留各自的歷史基準。
+Fork PR [#127](https://github.com/DF-wu/lilac-mono/pull/127) 已整合上游提交 [`5730555d`](https://github.com/stanley2058/lilac-mono/commit/5730555df3a00bb515efa92fd6c3aeeb3d4b4b44)。11 月 28 日維護盤點比對 fork main `13d02bcc` 與上游 [`2857d307`](https://github.com/stanley2058/lilac-mono/commit/2857d3076fee6561e86e94b97d78173715f0af61)。上游新版的具名 OpenAI-compatible 聊天伺服器、附件遭供應商拒絕後的重試及個別 worker 記憶體 watchdog 尚待整合。
+
+[11 月 11 日整合紀錄](./fork-integration-20261111/README.md) 保存 PR #101 基準、F01–F23 功能處置、程式碼歸屬與離線遷移支援。
 
 > [!IMPORTANT]
 > 這是維護文件，不是永久相容性承諾。Upstream sync 後，已被上游接收或不再存在的差異必須從本表移除或重新分類。
 
 [2026-10-22 維護審查](./fork-review-2026-10-22.md) 記錄仍需保留的擴充、對照此基準修正的整合缺陷，
-以及已移除的 watchdog 補丁。本次變更只在 fork 維護，不向 upstream 提交。
+以及已移除的 watchdog 補丁。較後的 v3 遷移與驗證見 [PR #95 整合紀錄](./fork-integration-pr95.md)。
+
+## 繼承的設定與遙測
+
+PR #127 納入上游的 Core 與 MCP 設定表單，以及引導式 MCP OAuth 設定。Fork 的 Telegram 與 OpenAI 搜尋仍由版本化的 Core 設定 schema 管理，可在 YAML 編輯器修改。詳見 [Core 設定](./core-config.md)。
+
+[PR #120 驗證紀錄](./pr120-sync-20261126.md) 保存當時的提交與衝突處理。繼承的遙測預設為 `errors: false` 與 `usage: false`。設定 `LILAC_TELEMETRY_DISABLED=1` 或 `DO_NOT_TRACK=1` 均可覆蓋啟用設定。
 
 ## 繼承的原生 Runner 與預覽更新
 
@@ -41,9 +49,11 @@ skill 遷移未完成事項。Native 工具送訊息預設排隊投遞，不啟�
 
 | 領域 | 差異 | 使用入口 | 限制或注意事項 |
 | --- | --- | --- | --- |
+| Native 麥克風聽寫 | 瀏覽器錄音後直接呼叫設定的 OpenAI-compatible 轉錄服務，把可編輯的文字附加到目前草稿 | [聽寫設定](./native-surface.md#microphone-dictation) | 依瀏覽器中的安裝與帳號啟用。選填的服務權杖僅存於分頁記憶體。需要麥克風權限、可連線的服務與 CORS 許可 |
+| Native 對話錄製 | 將已提交的 Native 使用者訊息、可見的助理文字或已就緒的附件傳到管理者設定的 Discord webhook。Threaded 模式會為每段 Native 對話使用獨立的 Discord 子討論串 | [設定與投遞保證](./native-discord-mirror.md)、fork PR [#96](https://github.com/DF-wu/lilac-mono/pull/96) 與 [#103](https://github.com/DF-wu/lilac-mono/pull/103) | 預設停用。盡力投遞，只處理新訊息 |
 | Telegram surface | 新增 DM、group、forum topic ingress；streamed HTML output；cancel、reaction、command menu、inbound/outbound attachments、workflow cards/actions、same-surface tools，並參與跨 surface 的 conversation memory（每個 chat 或 topic 一個 indexed thread，受 `allowedChatIds` 管制） | [`telegram-surface.md`](./telegram-surface.md)、fork PR [#45](https://github.com/DF-wu/lilac-mono/pull/45)、[#75](https://github.com/DF-wu/lilac-mono/pull/75) | 預設停用；僅 long polling；history 來自 local SQLite index |
 | OpenAI-compatible image provider | `generate.image` 跟隨 upstream 的 script runner（commit [`05115838`](https://github.com/stanley2058/lilac-mono/commit/05115838)）；設定 `OPENAI_COMPATIBLE_BASE_URL` 時，本 fork 會把 operator 的 OpenAI-compatible endpoint 以 `openaiCompatible` 加入 script 的 `providers` global，並在 `image-generation` skill 加上 `openai-compatible.md` recipe（列出 models、處理 `b64_json` 或 `url` 結果的生成、帶檔名 multipart 的編輯，以及 new-api 注意事項）。先前的結構化工具與 `tools.generate.image` 路由已移除 | [`generate-image-openai-compatible.md`](./generate-image-openai-compatible.md) | 適用 upstream 的 script contract：restricted callers 會被拒絕、由 provider 驗證請求，provider 之間不會 fallback |
-| OpenAI `web.search` provider | `tools.web.extract.providers` 可填 `openai`：`web.search` 會改走 OpenAI Responses 的 `web_search` 工具（以 `tool_choice: required` 強制搜尋），回傳答案的 URL citations，再附上未被引用的檢索來源；`tools.web.openai.{model,searchContextSize}` 可調整，`model` 填 `openai` / `openai-compatible` provider 的 `provider/model`。只做搜尋：`web.extract` 會略過它 | [`web-search-openai.md`](./web-search-openai.md)、[`core-config-migrations.md`](./core-config-migrations.md)、`apps/core/src/tool-server/tools/web-search/openai-web-search-provider.ts` | 準備回饋 upstream（尚未送出）；需要直連 `api.openai.com` 或有實作 Responses `web_search` 的 gateway；發布日期限制只能靠對模型的指示 |
+| OpenAI `web.search` provider | Core 設定 v2 與 v3 的 `tools.web.extract.providers` 可填 `openai`。`web.search` 呼叫 OpenAI Responses 的 `web_search` 工具，先回傳答案引用的網址，再附上未引用的搜尋來源。`tools.web.openai` 可指定 `provider/model` 與搜尋 context 大小 | [搜尋設定與備援](./web-search-openai.md)、[設定遷移](./core-config-migrations.md) | 每次 OpenAI Responses 嘗試上限 30 秒，相容閘道亦同。端點需實作 `web_search`，日期限制透過提示詞傳達給模型，`web.extract` 會略過此供應商 |
 | GitHub final-publication policy | Issue 與 PR review 的 prompt 告知 agent 由 Lilac 自行發布最終回覆：agent 不得再透過 `gh`、GitHub API 或 `surface.messages.send` 重複發布；若已直接發布，或 `gh pr review` 送出成功，則回傳 `NO_REPLY` | `apps/core/src/github/webhook/github-webhook-server.ts`、fork PR [#56](https://github.com/DF-wu/lilac-mono/pull/56) | 只是 prompt 指引；模型若忽略仍可能重複發文 |
 | Custom media plugin example | 提供 external Level 2 image/video plugin，使用 OpenAI-compatible image API 與 QuantumNous/new-api-compatible video flow | [`custom-media/README.md`](../examples/plugins/custom-media/README.md)、fork PR [#30](https://github.com/DF-wu/lilac-mono/pull/30) | Plugin 是 trusted in-process code；restricted callers 目前不能直接使用 external callables |
 | 本次輸入的壓縮保護 | Core 在 threshold 檢查前驗證本次輸入邊界；沒有舊歷史時略過軟性壓縮，摘要舊歷史時保留本次輸入原文。未提供保護邊界的呼叫端維持上游的作用中請求壓縮行為 | `packages/agent/auto-compaction.ts`、`apps/core/src/surface/bridge/bus-agent-runner.ts`、fork PR [#82](https://github.com/DF-wu/lilac-mono/pull/82) | 真正 overflow 仍走既有恢復／失敗路徑；略過軟性壓縮不保證下一次請求能放入 context |
@@ -51,8 +61,20 @@ skill 遷移未完成事項。Native 工具送訊息預設排隊投遞，不啟�
 | Compatible-provider tool images | 把 tool results 的圖片移至完整平行 tool-result group 後方，成為附有來源標籤的 user image message，讓通用 Chat Completions 接收視覺輸入而非序列化圖片資料 | `packages/utils/openai-compatible-tool-images.ts`、`packages/utils/tests/openai-compatible-tool-images.test.ts` | 僅轉換 provider view，canonical history 不變；endpoint 與模型仍須支援 user image inputs；官方 OpenAI Responses 路徑不使用此 shim |
 | Container delivery | Build workflow 發布經驗證的 `catalina`、`claudia` 與 SHA tags，`latest` 指向 `catalina`；每個 variant 都有各自的帳號與 home directory，image 另加入 `rsync` | [`build-image.yml`](../.github/workflows/build-image.yml)、[`Dockerfile`](../Dockerfile) | 兩個發布 variant 都使用 UID/GID 3000；host bind mounts 必須允許該數字身分存取 |
 | Upstream maintenance | 每 6 小時檢查 upstream；乾淨候選合併通過完整 CI 後更新 `main` 並發布映像；Git 衝突開 PR，由 Claude 唯讀分析並要求 `Catalina-df` review | [`sync-upstream.yml`](../.github/workflows/sync-upstream.yml)、[設定說明](./upstream-sync.md) | CI 失敗停止更新；衝突解決與整合驗證由人工負責 |
-| Core memory watchdog | `process.memory` watchdog 在 RSS 達 8 GiB（原為 4 GiB）時重啟 Core，RSS 警告事件從 3 GiB（原為 1.5 GiB）開始；768 MiB 主 isolate 上限不變 | `apps/core/src/tool-server/health-state.ts`、fork issue [#128](https://github.com/DF-wu/lilac-mono/issues/128) | 上限依部署主機寫死，該主機未設容器記憶體上限。較高上限只會延後保留記憶體造成的重啟，不會回收記憶體 |
-| Worker isolate memory telemetry | Core 的每個 worker isolate（thread search、materializer、summarization）透過 `BroadcastChannel` 回報自己的 heap 計數。`process.memory` 診斷與記憶體事件觀測值在 `isolates` 下列出這些數值；Core 每 10 分鐘記錄一筆 `runtime.memory.sample`，包含 RSS、主 isolate 與各 worker heap，以及每 30 秒取樣的 RSS 與主 `heapTotal` 高點 | `apps/core/src/shared/isolate-memory.ts`、`apps/core/src/runtime/memory-sampler.ts`、fork issue [#129](https://github.com/DF-wu/lilac-mono/issues/129) | 只做觀測，不會回收或重建 worker。worker 計數是各 isolate 自己的值，RSS 則是整個行程；`heapUsed` 是各 isolate 上次 GC 時的值。忙碌中的 worker 會在當前同步工作結束後才回覆，超過 1 秒則列為未回應 |
+| Core memory watchdog | 行程 RSS 達 8 GiB，或主 isolate 的 `heapUsed` 達 768 MiB，記憶體健康檢查即失敗。RSS 達 3 GiB 開始記錄警告事件。預設 watchdog 連續三次取樣失敗後重啟 Core | [容器診斷](./docker-deployment.md#core-memory-diagnostics)、fork PR [#130](https://github.com/DF-wu/lilac-mono/pull/130) | 門檻由程式定義。RSS 涵蓋整個行程，heap 門檻使用 Bun 主 isolate 上次 GC 後的計數 |
+| Worker isolate 記憶體診斷 | Thread search、materializer 與 summarization workers 透過 `BroadcastChannel` 回報各自的 heap 計數。記憶體事件在 `isolates` 下顯示這些數值。Core 每 10 分鐘記錄一筆 `runtime.memory.sample`，包含 RSS、isolate 計數，以及每 30 秒取樣的 RSS 與主 isolate `heapTotal` 高點 | [容器診斷](./docker-deployment.md#core-memory-diagnostics)、fork PR [#131](https://github.com/DF-wu/lilac-mono/pull/131) | 各 isolate 的 `heapUsed` 為上次 GC 後的值，RSS 涵蓋整個行程。曾回報的 worker 超過一秒未回應時可能列為未回應 |
+
+## 保留的修正與整合行為
+
+| 領域 | Fork 保留的行為 | 程式碼或驗證 |
+| --- | --- | --- |
+| HEIF 模型輸入 | 將驗證過的 HEIC/HEIF 附件轉成有大小上限的 JPEG，供模型與對話摘要使用。已存為資源的原檔仍可透過資源工具取得 | [附件處理](./native-surface.md#heif-attachments)、fork [#126](https://github.com/DF-wu/lilac-mono/pull/126)、`apps/core/src/resource/heif-model-image.ts` |
+| Native 瀏覽器快取 | 由 IndexedDB 交易決定討論串的存取順序，確保多分頁與時間戳相同時仍能按順序淘汰 | `apps/web/src/cache.ts`、`apps/web/tests/cache.test.ts`、fork [#114](https://github.com/DF-wu/lilac-mono/pull/114) |
+| 原始 session 權限 | 為受限的工具呼叫與 surface 操作保留請求發起者的 session | `request-control-authority.ts`、[PR #101 執行階段盤點](./fork-integration-20261111/runtime.md) |
+| Redis 訂閱清理 | 並行清理共用同一次操作，失敗後可以重試 | `packages/event-bus/redis-streams-bus.ts`、`packages/event-bus/tests/redis-streams-bus.test.ts` |
+| GitHub 審查替換 | 新審查 prompt 持久化發布後，保留尚未完成的中斷操作，交由 webhook 重送時重試 | `apps/core/src/github/github-state.ts`、`apps/core/tests/github/github-webhook-durable-delivery.test.ts` |
+| SSH 輸出收尾與檔案一致性 | 終止後若 SSH ControlMaster 仍持有輸出串流，限制等待時間。遠端工作目錄與 glob 維持與本機相同的行為 | [Remote runner](../DEVELOPMENT.md#remote-runner)、fork [#118](https://github.com/DF-wu/lilac-mono/pull/118) 與 [#119](https://github.com/DF-wu/lilac-mono/pull/119) |
+| 安裝程式的映像帳號 | 依選定映像的執行帳號準備 bind mount 中的私有資料。CI 驗證預設映像、Catalina 與 Claudia | [安裝資料與映像選擇](./installation.md)、`apps/installer/src/data-files.ts` |
 
 ## Telegram 現況
 
@@ -76,7 +98,7 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 
 ## 回饋上游的貢獻
 
-截至 2026-10-06，本 fork 向 upstream 開過的所有 pull request。已 merge 的貢獻兩邊都有，不再構成 fork divergence；已關閉的則說明某項 fork 差異為何仍存在或被放棄。
+下表記錄已送出的上游貢獻。已接收的變更若有 fork 專屬後續修正，會列在上方的現行清單。
 
 ### 已被上游接收的貢獻
 
@@ -86,6 +108,7 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 | `TAVILY_API_BASE_URL` 與相關 normalization/docs | Upstream PR [#4](https://github.com/stanley2058/lilac-mono/pull/4)、[#5](https://github.com/stanley2058/lilac-mono/pull/5) 於 2026-02-20、2026-02-21 merge | 視為 inherited upstream capability |
 | GitHub agent-comment marker、safe trigger parsing 與 self-trigger loop prevention | Upstream PR [#13](https://github.com/stanley2058/lilac-mono/pull/13) 於 2026-06-08 merge | 不列入 fork-only GitHub 差異 |
 | GitHub reply permalinks：`In reply to` 連結指向被引用的 issue/PR body 或 comment anchor，並使用設定的 GitHub host（支援 GHES）；agent 回覆與 workflow progress 訊息都適用（[`github-reply-permalinks.md`](./github-reply-permalinks.md)） | Upstream PR [#35](https://github.com/stanley2058/lilac-mono/pull/35) 於 2026-10-05 merge，源自 fork PR [#49](https://github.com/DF-wu/lilac-mono/pull/49) 與 [#78](https://github.com/DF-wu/lilac-mono/pull/78)；已於 [`ca808ccb`](https://github.com/DF-wu/lilac-mono/commit/ca808ccb) sync 回來 | 視為 inherited upstream capability；fork 的六個 permalink 接縫與兩個測試已與 upstream 相同，並已移出 footprint allowlist |
+| GitHub webhook 與 workflow 取消的投遞 UUID | 上游 PR [#36](https://github.com/stanley2058/lilac-mono/pull/36) 於 2026-11-11 合併 | 兩邊都在發布時建立或正規化 UUID。詳見[既有投遞識別碼相容性](../MIGRATIONS.md#uuid-request-delivery-identities) |
 
 ### 未 merge 即關閉
 
@@ -108,10 +131,11 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 - **Fork-specific Discord working-indicator defaults**：已回復 upstream defaults。
 - **舊 empty-reply feature flag**：已 revert 或由後續 upstream 行為取代。
 - **`smart-search` 基礎 runtime**：相關實作目前不存在於 tree，屬於 reverted/superseded 行為，不是現行 container capability。
+- **Native 搜尋的查詢範圍及索引**採用上游 [`5720b6b1`](https://github.com/stanley2058/lilac-mono/commit/5720b6b12bd5c69caea6450c09689c945244ce9e) 的實作。Fork 保留 [#121](https://github.com/DF-wu/lilac-mono/pull/121) 與 [#122](https://github.com/DF-wu/lilac-mono/pull/122) 的討論串隔離、訊息順序與穩定分頁測試。
 
 ## 相容性與安全邊界
 
-本 fork 保留 upstream 的主要架構與 config migration policy，但新增功能可能需要 `configVersion: 2`。Greenfield changes 可能是 breaking changes；升級前請閱讀 [`../MIGRATIONS.md`](../MIGRATIONS.md)。
+本 fork 沿用上游的設定遷移政策。Telegram 與 OpenAI 搜尋支援 Core 設定 v2 與 v3，v1 欄位定義維持凍結。升級前請閱讀 [遷移文件](../MIGRATIONS.md)。
 
 下列機制是 guardrails 或 trusted execution，不是 hostile-code sandbox：
 
@@ -129,6 +153,10 @@ Telegram 是目前最大的 fork-only product delta。已實作的主要路徑�
 
 | 功能 | Fork 自有模組 | Upstream 接縫 |
 | --- | --- | --- |
+| Native 麥克風聽寫 | `apps/web/src/dictation.ts`、`components/DictationButton.tsx`、`components/DictationSettings.tsx`、`tests/dictation.test.ts` | Chat 與 Composer 管理取消和送出，編輯器插入文字，Preferences 管理依安裝與帳號隔離的設定及分頁內的服務權杖 |
+| Native 對話錄製 | `apps/core/src/surface/native/discord-mirror*.ts` 處理觀察、webhook 投遞、子討論串路由和附件選擇 | Native runtime 啟用 recorder。`NativeStore` 管理已提交的顯示事件與持久化的子討論串保留紀錄 |
+| HEIF 模型輸入 | `apps/core/src/resource/heif-model-image.ts` 負責有限制的轉換 | Resource service、既有訊息與對話摘要的載入流程保留原檔，並準備模型用的圖片 |
+| Native 瀏覽器快取 | `apps/web/src/cache.ts` 與相關測試 | IndexedDB 寫入交易控制存取順序與淘汰 |
 | Telegram surface | `apps/core/src/surface/telegram/`（adapter、ingress、output、store、protocol，以及拆成 `telegram-request-router.ts`、`telegram-request-router-composition.ts` 與 `telegram-request-router-publish.ts` 的 router；router 對齊 upstream 的 Discord router，並原封不動地 import `surface/discord/discord-request-router/` 下的共用 helpers，見 [`telegram-feature-parity.zh-TW.md`](./telegram-feature-parity.zh-TW.md)）。`telegram-surface-runtime.ts` 負責啟動時的 adapter 解析、descriptor 初始化與監督、config hot-reload 與 workflow target 授權；`TelegramAdapter` 將初始化與 ingress 啟動分開 | `runtime/create-core-runtime.ts`（啟動時的 adapter 解析、runtime descriptor input、Telegram 初始化與 ingress 順序、config hot-reload 與 workflow target authorizer）、`runtime/compose-builtin-surface-runtimes.ts`（一個 descriptor entry）、`surface/types.ts` 的 closed platform unions、`builtin-surface-protocols.ts`、`bridge/request-ids.ts`、`surface/adapter.ts` 的 attachment-resolver capability、`surface/bridge/` 下 platform-aware 的 composition 與 relay refs、`transcript/transcript-store.ts` 與 legacy snapshot decoders 的 Telegram platform filters，以及 `workflow/` 下的 domain 型別、engine、waits、operation policy、progress projector 與 view、trigger scheduler 與 durable store（Telegram targets、`waitForReply`、progress cards 與 target 重新驗證） |
 | Telegram conversation memory | `apps/core/src/surface/telegram/telegram-conversation-source.ts`（覆蓋 `telegram-surface.db` 的 SQL views、projection decoders、attachment metadata）以及 `telegram-surface-runtime.ts` 裡的 `telegramConversationMemoryInput` / `hydrateTelegramConversationAttachments` | `conversation/thread-store.ts`（第三個 source 分支、`telegram_thread` kind、allowlist 子句）、`thread-service.ts`（surface 標籤與 allowlist 檢查）、summarization worker、其 protocol 與 `thread-worker.ts`、`runtime/create-core-runtime.ts`（掛上 source、hydrate Telegram refs、傳入 worker 路徑，並把 `surface.telegram.botName` 加入 thread store 的 main-agent user names）、`bus-agent-runner.ts`（recall 的 surface 標籤）、`tool-server/tools/conversation-thread.ts`（enum）、`packages/utils/prompt-templates/TOOLS.md`（Telegram `t.me` 連結） |
 | Telegram 設定 | `packages/utils/core-config/telegram-surface.ts`（型別、預設值、v2 schema）與 `telegram-runtime.ts`（token 與 database path helpers） | `core-config/types.ts`、`v1.ts`、`v2.ts`（各一個欄位）與 `core-config.ts` 的 re-export |

@@ -209,7 +209,7 @@ async function configureInstallation(
     const current = getConfigValue(loaded.document, []);
     prompt.note("Review installation");
     prompt.note(permissionReview(validatedConfig));
-    prompt.note(`Directory: ${root}\nContainer UID: 1000\nCore image: ${images.core}`);
+    prompt.note(`Directory: ${root}\nCore image: ${images.core}`);
     if (draft.computerEnabled)
       prompt.note(`Computer gateway: ${images.gateway}\nComputer runner: ${images.runner}`);
     if (
@@ -233,7 +233,7 @@ async function configureInstallation(
       prompt.note("Cancelled. Installation files were not changed.");
       return Result.ok({ installed: false, root });
     }
-    prompt.note("Preparing private data files for container UID 1000…");
+    prompt.note("Preparing private data files for the selected Core image…");
     yield* Result.await(
       writeInstallation({
         root,

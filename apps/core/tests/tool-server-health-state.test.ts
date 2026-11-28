@@ -274,9 +274,19 @@ describe("tool server health state", () => {
       expect(recovered.info.process.lastMemoryIncident?.status).toBe("recovered");
     });
 
-    it("restarts when the main isolate exceeds its limit with low rss", async () => {
+    it("counts external memory already included in the main heap only once", async () => {
+      const { health, onUnhealthy } = createWatchedHealth();
+      setMemory({ rss: 1000, heapUsed: 767, external: 68 });
+
+      expect((await memoryCheck(health))?.ok).toBe(true);
+      await health.runWatchdog();
+      await health.runWatchdog();
+      expect(onUnhealthy).not.toHaveBeenCalled();
+    });
+
+    it("restarts when the main isolate reaches its limit with low rss", async () => {
       const { health, onUnhealthy, warnings } = createWatchedHealth();
-      setMemory({ rss: 1000, heapUsed: 700, external: 68 });
+      setMemory({ rss: 1000, heapUsed: 768, external: 68 });
 
       expect(await memoryCheck(health)).toMatchObject({
         ok: false,

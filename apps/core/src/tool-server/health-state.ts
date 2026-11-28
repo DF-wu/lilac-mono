@@ -180,8 +180,7 @@ const DEFAULT_EVENT_LOOP_FAIL_STREAK = 3;
 const DEFAULT_WATCHDOG_INTERVAL_MS = 5_000;
 const DEFAULT_WATCHDOG_FAILURE_THRESHOLD = 3;
 const DEFAULT_TOOL_CALL_OVERDUE_GRACE_MS = 15_000;
-// Worker isolates share this process, so RSS includes bursts that a restart cannot usefully bound.
-// heapUsed and external exclude worker heaps, which makes them the restart signal for Core itself.
+// In Bun/JSC, heapUsed already counts the isolate's extra memory also reported in external.
 // The RSS ceiling still catches native leaks and runaway workers, which those counters cannot see.
 // Fork: a busy deployment starts near 1.8 GiB and retains burst capacity, so 4 GiB restarted healthy
 // Core after about a day; 8 GiB keeps the runaway guard while leaving room for concurrent runs.
@@ -505,7 +504,7 @@ export function createToolServerHealthState(options: ToolServerHealthStateOption
 
   function describeMemoryFailure(memory: ToolServerMemoryUsage): string | undefined {
     if (memory.rss >= maxRssBytes) return `rss ${memory.rss} exceeded limit ${maxRssBytes}`;
-    const mainIsolateBytes = memory.heapUsed + memory.external;
+    const mainIsolateBytes = memory.heapUsed;
     if (mainIsolateBytes < maxMainIsolateBytes) return undefined;
     return `main isolate memory ${mainIsolateBytes} exceeded limit ${maxMainIsolateBytes}`;
   }

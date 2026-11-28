@@ -314,6 +314,8 @@ bot only ever sees updates delivered to it. Reply context, `listMsg`, and unread
 tracking are therefore served from a local SQLite index at `dbPath`, populated as
 messages arrive. A freshly-provisioned bot has no history of a chat, even one it
 has been in for a while.
+At startup Core creates the database parent directory if needed and initializes
+the index before attaching it to conversation memory.
 
 **Inbound media is re-resolved from `file_id`, never fetched by URL.** Telegram
 download URLs embed the bot token and the underlying `file_path` expires after

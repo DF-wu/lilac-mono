@@ -1,6 +1,6 @@
-# Exact upstream-owned footprint after PR #101 and its follow-up.
-# Fork additions and every refreshed-baseline path are in docs/fork-integration-20261111/PATH-INVENTORY.md.
-# Validate with bun run fork:footprint -- --strict.
+# Upstream-owned paths changed by the fork since the integrated upstream merge base.
+# See docs/fork-differences.md for the current baseline and feature ownership.
+# Validate with bun run fork:footprint -- --strict after fetching upstream main.
 
 .env.example  # documents fork-only environment variables
 .github/workflows/ci.yml  # container variant matrix and the upstream-footprint job
@@ -27,7 +27,7 @@ apps/core/src/conversation/thread-summarization-worker.ts  # opens the telegram 
 apps/core/src/conversation/thread-worker.ts  # forwards the telegram source and hydrates telegram refs
 apps/core/src/custom-commands/manager.ts  # menu alias index and @target-aware command parsing
 apps/core/src/generated/config-schemas/core-config.schema.json  # generated from fork input schemas including Telegram and OpenAI search
-apps/core/src/github/webhook/github-webhook-server.ts  # final publication policy, UUID delivery identity repair and redacted contract error logging (#107)
+apps/core/src/github/webhook/github-webhook-server.ts  # final publication policy, interrupt replay, and redacted contract error logging
 apps/core/src/resource/service.ts  # leaves HEIF bytes available for model conversion instead of the Bun image preview
 apps/core/src/runtime/compose-builtin-surface-runtimes.ts  # includes the Telegram runtime descriptor entry
 apps/core/src/runtime/create-core-runtime.ts  # constructs and registers the Telegram surface module; collects worker isolate memory and starts the memory sampler
@@ -46,10 +46,9 @@ apps/core/src/surface/native/runtime.ts  # composes the opt-in fork-owned Discor
 apps/core/src/surface/native/store.ts  # committed display notifications, durable Discord child routing, and PR113 revoked-steer admission and assistant attribution
 apps/core/src/surface/native/push.test.ts  # updates the native schema upgrade regression for durable Discord child routing
 
-# --- OpenAI web.search provider (staged for an upstream contribution; remove once accepted)
 apps/core/src/surface/types.ts  # adds "telegram" to the closed SessionRef/MsgRef unions
 apps/core/src/tool-server/create-tool-server.ts  # x-lilac-origin-session-id header and initiator-scoped restricted calls
-apps/core/src/tool-server/health-state.ts  # 8 GiB RSS watchdog ceiling and 3 GiB warning level for the deployment host
+apps/core/src/tool-server/health-state.ts  # RSS watchdog thresholds and Bun/JSC heap accounting
 apps/core/src/tool-server/request-control-authority.ts  # origin session authority
 apps/core/src/tool-server/tools/conversation-thread.ts  # telegram in the surface filter enum
 apps/core/src/tool-server/tools/image-script.ts  # adds the openaiCompatible provider to the script providers
@@ -65,7 +64,7 @@ apps/core/src/transcript/stored-message-materialization.ts  # converts verified 
 apps/core/src/transcript/transcript-store.ts  # Telegram platform filters
 apps/core/src/workflow/durable-workflow-store.ts  # Telegram target revalidation
 apps/core/src/workflow/workflow-domain.ts  # Telegram workflow targets
-apps/core/src/workflow/workflow-engine.ts  # Telegram waitForReply/targets and legacy cancellation key to wire UUID normalization (#108)
+apps/core/src/workflow/workflow-engine.ts  # Telegram waitForReply and target integration
 apps/core/src/workflow/workflow-operation-policy.ts  # Telegram waitForReply policy
 apps/core/src/workflow/workflow-progress-projector.ts  # target authorization hook and Telegram ports
 apps/core/src/workflow/workflow-progress-view.ts  # Telegram progress card rendering
@@ -77,6 +76,7 @@ apps/core/tests/github/github-webhook-dispatch.test.ts  # F19: Final publication
 apps/core/tests/heartbeat/heartbeat-service.test.ts  # machine-independent quiet-hours timezone test
 apps/core/tests/resource/resource-service.test.ts  # covers HEIF conversion around the inline size limit and preservation of originals
 apps/core/tests/runtime/compose-builtin-surface-runtimes.test.ts  # covers the Telegram runtime entry
+apps/core/tests/runtime/core-runtime-resilience.case.ts  # verifies fresh Telegram history startup with a nested database path
 apps/core/tests/runtime/config-schemas.test.ts  # verifies fork editor schema acceptance and removed image config diagnostics
 apps/core/tests/surface/authenticated-request.test.ts  # Telegram principals
 apps/core/tests/surface/bridge/adapter-event-projection.test.ts  # Telegram adapter events
@@ -102,6 +102,7 @@ apps/core/tests/workflow/workflow-engine.test.ts  # Telegram workflow targets
 apps/core/tests/workflow/workflow-progress-projector.test.ts  # target authorization
 apps/core/tests/workflow/workflow-trigger-scheduler.test.ts  # target rechecks
 apps/core/tests/workflow/workflow-wait-resolver.test.ts  # Telegram reply waits
+apps/installer/src/wizard.ts  # reports private data preparation for the selected runtime image
 apps/tool-bridge/client.test.ts  # origin session header
 apps/tool-bridge/client.ts  # forwards the origin session header
 apps/tool-bridge/index.ts  # preserves lazy runtime configuration for content.inspect in the standalone bridge
@@ -115,6 +116,7 @@ docker/verify-image.sh  # verifies the container identity variants
 docs/core-config-migrations.md  # documents fork v2 config keys
 docs/docker-deployment.md  # documents container identity variants and optional native Discord recording setup
 docs/heartbeat.md  # clarifies that the fork's Telegram surface is not a heartbeat default destination
+docs/installation.md  # documents fork releases and variant-specific data ownership
 docs/native-surface.md  # documents fork-only Discord recording and browser dictation setup, delivery guarantees, and limits
 package.json  # fork:footprint script and scripts/fork lint, format, and typecheck coverage
 packages/agent/adapters/ai-sdk/adapter.ts  # executes parsed local tool calls on nonstandard finish reasons
@@ -138,6 +140,7 @@ packages/utils/model-provider.ts  # wires provider-local tool-image middleware; 
 packages/utils/prompt-templates/TOOLS.md  # mentions Telegram t.me links for conversation tools
 packages/utils/tests/core-config.versioning.test.ts  # v1/v2 drift test for fork keys
 packages/utils/tests/core-config.web-search-provider.test.ts  # covers the openai provider config
+plan/README.md  # records confirmed limits of fork extensions for later review
 scripts/architecture/architecture.test.ts  # expects the Telegram request router event consumer
 scripts/architecture/core-final-boundary-identities.ts  # registers the attachment-resolver capability predicate and the isolate memory channel decoder
 scripts/architecture/manifest.ts  # registers fork module boundaries, codecs, and exception adapters

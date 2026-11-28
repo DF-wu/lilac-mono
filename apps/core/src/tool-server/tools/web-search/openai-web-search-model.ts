@@ -1,6 +1,5 @@
+import { DEFAULT_OPENAI_WEB_SEARCH_MODEL_SPEC } from "@stanley2058/lilac-utils/core-config/openai-web-search";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
-
-import { DEFAULT_OPENAI_WEB_SEARCH_MODEL } from "./openai-web-search-provider";
 
 /**
  * Resolves `tools.web.openai.model` to the endpoint that runs the hosted
@@ -60,7 +59,7 @@ export function resolveOpenAIWebSearchModel(input: {
   readonly model: string | undefined;
   readonly environment: OpenAIWebSearchModelEnvironment;
 }): ResultType<ResolvedOpenAIWebSearchModel, OpenAIWebSearchModelInvalid> {
-  const raw = input.model?.trim() || `openai/${DEFAULT_OPENAI_WEB_SEARCH_MODEL}`;
+  const raw = input.model?.trim() || DEFAULT_OPENAI_WEB_SEARCH_MODEL_SPEC;
   const spec = resolveSpec(raw);
   const separator = spec.indexOf("/");
   const provider = separator === -1 ? "" : spec.slice(0, separator);

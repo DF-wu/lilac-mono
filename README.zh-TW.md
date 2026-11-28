@@ -30,13 +30,15 @@ Lilac 把平台訊息、路由、模型執行、工具、Skills 與可恢復工�
 
 ## 本 Fork 的主要差異
 
-以下只列出目前仍與上游不同的行為。GitHub reply permalinks 與 comment self-loop 防護已被上游接收，不再列出。完整依據、限制與所有向上游開過的 pull request 見 [`docs/fork-differences.zh-TW.md`](./docs/fork-differences.zh-TW.md)。
+現行功能與修正、上游整合基準和已接收的貢獻，見 [fork 維護清單](./docs/fork-differences.zh-TW.md)。
 
 | 領域 | 本 fork 提供的差異 | 重要限制 |
 | --- | --- | --- |
 | Telegram surface | DMs、群組、forum topics、串流 HTML 回覆、取消、reaction、command menu、inbound/outbound attachments、workflow cards、同 surface tools，以及納入跨 surface 對話記憶的 Telegram 歷史 | 預設停用；僅 long polling；記憶以每個聊天或 topic 為一個 thread |
+| Native 對話錄製 | 將 Native 使用者訊息、可見的助理文字及已就緒的附件傳到 Discord。詳見[設定與投遞保證](./docs/native-discord-mirror.md) | 預設停用，啟用後才開始盡力投遞。可選擇每段對話一個 Discord 子討論串 |
+| Native 麥克風聽寫 | 瀏覽器錄音後把轉錄文字附加到草稿。詳見[聽寫設定](./docs/native-surface.md#microphone-dictation) | 須手動啟用，並使用瀏覽器可連線且允許 Native 來源的轉錄服務 |
 | OpenAI-compatible 圖像 provider | 將 operator 的 OpenAI-compatible endpoint 以 `providers.openaiCompatible` 提供給上游的 `generate.image` scripts，並在 `image-generation` skill 附上 gateway recipe | 需要 `OPENAI_COMPATIBLE_BASE_URL`；restricted caller 不能執行圖像 script；provider 之間無自動 fallback |
-| OpenAI `web.search` provider | `tools.web.extract.providers` 填入 `openai` 後，`web.search` 改走 OpenAI Responses 的 `web_search` 工具，回傳答案引用的來源 | 僅 `configVersion: 2`；只做搜尋（`web.extract` 會略過）；日期限制只是對模型的指示 |
+| OpenAI `web.search` provider | `tools.web.extract.providers` 填入 `openai` 後，`web.search` 改走 OpenAI Responses 的 `web_search` 工具，回傳答案引用的來源 | 支援 Core 設定 v2 與 v3。`web.extract` 會略過。日期限制透過提示詞傳達給模型 |
 | Custom media plugin | 可部署的 Level 2 image/video plugin 範例，示範嚴格設定與檔案安全處理 | Plugin 是 trusted in-process code；restricted caller 目前不能使用 external callables |
 | 維運與交付 | 每 6 小時檢查 upstream、發布經驗證的 GHCR `catalina`/`claudia` tags，CI 並強制執行 upstream-footprint allowlist | 自動合併發生衝突時仍需人工處理 |
 
@@ -145,7 +147,7 @@ Core 必須有 `REDIS_URL` 與有效的 model 設定。啟用 Discord 時才需�
 | --- | --- | --- | --- |
 | Native | `surface.native.enabled: true`、installation ID、local 或 Clerk 認證，以及 provider credentials | 預設停用；僅限已認證的 owner 存取 | [`docs/native-surface.md`](./docs/native-surface.md) |
 | Discord | `DISCORD_TOKEN`；設定 `allowedChannelIds` 或 `allowedGuildIds` | 兩個 allowlist 都空時忽略所有 Discord traffic | [`core-config.example.yaml`](./packages/utils/config-templates/core-config.example.yaml) |
-| Telegram | `configVersion: 2`、`enabled: true`、`token`、`allowedChatIds` | 預設停用；空 chat allowlist 時忽略所有 chats | [`docs/telegram-surface.md`](./docs/telegram-surface.md) |
+| Telegram | `configVersion: 2` 或 `3`、`enabled: true`、`token`、`allowedChatIds` | 預設停用。允許清單為空時會忽略所有 chats | [`docs/telegram-surface.md`](./docs/telegram-surface.md) |
 | GitHub | GitHub App auth、`GITHUB_WEBHOOK_SECRET`、可被 GitHub 連到的 HTTPS/reverse proxy；user token 是可選的 preferred outbound identity | 沒有 GitHub App secret 時整個 surface 不啟動；signature 不符回傳 `401` | [`docs/github-reply-permalinks.md`](./docs/github-reply-permalinks.md) |
 
 GitHub webhook 預設監聽 port `8787`、path `/github/webhook`。Stock Compose 沒有轉送或公開 GitHub webhook 的環境與 port，因此 production deployment 必須自行補上 reverse proxy、environment 與 network wiring。

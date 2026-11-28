@@ -33,7 +33,8 @@ This check writes a temporary installation through the real installer, starts Co
 checks health, local authentication, operator tool access, and a completed native HTTP RPC request.
 A local fake OpenAI-compatible server supplies the streamed reply. No provider account or Discord
 credentials are needed. The check removes its Compose containers, volumes, and temporary files on exit.
-The image must use the installer's standard UID 1000. CI runs this check against `lilac:ci`.
+CI runs this check against the default `lilac` image (UID/GID 1000) and the Catalina and Claudia
+variants (UID/GID 3000). The installer prepares `/data` for the identity in the selected image.
 
 Start the Compose deployment and verify operator access against the running Core service:
 
@@ -45,6 +46,20 @@ docker compose logs -f lilac
 ```
 
 `bun run docker:verify` runs `tools --operator --list` inside the container. This checks that the root CLI can load the generated token and that Core received the matching hash. Compose readiness uses Core's `/readyz` endpoint. The generic `mem_limit` and `pids_limit` settings bound the whole container and can be adjusted with `LILAC_CONTAINER_MEMORY_LIMIT` and `LILAC_CONTAINER_PIDS_LIMIT`.
+
+## Core memory diagnostics
+
+Core starts a warning incident when process RSS reaches 3 GiB. The `process.memory` check fails at
+8 GiB process RSS or 768 MiB main-isolate `heapUsed`. The default watchdog restarts Core after three
+consecutive failed samples. Bun's `external` counter overlaps with `heapUsed` and is reported
+separately. Source Compose defaults to a `4g` container limit, so the container can hit its own
+limit before Core reaches the 8 GiB RSS threshold.
+
+Core logs `runtime.memory.sample` every ten minutes. It includes process-wide RSS, its main-isolate
+counters, responses from the thread search, materializer, and summarization workers, and RSS and
+main-isolate `heapTotal` peaks sampled every 30 seconds. Memory incidents also request worker
+counters. A previously observed isolate that misses the one-second probe deadline is reported as
+unresponsive until it responds or is removed after repeated misses.
 
 ## Optional Native Conversation Recording
 

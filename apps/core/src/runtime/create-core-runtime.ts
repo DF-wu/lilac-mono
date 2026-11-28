@@ -2112,6 +2112,89 @@ export async function createCoreRuntime(
               });
             },
           });
+          stopDiscordSearchIndexer = await startDiscordSearchIndexer({
+            eventSource: discordEventSource,
+            search: discordSearchService,
+            getConfig: () => getCoreConfig(),
+            materializer: conversationThreadMaterializer,
+          });
+
+          logger.debug("Discord search indexer started", {
+            dbPath: discordSearchDbPath,
+          });
+
+          // Subscribe to adapter events before connecting, so we don't miss early messages.
+          await startSurfaceAdapterIngress({
+            registry,
+            handles: surfaceAdapterIngressHandles,
+          });
+
+          requestMessageCache = createRequestMessageCache();
+
+          logger.debug("Request message cache initialized");
+
+          stopWorkflowActionResolver = await startWorkflowActionResolver({
+            bus: durableBus,
+            store: activeDurableWorkflowStore,
+            subscriptionId: subId(subscriptionPrefix, "workflow-actions"),
+            surfaceProtocolResolver: registry.protocolResolver(),
+          });
+
+          // Subscribe durably before adapter.connect() so replies around startup replay.
+          workflowWaitResolver = new WorkflowWaitResolver({
+            bus: durableBus,
+            store: activeDurableWorkflowStore,
+            subscriptionId: subId(subscriptionPrefix, "workflow-waits"),
+            confirmLegacyGroupSingleVersionRollout:
+              process.env.LILAC_CONFIRM_SINGLE_VERSION_WORKFLOW_WAIT_RESOLVER === "1",
+          });
+          await workflowWaitResolver.start();
+
+          const activeQuestionStore = questionStore;
+          if (!activeQuestionStore) {
+            return {
+              kind: "result",
+              result: Result.err(
+                new CoreRuntimeStartFailed({
+                  operation: "startup",
+                  cause: undefined,
+                  message: "Question store is unavailable",
+                }),
+              ),
+            };
+          }
+          questionService = new QuestionService({
+            store: activeQuestionStore,
+            surfaces: registry.questionResolver(),
+            logger,
+          });
+          const questionsStarted = await questionService.start();
+          const questionStartError = questionsStarted.match({
+            ok: () => null,
+            err: (error) => error,
+          });
+          if (questionStartError) {
+            return {
+              kind: "result",
+              result: Result.err(
+                new CoreRuntimeStartFailed({
+                  operation: "startup",
+                  cause: questionStartError,
+                  message: questionStartError.message,
+                }),
+              ),
+            };
+          }
+
+          await connectAndValidateSurfaceAdapters({
+            registry,
+            connected: connectedSurfaceAdapters,
+          });
+
+          logger.debug("Surface adapters connected");
+
+          await questionService.finishStartupRecovery();
+
           const hydrateThreadAttachments: ConversationThreadAttachmentHydrator = async (input) => {
             const hydrated: Awaited<
               ReturnType<ConversationThreadAttachmentHydrator>
@@ -2220,6 +2303,7 @@ export async function createCoreRuntime(
             : undefined;
           if (nativeConversationDbPath)
             activeConversationThreadStore.attachNativeSource(nativeConversationDbPath);
+          // Telegram connection creates its history schema before conversation readers attach it.
           const telegramConversationMemory = telegramConversationMemoryInput({
             adapter: telegramAdapter,
             config: startupConfig,
@@ -2342,89 +2426,6 @@ export async function createCoreRuntime(
               });
             },
           };
-          stopDiscordSearchIndexer = await startDiscordSearchIndexer({
-            eventSource: discordEventSource,
-            search: discordSearchService,
-            getConfig: () => getCoreConfig(),
-            materializer: conversationThreadMaterializer,
-          });
-
-          logger.debug("Discord search indexer started", {
-            dbPath: discordSearchDbPath,
-          });
-
-          // Subscribe to adapter events before connecting, so we don't miss early messages.
-          await startSurfaceAdapterIngress({
-            registry,
-            handles: surfaceAdapterIngressHandles,
-          });
-
-          requestMessageCache = createRequestMessageCache();
-
-          logger.debug("Request message cache initialized");
-
-          stopWorkflowActionResolver = await startWorkflowActionResolver({
-            bus: durableBus,
-            store: activeDurableWorkflowStore,
-            subscriptionId: subId(subscriptionPrefix, "workflow-actions"),
-            surfaceProtocolResolver: registry.protocolResolver(),
-          });
-
-          // Subscribe durably before adapter.connect() so replies around startup replay.
-          workflowWaitResolver = new WorkflowWaitResolver({
-            bus: durableBus,
-            store: activeDurableWorkflowStore,
-            subscriptionId: subId(subscriptionPrefix, "workflow-waits"),
-            confirmLegacyGroupSingleVersionRollout:
-              process.env.LILAC_CONFIRM_SINGLE_VERSION_WORKFLOW_WAIT_RESOLVER === "1",
-          });
-          await workflowWaitResolver.start();
-
-          const activeQuestionStore = questionStore;
-          if (!activeQuestionStore) {
-            return {
-              kind: "result",
-              result: Result.err(
-                new CoreRuntimeStartFailed({
-                  operation: "startup",
-                  cause: undefined,
-                  message: "Question store is unavailable",
-                }),
-              ),
-            };
-          }
-          questionService = new QuestionService({
-            store: activeQuestionStore,
-            surfaces: registry.questionResolver(),
-            logger,
-          });
-          const questionsStarted = await questionService.start();
-          const questionStartError = questionsStarted.match({
-            ok: () => null,
-            err: (error) => error,
-          });
-          if (questionStartError) {
-            return {
-              kind: "result",
-              result: Result.err(
-                new CoreRuntimeStartFailed({
-                  operation: "startup",
-                  cause: questionStartError,
-                  message: questionStartError.message,
-                }),
-              ),
-            };
-          }
-
-          await connectAndValidateSurfaceAdapters({
-            registry,
-            connected: connectedSurfaceAdapters,
-          });
-
-          logger.debug("Surface adapters connected");
-
-          await questionService.finishStartupRecovery();
-
           workflowProgressProjector = new WorkflowProgressProjector({
             bus: durableBus,
             store: activeDurableWorkflowStore,
