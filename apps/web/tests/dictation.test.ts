@@ -10,7 +10,7 @@ const original = Object.getOwnPropertyDescriptors(globalThis);
 let stopped = 0;
 let bytes = 12;
 let failStart = false;
-let mp4 = false;
+let supportsMp4 = false;
 const stream = { getTracks: () => [{ stop: () => stopped++ }] } as unknown as MediaStream;
 class FakeRecorder {
   state = "inactive";
@@ -19,7 +19,7 @@ class FakeRecorder {
   onstop?: () => void;
   onerror?: () => void;
   static isTypeSupported(type: string) {
-    return mp4 ? type === "audio/mp4" : type === "audio/webm;codecs=opus";
+    return type === "audio/webm;codecs=opus" || (supportsMp4 && type === "audio/mp4");
   }
   constructor(_stream: MediaStream, options?: MediaRecorderOptions) {
     this.mimeType = options?.mimeType ?? "audio/webm";
@@ -40,7 +40,7 @@ beforeEach(() => {
   stopped = 0;
   bytes = 12;
   failStart = false;
-  mp4 = false;
+  supportsMp4 = false;
   Object.defineProperties(globalThis, {
     isSecureContext: { configurable: true, value: true },
     navigator: {
@@ -138,9 +138,9 @@ test.each([
   expect(h.errors).toEqual([]);
 });
 test.each([false, true])(
-  "uploads typed multipart without cookies, redirects, or Core headers (mp4=%s)",
-  async (useMp4) => {
-    mp4 = useMp4;
+  "uploads MP4 when supported alongside WebM (mp4=%s), otherwise uses WebM",
+  async (hasMp4) => {
+    supportsMp4 = hasMp4;
     let request: RequestInit | undefined;
     const fetcher = mock(async (url: string, options: RequestInit) => {
       expect(url).toBe(config.endpoint);
@@ -167,8 +167,8 @@ test.each([false, true])(
     expect(body.get("response_format")).toBe("json");
     const file = body.get("file") as File;
     expect(file.size).toBe(12);
-    expect(file.name).toBe(useMp4 ? "dictation.mp4" : "dictation.webm");
-    expect(file.type).toBe(useMp4 ? "audio/mp4" : "audio/webm;codecs=opus");
+    expect(file.name).toBe(hasMp4 ? "dictation.mp4" : "dictation.webm");
+    expect(file.type).toBe(hasMp4 ? "audio/mp4" : "audio/webm;codecs=opus");
   },
 );
 test("cancels late permission without recording or uploading", async () => {
