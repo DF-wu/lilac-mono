@@ -39,7 +39,7 @@ export function dictationSupport(): string | undefined {
 }
 
 function recordingFormat() {
-  return ["audio/webm;codecs=opus", "audio/mp4", "audio/webm"].find((type) =>
+  return ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"].find((type) =>
     MediaRecorder.isTypeSupported(type),
   );
 }
