@@ -573,6 +573,16 @@ describe("subagent model selection", () => {
         },
       }),
     ).toMatchObject({ supportsAudio: true, supportsVideo: true });
+    const pdfCapability = {
+      ...capability,
+      modalities: { input: ["text" as const, "image" as const, "pdf" as const] },
+    };
+    expect(
+      resolveStoredResourceProviderTarget({ provider: "openai", capability: pdfCapability }),
+    ).toMatchObject({ supportsImage: true, supportsPdf: true });
+    expect(
+      resolveStoredResourceProviderTarget({ provider: "codex", capability: pdfCapability }),
+    ).toMatchObject({ supportsImage: true, supportsPdf: false });
     expect(
       resolveStoredResourceProviderTarget({
         provider: "claude-code",
@@ -2092,6 +2102,115 @@ describe("startBusAgentRunner production path", () => {
       await bus.close();
     }
   });
+
+  it.each([
+    {
+      name: "an unrelated HTTP 400",
+      statusCode: 400,
+      message: "Invalid request option",
+      withPdf: false,
+    },
+    {
+      name: "an ambiguous PDF rejection",
+      statusCode: 415,
+      message: "This PDF input is unsupported",
+      withPdf: true,
+    },
+  ])(
+    "preserves canonical media after $name without retrying stripped input",
+    async ({ statusCode, message, withPdf }) => {
+      const config = parseCoreConfigV2ToUniversal({});
+      config.models.main = { model: "openai/rejected-media" };
+      config.agent.retry = { enabled: false, maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 };
+      const bus = createLilacBus(createInMemoryRawBus());
+      const pluginManager = corePrimaryTestPluginManager(() => undefined);
+      const imageData =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=";
+      const media: ModelMessage[] = [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Retain the image and inspect any document" },
+            {
+              type: "file",
+              mediaType: "image/png",
+              filename: "supported.png",
+              data: { type: "data", data: imageData },
+            },
+            ...(withPdf
+              ? [
+                  {
+                    type: "file" as const,
+                    mediaType: "application/pdf",
+                    filename: "rejected.pdf",
+                    data: { type: "data" as const, data: "JVBERi0=" },
+                  },
+                ]
+              : []),
+          ],
+        },
+      ];
+      const prompts: string[] = [];
+      let activeAgent: AiSdkPiAgent | undefined;
+      let canonicalAtFirstCall: ModelMessage[] | undefined;
+      const runner = await startBusAgentRunner({
+        bus,
+        subscriptionId: "preserve-rejected-media",
+        reportFatalPanic: () => undefined,
+        issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+        config,
+        pluginManager,
+        createAgent: (options) => {
+          activeAgent = new AiSdkPiAgent({
+            ...options,
+            messages: [
+              ...structuredClone(media),
+              { role: "assistant", content: "noted" },
+              ...(options.messages ?? []),
+            ],
+            model: new MockLanguageModelV4({
+              modelId: "rejected-media",
+              doStream: async (call) => {
+                canonicalAtFirstCall ??= structuredClone(activeAgent!.state.messages);
+                prompts.push(JSON.stringify(call.prompt));
+                throw new APICallError({
+                  message,
+                  url: "https://api.openai.com/v1/responses",
+                  requestBodyValues: {},
+                  statusCode,
+                  isRetryable: false,
+                });
+              },
+            }),
+          });
+          return activeAgent;
+        },
+      });
+      const requestId = "discord:preserve-rejected-media:message";
+      const lifecycle = await observeRequestLifecycle(bus, requestId);
+      try {
+        await publishRunnerRequest({
+          bus,
+          requestId,
+          sessionId: "preserve-rejected-media",
+          requestClient: "discord",
+          text: "inspect the attachments",
+        });
+        await expect(lifecycle.terminal).resolves.toBe("failed");
+        await runner.waitForIdle();
+        expect(prompts).toHaveLength(1);
+        expect(prompts[0]).toContain(imageData);
+        if (withPdf) expect(prompts[0]).toContain("JVBERi0=");
+        expect(canonicalAtFirstCall).toBeDefined();
+        expect(activeAgent?.state.messages).toEqual(canonicalAtFirstCall);
+      } finally {
+        await lifecycle.stop();
+        await runner.stop();
+        await pluginManager.destroy();
+        await bus.close();
+      }
+    },
+  );
 
   it.each(["followUp", "steer"] as const)(
     "keeps the initiator and updates tool context for different-user %s",

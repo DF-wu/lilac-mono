@@ -13,6 +13,12 @@ Earlier fork versions replaced this runner with a structured tool (prompt, Lilac
 model alias, size, mask) and `tools.generate.image` routing. That tool and its
 configuration are removed; see [Migrating from the structured tool](#migrating-from-the-structured-tool).
 
+Named v3 chat endpoints do not change this script interface. The global remains
+`providers.openaiCompatible`, backed by the single legacy environment endpoint. No
+collection of named credentials is injected. Selecting a named image endpoint needs
+an owner-approved script selector or global contract; configuring named chat servers
+alone does not change image defaults, permission profiles, or MCP exposure.
+
 ## How it works
 
 | Module | Owns |

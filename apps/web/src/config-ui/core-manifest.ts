@@ -194,16 +194,46 @@ export const coreManifest: Manifest<P> = {
           entries: [
             {
               path: "models.catalog.providers",
-              label: "Provider visibility",
-              help: "Controls which providers appear in model pickers. Auto shows a provider when its credentials are configured.",
+              label: "Available providers",
+              help: "Sets which providers' models chats and agents can choose from. Models already set in this config still work. Auto includes a provider when its credentials are configured.",
               widget: "map",
               options: {
                 '"auto"': "Auto",
-                '"enabled"': "Shown",
-                '"disabled"': "Hidden",
+                '"enabled"': "Enabled",
+                '"disabled"': "Disabled",
               },
               suggestions: CATALOG_PROVIDERS,
             },
+          ],
+        },
+        {
+          title: "OpenAI-compatible servers",
+          entries: [
+            items({
+              collection: "models.providers.openaiCompatible",
+              label: "Servers",
+              help: "Servers that speak the OpenAI API. Use their models as `openai-compatible/<server>/<model>`.",
+              itemNoun: "server",
+              keyLabel: "Server",
+              keyPlaceholder: "vllm",
+              newItem: { baseUrl: "" },
+              summary: ["baseUrl"],
+              fields: [
+                {
+                  path: "baseUrl",
+                  label: "Base URL",
+                  help: "API base URL, usually ending in `/v1`.",
+                  placeholder: "http://gpu-box:8000/v1",
+                },
+                {
+                  path: "apiKeyEnv",
+                  label: "API key variable",
+                  hint: "Environment variable name; do not paste the key.",
+                  help: "Environment variable holding the server's API key. Leave empty for servers without authentication. Changing the variable's value needs a restart.",
+                  placeholder: "VLLM_API_KEY",
+                },
+              ],
+            }),
           ],
         },
         {

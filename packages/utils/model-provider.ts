@@ -2,17 +2,7 @@
 import { env, type ResponsesTransportMode } from "./env";
 import { createHash } from "node:crypto";
 
-import { createCerebras } from "@ai-sdk/cerebras";
-import { createOpenAI } from "@ai-sdk/openai";
-import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { createXai } from "@ai-sdk/xai";
-import { createOpenRouter } from "@openrouter/ai-sdk-provider";
-import { createAnthropic } from "@ai-sdk/anthropic";
-import { createGroq } from "@ai-sdk/groq";
-import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import type { OpenAICompatibleProvider } from "@ai-sdk/openai-compatible";
-import { createGateway } from "ai";
-import { createClaudeCode } from "./claude-sdk";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
@@ -25,14 +15,64 @@ import {
 export { refreshCodexOAuthTokens, shouldRefreshCodexOAuthTokens } from "./codex-provider-auth";
 export type { RefreshCodexOAuthTokensOptions } from "./codex-provider-auth";
 import { createLogger } from "./logging";
+import {
+  configureOpenAICompatibleServers,
+  getActiveOpenAICompatibleServers,
+  selectOpenAICompatibleServer,
+  type OpenAICompatibleServers,
+} from "./openai-compatible-servers";
 import { withOpenAIImageEditFilenamesFetch } from "./openai-image-edit-fetch";
 import { withOpenAICompatibleToolImages } from "./openai-compatible-tool-images";
 import { createOpenAIResponsesWebSocketFetch } from "./openai-responses-websocket-fetch";
 import { withLlmWireDebugFetch } from "./llm-wire-debug";
 import { captureResultOutcome, isPanic, isRecord } from "./runtime-utils";
 import { withServerCompactionRequestFetch } from "./server-compaction-request";
+import type { OpenAICompatibleServerConfig } from "./core-config/types";
 
 export { claudeCodeExecutableSettings } from "./claude-code-executable";
+export { configureOpenAICompatibleServers, type OpenAICompatibleServers };
+
+// Keep provider SDKs lazy so importing utils or unused providers does not load every SDK.
+function loadCerebras(): typeof import("@ai-sdk/cerebras") {
+  const mod: typeof import("@ai-sdk/cerebras") = require("@ai-sdk/cerebras");
+  return mod;
+}
+function loadOpenAI(): typeof import("@ai-sdk/openai") {
+  const mod: typeof import("@ai-sdk/openai") = require("@ai-sdk/openai");
+  return mod;
+}
+function loadOpenAICompatible(): typeof import("@ai-sdk/openai-compatible") {
+  const mod: typeof import("@ai-sdk/openai-compatible") = require("@ai-sdk/openai-compatible");
+  return mod;
+}
+function loadXai(): typeof import("@ai-sdk/xai") {
+  const mod: typeof import("@ai-sdk/xai") = require("@ai-sdk/xai");
+  return mod;
+}
+function loadOpenRouter(): typeof import("@openrouter/ai-sdk-provider") {
+  const mod: typeof import("@openrouter/ai-sdk-provider") = require("@openrouter/ai-sdk-provider");
+  return mod;
+}
+function loadAnthropic(): typeof import("@ai-sdk/anthropic") {
+  const mod: typeof import("@ai-sdk/anthropic") = require("@ai-sdk/anthropic");
+  return mod;
+}
+function loadGroq(): typeof import("@ai-sdk/groq") {
+  const mod: typeof import("@ai-sdk/groq") = require("@ai-sdk/groq");
+  return mod;
+}
+function loadGoogle(): typeof import("@ai-sdk/google") {
+  const mod: typeof import("@ai-sdk/google") = require("@ai-sdk/google");
+  return mod;
+}
+function loadAi(): typeof import("ai") {
+  const mod: typeof import("ai") = require("ai");
+  return mod;
+}
+function loadClaudeSdk(): typeof import("./claude-sdk") {
+  const mod: typeof import("./claude-sdk") = require("./claude-sdk");
+  return mod;
+}
 
 export type Providers =
   | "openai"
@@ -278,7 +318,7 @@ export function createCodexOAuthProvider(options: CreateCodexOAuthProviderOption
     warn: (message, details) => logger.warn(message, details),
   });
 
-  return createOpenAI({
+  return loadOpenAI().createOpenAI({
     baseURL: "https://chatgpt.com/backend-api/codex",
     apiKey: OAUTH_DUMMY_KEY,
     fetch: withServerCompactionRequestFetch((async (requestInput, init) => {
@@ -362,7 +402,7 @@ function createOpenAIProviderForTransport(mode: ResponsesTransportMode) {
     }),
   );
 
-  return createOpenAI({
+  return loadOpenAI().createOpenAI({
     baseURL: env.providers.openai.baseUrl,
     apiKey: env.providers.openai.apiKey,
     fetch: withOpenAIImageEditFilenamesFetch(openaiFetch),
@@ -373,40 +413,161 @@ export function createOpenAIResponsesSseModelProvider() {
   return createOpenAIProviderForTransport("sse");
 }
 
+// Keyed by config object so clients for replaced config snapshots can be collected.
+const openAICompatibleClients = new WeakMap<
+  OpenAICompatibleServerConfig,
+  OpenAICompatibleProvider
+>();
+
+function openAICompatibleServerClient(
+  name: string,
+  server: OpenAICompatibleServerConfig,
+): OpenAICompatibleProvider {
+  const cached = openAICompatibleClients.get(server);
+  if (cached) return cached;
+  const client = createOpenAICompatibleServer(name, server);
+  openAICompatibleClients.set(server, client);
+  return client;
+}
+
+function createOpenAICompatibleServer(
+  name: string,
+  server: OpenAICompatibleServerConfig,
+): OpenAICompatibleProvider {
+  const apiKey = server.apiKeyEnv ? process.env[server.apiKeyEnv]?.trim() : undefined;
+  if (server.apiKeyEnv && !apiKey) {
+    createLogger({ module: "utils:model-provider" }).warn(
+      "openai-compatible server api key env var is not set",
+      { server: name, apiKeyEnv: server.apiKeyEnv },
+    );
+  }
+  return createOpenAICompatibleClient(server.baseUrl, apiKey || undefined);
+}
+
+function createOpenAICompatibleClient(baseURL: string, apiKey: string | undefined) {
+  // Every server shares the `openaiCompatible` options namespace that rules and aliases target.
+  return withOpenAICompatibleToolImages(
+    loadOpenAICompatible().createOpenAICompatible({
+      name: "openaiCompatible",
+      baseURL,
+      apiKey,
+      includeUsage: true,
+    }),
+  );
+}
+
+export type OpenAICompatibleRoute = { provider: OpenAICompatibleProvider; modelId: string };
+
+export class OpenAICompatibleModelUnrouted extends TaggedError("OpenAICompatibleModelUnrouted")<{
+  readonly modelId: string;
+  readonly reason: "no-server" | "no-model";
+  readonly message: string;
+}> {}
+
+export function routeOpenAICompatibleModel(
+  modelId: string,
+  servers: OpenAICompatibleServers = getActiveOpenAICompatibleServers(),
+): ResultType<OpenAICompatibleRoute, OpenAICompatibleModelUnrouted> {
+  const selected = selectOpenAICompatibleServer(modelId, servers);
+  const server = selected?.server;
+  const name = selected?.name ?? "";
+  const serverModelId = selected?.modelId ?? modelId;
+  if (server && !serverModelId) {
+    return Result.err(
+      new OpenAICompatibleModelUnrouted({
+        modelId,
+        reason: "no-model",
+        message: `'${modelId}' names OpenAI-compatible server '${name}' without a model`,
+      }),
+    );
+  }
+  if (server) {
+    return Result.ok({
+      provider: openAICompatibleServerClient(name, server),
+      modelId: serverModelId,
+    });
+  }
+  const legacy = providers["openai-compatible"];
+  if (legacy) return Result.ok({ provider: legacy, modelId });
+  return Result.err(
+    new OpenAICompatibleModelUnrouted({
+      modelId,
+      reason: "no-server",
+      message: `No OpenAI-compatible server for '${modelId}': name a server from models.providers.openaiCompatible or set OPENAI_COMPATIBLE_BASE_URL`,
+    }),
+  );
+}
+
+type BuiltinModelProviders = {
+  openai: ReturnType<(typeof import("@ai-sdk/openai"))["createOpenAI"]> | null;
+  "openai-compatible": OpenAICompatibleProvider | null;
+  cerebras: ReturnType<(typeof import("@ai-sdk/cerebras"))["createCerebras"]>;
+  codex: ReturnType<typeof createCodexOAuthProvider>;
+  xai: ReturnType<(typeof import("@ai-sdk/xai"))["createXai"]> | null;
+  anthropic: ReturnType<(typeof import("@ai-sdk/anthropic"))["createAnthropic"]> | null;
+  "claude-code": ReturnType<(typeof import("./claude-sdk"))["createClaudeCode"]>;
+  openrouter: ReturnType<(typeof import("@openrouter/ai-sdk-provider"))["createOpenRouter"]> | null;
+  groq: ReturnType<(typeof import("@ai-sdk/groq"))["createGroq"]> | null;
+  google: ReturnType<(typeof import("@ai-sdk/google"))["createGoogleGenerativeAI"]> | null;
+  vercel: ReturnType<(typeof import("ai"))["createGateway"]> | null;
+};
+
+function lazySlot<T>(factory: () => T): { get: () => T; set: (next: T) => void } {
+  let initialized = false;
+  let value: T;
+  return {
+    get() {
+      if (!initialized) {
+        value = factory();
+        initialized = true;
+      }
+      return value;
+    },
+    set(next: T) {
+      value = next;
+      initialized = true;
+    },
+  };
+}
+
 export function getModelProviders() {
-  const providers = {
-    openai: env.providers.openai
+  const openaiSlot = lazySlot(() =>
+    env.providers.openai
       ? createOpenAIProviderForTransport(env.providers.openai.responsesTransport)
       : null,
-
-    "openai-compatible": env.providers.openaiCompatible.baseUrl
-      ? withOpenAICompatibleToolImages(
-          createOpenAICompatible({
-            name: "openaiCompatible",
-            baseURL: env.providers.openaiCompatible.baseUrl,
-            apiKey: env.providers.openaiCompatible.apiKey,
-            includeUsage: true,
-          }),
+  );
+  const openaiCompatibleSlot = lazySlot(() =>
+    env.providers.openaiCompatible.baseUrl
+      ? createOpenAICompatibleClient(
+          env.providers.openaiCompatible.baseUrl,
+          env.providers.openaiCompatible.apiKey,
         )
       : null,
-
-    cerebras: createCerebras({
+  );
+  const cerebrasSlot = lazySlot(() =>
+    loadCerebras().createCerebras({
       apiKey: env.providers.cerebras.apiKey,
     }),
-    codex: createCodexOAuthProvider(),
-    xai: env.providers.xai
-      ? createXai({
+  );
+  const codexSlot = lazySlot(() => createCodexOAuthProvider());
+  const xaiSlot = lazySlot(() =>
+    env.providers.xai
+      ? loadXai().createXai({
           baseURL: env.providers.xai.baseUrl,
           apiKey: env.providers.xai.apiKey,
         })
       : null,
-    anthropic: env.providers.anthropic
-      ? createAnthropic({
+  );
+  const anthropicSlot = lazySlot(() =>
+    env.providers.anthropic
+      ? loadAnthropic().createAnthropic({
           baseURL: env.providers.anthropic.baseUrl,
           apiKey: env.providers.anthropic.apiKey,
         })
       : null,
-    "claude-code": createClaudeCode({
+  );
+  const claudeCodeSlot = lazySlot(() =>
+    loadClaudeSdk().createClaudeCode({
       defaultSettings: {
         ...claudeCodeExecutableSettings(),
         tools: [],
@@ -414,32 +575,110 @@ export function getModelProviders() {
         persistSession: false,
       },
     }),
-    openrouter: env.providers.openrouter
-      ? createOpenRouter({
+  );
+  const openrouterSlot = lazySlot(() =>
+    env.providers.openrouter
+      ? loadOpenRouter().createOpenRouter({
           baseURL: env.providers.openrouter.baseUrl,
           apiKey: env.providers.openrouter.apiKey,
         })
       : null,
-    groq: env.providers.groq
-      ? createGroq({
+  );
+  const groqSlot = lazySlot(() =>
+    env.providers.groq
+      ? loadGroq().createGroq({
           baseURL: env.providers.groq.baseUrl,
           apiKey: env.providers.groq.apiKey,
         })
       : null,
-    google: env.providers.google
-      ? createGoogleGenerativeAI({
+  );
+  const googleSlot = lazySlot(() =>
+    env.providers.google
+      ? loadGoogle().createGoogleGenerativeAI({
           baseURL: env.providers.google.baseUrl,
           apiKey: env.providers.google.apiKey,
         })
       : null,
-    vercel: env.providers.vercel
-      ? createGateway({
+  );
+  const vercelSlot = lazySlot(() =>
+    env.providers.vercel
+      ? loadAi().createGateway({
           baseURL: env.providers.vercel.baseUrl,
           apiKey: env.providers.vercel.apiKey,
         })
       : null,
-  } satisfies Record<Providers, unknown>;
-  return providers as typeof providers & Record<string, OpenAICompatibleProvider>;
+  );
+
+  const providers: BuiltinModelProviders = {
+    get openai() {
+      return openaiSlot.get();
+    },
+    set openai(next) {
+      openaiSlot.set(next);
+    },
+    // Named servers live outside this table; resolve them with routeOpenAICompatibleModel.
+    get "openai-compatible"() {
+      return openaiCompatibleSlot.get();
+    },
+    set "openai-compatible"(next) {
+      openaiCompatibleSlot.set(next);
+    },
+    get cerebras() {
+      return cerebrasSlot.get();
+    },
+    set cerebras(next) {
+      cerebrasSlot.set(next);
+    },
+    get codex() {
+      return codexSlot.get();
+    },
+    set codex(next) {
+      codexSlot.set(next);
+    },
+    get xai() {
+      return xaiSlot.get();
+    },
+    set xai(next) {
+      xaiSlot.set(next);
+    },
+    get anthropic() {
+      return anthropicSlot.get();
+    },
+    set anthropic(next) {
+      anthropicSlot.set(next);
+    },
+    get "claude-code"() {
+      return claudeCodeSlot.get();
+    },
+    set "claude-code"(next) {
+      claudeCodeSlot.set(next);
+    },
+    get openrouter() {
+      return openrouterSlot.get();
+    },
+    set openrouter(next) {
+      openrouterSlot.set(next);
+    },
+    get groq() {
+      return groqSlot.get();
+    },
+    set groq(next) {
+      groqSlot.set(next);
+    },
+    get google() {
+      return googleSlot.get();
+    },
+    set google(next) {
+      googleSlot.set(next);
+    },
+    get vercel() {
+      return vercelSlot.get();
+    },
+    set vercel(next) {
+      vercelSlot.set(next);
+    },
+  };
+  return providers as BuiltinModelProviders & Record<string, OpenAICompatibleProvider>;
 }
 
 export const providers = getModelProviders();

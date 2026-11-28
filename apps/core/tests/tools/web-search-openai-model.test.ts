@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 
 import { resolveOpenAIWebSearchModel } from "../../src/tool-server/tools/web-search/openai-web-search-model";
 
@@ -93,4 +93,63 @@ describe("resolveOpenAIWebSearchModel", () => {
       expect(result.isErr() && result.error.message).toMatch(/not in provider\/model format/u);
     }
   });
+});
+
+const originalNamedKey = process.env.LILAC_TEST_SEARCH_KEY;
+afterEach(() => {
+  if (originalNamedKey === undefined) delete process.env.LILAC_TEST_SEARCH_KEY;
+  else process.env.LILAC_TEST_SEARCH_KEY = originalNamedKey;
+});
+
+it("selects an explicit named Responses endpoint before the legacy gateway", () => {
+  process.env.LILAC_TEST_SEARCH_KEY = "named-key";
+  const resolved = resolveOpenAIWebSearchModel({
+    model: "openai-compatible/search/team/model",
+    environment,
+    openAICompatibleServers: {
+      search: { baseUrl: "https://named.example.test/v1", apiKeyEnv: "LILAC_TEST_SEARCH_KEY" },
+    },
+  }).unwrap();
+  expect(resolved).toEqual({
+    provider: "openai-compatible",
+    modelId: "team/model",
+    spec: "openai-compatible/search/team/model",
+    apiKey: "named-key",
+    baseUrl: "https://named.example.test/v1",
+  });
+});
+
+it("keeps unmatched slash-containing model ids on the legacy endpoint", () => {
+  const resolved = resolveOpenAIWebSearchModel({
+    model: "openai-compatible/team/model",
+    environment,
+    openAICompatibleServers: { search: { baseUrl: "https://named.example.test/v1" } },
+  }).unwrap();
+  expect(resolved).toMatchObject({
+    modelId: "team/model",
+    apiKey: "compat-key",
+    baseUrl: environment.openaiCompatible.baseUrl,
+  });
+});
+
+it("rejects named endpoints without credentials instead of falling back to another key", () => {
+  delete process.env.LILAC_TEST_SEARCH_KEY;
+  for (const apiKeyEnv of [undefined, "LILAC_TEST_SEARCH_KEY"]) {
+    const result = resolveOpenAIWebSearchModel({
+      model: "openai-compatible/search/model",
+      environment,
+      openAICompatibleServers: { search: { baseUrl: "https://named.example.test/v1", apiKeyEnv } },
+    });
+    expect(result.isErr()).toBe(true);
+    expect(result.isErr() && result.error.message).toContain("credentials");
+  }
+});
+
+it("rejects a named endpoint without its model", () => {
+  const result = resolveOpenAIWebSearchModel({
+    model: "openai-compatible/search/",
+    environment,
+    openAICompatibleServers: { search: { baseUrl: "https://named.example.test/v1" } },
+  });
+  expect(result.isErr()).toBe(true);
 });

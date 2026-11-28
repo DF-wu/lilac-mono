@@ -3008,7 +3008,7 @@ describe("createToolServer", () => {
       }),
       healthConfig: {
         eventLoopLagFailMs: 60_000,
-        maxRssBytes: Number.MAX_SAFE_INTEGER,
+        maxMainIsolateBytes: Number.MAX_SAFE_INTEGER,
       },
     });
 
@@ -3051,7 +3051,7 @@ describe("createToolServer", () => {
     await server.stop();
   });
 
-  it("ignores heap accounting and only uses rss for memory health", async () => {
+  it("reports process memory values in /healthz when main-isolate usage is within limit", async () => {
     setMockMemoryUsage({
       rss: 300 * 1024 * 1024,
       heapUsed: 90 * 1024 * 1024,
@@ -3064,7 +3064,7 @@ describe("createToolServer", () => {
       tools: [],
       healthConfig: {
         eventLoopLagFailMs: 60_000,
-        maxRssBytes: Number.MAX_SAFE_INTEGER,
+        maxMainIsolateBytes: Number.MAX_SAFE_INTEGER,
       },
     });
 
@@ -3087,11 +3087,11 @@ describe("createToolServer", () => {
     await server.stop();
   });
 
-  it("fails health when rss exceeds the limit", async () => {
+  it("fails health when main-isolate memory exceeds the limit", async () => {
     setMockMemoryUsage({
       rss: 300 * 1024 * 1024,
-      heapUsed: 98 * 1024 * 1024,
-      heapTotal: 100 * 1024 * 1024,
+      heapUsed: 260 * 1024 * 1024,
+      heapTotal: 280 * 1024 * 1024,
       external: 0,
       arrayBuffers: 0,
     });
@@ -3100,7 +3100,7 @@ describe("createToolServer", () => {
       tools: [],
       healthConfig: {
         eventLoopLagFailMs: 60_000,
-        maxRssBytes: 256 * 1024 * 1024,
+        maxMainIsolateBytes: 256 * 1024 * 1024,
       },
     });
 
@@ -3114,7 +3114,7 @@ describe("createToolServer", () => {
     };
     expect(healthBody.checks.find((check) => check.name === "process.memory")).toMatchObject({
       ok: false,
-      reason: `rss ${300 * 1024 * 1024} exceeded limit ${256 * 1024 * 1024}`,
+      reason: `main isolate memory ${260 * 1024 * 1024} exceeded limit ${256 * 1024 * 1024}`,
     });
 
     await server.stop();
@@ -3153,7 +3153,7 @@ describe("createToolServer", () => {
         },
         healthConfig: {
           eventLoopLagFailMs: 60_000,
-          maxRssBytes: Number.MAX_SAFE_INTEGER,
+          maxMainIsolateBytes: Number.MAX_SAFE_INTEGER,
           toolCallOverdueGraceMs: 10,
         },
       });
@@ -3636,6 +3636,67 @@ describe("createToolServer", () => {
     }
   });
 
+  it("logs caller-caused tool failures as warnings and tool faults as errors", async () => {
+    const logged: Array<{ level: string; message: string; fields: Record<string, unknown> }> = [];
+    const logger = createLogger({ module: "tool-failure-level-test" });
+    for (const level of ["warn", "error"] as const) {
+      Object.defineProperty(logger, level, {
+        value(message: string, fields: Record<string, unknown>) {
+          logged.push({ level, message, fields });
+        },
+      });
+    }
+    const tool: ServerTool = {
+      id: "failing",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          { callableId: "failing.usage", name: "Usage", description: "Usage", shortInput: [] },
+          {
+            callableId: "failing.internal",
+            name: "Internal",
+            description: "Internal",
+            shortInput: [],
+          },
+        ];
+      },
+      async call(callableId) {
+        const kind = callableId === "failing.usage" ? "usage" : "internal";
+        return Result.err(
+          serverToolFailure({ kind, code: `${kind}_failure`, message: kind, retryable: false }),
+        );
+      },
+    };
+    const server = createToolServer({ tools: [tool], logger });
+    await server.init();
+    try {
+      for (const callableId of ["failing.usage", "failing.internal"]) {
+        await server.app.handle(
+          new Request("http://localhost/call", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ callableId, input: {} }),
+          }),
+        );
+      }
+      expect(
+        logged
+          .filter((entry) => entry.message === "tool.call.result")
+          .map((entry) => [
+            entry.level,
+            entry.fields["errorKind"],
+            entry.fields["builtinCallableId"],
+          ]),
+      ).toEqual([
+        ["warn", "usage", "failing.usage"],
+        ["error", "internal", "failing.internal"],
+      ]);
+    } finally {
+      await server.stop();
+    }
+  });
+
   it("refreshes routing when a committed reload then panics during cleanup", async () => {
     const toolFor = (id: string): ServerTool => ({
       id,
@@ -3826,7 +3887,7 @@ describe("createToolServer", () => {
         },
         healthConfig: {
           eventLoopLagFailMs: 60_000,
-          maxRssBytes: Number.MAX_SAFE_INTEGER,
+          maxMainIsolateBytes: Number.MAX_SAFE_INTEGER,
           toolCallOverdueGraceMs: 10,
         },
         reportFatalToolCallDefect: (defect) => reported.push(defect),
