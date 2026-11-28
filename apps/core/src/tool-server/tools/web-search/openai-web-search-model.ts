@@ -1,13 +1,18 @@
 import { DEFAULT_OPENAI_WEB_SEARCH_MODEL_SPEC } from "@stanley2058/lilac-utils/core-config/openai-web-search";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
+import {
+  selectOpenAICompatibleServer,
+  type OpenAICompatibleServers,
+} from "@stanley2058/lilac-utils/openai-compatible-servers";
+
 /**
  * Resolves `tools.web.openai.model` to the endpoint that runs the hosted
  * `web_search` call. The value is a `provider/model` spec; a bare model id
  * (the original form, kept for existing configs) means `openai/<id>`. Only
  * `openai` and `openai-compatible` models can drive the OpenAI Responses
  * `web_search` tool, so the provider selects between the `OPENAI_*` and
- * `OPENAI_COMPATIBLE_*` credentials.
+ * `OPENAI_COMPATIBLE_*` credentials, or an explicitly named compatible server.
  */
 
 export type OpenAIWebSearchEndpoint = {
@@ -58,6 +63,7 @@ function resolveSpec(raw: string): string {
 export function resolveOpenAIWebSearchModel(input: {
   readonly model: string | undefined;
   readonly environment: OpenAIWebSearchModelEnvironment;
+  readonly openAICompatibleServers?: OpenAICompatibleServers;
 }): ResultType<ResolvedOpenAIWebSearchModel, OpenAIWebSearchModelInvalid> {
   const raw = input.model?.trim() || DEFAULT_OPENAI_WEB_SEARCH_MODEL_SPEC;
   const spec = resolveSpec(raw);
@@ -80,6 +86,24 @@ export function resolveOpenAIWebSearchModel(input: {
       spec,
       apiKey: input.environment.openai.apiKey,
       baseUrl: input.environment.openai.baseUrl,
+    });
+  }
+  const named = selectOpenAICompatibleServer(modelId, input.openAICompatibleServers ?? {});
+  if (named) {
+    if (!named.modelId)
+      return invalid(raw, `names OpenAI-compatible server '${named.name}' without a model.`);
+    const apiKey = named.server.apiKeyEnv ? process.env[named.server.apiKeyEnv]?.trim() : undefined;
+    if (!apiKey)
+      return invalid(
+        raw,
+        `names OpenAI-compatible server '${named.name}' without credentials for Responses web_search.`,
+      );
+    return Result.ok({
+      provider,
+      modelId: named.modelId,
+      spec,
+      apiKey,
+      baseUrl: named.server.baseUrl,
     });
   }
   const compatible = input.environment.openaiCompatible;

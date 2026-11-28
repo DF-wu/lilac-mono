@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, jest } from "bun:test";
 import { createLogger } from "@stanley2058/lilac-utils";
+import type { OpenAICompatibleServers } from "@stanley2058/lilac-utils/openai-compatible-servers";
 import type { ServerToolResult } from "@stanley2058/lilac-plugin-runtime";
 import { Panic } from "better-result";
 
@@ -930,6 +931,46 @@ describe("web search and permits", () => {
     expect(seen[0]?.openai).toEqual({ apiKey: undefined });
   });
 
+  it("deduplicates invalid OpenAI search diagnostics and reports a changed resolution error", async () => {
+    const logger = createLogger({ module: "web-search-refresh-test" });
+    const logError = jest.spyOn(logger, "logError").mockImplementation(() => undefined);
+    let namedServers: OpenAICompatibleServers = {
+      search: { baseUrl: "https://search.example.test/v1" },
+    };
+    const tool = new Web({
+      ...baseWebDependencies,
+      createLogger: () => logger,
+      loadWebToolConfig: async () => ({
+        extractProviders: ["openai"],
+        fetchMode: "auto",
+        firecrawlPolicy: undefined,
+        openaiPolicy: { model: "openai-compatible/search/", searchContextSize: "medium" },
+        openAICompatibleServers: namedServers,
+      }),
+    });
+    const diagnostics = () =>
+      logError.mock.calls.filter(
+        ([message]) =>
+          message ===
+          "web.search provider 'openai' is unavailable: tools.web.openai.model cannot run web_search",
+      );
+    try {
+      for (let call = 0; call < 2; call += 1) {
+        expect((await tool.call("search", { query: "invalid" })).isErr()).toBe(true);
+      }
+      expect(diagnostics()).toHaveLength(1);
+      expect(JSON.stringify(diagnostics())).toContain("without a model");
+      namedServers = {};
+      for (let call = 0; call < 2; call += 1) {
+        expect((await tool.call("search", { query: "changed error" })).isErr()).toBe(true);
+      }
+      expect(diagnostics()).toHaveLength(2);
+      expect(JSON.stringify(diagnostics().at(-1))).toContain("OPENAI_COMPATIBLE_BASE_URL");
+    } finally {
+      logError.mockRestore();
+    }
+  });
+
   it("preserves Panic from web config loading", async () => {
     const panic = new Panic({ message: "web config invariant" });
     const tool = createTool({
@@ -1454,6 +1495,152 @@ describe("fetch URL protocols", () => {
         );
         expect(result.isErr()).toBe(true);
       }
+    }
+  });
+});
+
+describe("Responses search endpoint integration", () => {
+  it.each(["bare", "official", "legacy", "named"] as const)(
+    "uses %s endpoint selection and preserves citations",
+    async (selection) => {
+      const requests: { path: string; authorization: string | null; body: any }[] = [];
+      const server = startServer(async (request) => {
+        requests.push({
+          path: new URL(request.url).pathname,
+          authorization: request.headers.get("authorization"),
+          body: await request.json(),
+        });
+        return Response.json({
+          status: "completed",
+          output: [
+            { type: "web_search_call", status: "completed" },
+            {
+              type: "message",
+              content: [
+                {
+                  type: "output_text",
+                  text: "Supported fact.",
+                  annotations: [
+                    {
+                      type: "url_citation",
+                      url: "https://example.test/source?utm_source=openai",
+                      title: "Source",
+                      start_index: 0,
+                      end_index: 15,
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        });
+      });
+      const originalKey = process.env.LILAC_TEST_SEARCH_INTEGRATION_KEY;
+      process.env.LILAC_TEST_SEARCH_INTEGRATION_KEY = "named-test-key";
+      try {
+        const models = {
+          bare: "model",
+          official: "openai/model",
+          legacy: "openai-compatible/team/model",
+          named: "openai-compatible/search/team/model",
+        };
+        const tool = new Web({
+          ...baseWebDependencies,
+          loadWebToolConfig: async () => ({
+            extractProviders: ["openai"],
+            fetchMode: "auto",
+            firecrawlPolicy: undefined,
+            openaiPolicy: { model: models[selection], searchContextSize: "high" },
+            openAICompatibleServers: {
+              search: {
+                baseUrl: `${server.url}named/v1`,
+                apiKeyEnv: "LILAC_TEST_SEARCH_INTEGRATION_KEY",
+              },
+            },
+          }),
+          getProviderEnvironment: () => ({
+            ...emptyEnvironment,
+            openai: { baseUrl: `${server.url}official/v1`, apiKey: "official-test-key" },
+            openaiCompatible: { baseUrl: `${server.url}legacy/v1`, apiKey: "legacy-test-key" },
+          }),
+        });
+        const results = await toolValue(tool.call("search", { query: "fact" }));
+        expect(requests).toHaveLength(1);
+        const endpoint = selection === "bare" ? "official" : selection;
+        expect(requests[0]).toMatchObject({
+          path: `/${endpoint}/v1/responses`,
+          authorization: `Bearer ${endpoint}-test-key`,
+          body: {
+            model: selection === "bare" || selection === "official" ? "model" : "team/model",
+            tools: [{ type: "web_search", search_context_size: "high" }],
+            store: false,
+            tool_choice: "required",
+          },
+        });
+        expect(results).toMatchObject([
+          {
+            url: "https://example.test/source",
+            title: "Source",
+            content: expect.stringContaining("Supported fact."),
+          },
+        ]);
+      } finally {
+        if (originalKey === undefined) delete process.env.LILAC_TEST_SEARCH_INTEGRATION_KEY;
+        else process.env.LILAC_TEST_SEARCH_INTEGRATION_KEY = originalKey;
+      }
+    },
+  );
+
+  it("refreshes a named endpoint and credentials for the same search model", async () => {
+    const requests: { path: string; authorization: string | null }[] = [];
+    const server = startServer((request) => {
+      requests.push({
+        path: new URL(request.url).pathname,
+        authorization: request.headers.get("authorization"),
+      });
+      return Response.json({
+        status: "completed",
+        output: [{ type: "web_search_call", status: "completed" }],
+      });
+    });
+    const originalKey = process.env.LILAC_TEST_SEARCH_INTEGRATION_KEY;
+    process.env.LILAC_TEST_SEARCH_INTEGRATION_KEY = "first-test-key";
+    let baseUrl = `${server.url}first/v1`;
+    const tool = new Web({
+      ...baseWebDependencies,
+      loadWebToolConfig: async () => ({
+        extractProviders: ["openai"],
+        fetchMode: "auto",
+        firecrawlPolicy: undefined,
+        openaiPolicy: { model: "openai-compatible/search/model", searchContextSize: "medium" },
+        openAICompatibleServers: {
+          search: { baseUrl, apiKeyEnv: "LILAC_TEST_SEARCH_INTEGRATION_KEY" },
+        },
+      }),
+    });
+    try {
+      await tool.call("search", { query: "first" });
+      const retainedStrings = () =>
+        Object.values(tool)
+          .filter((value) => typeof value === "string")
+          .join("\n");
+      expect(retainedStrings()).not.toContain("first-test-key");
+      baseUrl = `${server.url}second/v1`;
+      process.env.LILAC_TEST_SEARCH_INTEGRATION_KEY = "second-test-key";
+      await tool.call("search", { query: "second" });
+      process.env.LILAC_TEST_SEARCH_INTEGRATION_KEY = "rotated-test-key";
+      await tool.call("search", { query: "rotated" });
+      expect(retainedStrings()).not.toContain("rotated-test-key");
+      delete process.env.LILAC_TEST_SEARCH_INTEGRATION_KEY;
+      expect((await tool.call("search", { query: "missing" })).isErr()).toBe(true);
+      expect(requests).toEqual([
+        { path: "/first/v1/responses", authorization: "Bearer first-test-key" },
+        { path: "/second/v1/responses", authorization: "Bearer second-test-key" },
+        { path: "/second/v1/responses", authorization: "Bearer rotated-test-key" },
+      ]);
+    } finally {
+      if (originalKey === undefined) delete process.env.LILAC_TEST_SEARCH_INTEGRATION_KEY;
+      else process.env.LILAC_TEST_SEARCH_INTEGRATION_KEY = originalKey;
     }
   });
 });

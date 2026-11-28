@@ -179,6 +179,36 @@ tools:
 | `tools.web.openai.model` | `openai/gpt-5-mini` | The mediator model as `provider/model`. `openai/<id>` uses `OPENAI_API_KEY` and `OPENAI_BASE_URL`; `openai-compatible/<id>` uses `OPENAI_COMPATIBLE_API_KEY` and `OPENAI_COMPATIBLE_BASE_URL`. A bare model id from an older config means `openai/<id>`. Any other provider (for example `anthropic/...`) leaves the `openai` provider unconfigured and logs the reason. |
 | `tools.web.openai.searchContextSize` | `medium` | Passed to the hosted tool as `search_context_size`; controls how much retrieved text the mediator sees. |
 
+In v3, an explicit named endpoint reuses `models.providers.openaiCompatible`:
+
+```yaml
+configVersion: 3
+models:
+  providers:
+    openaiCompatible:
+      search:
+        baseUrl: https://gateway.example.test/v1
+        apiKeyEnv: SEARCH_API_KEY
+tools:
+  web:
+    extract:
+      providers: [openai]
+    openai:
+      model: openai-compatible/search/team/model
+```
+
+The request uses the selected server's `/responses`, model `team/model`, and only
+`SEARCH_API_KEY`. A matching server name takes precedence over the legacy environment
+endpoint. An unmatched prefix retains the full legacy model ID, as upstream chat
+routing does. Named search requires a nonempty key; it never borrows another endpoint's
+credentials. It also requires actual Responses hosted-search support. Config reloads
+refresh the selected search connection. Bare IDs and `openai/<id>` still select the
+OpenAI environment connection, even if a compatible server shares that name.
+
+V2 configurations keep their existing environment route. Downgrading to code without
+named search support requires restoring a legacy or official search model ref; the
+older fork would send the named prefix as part of the legacy model ID.
+
 Credentials never live in `core-config.yaml`. When the base URL points at an
 OpenAI-compatible gateway, that gateway must relay `POST /responses` with the
 hosted `web_search` tool; a gateway that only proxies chat completions returns a

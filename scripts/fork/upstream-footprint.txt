@@ -137,6 +137,7 @@ packages/utils/core-config/v1.ts  # v1 fallbacks for fork config keys
 packages/utils/core-config/v2.ts  # v2 schema includes fork config modules
 packages/utils/index.ts  # re-exports the custom-command menu module
 packages/utils/model-provider.ts  # wires provider-local tool-image middleware; transformation lives in a fork-owned module
+packages/utils/openai-compatible-servers.ts  # shares upstream named endpoint selection with fork Responses web.search
 packages/utils/prompt-templates/TOOLS.md  # mentions Telegram t.me links for conversation tools
 packages/utils/tests/core-config.versioning.test.ts  # v1/v2 drift test for fork keys
 packages/utils/tests/core-config.web-search-provider.test.ts  # covers the openai provider config
@@ -247,3 +248,9 @@ apps/core/tests/runtime/config-files.test.ts  # proves the shared patch path pre
 apps/core/tests/ssh/remote-runner-hosts.ts  # shares the fork's bounded process-exit assertion with upstream's relocated SSH tests
 apps/core/tests/ssh/remote-runner-shell-fallback.test.ts  # retains PID-before-readiness and bounded cleanup assertions after upstream relocation
 apps/web/src/config-ui/core-manifest.ts  # retains fork configuration in the YAML editor alongside upstream structured forms
+
+apps/core/tests/conversation/thread-embedding.test.ts  # verifies named endpoint document/query embeddings survive the tool-image wrapper and config replacement
+packages/utils/tests/openai-compatible-servers.test.ts  # verifies wrapped provider methods and upstream snapshot client caching
+
+apps/core/src/agent/rejected-input-media-recovery.ts  # omits broad media-stripping retry that cannot safely identify a rejected attachment
+apps/core/tests/agent/rejected-input-media-recovery.test.ts  # replaces stripping-policy tests with canonical-media preservation at the normal runner entry point

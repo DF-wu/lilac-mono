@@ -93,7 +93,8 @@ describe("isolate memory collector", () => {
     ]);
     for (const worker of round.workers) {
       expect(worker.heapUsed).toBeGreaterThan(0);
-      expect(worker.heapTotal).toBeGreaterThanOrEqual(worker.heapUsed);
+      // Bun/JSC includes external memory in heapUsed, but not heapTotal.
+      expect(worker.heapTotal + worker.external).toBeGreaterThanOrEqual(worker.heapUsed);
       expect(worker).not.toHaveProperty("rss");
     }
     collector.close();

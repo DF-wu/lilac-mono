@@ -1,7 +1,10 @@
 import type { Database } from "bun:sqlite";
 import { Result } from "better-result";
 import { z } from "zod";
-import { CorruptPersistedFields, type PersistedDataError } from "@stanley2058/lilac-utils";
+import {
+  CorruptPersistedFields,
+  type PersistedDataError,
+} from "@stanley2058/lilac-utils/persistence";
 
 /**
  * Telegram as a conversation-memory source.

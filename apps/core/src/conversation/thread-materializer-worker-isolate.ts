@@ -1,4 +1,6 @@
-import { createLogger, formatTaggedErrorForLog, getCoreConfig } from "@stanley2058/lilac-utils";
+import { getCoreConfig } from "@stanley2058/lilac-utils/core-config";
+import { createLogger } from "@stanley2058/lilac-utils/logging";
+import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils/tagged-error-log";
 import { Panic, Result, TaggedError } from "better-result";
 
 import { installIsolateMemoryResponder } from "../shared/isolate-memory";
@@ -9,6 +11,10 @@ import {
   type ThreadMaterializerWorkerResponse,
 } from "./thread-materializer-worker-protocol";
 import { ConversationThreadStore } from "./thread-store";
+import {
+  DEFAULT_MATERIALIZER_WORKER_MAX_ISOLATE_BYTES,
+  startWorkerMemoryWatchdog,
+} from "./worker-memory-watchdog";
 
 const logger = createLogger({ module: "conversation-thread-materializer-worker-isolate" });
 
@@ -103,6 +109,16 @@ async function runRequest(request: ThreadMaterializerWorkerRequest): Promise<voi
 }
 
 installIsolateMemoryResponder("thread-materializer");
+startWorkerMemoryWatchdog({
+  workerName: "thread-materializer-worker",
+  maxIsolateBytes: DEFAULT_MATERIALIZER_WORKER_MAX_ISOLATE_BYTES,
+  emit: (event) => respond(event),
+  onExceeded: () => {
+    store?.close();
+    store = null;
+  },
+});
+
 let requestQueue = Promise.resolve();
 
 self.addEventListener("message", (event: MessageEvent<unknown>) => {

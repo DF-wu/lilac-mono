@@ -1,5 +1,5 @@
 import type { OpenAICompatibleProvider } from "@ai-sdk/openai-compatible";
-import { wrapLanguageModel, type LanguageModelMiddleware } from "ai";
+import type { LanguageModelMiddleware } from "ai";
 
 type ChatModel = ReturnType<OpenAICompatibleProvider>;
 type Prompt = Parameters<ChatModel["doGenerate"]>[0]["prompt"];
@@ -54,6 +54,7 @@ const toolImageMiddleware: LanguageModelMiddleware = {
 export function withOpenAICompatibleToolImages(
   provider: OpenAICompatibleProvider,
 ): OpenAICompatibleProvider {
+  const { wrapLanguageModel }: typeof import("ai") = require("ai");
   const languageModel: OpenAICompatibleProvider["languageModel"] = (modelId, config) =>
     wrapLanguageModel({
       model: provider.languageModel(modelId, config),

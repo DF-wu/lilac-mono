@@ -390,7 +390,13 @@ function rebuildDiscordConversationThreads(
   materializer.markAllDirty();
   void Promise.allSettled([materializer.flush()]).then(([settled]) => {
     // A failed or interrupted rebuild stays pending, so the next start repeats it.
-    if (settled?.status === "fulfilled" && getStore() === store) store.completeDiscordRebuild();
+    if (
+      settled?.status === "fulfilled" &&
+      !materializer.hasIncompleteWork() &&
+      getStore() === store
+    ) {
+      store.completeDiscordRebuild();
+    }
   });
 }
 
@@ -1552,6 +1558,12 @@ export async function createCoreRuntime(
       details: redisHealth,
     });
 
+    const workerMemory = {
+      searchPool: conversationThreadSearchPool?.getMemoryDiagnostics() ?? [],
+      materializer: conversationThreadMaterializer?.getMemoryDiagnostics() ?? null,
+      summarization: stopConversationThreadSummarizationWorker?.getMemoryDiagnostics() ?? null,
+    };
+
     return {
       checks,
       ...(options.includeMemoryDiagnostics
@@ -1561,6 +1573,7 @@ export async function createCoreRuntime(
               openObserve: getOpenObserveDiagnostics(),
               telemetry: getTelemetryDiagnostics(),
               isolates: await isolateMemory.collect(),
+              workers: workerMemory,
             },
           }
         : {}),
@@ -1570,6 +1583,7 @@ export async function createCoreRuntime(
           runtimeFullyStarted,
           mcpRegistryInitPending: mcpRegistryInitPromise !== null,
           mcpOAuthCallback: mcpOAuthCallback.getStatus(),
+          workers: workerMemory,
         },
         ...surfaceInfo,
         redis: redisHealth,
