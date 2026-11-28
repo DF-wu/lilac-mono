@@ -44,16 +44,15 @@ into one runtime.
 
 ## Fork Differences
 
-The [November 11 integration inventory](./docs/fork-integration-20261111/README.md) records the exact upstream and fork pins, every retained feature, migration support boundaries, verification, and remaining limitations for PR #101 and its follow-up.
-
-The table below lists only behavior that still differs from upstream. GitHub reply permalinks and comment self-loop protection were accepted upstream and are no longer listed. For the full rationale, limitations, and every pull request opened against upstream, see [`docs/fork-differences.md`](./docs/fork-differences.md).
+See the [fork maintenance inventory](./docs/fork-differences.md) for retained features and fixes, upstream contributions, and the current upstream baseline.
 
 | Area                            | Difference provided by this fork                                                                                                                       | Important limitations                                                                             |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
 | Telegram surface                | DMs, groups, forum topics, streaming HTML replies, cancellation, reactions, command menu, inbound/outbound attachments, workflow cards, same-surface tools, and Telegram history in cross-surface conversation memory | Disabled by default; long polling only; memory indexes one thread per chat or topic |
 | Native conversation recording  | Records native human messages and visible assistant text/ready attachments to an owner-provisioned Discord webhook; see [setup and guarantees](./docs/native-discord-mirror.md) | Optional `LILAC_NATIVE_DISCORD_WEBHOOK_URL`; `LILAC_NATIVE_DISCORD_ROUTING=threaded` opts into durable child routing; disabled by default, best effort, no historical backfill |
+| Native microphone dictation | Records a take in the browser and appends the transcribed text to the draft. See [dictation setup](./docs/native-surface.md#microphone-dictation) | Opt-in and requires a browser-accessible transcription service that permits the Native origin |
 | OpenAI-compatible image provider | Exposes the operator's OpenAI-compatible endpoint to upstream's `generate.image` scripts as `providers.openaiCompatible`, with a gateway recipe in the `image-generation` skill | Requires `OPENAI_COMPATIBLE_BASE_URL`; restricted callers cannot run image scripts; no automatic fallback between providers |
-| OpenAI `web.search` provider    | `openai` in `tools.web.extract.providers` runs `web.search` through the OpenAI Responses `web_search` tool and returns the answer's cited sources     | `configVersion: 2` only; search-only (`web.extract` skips it); date filters are model guidance only |
+| OpenAI `web.search` provider    | `openai` in `tools.web.extract.providers` runs `web.search` through the OpenAI Responses `web_search` tool and returns the answer's cited sources | Core config v2 and v3. `web.extract` skips it. Date filters are model guidance |
 | Custom media plugin             | Deployable Level 2 image/video plugin example demonstrating strict configuration and file-safety handling                                              | The plugin is trusted in-process code; restricted callers currently cannot use external callables |
 | Operations and delivery         | Upstream checks every 6 hours, GHCR publishes verified `catalina`/`claudia` tags, and CI enforces the upstream-footprint allowlist                     | Automatic merges still require manual handling when conflicts occur                               |
 
@@ -94,8 +93,8 @@ flowchart LR
     Fork --> Images[GHCR image workflow]
 ```
 
-Git conflicts remain fork review PRs for human resolution. See the
-[maintenance review](./docs/fork-review-2026-10-22.md) for the current upstream alignment work.
+Git conflicts open fork review PRs for human resolution. See the
+[upstream sync guide](./docs/upstream-sync.md) for verification and publication details.
 
 ## Quick Start
 

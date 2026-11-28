@@ -29,9 +29,12 @@ sequenceDiagram
     Tool-->>Agent: the same array, identical in shape to Tavily/Exa/Firecrawl results
 ```
 
-If the provider fails with a retriable error (rate limit, 5xx, timeout, network
-error), `web.search` continues with the next provider in the list, exactly as
-for the other providers.
+Each OpenAI search attempt has a 30-second deadline, including requests to a
+compatible gateway. Other search providers have a 10-second deadline per
+attempt. After a retryable failure such as a rate limit, 5xx, timeout, or network
+error, `web.search` retries the same provider once. If that attempt also fails
+with a retryable error, it proceeds to the next provider in the list. Caller
+cancellation stops both retry and fallback.
 
 ## What the mediator model receives
 
@@ -200,8 +203,8 @@ the only provider, `web.extract` reports:
 
 - Results are mediated: snippets are summaries by the configured model, not
   page excerpts, and the mediator has no conversation context.
-- Each search is one extra model call. Expect roughly 15–20 seconds and the
-  mediator's token cost on top of the hosted search fee.
+- Each search attempt is one extra model call. It incurs the mediator's token
+  cost and the hosted search fee.
 - Date and topic constraints are prompt guidance, not filters. `searchDepth`
   is ignored.
 - Search only; `web.extract` never uses this provider.

@@ -1,4 +1,6 @@
 import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 import { configureSqliteConnection } from "../../../shared/sqlite";
 import type { AdapterEvent } from "../../events";
@@ -101,6 +103,7 @@ export class TelegramSurfaceStore {
   private readonly db: Database;
 
   constructor(dbPath: string) {
+    mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     configureSqliteConnection(this.db);
     this.migrate();

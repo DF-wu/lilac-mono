@@ -29,6 +29,14 @@ The script resolves one published release, downloads the binary for your machine
 SHA-256 checksum. Interactive input comes from the terminal, so the piped shell script does not consume
 your prompt responses.
 
+This command selects the upstream release. To install this fork, choose a tag from the
+[fork releases](https://github.com/DF-wu/lilac-mono/releases), replace `<release-tag>`, and run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/DF-wu/lilac-mono/main/install.sh |
+  LILAC_RELEASE_BASE_URL='https://github.com/DF-wu/lilac-mono/releases/download/<release-tag>' bash
+```
+
 Use the arrow keys to navigate menus and Enter to select. Press Escape or Ctrl+C to cancel.
 Text fields show editable defaults. Credentials are masked; when updating an existing credential,
 press Enter without typing to keep it.
@@ -141,12 +149,10 @@ The selected installation directory contains:
 | `data/secret/` | File-based credentials, including Codex login when configured |
 | `data/workspace/` | Lilac's working directory |
 
-Redis keeps its data in a Compose volume. Reinstallation preserves these files and volumes. Published
-Core images use UID `1000`. Setup uses a short-lived container to prepare private data files for
-that UID and to read them on later runs when your host user cannot. The host-side Compose file,
-environment file, and installer remain owned by your user. See
-[container storage and UID](docker-deployment.md#storage-and-uid) for manual deployments with a
-different build-time UID.
+Redis keeps its data in a Compose volume. Reinstallation preserves these files and volumes. The
+scheduled release uses UID/GID `1000`. If you select a Catalina or Claudia image, setup prepares
+private data for UID/GID `3000` from the image's identity record. The host-side Compose file,
+environment file, and installer remain owned by your user. See [container storage and UID](docker-deployment.md#storage-and-uid).
 
 From the installation directory, run:
 
@@ -164,8 +170,9 @@ data. Setup reads Compose's resolved configuration, including environment files,
 profiles, and list-form settings. Existing environment files keep their contents and format;
 confirmed credential changes are written as explicit Compose environment values.
 
-Guided setup manages a writable bind mount from the installation's `data` directory to Core's `/data`,
-with Core running as UID `1000`. It checks this layout before accessing configuration. Named data
+Guided setup manages a writable bind mount from the installation's `data` directory to Core's `/data`.
+Leave the Core service's Compose `user` field unset when selecting a Catalina or Claudia image so its
+entrypoint can switch to the image account. Setup checks the mount layout before accessing configuration. Named data
 volumes, different data directories, and mounts that cover part of `/data` require manual Compose
 management. Setup stops with instructions when it cannot manage the existing layout.
 Core and gateway definitions must also live in `compose.yaml`. YAML anchors and merges are supported;
@@ -217,6 +224,10 @@ computer-use gateway, and computer-use runner images natively for Linux amd64 an
 them, and merges their manifests. The CLI is then compiled and run natively on Linux and macOS for
 both architectures, outside the source checkout. A GitHub Release becomes visible only after all
 images and binaries succeed. Failed partial builds cannot become the default installer release.
+
+The fork publishes `catalina`, `claudia`, and revision tags through a separate verified image
+workflow. The `latest` container tag points to Catalina. The guided installer's release still uses
+its embedded digests.
 
 Published packages are:
 

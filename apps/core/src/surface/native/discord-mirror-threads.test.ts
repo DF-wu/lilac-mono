@@ -147,12 +147,19 @@ test("destination includes webhook and parent identity, but excludes credential 
 });
 
 test("uncertain create responses and crash reservations block duplicate creates across restart", async () => {
-  for (const outcome of ["network", "server", "malformed", "http-timeout"] as const) {
+  for (const outcome of ["network", "server", "malformed", "http-timeout", "oversize"] as const) {
     const f = fixture();
     f.create(async () => {
       if (outcome === "network") throw new Error("PRIVATE_SENTINEL");
       if (outcome === "server") return Response.json({}, { status: 503 });
       if (outcome === "http-timeout") return Response.json({}, { status: 408 });
+      if (outcome === "oversize")
+        return Response.json({
+          id: "300",
+          type: 11,
+          parent_id: "200",
+          padding: "x".repeat(65_536),
+        });
       return Response.json({ id: "broken" });
     });
     expect(await f.make().resolve("native-a", "First")).toBeNull();

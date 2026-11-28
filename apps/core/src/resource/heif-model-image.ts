@@ -70,7 +70,7 @@ export async function convertHeifForModel(data: Uint8Array, filename?: string) {
       return adaptToolResultToHost(Result.err(converted.error.cause));
     return null;
   }
-  const jpeg = converted.match({ ok: (bytes) => bytes, err: () => null });
+  const jpeg = converted.value;
   if (
     !jpeg ||
     jpeg[0] !== 0xff ||

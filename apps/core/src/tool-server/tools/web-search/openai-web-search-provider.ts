@@ -1,3 +1,8 @@
+import {
+  DEFAULT_OPENAI_WEB_SEARCH_CONTEXT_SIZE,
+  DEFAULT_OPENAI_WEB_SEARCH_MODEL_ID,
+  type OpenAIWebSearchConfig,
+} from "@stanley2058/lilac-utils/core-config/openai-web-search";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
@@ -16,11 +21,8 @@ import type { WebSearchInput, WebSearchProvider, WebSearchResult } from "./types
  * This provider does not implement `web.extract`.
  */
 
-export const OPENAI_WEB_SEARCH_CONTEXT_SIZES = ["low", "medium", "high"] as const;
-export type OpenAIWebSearchContextSize = (typeof OPENAI_WEB_SEARCH_CONTEXT_SIZES)[number];
+export type OpenAIWebSearchContextSize = OpenAIWebSearchConfig["searchContextSize"];
 
-export const DEFAULT_OPENAI_WEB_SEARCH_MODEL = "gpt-5-mini";
-const DEFAULT_OPENAI_WEB_SEARCH_CONTEXT_SIZE: OpenAIWebSearchContextSize = "medium";
 const DEFAULT_OPENAI_API_BASE_URL = "https://api.openai.com/v1";
 
 const urlCitationSchema = z.object({
@@ -381,7 +383,7 @@ export class OpenAIWebSearchProvider implements WebSearchProvider {
     const apiKey = adaptOpenAIWebSearchResultToHost(decodeOpenAIApiKey(this.config.apiKey));
 
     const body = {
-      model: this.config.model?.trim() || DEFAULT_OPENAI_WEB_SEARCH_MODEL,
+      model: this.config.model?.trim() || DEFAULT_OPENAI_WEB_SEARCH_MODEL_ID,
       input: buildOpenAIWebSearchInstructions(input),
       tools: [
         {

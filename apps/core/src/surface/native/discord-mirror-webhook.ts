@@ -45,7 +45,7 @@ export function discordMirrorWebhookUrl(value?: string): string | undefined {
   return `https://discord.com${url.pathname.replace(/^\/api\/(?!v10\/)/, "/api/v10/")}`;
 }
 
-export async function readDiscordMirrorReply(response: Response) {
+async function readDiscordMirrorReply(response: Response) {
   const reader = response.body?.getReader();
   if (!reader) return null;
   let length = 0;
@@ -65,6 +65,36 @@ export async function readDiscordMirrorReply(response: Response) {
     catch: () => null,
   });
   return parsed.match({ ok: decodeDiscordMirrorReply, err: () => null });
+}
+
+export async function fetchDiscordMirrorReply(
+  send: MirrorFetch,
+  url: string,
+  signal: AbortSignal,
+  request: () => Pick<RequestInit, "method" | "headers" | "body">,
+) {
+  const captured = await Result.tryPromise({
+    try: async () => {
+      const response = await send(url, {
+        ...request(),
+        redirect: "error",
+        signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+      });
+      const reply = await readDiscordMirrorReply(response);
+      const remaining = response.headers.get("x-ratelimit-remaining");
+      const reset = Number(response.headers.get("x-ratelimit-reset-after"));
+      const retry = reply?.retry_after ?? Number(response.headers.get("retry-after") ?? 1);
+      return {
+        status: response.status,
+        reply,
+        resetAfterMs: remaining === "0" && Number.isFinite(reset) && reset > 0 ? reset * 1000 : 0,
+        retryAfterMs: Number.isFinite(retry) && retry >= 0 ? retry * 1000 : 1000,
+      };
+    },
+    catch: () => null,
+  });
+  if (captured.isErr()) return null;
+  return captured.value;
 }
 
 export function createDiscordMirrorWebhook(options: {
@@ -116,41 +146,21 @@ export function createDiscordMirrorWebhook(options: {
       if (id) url.pathname += `/messages/${id}`;
       if (method === "POST") url.searchParams.set("wait", "true");
       if (threadId) url.searchParams.set("thread_id", threadId);
-      const captured = await Result.tryPromise({
-        try: async () => {
-          const response = await send(url.toString(), {
-            method,
-            redirect: "error",
-            signal: AbortSignal.any([options.signal, AbortSignal.timeout(10_000)]),
-            ...(method === "DELETE" ? {} : { body: form }),
-          });
-          const reply = await readDiscordMirrorReply(response);
-          return {
-            status: response.status,
-            reply,
-            remaining: response.headers.get("x-ratelimit-remaining"),
-            reset: response.headers.get("x-ratelimit-reset-after"),
-            retry: response.headers.get("retry-after"),
-          };
-        },
-        catch: () => new Error("Native Discord mirror transport failed"),
-      });
-      const response = captured.match({ ok: (value) => value, err: () => null });
+      const response = await fetchDiscordMirrorReply(send, url.toString(), options.signal, () => ({
+        method,
+        ...(method === "DELETE" ? {} : { body: form }),
+      }));
       if (!response) {
         // An uncertain POST may already exist on Discord; never blindly repeat it.
         options.warn("Native Discord mirror request failed; update dropped");
         return null;
       }
-      const reset = Number(response.reset);
-      if (response.remaining === "0" && Number.isFinite(reset) && reset > 0)
-        blockedUntil = Date.now() + reset * 1000;
+      if (response.resetAfterMs > 0) blockedUntil = Date.now() + response.resetAfterMs;
       if (response.status >= 200 && response.status < 300)
         return method === "DELETE" ? (id ?? null) : (response.reply?.id ?? null);
       if (method === "DELETE" && response.status === 404) return id ?? null;
       if (response.status === 429) {
-        const seconds = response.reply?.retry_after ?? Number(response.retry ?? 1);
-        blockedUntil =
-          Date.now() + (Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : 1000);
+        blockedUntil = Date.now() + response.retryAfterMs;
         continue;
       }
       if (response.status >= 500 && method !== "POST") {

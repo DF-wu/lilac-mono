@@ -9,6 +9,7 @@
 | 文件 | 內容 |
 | --- | --- |
 | [`fork-differences.zh-TW.md`](./fork-differences.zh-TW.md) | 本 fork 與 upstream 的現行差異、限制、同步政策與已 upstreamed 貢獻 |
+| [`upstream-sync.md`](./upstream-sync.md) | 上游同步流程、衝突審查與映像發布 |
 | [`fork-review-2026-10-22.md`](./fork-review-2026-10-22.md) | 對照 upstream `4f7eedb8` 的 fork 維護審查：保留的擴充、移除的補丁、修正與驗證限制 |
 | [`../PROJECT.md`](../PROJECT.md) | Core 的持久架構、名詞、workspace 擁有權、信任邊界與持久化指南 |
 | [`../MIGRATIONS.md`](../MIGRATIONS.md) | Core config 與儲存格式的 migration contract |
@@ -21,6 +22,7 @@
 | --- | --- |
 | [`docker-deployment.md`](./docker-deployment.md) | Docker/Compose、operator token、持久化、UID、安全邊界與診斷 |
 | [`native-surface.md`](./native-surface.md) | Native Web surface：認證、設定、操作與臨時 operator console |
+| [`native-discord-mirror.md`](./native-discord-mirror.md) | 選用的 Native 對話錄製、Discord 子討論串路由與投遞限制 |
 | [`heartbeat.md`](./heartbeat.md) | 主動追蹤：設定、舊 inbox 遷移、支援的通知目的地、實際投遞驗證與排程限制 |
 | [`native-surface-verification.md`](./native-surface-verification.md) | 舊版獨立 native client 的驗證紀錄（歷史文件）；目前的 console 設定見 `native-surface.md` |
 | [`telegram-surface.md`](./telegram-surface.md) | BotFather、allowlists、群組、forum topics、workflow、對話記憶、驗證與限制 |

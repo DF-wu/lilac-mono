@@ -12,6 +12,7 @@ import {
   createIsolatedRedis,
   withinRedisDeadline,
 } from "../../../../packages/event-bus/tests/helpers/isolated-redis";
+import { FakeBotApiServer } from "../surface/telegram/fake-bot-api-server";
 
 type NativeClient = ContractRouterClient<typeof nativeContract>;
 
@@ -185,6 +186,9 @@ test("full runtime readiness, ingress, graceful drain recovery and Redis outage 
   cleanup.defer(() => rm(directory, { recursive: true, force: true }));
   const workspace = path.join(directory, "workspace");
   await mkdir(workspace);
+  const telegram = new FakeBotApiServer();
+  cleanup.defer(() => telegram.close());
+  const telegramDbPath = path.join(directory, "telegram", "history.db");
   const nativePort = await unusedPort();
   const toolPort = await unusedPort();
   const nativeUrl = `http://127.0.0.1:${nativePort}`;
@@ -225,6 +229,12 @@ test("full runtime readiness, ingress, graceful drain recovery and Redis outage 
         fast: { model: "openai-compatible/fixture" },
       },
       surface: {
+        telegram: {
+          enabled: true,
+          token: "123:fixture",
+          dbPath: telegramDbPath,
+          apiRoot: telegram.url,
+        },
         native: {
           enabled: true,
           installationId: "runtime-test",
@@ -259,6 +269,9 @@ test("full runtime readiness, ingress, graceful drain recovery and Redis outage 
     const first = startChild(env);
     cleanup.defer(() => first.close());
     await first.phase("ready");
+    const telegramHistory = new Database(telegramDbPath, { readonly: true });
+    cleanup.defer(() => telegramHistory.close());
+    expect(telegramHistory.query("SELECT * FROM telegram_sessions").all()).toEqual([]);
     expect((await fetch(`http://127.0.0.1:${toolPort}/readyz`)).status).toBe(200);
     const firstConnection = await connect(nativeUrl);
     cleanup.defer(() => firstConnection.socket.close());
